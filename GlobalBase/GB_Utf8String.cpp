@@ -587,7 +587,7 @@ char32_t GetUtf8Char(const string& utf8Str, int64_t index)
         {
             if (!ok)
             {
-                return false;              // 该“字符”本身就是非法起始字节
+                return kInvalidCodePoint;              // 该“字符”本身就是非法起始字节
             }
             return cp;
         }
@@ -732,6 +732,71 @@ vector<string> Utf8Split(const string& textUtf8, char32_t delimiter)
 
     parts.emplace_back(textUtf8.substr(tokenStart));
     return parts;
+}
+
+bool Utf8StartsWith(const string& textUtf8, const string& targetUtf8, bool caseSensitive)
+{
+    // 与 std::string::rfind("",0)==0 的语义一致：空目标串恒为 true
+    if (targetUtf8.empty())
+    {
+        return true;
+    }
+
+    // ASCII 快速路径：大小写敏感，且两端均为纯 ASCII，直接做字节前缀比较
+    auto isAllAscii = [](const std::string& s) -> bool
+        {
+            for (unsigned char ch : s)
+            {
+                if (ch >= 0x80)
+                {
+                    return false;
+                }
+            }
+            return true;
+        };
+    if (caseSensitive && isAllAscii(textUtf8) && isAllAscii(targetUtf8))
+    {
+        if (textUtf8.size() < targetUtf8.size())
+        {
+            return false;
+        }
+        return std::char_traits<char>::compare(textUtf8.data(), targetUtf8.data(), targetUtf8.size()) == 0;
+    }
+
+    // 通用路径：逐码点对齐比较（不解整串，流式解码）
+    size_t posText = 0;
+    size_t posPat = 0;
+
+    while (posPat < targetUtf8.size())
+    {
+        if (posText >= textUtf8.size())
+        {
+            return false; // 模式未耗尽而文本已到结尾
+        }
+
+        char32_t cpText = 0, cpPat = 0;
+        size_t nextText = posText, nextPat = posPat;
+
+        internal::DecodeOneOrReplacement(textUtf8, posText, cpText, nextText);
+        internal::DecodeOneOrReplacement(targetUtf8, posPat, cpPat, nextPat);
+
+        if (!caseSensitive)
+        {
+            cpText = internal::ToLowerAscii(cpText);
+            cpPat = internal::ToLowerAscii(cpPat);
+        }
+
+        if (cpText != cpPat)
+        {
+            return false;
+        }
+
+        posText = nextText;
+        posPat = nextPat;
+    }
+
+    // 成功消费完整的模式串
+    return true;
 }
 
 int64_t Utf8Find(const string& text, const string& needle, bool caseSensitive)

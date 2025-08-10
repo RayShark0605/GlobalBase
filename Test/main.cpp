@@ -27,6 +27,13 @@ int main(int argc, char* argv[])
 
 	cout << IsUtf8(text1_Utf8) << endl;	// 1
 	cout << IsUtf8(text1_Ansi) << endl;	// 0
+	cout << endl;
+
+	cout << Utf8StartsWith(GB_STR("世界！My World！こんにちは"), GB_STR("世界！")) << endl;	// 1
+	cout << Utf8StartsWith(GB_STR("こんにちは"), GB_STR("こん")) << endl;	// 1
+	cout << Utf8StartsWith(GB_STR("こんにちは"), GB_STR("こんにちは")) << endl;	// 1
+	cout << Utf8StartsWith(GB_STR("Hello"), GB_STR("hello")) << endl;	// 0
+	cout << Utf8StartsWith(GB_STR("Hello"), GB_STR("hello"), false) << endl;	// 1
 
 	return 0;
 }

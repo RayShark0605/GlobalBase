@@ -56,6 +56,9 @@ GLOBALBASE_PORT std::string Utf8ToUpper(const std::string& utf8Str);
 // 按“单个 Unicode 码点”分割
 GLOBALBASE_PORT std::vector<std::string> Utf8Split(const std::string& textUtf8, char32_t delimiter);
 
+// 检查 UTF-8 字符串是否以指定的 UTF-8 字符串开头（可选大小写敏感）
+GLOBALBASE_PORT bool Utf8StartsWith(const std::string& textUtf8, const std::string& targetUtf8, bool caseSensitive = true);
+
 // 查找子串：返回第一个匹配的起始位置（UTF-8 字符偏移），未找到返回 -1
 GLOBALBASE_PORT int64_t Utf8Find(const std::string& text, const std::string& needle, bool caseSensitive = true);
 
