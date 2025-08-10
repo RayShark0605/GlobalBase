@@ -1,4 +1,4 @@
-#include "GB_Utility.h"
+ï»¿#include "GB_Utility.h"
 
 #if defined(_WIN32)
 #include <windows.h>
@@ -18,14 +18,14 @@ void GetConsoleEncodingCode(unsigned int& code)
     UINT cp = ::GetConsoleOutputCP();
     if (cp == 0)
     {
-        cp = ::GetACP(); // ¶µµ×
+        cp = ::GetACP(); // å…œåº•
     }
 	code = cp;
 #else
     const char* cur = setlocale(LC_CTYPE, nullptr);
     if (!cur || string(cur) == "C" || string(cur) == "POSIX")
     {
-        setlocale(LC_CTYPE, ""); // ÈÃËü´Ó»·¾³¼Ì³Ğ
+        setlocale(LC_CTYPE, ""); // è®©å®ƒä»ç¯å¢ƒç»§æ‰¿
     }
     const char* cs = nl_langinfo(CODESET);
     if (cs && *cs)
@@ -76,12 +76,12 @@ void GetConsoleEncodingCode(unsigned int& code)
         }
         else
         {
-            code = UINT_MAX; // Î´Öª±àÂë
+            code = UINT_MAX; // æœªçŸ¥ç¼–ç 
         }
     }
     else
     {
-        code = UINT_MAX; // Î´Öª±àÂë£¬¶µµ×Îª UTF-8
+        code = UINT_MAX; // æœªçŸ¥ç¼–ç ï¼Œå…œåº•ä¸º UTF-8
 	}
 #endif
 }
@@ -92,7 +92,7 @@ void GetConsoleEncodingString(string& encodingString)
 	UINT cp = ::GetConsoleOutputCP();
     if (cp == 0)
     {
-        cp = ::GetACP(); // ¶µµ×
+        cp = ::GetACP(); // å…œåº•
     }
     switch (cp)
     {
@@ -119,7 +119,7 @@ void GetConsoleEncodingString(string& encodingString)
     const char* cur = setlocale(LC_CTYPE, nullptr);
     if (!cur || string(cur) == "C" || string(cur) == "POSIX")
     {
-        setlocale(LC_CTYPE, ""); // ÈÃËü´Ó»·¾³¼Ì³Ğ
+        setlocale(LC_CTYPE, ""); // è®©å®ƒä»ç¯å¢ƒç»§æ‰¿
     }
 
     const char* cs = nl_langinfo(CODESET);
@@ -128,7 +128,7 @@ void GetConsoleEncodingString(string& encodingString)
         encodingString = string(cs);
         return;
     }
-    // ¶µµ×£¨¼«ÉÙ¼û£©
+    // å…œåº•ï¼ˆæå°‘è§ï¼‰
     encodingString = "UTF-8";
 #endif
 }
@@ -136,18 +136,18 @@ void GetConsoleEncodingString(string& encodingString)
 bool SetConsoleEncoding(unsigned int codePageId)
 {
 #if defined(_WIN32)
-    if (!::SetConsoleOutputCP(codePageId)) // Í¬Ê±ÉèÖÃÊä³öÓëÊäÈëÂëÒ³
+    if (!::SetConsoleOutputCP(codePageId)) // åŒæ—¶è®¾ç½®è¾“å‡ºä¸è¾“å…¥ç é¡µ
     {
         return false;
     }
-    if (!::SetConsoleCP(codePageId)) // »Ø¹öÊä³öÂëÒ³£¨¾¡Á¦¶øÎª£©
+    if (!::SetConsoleCP(codePageId)) // å›æ»šè¾“å‡ºç é¡µï¼ˆå°½åŠ›è€Œä¸ºï¼‰
     {
         ::SetConsoleOutputCP(::GetConsoleOutputCP());
         return false;
     }
     return true;
 #else
-    // POSIX: Ö»ÄÜÉèÖÃ½ø³Ìlocale£¬²»±£Ö¤¸Ä±äÖÕ¶ËµÄÊµ¼ÊÏÔÊ¾±àÂë
+    // POSIX: åªèƒ½è®¾ç½®è¿›ç¨‹localeï¼Œä¸ä¿è¯æ”¹å˜ç»ˆç«¯çš„å®é™…æ˜¾ç¤ºç¼–ç 
     auto trySet = [](const char* loc) -> bool
         {
             if (!loc || !*loc)
@@ -158,7 +158,7 @@ bool SetConsoleEncoding(unsigned int codePageId)
             return ret != nullptr;
         };
 
-    // ¸ù¾İµ±Ç°ÓïÑÔµØÓò£¬ÓÅÏÈ³¢ÊÔ¡°±£³ÖÓïÑÔµØÓò + ¸ü»»×Ö·û¼¯¡±µÄĞÎÊ½
+    // æ ¹æ®å½“å‰è¯­è¨€åœ°åŸŸï¼Œä¼˜å…ˆå°è¯•â€œä¿æŒè¯­è¨€åœ°åŸŸ + æ›´æ¢å­—ç¬¦é›†â€çš„å½¢å¼
     auto tryWithCurrentTerritory = [&](const char* charset) -> bool
         {
             const char* cur = setlocale(LC_CTYPE, nullptr);
@@ -176,7 +176,7 @@ bool SetConsoleEncoding(unsigned int codePageId)
             return trySet(cand.c_str());
         };
 
-    // ºòÑ¡localeÁĞ±í£¨²»Í¬·¢ĞĞ°æ¿ÉÓÃĞÔ²»Í¬£©
+    // å€™é€‰localeåˆ—è¡¨ï¼ˆä¸åŒå‘è¡Œç‰ˆå¯ç”¨æ€§ä¸åŒï¼‰
     vector<const char*> candidates;
 
     switch (codePageId)
@@ -185,16 +185,16 @@ bool SetConsoleEncoding(unsigned int codePageId)
     {
         if (tryWithCurrentTerritory("UTF-8"))
         {
-            // ÔÙÓÃ CODESET Ğ£Ñé
+            // å†ç”¨ CODESET æ ¡éªŒ
             const char* cs = nl_langinfo(CODESET);
             return (cs && strcmp(cs, "UTF-8") == 0);
         }
         candidates = {
-            "C.UTF-8",        // Debian/UbuntuµÈ³£¼û
+            "C.UTF-8",        // Debian/Ubuntuç­‰å¸¸è§
             "en_US.UTF-8",
             "zh_CN.UTF-8",
-            ".UTF-8",         // Ò»Ğ©libc½ÓÊÜ½öÖ¸¶¨×Ö·û¼¯
-            "UTF-8"           // ¼«ÉÙÊıÊµÏÖ
+            ".UTF-8",         // ä¸€äº›libcæ¥å—ä»…æŒ‡å®šå­—ç¬¦é›†
+            "UTF-8"           // æå°‘æ•°å®ç°
         };
         break;
     }
@@ -218,7 +218,7 @@ bool SetConsoleEncoding(unsigned int codePageId)
         if (tryWithCurrentTerritory("CP949")) return true;
         candidates = { "ko_KR.CP949", "ko_KR.EUC-KR", ".CP949", ".EUC-KR" };
         break;
-    case 1250:  // Windows-1250£¨¿ÉÄÜÎŞ¸Ãlocale£©
+    case 1250:  // Windows-1250ï¼ˆå¯èƒ½æ— è¯¥localeï¼‰
         if (tryWithCurrentTerritory("CP1250")) return true;
         candidates = { "cs_CZ.CP1250", ".CP1250" };
         break;
@@ -230,14 +230,14 @@ bool SetConsoleEncoding(unsigned int codePageId)
         if (tryWithCurrentTerritory("CP1252")) return true;
         candidates = { "en_US.CP1252", ".CP1252" };
         break;
-    case 437:   // CP437 ¡ú ÍË»Ø C/POSIX£¨½üËÆ US-ASCII£©
+    case 437:   // CP437 â†’ é€€å› C/POSIXï¼ˆè¿‘ä¼¼ US-ASCIIï¼‰
         candidates = { "C", "POSIX" };
         break;
-    case 850:   // CP850 ¡ú ½üËÆ ISO-8859-1
+    case 850:   // CP850 â†’ è¿‘ä¼¼ ISO-8859-1
         candidates = { "en_US.ISO-8859-1", "de_DE.ISO-8859-1", ".ISO-8859-1" };
         break;
     default:
-        return false; // Î´Öª/²»Ö§³Ö
+        return false; // æœªçŸ¥/ä¸æ”¯æŒ
     }
 
     for (const char* cand : candidates)

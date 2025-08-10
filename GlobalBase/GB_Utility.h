@@ -1,4 +1,4 @@
-#ifndef GLOBALBASE_UTILITY_H_H
+ï»¿#ifndef GLOBALBASE_UTILITY_H_H
 #define GLOBALBASE_UTILITY_H_H
 
 #include <string>
@@ -17,14 +17,14 @@
 #include "GlobalBasePort.h"
 
 
-// »ñÈ¡µ±Ç°¿ØÖÆÌ¨±àÂë
+// è·å–å½“å‰æ§åˆ¶å°ç¼–ç 
 GLOBALBASE_PORT void GetConsoleEncodingString(std::string& encodingString);
-GLOBALBASE_PORT void GetConsoleEncodingCode(unsigned int& code); // Î´Öª±àÂëÔò·µ»ØUINT_MAX
+GLOBALBASE_PORT void GetConsoleEncodingCode(unsigned int& code); // æœªçŸ¥ç¼–ç åˆ™è¿”å›UINT_MAX
 
-// ÉèÖÃ¿ØÖÆÌ¨±àÂë
+// è®¾ç½®æ§åˆ¶å°ç¼–ç 
 GLOBALBASE_PORT bool SetConsoleEncoding(unsigned int codePageId);
 
-// ÉèÖÃ¿ØÖÆÌ¨±àÂëÎª UTF-8
+// è®¾ç½®æ§åˆ¶å°ç¼–ç ä¸º UTF-8
 GLOBALBASE_PORT bool SetConsoleEncodingToUtf8();
 
 

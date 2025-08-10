@@ -1,4 +1,4 @@
-#include "GB_Utf8String.h"
+ï»¿#include "GB_Utf8String.h"
 #if defined(_WIN32)
 #include <windows.h>
 #else
@@ -11,9 +11,9 @@ using namespace std;
 
 namespace internal
 {
-    // ´Ó s[pos] ½âÂëÒ»¸ö UTF-8 Âëµã£º
-    // ³É¹¦£º·µ»Ø true£¬Ğ´³ö codePoint Óë nextPos£¨ÏÂÒ»¸ö×Ö½ÚÎ»ÖÃ£©
-    // Ê§°Ü£º·µ»Ø false£¬½öÇ°½øÒ»¸ö×Ö½Ú£¨nextPos = pos + 1£©£¬µ÷ÓÃ·½¿É°´¡°Ô­Ê¼×Ö½Ú¡±´¦Àí
+    // ä» s[pos] è§£ç ä¸€ä¸ª UTF-8 ç ç‚¹ï¼š
+    // æˆåŠŸï¼šè¿”å› trueï¼Œå†™å‡º codePoint ä¸ nextPosï¼ˆä¸‹ä¸€ä¸ªå­—èŠ‚ä½ç½®ï¼‰
+    // å¤±è´¥ï¼šè¿”å› falseï¼Œä»…å‰è¿›ä¸€ä¸ªå­—èŠ‚ï¼ˆnextPos = pos + 1ï¼‰ï¼Œè°ƒç”¨æ–¹å¯æŒ‰â€œåŸå§‹å­—èŠ‚â€å¤„ç†
     static bool DecodeOne(const string& s, size_t pos, char32_t& codePoint, size_t& nextPos)
     {
         const size_t n = s.size();
@@ -38,13 +38,13 @@ namespace internal
         else if ((b0 & 0xF8) == 0xF0) { len = 4; cp = (b0 & 0x07); }
         else
         {
-            nextPos = pos + 1; // ·Ç·¨ÆğÊ¼×Ö½Ú
+            nextPos = pos + 1; // éæ³•èµ·å§‹å­—èŠ‚
             return false;
         }
 
         if (pos + len > n)
         {
-            nextPos = pos + 1; // ½Ø¶Ï
+            nextPos = pos + 1; // æˆªæ–­
             return false;
         }
 
@@ -53,13 +53,13 @@ namespace internal
             unsigned char bx = static_cast<unsigned char>(s[pos + i]);
             if ((bx & 0xC0) != 0x80)
             {
-                nextPos = pos + 1; // ·Ç 10xxxxxx
+                nextPos = pos + 1; // é 10xxxxxx
                 return false;
             }
             cp = (cp << 6) | (bx & 0x3F);
         }
 
-        // RFC 3629£º×î¶Ì±àÂë¡¢ºÏ·¨·¶Î§¡¢ÅÅ³ı´úÀíÏî
+        // RFC 3629ï¼šæœ€çŸ­ç¼–ç ã€åˆæ³•èŒƒå›´ã€æ’é™¤ä»£ç†é¡¹
         if ((len == 2 && cp < 0x80) ||
             (len == 3 && cp < 0x800) ||
             (len == 4 && (cp < 0x10000 || cp > 0x10FFFF)) ||
@@ -81,7 +81,7 @@ namespace internal
         {
             return false;
         }
-        return nextPos == s.size(); // ±ØĞëÇ¡ºÃÒ»¸öÂëµã
+        return nextPos == s.size(); // å¿…é¡»æ°å¥½ä¸€ä¸ªç ç‚¹
     }
 
 }
@@ -103,10 +103,10 @@ string WStringToUtf8(const wstring& ws)
         return {};
     }
 
-    // 1) ¼ÆËãËùĞè×Ö½ÚÊı£¨²»º¬ '\0'£©
+    // 1) è®¡ç®—æ‰€éœ€å­—èŠ‚æ•°ï¼ˆä¸å« '\0'ï¼‰
     const int sizeRequired = ::WideCharToMultiByte(
         CP_UTF8,
-        WC_ERR_INVALID_CHARS, // ·Ç·¨´úÀíÏîÖ±½Ó±¨´í
+        WC_ERR_INVALID_CHARS, // éæ³•ä»£ç†é¡¹ç›´æ¥æŠ¥é”™
         ws.data(),
         static_cast<int>(ws.size()),
         nullptr,
@@ -119,7 +119,7 @@ string WStringToUtf8(const wstring& ws)
         throw runtime_error("WideCharToMultiByte failed (size).");
     }
 
-    // 2) Êµ¼Ê×ª»»
+    // 2) å®é™…è½¬æ¢
     string result(static_cast<size_t>(sizeRequired), '\0');
     int written = ::WideCharToMultiByte(
         CP_UTF8,
@@ -142,7 +142,7 @@ string WStringToUtf8(const wstring& ws)
         return {};
     }
 
-    // ·Ç Windows£ºÍ¨³£ wchar_t Îª 4 ×Ö½Ú£¨UTF-32£©
+    // é Windowsï¼šé€šå¸¸ wchar_t ä¸º 4 å­—èŠ‚ï¼ˆUTF-32ï¼‰
     wstring_convert<codecvt_utf8<wchar_t>> conv;
     try
     {
@@ -163,10 +163,10 @@ wstring Utf8ToWString(const string& utf8Str)
         return {};
     }
 
-    // 1) ¼ÆËãĞèÒªµÄ wchar_t ÊıÁ¿£¨²»º¬ '\0'£©
+    // 1) è®¡ç®—éœ€è¦çš„ wchar_t æ•°é‡ï¼ˆä¸å« '\0'ï¼‰
     const int sizeRequired = ::MultiByteToWideChar(
         CP_UTF8,
-        MB_ERR_INVALID_CHARS,          // ·Ç·¨ UTF-8 ĞòÁĞÖ±½Ó±¨´í
+        MB_ERR_INVALID_CHARS,          // éæ³• UTF-8 åºåˆ—ç›´æ¥æŠ¥é”™
         utf8Str.data(),
         static_cast<int>(utf8Str.size()),
         nullptr,
@@ -177,7 +177,7 @@ wstring Utf8ToWString(const string& utf8Str)
         throw runtime_error("MultiByteToWideChar failed (size).");
     }
 
-    // 2) Êµ¼Ê×ª»»
+    // 2) å®é™…è½¬æ¢
     wstring result(static_cast<size_t>(sizeRequired), L'\0');
     int written = ::MultiByteToWideChar(
         CP_UTF8,
@@ -223,7 +223,7 @@ vector<string> Utf8Split(const string& textUtf8, char32_t delimiter)
 		bool ok = internal::DecodeOne(textUtf8, pos, cp, nextPos);
         if (!ok)
         {
-            // ·Ç·¨×Ö½Ú£º°´Ô­ÑùÌø¹ıÒ»¸ö×Ö½Ú£¨×¢Òâ£º²»ÄÜ°Ñ delimiter Óë×Ö½ÚÖ±½Ó±È½Ï£©
+            // éæ³•å­—èŠ‚ï¼šæŒ‰åŸæ ·è·³è¿‡ä¸€ä¸ªå­—èŠ‚ï¼ˆæ³¨æ„ï¼šä¸èƒ½æŠŠ delimiter ä¸å­—èŠ‚ç›´æ¥æ¯”è¾ƒï¼‰
             pos++;
             continue;
         }

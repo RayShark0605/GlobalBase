@@ -1,9 +1,9 @@
-#ifndef GLOBALBASE_UTF8_STRING_H_H
+ï»¿#ifndef GLOBALBASE_UTF8_STRING_H_H
 #define GLOBALBASE_UTF8_STRING_H_H
 
 #include "GB_Utility.h"
 
-// ¹¹Ôì UTF-8 ×Ö·û´®
+// æ„é€  UTF-8 å­—ç¬¦ä¸²
 GLOBALBASE_PORT std::string MakeUtf8String(const char* s);
 
 // C++20
@@ -21,13 +21,13 @@ inline std::string MakeUtf8String(const char8_t* s)
 #define GB_STR(x) MakeUtf8String(u8##x)
 #define GB_CHAR(ch) U##ch
 
-// std::wstring ×ª UTF-8
+// std::wstring è½¬ UTF-8
 GLOBALBASE_PORT std::string WStringToUtf8(const std::wstring& ws);
 
-// UTF-8 ×ª std::wstring
+// UTF-8 è½¬ std::wstring
 GLOBALBASE_PORT std::wstring Utf8ToWString(const std::string& utf8Str);
 
-// °´¡°µ¥¸ö Unicode Âëµã¡±·Ö¸î
+// æŒ‰â€œå•ä¸ª Unicode ç ç‚¹â€åˆ†å‰²
 GLOBALBASE_PORT std::vector<std::string> Utf8Split(const std::string& textUtf8, char32_t delimiter);
 
 

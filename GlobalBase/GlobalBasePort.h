@@ -1,10 +1,10 @@
-#ifndef GLOBALBASE_PORT_H_H
+ï»¿#ifndef GLOBALBASE_PORT_H_H
 #define GLOBALBASE_PORT_H_H
 
 #if defined(GLOBALBASE_STATIC)
 #define GLOBALBASE_PORT
 
-// Windows: ÓÃ __declspec(dllexport/dllimport)
+// Windows: ç”¨ __declspec(dllexport/dllimport)
 #elif defined(_WIN32) || defined(_WIN64)
 #if defined(GLOBALBASE_EXPORTS)
 #define GLOBALBASE_PORT __declspec(dllexport)
@@ -12,7 +12,7 @@
 #define GLOBALBASE_PORT __declspec(dllimport)
 #endif
 
-// ·Ç Windows: ÓÃ ELF µÄ¿É¼ûĞÔÊôĞÔ£¬»òÁô¿Õ
+// é Windows: ç”¨ ELF çš„å¯è§æ€§å±æ€§ï¼Œæˆ–ç•™ç©º
 #else
 #if defined(__GNUC__) || defined(__clang__)
 #define GLOBALBASE_PORT __attribute__((visibility("default")))
