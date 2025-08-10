@@ -2,6 +2,10 @@
 #if defined(_WIN32)
 #include <windows.h>
 #else
+#include <clocale>
+#include <cwchar>
+#include <cerrno>
+#include <stdexcept>
 #include <locale>
 #include <codecvt>
 #include <climits>
@@ -119,6 +123,30 @@ namespace internal
         // Unicode 标准平面范围：U+0000 ~ U+10FFFF，排除代理区
         return cp <= 0x10FFFF && !(cp >= 0xD800 && cp <= 0xDFFF);
     }
+
+    // 说明：这里的“ANSI”指当前 LC_CTYPE locale 的多字节编码（如 zh_CN.GB18030）。
+    // 若当前是 "C"/"POSIX"（7-bit ASCII），请先 setlocale 到合适的本地编码。
+    static void EnsureLocaleInitialized()
+    {
+        const char* cur = std::setlocale(LC_CTYPE, nullptr);
+        if (!cur || std::string(cur) == "C" || std::string(cur) == "POSIX")
+        {
+            std::setlocale(LC_CTYPE, ""); // 从环境继承
+        }
+    }
+#ifndef _WIN32
+    static std::wstring Utf8ToWString_Posix(const std::string& utf8Str)
+    {
+        std::wstring_convert<std::codecvt_utf8<wchar_t>> c8; // C++11 可用
+        return c8.from_bytes(utf8Str);
+    }
+
+    static std::string WStringToUtf8_Posix(const std::wstring& ws)
+    {
+        std::wstring_convert<std::codecvt_utf8<wchar_t>> c8;
+        return c8.to_bytes(ws);
+    }
+#endif // !_WIN32
 }
 
 string MakeUtf8String(const char* s)
@@ -237,38 +265,47 @@ string Utf8ToAnsi(const string& utf8Str)
     return ansi;
 
 #else
-    // 非 Windows：使用当前 LC_CTYPE locale 的多字节编码作为“ANSI”
-    // 若当前为 "C"/"POSIX"（7-bit ASCII），请先 setlocale 到你的目标编码（如 zh_CN.GB18030）。
-    const char* cur = setlocale(LC_CTYPE, nullptr);
-    if (!cur || string(cur) == "C" || string(cur) == "POSIX")
+    if (utf8Str.empty())
     {
-        setlocale(LC_CTYPE, ""); // 从环境继承
-    }
-    const string locName = setlocale(LC_CTYPE, nullptr);
-
-    // UTF-8 -> wchar_t
-    wstring ws;
-    try
-    {
-        wstring_convert<codecvt_utf8<wchar_t>> c8;
-        ws = c8.from_bytes(utf8Str);
-    }
-    catch (const range_error&)
-    {
-        throw runtime_error("UTF-8 decoding failed.");
+        return {};
     }
 
-    // wchar_t -> 本地多字节（ANSI）
+    EnsureLocaleInitialized();
+
+    // UTF-8 -> wstring
+    std::wstring ws;
     try
     {
-        wstring_convert<codecvt_byname<wchar_t, char, mbstate_t>>
-            c_loc(new codecvt_byname<wchar_t, char, mbstate_t>(locName));
-        return c_loc.to_bytes(ws);
+        ws = Utf8ToWString_Posix(utf8Str);
     }
-    catch (const range_error&)
+    catch (const std::range_error&)
     {
-        throw runtime_error("Local multibyte encoding failed (wstring -> bytes).");
+        throw std::runtime_error("UTF-8 decoding failed.");
     }
+
+    // wstring -> 本地多字节（依赖 LC_CTYPE）
+    const wchar_t* src = ws.c_str();
+    std::mbstate_t st = std::mbstate_t{};
+    // 1) 预计算所需字节数（不含终止 '\0'）
+    errno = 0;
+    std::size_t need = std::wcsrtombs(nullptr, &src, 0, &st);
+    if (need == static_cast<std::size_t>(-1))
+    {
+        throw std::runtime_error("Local multibyte encoding failed (wstring -> bytes).");
+    }
+
+    std::string out(need, '\0');
+    src = ws.c_str();
+    st = std::mbstate_t{};
+    errno = 0;
+    std::size_t written = std::wcsrtombs(&out[0], &src, need, &st);
+    if (written == static_cast<std::size_t>(-1))
+    {
+        throw std::runtime_error("Local multibyte encoding failed (wstring -> bytes).");
+    }
+    // wcsrtombs 返回的字节数不含 '\0'，长度正好是 written/need
+    // out 已经是正确大小
+    return out;
 #endif
 }
 
@@ -339,35 +376,42 @@ string AnsiToUtf8(const string& ansiStr)
     return utf8;
 
 #else
-    // 非 Windows：本地多字节（ANSI） -> wchar_t
-    const char* cur = setlocale(LC_CTYPE, nullptr);
-    if (!cur || string(cur) == "C" || string(cur) == "POSIX")
+    if (ansiStr.empty())
     {
-        setlocale(LC_CTYPE, ""); // 从环境继承
-    }
-    const string locName = setlocale(LC_CTYPE, nullptr);
-
-    wstring ws;
-    try
-    {
-        wstring_convert<codecvt_byname<wchar_t, char, mbstate_t>>
-            c_loc(new codecvt_byname<wchar_t, char, mbstate_t>(locName));
-        ws = c_loc.from_bytes(ansiStr);
-    }
-    catch (const range_error&)
-    {
-        throw runtime_error("Local multibyte decoding failed (bytes -> wstring).");
+        return {};
     }
 
-    // wchar_t -> UTF-8
+    EnsureLocaleInitialized();
+
+    // 本地多字节 -> wstring（依赖 LC_CTYPE）
+    const char* src = ansiStr.c_str();
+    std::mbstate_t st = std::mbstate_t{};
+    errno = 0;
+    // 1) 计算需要的 wchar_t 数量（不含终止 L'\0'）
+    std::size_t wlen = std::mbsrtowcs(nullptr, &src, 0, &st);
+    if (wlen == static_cast<std::size_t>(-1))
+    {
+        throw std::runtime_error("Local multibyte decoding failed (bytes -> wstring).");
+    }
+
+    std::wstring ws(wlen, L'\0');
+    src = ansiStr.c_str();
+    st = std::mbstate_t{};
+    errno = 0;
+    std::size_t wwritten = std::mbsrtowcs(&ws[0], &src, wlen, &st);
+    if (wwritten == static_cast<std::size_t>(-1))
+    {
+        throw std::runtime_error("Local multibyte decoding failed (bytes -> wstring).");
+    }
+
+    // wstring -> UTF-8
     try
     {
-        wstring_convert<codecvt_utf8<wchar_t>> c8;
-        return c8.to_bytes(ws);
+        return WStringToUtf8_Posix(ws);
     }
-    catch (const range_error&)
+    catch (const std::range_error&)
     {
-        throw runtime_error("UTF-8 encoding failed.");
+        throw std::runtime_error("UTF-8 encoding failed.");
     }
 #endif
 }
@@ -436,15 +480,14 @@ string WStringToUtf8(const wstring& ws)
         return {};
     }
 
-    // 非 Windows：通常 wchar_t 为 4 字节（UTF-32）
-    wstring_convert<codecvt_utf8<wchar_t>> conv;
+    wstring_convert<codecvt_utf8<wchar_t>> cvt;
     try
     {
-        return conv.to_bytes(ws);
+        return cvt.to_bytes(ws);
     }
     catch (const range_error&)
     {
-        throw runtime_error("UTF-32 to UTF-8 conversion failed.");
+        throw runtime_error("WStringToUtf8 conversion failed.");
     }
 #endif
 }
@@ -499,7 +542,7 @@ wstring Utf8ToWString(const string& utf8Str)
     }
     catch (const range_error&)
     {
-        throw runtime_error("UTF-8 to UTF-32 conversion failed.");
+        throw runtime_error("Utf8ToWString conversion failed.");
     }
 #endif
 }
