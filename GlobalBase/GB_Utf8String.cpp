@@ -84,6 +84,41 @@ namespace internal
         return nextPos == s.size(); // 必须恰好一个码点
     }
 
+    static char32_t ToLowerAscii(char32_t cp)
+    {
+        // 仅 ASCII 大小写折叠
+        if (cp >= U'A' && cp <= U'Z')
+        {
+            return cp + (U'a' - U'A');
+        }
+        return cp;
+    }
+
+    // 统一的“读一个码点”：如果 internal::DecodeOne 失败，就把该字节当作 U+FFFD 消费 1 字节
+    static void DecodeOneOrReplacement(const string& s, size_t pos, char32_t& cp, size_t& nextPos)
+    {
+        if (!internal::DecodeOne(s, pos, cp, nextPos))
+        {
+            cp = 0xFFFDu;
+            nextPos = pos + 1; // 失败时按 1 字节前进，保持可数性
+        }
+    }
+
+    // 仅 ASCII 的大小写转换，避免受本地化影响
+    static char ToLowerAsciiChar(char ch)
+    {
+        return (ch >= 'A' && ch <= 'Z') ? static_cast<char>(ch - 'A' + 'a') : ch;
+    }
+    static char ToUpperAsciiChar(char ch)
+    {
+        return (ch >= 'a' && ch <= 'z') ? static_cast<char>(ch - 'a' + 'A') : ch;
+    }
+
+    static bool IsValidUnicode(uint32_t cp)
+    {
+        // Unicode 标准平面范围：U+0000 ~ U+10FFFF，排除代理区
+        return cp <= 0x10FFFF && !(cp >= 0xD800 && cp <= 0xDFFF);
+    }
 }
 
 string MakeUtf8String(const char* s)
@@ -93,6 +128,265 @@ string MakeUtf8String(const char* s)
         return {};
     }
 	return string(s);
+}
+
+string MakeUtf8String(char32_t utf8Char)
+{
+    uint32_t u = static_cast<uint32_t>(utf8Char);
+    string out;
+
+    if (!internal::IsValidUnicode(u))
+    {
+        // 用 U+FFFD 作为替代
+        u = 0xFFFD;
+    }
+
+    if (u <= 0x7F)
+    {
+        out.push_back(static_cast<char>(u));
+    }
+    else if (u <= 0x7FF)
+    {
+        out.push_back(static_cast<char>(0xC0 | (u >> 6)));
+        out.push_back(static_cast<char>(0x80 | (u & 0x3F)));
+    }
+    else if (u <= 0xFFFF)
+    {
+        out.push_back(static_cast<char>(0xE0 | (u >> 12)));
+        out.push_back(static_cast<char>(0x80 | ((u >> 6) & 0x3F)));
+        out.push_back(static_cast<char>(0x80 | (u & 0x3F)));
+    }
+    else // u <= 0x10FFFF
+    {
+        out.push_back(static_cast<char>(0xF0 | (u >> 18)));
+        out.push_back(static_cast<char>(0x80 | ((u >> 12) & 0x3F)));
+        out.push_back(static_cast<char>(0x80 | ((u >> 6) & 0x3F)));
+        out.push_back(static_cast<char>(0x80 | (u & 0x3F)));
+    }
+
+    return out;
+}
+
+string Utf8ToAnsi(const string& utf8Str)
+{
+    if (utf8Str.empty())
+    {
+        return {};
+    }
+#if defined(_WIN32)
+    // UTF-8 -> UTF-16
+    const int wlen = ::MultiByteToWideChar(
+        CP_UTF8,
+        MB_ERR_INVALID_CHARS,            // 无效序列直接失败
+        utf8Str.data(),
+        static_cast<int>(utf8Str.size()),
+        nullptr,
+        0
+    );
+    if (wlen <= 0)
+    {
+        throw runtime_error("MultiByteToWideChar(CP_UTF8) failed (size).");
+    }
+    wstring ws(static_cast<size_t>(wlen), L'\0');
+    const int wwritten = ::MultiByteToWideChar(
+        CP_UTF8,
+        MB_ERR_INVALID_CHARS,
+        utf8Str.data(),
+        static_cast<int>(utf8Str.size()),
+        &ws[0],
+        wlen
+    );
+    if (wwritten <= 0)
+    {
+        throw runtime_error("MultiByteToWideChar(CP_UTF8) failed (convert).");
+    }
+
+    // UTF-16 -> ANSI(ACP)
+    // 说明：CP_ACP 为系统 ANSI 代码页；不同机器可能不同，且会被用户修改。
+    const int alen = ::WideCharToMultiByte(
+        CP_ACP,
+        WC_NO_BEST_FIT_CHARS,            // 避免近似匹配（可选）
+        ws.data(),
+        static_cast<int>(ws.size()),
+        nullptr,
+        0,
+        nullptr,
+        nullptr
+    );
+    if (alen <= 0)
+    {
+        throw runtime_error("WideCharToMultiByte(CP_ACP) failed (size).");
+    }
+    string ansi(static_cast<size_t>(alen), '\0');
+    BOOL usedDefaultChar = FALSE;
+    const int awritten = ::WideCharToMultiByte(
+        CP_ACP,
+        WC_NO_BEST_FIT_CHARS,
+        ws.data(),
+        static_cast<int>(ws.size()),
+        &ansi[0],
+        alen,
+        nullptr,                          // 默认 '?'
+        &usedDefaultChar                  // 如有无法表示的字符会置 TRUE
+    );
+    if (awritten <= 0)
+    {
+        throw runtime_error("WideCharToMultiByte(CP_ACP) failed (convert).");
+    }
+    // 这里不把 usedDefaultChar 当作错误抛出；如需“严格模式”可改为检测后抛异常。
+    return ansi;
+
+#else
+    // 非 Windows：使用当前 LC_CTYPE locale 的多字节编码作为“ANSI”
+    // 若当前为 "C"/"POSIX"（7-bit ASCII），请先 setlocale 到你的目标编码（如 zh_CN.GB18030）。
+    const char* cur = setlocale(LC_CTYPE, nullptr);
+    if (!cur || string(cur) == "C" || string(cur) == "POSIX")
+    {
+        setlocale(LC_CTYPE, ""); // 从环境继承
+    }
+    const string locName = setlocale(LC_CTYPE, nullptr);
+
+    // UTF-8 -> wchar_t
+    wstring ws;
+    try
+    {
+        wstring_convert<codecvt_utf8<wchar_t>> c8;
+        ws = c8.from_bytes(utf8Str);
+    }
+    catch (const range_error&)
+    {
+        throw runtime_error("UTF-8 decoding failed.");
+    }
+
+    // wchar_t -> 本地多字节（ANSI）
+    try
+    {
+        wstring_convert<codecvt_byname<wchar_t, char, mbstate_t>>
+            c_loc(new codecvt_byname<wchar_t, char, mbstate_t>(locName));
+        return c_loc.to_bytes(ws);
+    }
+    catch (const range_error&)
+    {
+        throw runtime_error("Local multibyte encoding failed (wstring -> bytes).");
+    }
+#endif
+}
+
+string AnsiToUtf8(const string& ansiStr)
+{
+    if (ansiStr.empty())
+    {
+        return {};
+    }
+#if defined(_WIN32)
+    // ANSI(ACP) -> UTF-16
+    const int wlen = ::MultiByteToWideChar(
+        CP_ACP,
+        0,                                 // 不加 MB_ERR_INVALID_CHARS，防止某些旧代码页数据直接失败
+        ansiStr.data(),
+        static_cast<int>(ansiStr.size()),
+        nullptr,
+        0
+    );
+    if (wlen <= 0)
+    {
+        throw runtime_error("MultiByteToWideChar(CP_ACP) failed (size).");
+    }
+    wstring ws(static_cast<size_t>(wlen), L'\0');
+    const int wwritten = ::MultiByteToWideChar(
+        CP_ACP,
+        0,
+        ansiStr.data(),
+        static_cast<int>(ansiStr.size()),
+        &ws[0],
+        wlen
+    );
+    if (wwritten <= 0)
+    {
+        throw runtime_error("MultiByteToWideChar(CP_ACP) failed (convert).");
+    }
+
+    // UTF-16 -> UTF-8
+    const int u8len = ::WideCharToMultiByte(
+        CP_UTF8,
+        0,
+        ws.data(),
+        static_cast<int>(ws.size()),
+        nullptr,
+        0,
+        nullptr,
+        nullptr
+    );
+    if (u8len <= 0)
+    {
+        throw runtime_error("WideCharToMultiByte(CP_UTF8) failed (size).");
+    }
+    string utf8(static_cast<size_t>(u8len), '\0');
+    const int u8written = ::WideCharToMultiByte(
+        CP_UTF8,
+        0,
+        ws.data(),
+        static_cast<int>(ws.size()),
+        &utf8[0],
+        u8len,
+        nullptr,
+        nullptr
+    );
+    if (u8written <= 0)
+    {
+        throw runtime_error("WideCharToMultiByte(CP_UTF8) failed (convert).");
+    }
+    return utf8;
+
+#else
+    // 非 Windows：本地多字节（ANSI） -> wchar_t
+    const char* cur = setlocale(LC_CTYPE, nullptr);
+    if (!cur || string(cur) == "C" || string(cur) == "POSIX")
+    {
+        setlocale(LC_CTYPE, ""); // 从环境继承
+    }
+    const string locName = setlocale(LC_CTYPE, nullptr);
+
+    wstring ws;
+    try
+    {
+        wstring_convert<codecvt_byname<wchar_t, char, mbstate_t>>
+            c_loc(new codecvt_byname<wchar_t, char, mbstate_t>(locName));
+        ws = c_loc.from_bytes(ansiStr);
+    }
+    catch (const range_error&)
+    {
+        throw runtime_error("Local multibyte decoding failed (bytes -> wstring).");
+    }
+
+    // wchar_t -> UTF-8
+    try
+    {
+        wstring_convert<codecvt_utf8<wchar_t>> c8;
+        return c8.to_bytes(ws);
+    }
+    catch (const range_error&)
+    {
+        throw runtime_error("UTF-8 encoding failed.");
+    }
+#endif
+}
+
+bool IsUtf8(const string& text)
+{
+    size_t pos = 0;
+    while (pos < text.size())
+    {
+        char32_t cp = 0;
+        size_t nextPos = pos;
+        // 严格：一旦解码失败立即判 false（DecodeOne 已按 RFC 3629 检查最短编码/代理项等）
+        if (!internal::DecodeOne(text, pos, cp, nextPos))
+        {
+            return false;
+        }
+        pos = nextPos;
+    }
+    return true;
 }
 
 string WStringToUtf8(const wstring& ws)
@@ -189,7 +483,7 @@ wstring Utf8ToWString(const string& utf8Str)
     );
     if (written <= 0)
     {
-        throw std::runtime_error("MultiByteToWideChar failed (convert).");
+        throw runtime_error("MultiByteToWideChar failed (convert).");
     }
     return result;
 #else
@@ -208,6 +502,162 @@ wstring Utf8ToWString(const string& utf8Str)
         throw runtime_error("UTF-8 to UTF-32 conversion failed.");
     }
 #endif
+}
+
+// 获取 UTF-8 字符串的长度（以 UTF-8 字符/码点 为单位）
+size_t GetUtf8Length(const string& utf8Str)
+{
+    size_t len = 0;
+    size_t pos = 0;
+    while (pos < utf8Str.size())
+    {
+        char32_t cp = 0;
+        size_t nextPos = pos;
+        internal::DecodeOne(utf8Str, pos, cp, nextPos); // 成功或失败都前进
+        pos = nextPos;
+        len++; // 非法字节按 1 个“字符”统计
+    }
+    return len;
+}
+
+char32_t GetUtf8Char(const string& utf8Str, int64_t index)
+{
+    // 不抛异常，不用可选类型：失败返回一个不可能出现的值 0x110000（> U+10FFFF）
+    static constexpr char32_t kInvalidCodePoint = 0x110000;
+
+    if (index < 0)
+    {
+        return kInvalidCodePoint;
+    }
+
+    size_t pos = 0;
+    int64_t curIndex = 0;
+
+    while (pos < utf8Str.size())
+    {
+        char32_t cp = 0;
+        size_t nextPos = pos;
+        bool ok = internal::DecodeOne(utf8Str, pos, cp, nextPos); // 失败也会 nextPos = pos + 1
+
+        if (curIndex == index)
+        {
+            if (!ok)
+            {
+                return false;              // 该“字符”本身就是非法起始字节
+            }
+            return cp;
+        }
+
+        pos = nextPos;
+        curIndex++;                        // 非法字节按“一个字符”计数，与你前面 API 约定一致
+    }
+    return kInvalidCodePoint;
+}
+
+string Utf8Substr(const string& utf8Str, int64_t start, int64_t length)
+{
+    if (start < 0 || length < 0)
+    {
+        return {}; // 不支持负索引；负长度视为空
+    }
+
+    // 快速返回：空串
+    if (utf8Str.empty() || length == 0)
+    {
+        return {};
+    }
+
+    size_t pos = 0;
+    int64_t charIndex = 0;
+
+    // 1) 找到起始码点对应的字节偏移
+    size_t startByte = string::npos;
+    while (pos < utf8Str.size() && charIndex < start)
+    {
+        char32_t cp = 0;
+        size_t nextPos = pos;
+        internal::DecodeOne(utf8Str, pos, cp, nextPos);
+        pos = nextPos;
+        charIndex++;
+    }
+    if (charIndex < start)
+    {
+        return {}; // 起始 >= 总长度
+    }
+    startByte = pos;
+
+    // 2) 继续前进 length 个码点，得到结束字节偏移
+    int64_t remain = length;
+    while (pos < utf8Str.size() && remain > 0)
+    {
+        char32_t cp = 0;
+        size_t nextPos = pos;
+        internal::DecodeOne(utf8Str, pos, cp, nextPos);
+        pos = nextPos;
+        remain--;
+    }
+    const size_t endByte = pos; // 若提前结束，endByte==size()
+    return utf8Str.substr(startByte, endByte - startByte);
+}
+
+string Utf8ToLower(const string& utf8Str)
+{
+    string out;
+    out.reserve(utf8Str.size()); // 最终长度不会超过原串
+
+    size_t pos = 0;
+    while (pos < utf8Str.size())
+    {
+        char32_t cp = 0;
+        size_t nextPos = pos;
+        bool ok = internal::DecodeOne(utf8Str, pos, cp, nextPos);
+
+        // 对于 ASCII（单字节、且 < 0x80），做大小写转换
+        if (ok && nextPos == pos + 1)
+        {
+            unsigned char b0 = static_cast<unsigned char>(utf8Str[pos]);
+            if (b0 < 0x80)
+            {
+                out.push_back(internal::ToLowerAsciiChar(static_cast<char>(b0)));
+                pos = nextPos;
+                continue;
+            }
+        }
+
+        // 非 ASCII 或解码失败：原样拷贝这段字节
+        out.append(utf8Str.data() + pos, utf8Str.data() + nextPos);
+        pos = nextPos;
+    }
+    return out;
+}
+
+string Utf8ToUpper(const string& utf8Str)
+{
+    string out;
+    out.reserve(utf8Str.size());
+
+    size_t pos = 0;
+    while (pos < utf8Str.size())
+    {
+        char32_t cp = 0;
+        size_t nextPos = pos;
+        bool ok = internal::DecodeOne(utf8Str, pos, cp, nextPos);
+
+        if (ok && nextPos == pos + 1)
+        {
+            unsigned char b0 = static_cast<unsigned char>(utf8Str[pos]);
+            if (b0 < 0x80)
+            {
+                out.push_back(internal::ToUpperAsciiChar(static_cast<char>(b0)));
+                pos = nextPos;
+                continue;
+            }
+        }
+
+        out.append(utf8Str.data() + pos, utf8Str.data() + nextPos);
+        pos = nextPos;
+    }
+    return out;
 }
 
 vector<string> Utf8Split(const string& textUtf8, char32_t delimiter)
@@ -238,6 +688,89 @@ vector<string> Utf8Split(const string& textUtf8, char32_t delimiter)
 
     parts.emplace_back(textUtf8.substr(tokenStart));
     return parts;
+}
+
+int64_t Utf8Find(const string& text, const string& needle, bool caseSensitive)
+{
+    // 1) 预解码模式串到码点数组（并可选 ASCII 折叠）
+    vector<char32_t> pat;
+    {
+        size_t pos = 0;
+        while (pos < needle.size())
+        {
+            char32_t cp = 0;
+            size_t nextPos = pos;
+            internal::DecodeOneOrReplacement(needle, pos, cp, nextPos);
+            if (!caseSensitive)
+            {
+                cp = internal::ToLowerAscii(cp);
+            }
+            pat.push_back(cp);
+            pos = nextPos;
+        }
+    }
+
+    const size_t m = pat.size();
+    if (m == 0)
+    {
+        return 0; // 与 string::find("") 一致
+    }
+
+    // 2) 计算 KMP 的前缀函数（LPS）
+    vector<size_t> lps(m, 0);
+    {
+        size_t len = 0;
+        for (size_t i = 1; i < m; )
+        {
+            if (pat[i] == pat[len])
+            {
+                lps[i++] = ++len;
+            }
+            else if (len != 0)
+            {
+                len = lps[len - 1];
+            }
+            else
+            {
+                lps[i++] = 0;
+            }
+        }
+    }
+
+    // 3) 流式解码 text 并进行 KMP 匹配（无需整串展开为码点向量）
+    size_t j = 0;                // 已匹配 pat[0..j-1]
+    size_t textBytePos = 0;      // 字节位置
+    int64_t textCharIndex = 0;   // 已读码点数量（也就是当前码点索引）
+
+    while (textBytePos < text.size())
+    {
+        char32_t cp = 0;
+        size_t nextPos = textBytePos;
+        internal::DecodeOneOrReplacement(text, textBytePos, cp, nextPos);
+        if (!caseSensitive)
+        {
+            cp = internal::ToLowerAscii(cp);
+        }
+
+        while (j > 0 && cp != pat[j])
+        {
+            j = lps[j - 1];
+        }
+        if (cp == pat[j])
+        {
+            j++;
+            if (j == m)
+            {
+                // 命中：起始“码点偏移” = 当前码点索引 - m + 1
+                return textCharIndex - static_cast<int64_t>(m) + 1;
+            }
+        }
+
+        textBytePos = nextPos;
+        textCharIndex++;
+    }
+
+    return -1;
 }
 
 
