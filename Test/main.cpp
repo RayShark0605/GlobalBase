@@ -1,4 +1,4 @@
-#include <iostream>
+ï»¿#include <iostream>
 #include "GlobalBase.h"
 
 
@@ -7,8 +7,8 @@ int main(int argc, char* argv[])
 {
 	const bool success = SetConsoleEncodingToUtf8();
 
-	string text = GB_STR("Hello£¡ÊÀ½ç£¡¤³¤ó¤Ë¤Á¤Ï");
-	vector<string> parts = Utf8Split(text, GB_CHAR('£¡'));
+	string text = GB_STR("Helloï¼ä¸–ç•Œï¼ã“ã‚“ã«ã¡ã¯");
+	vector<string> parts = Utf8Split(text, GB_CHAR('ï¼'));
 	for (const string& part : parts)
 	{
 		cout << part << endl;
