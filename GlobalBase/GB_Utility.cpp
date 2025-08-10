@@ -6,6 +6,7 @@
 #include <clocale>
 #include <climits>
 #include <langinfo.h>
+#include <cstring>
 #endif
 
 
