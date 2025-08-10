@@ -124,6 +124,7 @@ namespace internal
         return cp <= 0x10FFFF && !(cp >= 0xD800 && cp <= 0xDFFF);
     }
 
+#ifndef _WIN32
     // 说明：这里的“ANSI”指当前 LC_CTYPE locale 的多字节编码（如 zh_CN.GB18030）。
     // 若当前是 "C"/"POSIX"（7-bit ASCII），请先 setlocale 到合适的本地编码。
     static void EnsureLocaleInitialized()
@@ -134,7 +135,7 @@ namespace internal
             std::setlocale(LC_CTYPE, ""); // 从环境继承
         }
     }
-#ifndef _WIN32
+
     static std::wstring Utf8ToWString_Posix(const std::string& utf8Str)
     {
         std::wstring_convert<std::codecvt_utf8<wchar_t>> c8; // C++11 可用
@@ -270,13 +271,13 @@ string Utf8ToAnsi(const string& utf8Str)
         return {};
     }
 
-    EnsureLocaleInitialized();
+    internal::EnsureLocaleInitialized();
 
     // UTF-8 -> wstring
     std::wstring ws;
     try
     {
-        ws = Utf8ToWString_Posix(utf8Str);
+        ws = internal::Utf8ToWString_Posix(utf8Str);
     }
     catch (const std::range_error&)
     {
@@ -381,7 +382,7 @@ string AnsiToUtf8(const string& ansiStr)
         return {};
     }
 
-    EnsureLocaleInitialized();
+    internal::EnsureLocaleInitialized();
 
     // 本地多字节 -> wstring（依赖 LC_CTYPE）
     const char* src = ansiStr.c_str();
@@ -407,7 +408,7 @@ string AnsiToUtf8(const string& ansiStr)
     // wstring -> UTF-8
     try
     {
-        return WStringToUtf8_Posix(ws);
+        return internal::WStringToUtf8_Posix(ws);
     }
     catch (const std::range_error&)
     {
