@@ -59,8 +59,19 @@ GLOBALBASE_PORT std::vector<std::string> Utf8Split(const std::string& textUtf8, 
 // 检查 UTF-8 字符串是否以指定的 UTF-8 字符串开头（可选大小写敏感）
 GLOBALBASE_PORT bool Utf8StartsWith(const std::string& textUtf8, const std::string& targetUtf8, bool caseSensitive = true);
 
+// 检查 UTF-8 字符串是否以指定的 UTF-8 字符串结尾（可选大小写敏感）
+GLOBALBASE_PORT bool Utf8EndsWith(const std::string& textUtf8, const std::string& targetUtf8, bool caseSensitive = true);
+
 // 查找子串：返回第一个匹配的起始位置（UTF-8 字符偏移），未找到返回 -1
 GLOBALBASE_PORT int64_t Utf8Find(const std::string& text, const std::string& needle, bool caseSensitive = true);
+
+// 删除 UTF-8 字符串两端的指定字符（默认空白字符、Tab、\r和\n）
+GLOBALBASE_PORT std::string Utf8Trim(const std::string& utf8Str, const std::string& trimChars = " \t\r\n");
+GLOBALBASE_PORT std::string Utf8TrimLeft(const std::string& utf8Str, const std::string& trimChars = " \t\r\n");
+GLOBALBASE_PORT std::string Utf8TrimRight(const std::string& utf8Str, const std::string& trimChars = " \t\r\n");
+
+// 替换 UTF-8 字符串中的子串（可选大小写敏感）
+GLOBALBASE_PORT std::string Utf8Replace(const std::string& utf8Str, const std::string& oldValue, const std::string& newValue, bool caseSensitive = true);
 
 
 

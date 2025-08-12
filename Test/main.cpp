@@ -34,6 +34,26 @@ int main(int argc, char* argv[])
 	cout << Utf8StartsWith(GB_STR("こんにちは"), GB_STR("こんにちは")) << endl;	// 1
 	cout << Utf8StartsWith(GB_STR("Hello"), GB_STR("hello")) << endl;	// 0
 	cout << Utf8StartsWith(GB_STR("Hello"), GB_STR("hello"), false) << endl;	// 1
+	cout << endl;
+
+	cout << Utf8Trim(GB_STR(" こんにちは\n")) << endl;
+	cout << Utf8TrimLeft(GB_STR(" 世界！\n")) << endl;
+	cout << endl;
+
+	cout << Utf8EndsWith(GB_STR("世界！My World！こんにちは"), GB_STR("ちは")) << endl;	// 1
+	cout << Utf8EndsWith(GB_STR("こんにちは"), GB_STR("は")) << endl;	// 1
+	cout << Utf8EndsWith(GB_STR("こんにちは"), GB_STR("こん")) << endl;	// 0
+	cout << Utf8EndsWith(GB_STR("Hello"), GB_STR("LO")) << endl;	// 0
+	cout << Utf8EndsWith(GB_STR("Hello"), GB_STR("LO"), false) << endl;	// 1
+	cout << endl;
+
+	cout << Utf8Replace(GB_STR("Hello"), GB_STR("ll"), GB_STR("00")) << endl;	// He00o
+	cout << Utf8Replace(GB_STR("Hello"), GB_STR("LL"), GB_STR("00")) << endl;	// Hello
+	cout << Utf8Replace(GB_STR("Hello"), GB_STR("LL"), GB_STR("00"), false) << endl;	// He00o
+	cout << Utf8Replace(GB_STR("世界！My World！こんにちは"), GB_STR("こんに"), GB_STR("你好")) << endl;	// 世界！My World！你好ちは
+	cout << Utf8Replace(GB_STR("世界！My World！こんにちは"), GB_STR("世"), GB_STR("你好")) << endl;	// 你好界！My World！こんにちは
+	cout << endl;
+
 
 	return 0;
 }

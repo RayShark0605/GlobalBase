@@ -129,25 +129,99 @@ namespace internal
     // 若当前是 "C"/"POSIX"（7-bit ASCII），请先 setlocale 到合适的本地编码。
     static void EnsureLocaleInitialized()
     {
-        const char* cur = std::setlocale(LC_CTYPE, nullptr);
-        if (!cur || std::string(cur) == "C" || std::string(cur) == "POSIX")
+        const char* cur = setlocale(LC_CTYPE, nullptr);
+        if (!cur || string(cur) == "C" || string(cur) == "POSIX")
         {
-            std::setlocale(LC_CTYPE, ""); // 从环境继承
+            setlocale(LC_CTYPE, ""); // 从环境继承
         }
     }
 
-    static std::wstring Utf8ToWString_Posix(const std::string& utf8Str)
+    static wstring Utf8ToWString_Posix(const string& utf8Str)
     {
-        std::wstring_convert<std::codecvt_utf8<wchar_t>> c8; // C++11 可用
+        wstring_convert<codecvt_utf8<wchar_t>> c8; // C++11 可用
         return c8.from_bytes(utf8Str);
     }
 
-    static std::string WStringToUtf8_Posix(const std::wstring& ws)
+    static string WStringToUtf8_Posix(const wstring& ws)
     {
-        std::wstring_convert<std::codecvt_utf8<wchar_t>> c8;
+        wstring_convert<codecvt_utf8<wchar_t>> c8;
         return c8.to_bytes(ws);
     }
 #endif // !_WIN32
+
+    static bool IsAllAscii(const string& s)
+    {
+        for (unsigned char ch : s)
+        {
+            if (ch >= 0x80)
+            {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    static unordered_set<char32_t> BuildTrimSet(const string& trimCharsUtf8)
+    {
+        unordered_set<char32_t> st;
+        size_t pos = 0;
+        while (pos < trimCharsUtf8.size())
+        {
+            char32_t cp = 0;
+            size_t nextPos = pos;
+            internal::DecodeOneOrReplacement(trimCharsUtf8, pos, cp, nextPos);
+            st.insert(cp);
+            pos = nextPos;
+        }
+        return st;
+    }
+
+    static string TrimLeftImpl(const string& s, const unordered_set<char32_t>& trimSet)
+    {
+        size_t pos = 0;
+        while (pos < s.size())
+        {
+            char32_t cp = 0;
+            size_t nextPos = pos;
+            internal::DecodeOneOrReplacement(s, pos, cp, nextPos);
+            if (trimSet.find(cp) == trimSet.end())
+            {
+                break;
+            }
+            pos = nextPos;
+        }
+        return s.substr(pos);
+    }
+
+    static string TrimRightImpl(const string& s, const unordered_set<char32_t>& trimSet)
+    {
+        // 从左到右扫描，记录最后一个“非修剪码点”的末尾字节位置
+        size_t pos = 0;
+        size_t lastNonTrimEnd = 0;
+        bool seenNonTrim = false;
+
+        while (pos < s.size())
+        {
+            char32_t cp = 0;
+            size_t nextPos = pos;
+            internal::DecodeOneOrReplacement(s, pos, cp, nextPos);
+            if (trimSet.find(cp) == trimSet.end())
+            {
+                seenNonTrim = true;
+                lastNonTrimEnd = nextPos;
+            }
+            pos = nextPos;
+        }
+
+        if (!seenNonTrim)
+        {
+            return {};
+        }
+        return s.substr(0, lastNonTrimEnd);
+    }
+
+
+
 }
 
 string MakeUtf8String(const char* s)
@@ -274,35 +348,35 @@ string Utf8ToAnsi(const string& utf8Str)
     internal::EnsureLocaleInitialized();
 
     // UTF-8 -> wstring
-    std::wstring ws;
+    wstring ws;
     try
     {
         ws = internal::Utf8ToWString_Posix(utf8Str);
     }
-    catch (const std::range_error&)
+    catch (const range_error&)
     {
-        throw std::runtime_error("UTF-8 decoding failed.");
+        throw runtime_error("UTF-8 decoding failed.");
     }
 
     // wstring -> 本地多字节（依赖 LC_CTYPE）
     const wchar_t* src = ws.c_str();
-    std::mbstate_t st = std::mbstate_t{};
+    mbstate_t st = mbstate_t{};
     // 1) 预计算所需字节数（不含终止 '\0'）
     errno = 0;
-    std::size_t need = std::wcsrtombs(nullptr, &src, 0, &st);
-    if (need == static_cast<std::size_t>(-1))
+    size_t need = wcsrtombs(nullptr, &src, 0, &st);
+    if (need == static_cast<size_t>(-1))
     {
-        throw std::runtime_error("Local multibyte encoding failed (wstring -> bytes).");
+        throw runtime_error("Local multibyte encoding failed (wstring -> bytes).");
     }
 
-    std::string out(need, '\0');
+    string out(need, '\0');
     src = ws.c_str();
-    st = std::mbstate_t{};
+    st = mbstate_t{};
     errno = 0;
-    std::size_t written = std::wcsrtombs(&out[0], &src, need, &st);
-    if (written == static_cast<std::size_t>(-1))
+    size_t written = wcsrtombs(&out[0], &src, need, &st);
+    if (written == static_cast<size_t>(-1))
     {
-        throw std::runtime_error("Local multibyte encoding failed (wstring -> bytes).");
+        throw runtime_error("Local multibyte encoding failed (wstring -> bytes).");
     }
     // wcsrtombs 返回的字节数不含 '\0'，长度正好是 written/need
     // out 已经是正确大小
@@ -386,23 +460,23 @@ string AnsiToUtf8(const string& ansiStr)
 
     // 本地多字节 -> wstring（依赖 LC_CTYPE）
     const char* src = ansiStr.c_str();
-    std::mbstate_t st = std::mbstate_t{};
+    mbstate_t st = mbstate_t{};
     errno = 0;
     // 1) 计算需要的 wchar_t 数量（不含终止 L'\0'）
-    std::size_t wlen = std::mbsrtowcs(nullptr, &src, 0, &st);
-    if (wlen == static_cast<std::size_t>(-1))
+    size_t wlen = mbsrtowcs(nullptr, &src, 0, &st);
+    if (wlen == static_cast<size_t>(-1))
     {
-        throw std::runtime_error("Local multibyte decoding failed (bytes -> wstring).");
+        throw runtime_error("Local multibyte decoding failed (bytes -> wstring).");
     }
 
-    std::wstring ws(wlen, L'\0');
+    wstring ws(wlen, L'\0');
     src = ansiStr.c_str();
-    st = std::mbstate_t{};
+    st = mbstate_t{};
     errno = 0;
-    std::size_t wwritten = std::mbsrtowcs(&ws[0], &src, wlen, &st);
-    if (wwritten == static_cast<std::size_t>(-1))
+    size_t wwritten = mbsrtowcs(&ws[0], &src, wlen, &st);
+    if (wwritten == static_cast<size_t>(-1))
     {
-        throw std::runtime_error("Local multibyte decoding failed (bytes -> wstring).");
+        throw runtime_error("Local multibyte decoding failed (bytes -> wstring).");
     }
 
     // wstring -> UTF-8
@@ -410,9 +484,9 @@ string AnsiToUtf8(const string& ansiStr)
     {
         return internal::WStringToUtf8_Posix(ws);
     }
-    catch (const std::range_error&)
+    catch (const range_error&)
     {
-        throw std::runtime_error("UTF-8 encoding failed.");
+        throw runtime_error("UTF-8 encoding failed.");
     }
 #endif
 }
@@ -736,14 +810,14 @@ vector<string> Utf8Split(const string& textUtf8, char32_t delimiter)
 
 bool Utf8StartsWith(const string& textUtf8, const string& targetUtf8, bool caseSensitive)
 {
-    // 与 std::string::rfind("",0)==0 的语义一致：空目标串恒为 true
+    // 与 string::rfind("",0)==0 的语义一致：空目标串恒为 true
     if (targetUtf8.empty())
     {
         return true;
     }
 
     // ASCII 快速路径：大小写敏感，且两端均为纯 ASCII，直接做字节前缀比较
-    auto isAllAscii = [](const std::string& s) -> bool
+    auto isAllAscii = [](const string& s) -> bool
         {
             for (unsigned char ch : s)
             {
@@ -760,7 +834,7 @@ bool Utf8StartsWith(const string& textUtf8, const string& targetUtf8, bool caseS
         {
             return false;
         }
-        return std::char_traits<char>::compare(textUtf8.data(), targetUtf8.data(), targetUtf8.size()) == 0;
+        return char_traits<char>::compare(textUtf8.data(), targetUtf8.data(), targetUtf8.size()) == 0;
     }
 
     // 通用路径：逐码点对齐比较（不解整串，流式解码）
@@ -796,6 +870,97 @@ bool Utf8StartsWith(const string& textUtf8, const string& targetUtf8, bool caseS
     }
 
     // 成功消费完整的模式串
+    return true;
+}
+
+bool Utf8EndsWith(const string& textUtf8, const string& targetUtf8, bool caseSensitive)
+{
+    // 1) 空目标：恒真
+    if (targetUtf8.empty())
+    {
+        return true;
+    }
+
+    // 2) ASCII + 大小写敏感：字节后缀快速路径
+
+    if (caseSensitive && internal::IsAllAscii(textUtf8) && internal::IsAllAscii(targetUtf8))
+    {
+        if (targetUtf8.size() > textUtf8.size())
+        {
+            return false;
+        }
+        const size_t off = textUtf8.size() - targetUtf8.size();
+        // 手写比较，避免额外依赖
+        for (size_t i = 0; i < targetUtf8.size(); ++i)
+        {
+            if (textUtf8[off + i] != targetUtf8[i]) return false;
+        }
+        return true;
+    }
+
+    // 3) 通用路径：按“码点”比较（非法字节用 U+FFFD 消费 1 字节）
+    // 3.1 解码模式串
+    vector<char32_t> pat;
+    pat.reserve(targetUtf8.size()); // 上界，不会越界
+    {
+        size_t pos = 0;
+        while (pos < targetUtf8.size())
+        {
+            char32_t cp = 0;
+            size_t nextPos = pos;
+            internal::DecodeOneOrReplacement(targetUtf8, pos, cp, nextPos);
+            if (!caseSensitive)
+            {
+                cp = internal::ToLowerAscii(cp); // 仅 ASCII 折叠，保持与库里其他函数一致
+            }
+            pat.push_back(cp);
+            pos = nextPos;
+        }
+    }
+
+    const size_t m = pat.size();
+    if (m == 0)
+    {
+        // 正常情况下不会出现（即使都是非法字节也会得到若干 U+FFFD），兜底返回 true
+        return true;
+    }
+
+    // 3.2 流式解码 text，只保留“最后 m 个码点”
+    vector<char32_t> ring(m);
+    size_t written = 0;
+
+    {
+        size_t pos = 0;
+        while (pos < textUtf8.size())
+        {
+            char32_t cp = 0;
+            size_t nextPos = pos;
+            internal::DecodeOneOrReplacement(textUtf8, pos, cp, nextPos);
+            if (!caseSensitive)
+            {
+                cp = internal::ToLowerAscii(cp);
+            }
+            ring[written % m] = cp;
+            written++;
+            pos = nextPos;
+        }
+    }
+
+    if (written < m)
+    {
+        // 文本的码点数 < 模式码点数 → 不可能是后缀
+        return false;
+    }
+
+    // 3.3 比较最后 m 个码点是否与 pat 一致
+    const size_t start = (written - m) % m;
+    for (size_t i = 0; i < m; ++i)
+    {
+        if (ring[(start + i) % m] != pat[i])
+        {
+            return false;
+        }
+    }
     return true;
 }
 
@@ -882,5 +1047,125 @@ int64_t Utf8Find(const string& text, const string& needle, bool caseSensitive)
     return -1;
 }
 
+string Utf8Trim(const string& utf8Str, const string& trimChars)
+{
+    if (utf8Str.empty() || trimChars.empty())
+    {
+        return utf8Str;
+    }
 
+    // ASCII 快速路径
+    if (internal::IsAllAscii(utf8Str) && internal::IsAllAscii(trimChars))
+    {
+        const size_t first = utf8Str.find_first_not_of(trimChars);
+        if (first == string::npos) return string();
+        const size_t last = utf8Str.find_last_not_of(trimChars);
+        return utf8Str.substr(first, last - first + 1);
+    }
+
+    const unordered_set<char32_t> trimSet = internal::BuildTrimSet(trimChars);
+    // 左修剪后再右修剪（两次单次线性扫描）
+    return internal::TrimRightImpl(internal::TrimLeftImpl(utf8Str, trimSet), trimSet);
+}
+
+string Utf8TrimLeft(const string& utf8Str, const string& trimChars)
+{
+    if (utf8Str.empty() || trimChars.empty())
+    {
+        return utf8Str;
+    }
+
+    // ASCII 快速路径
+    if (internal::IsAllAscii(utf8Str) && internal::IsAllAscii(trimChars))
+    {
+        const size_t first = utf8Str.find_first_not_of(trimChars);
+        if (first == string::npos) return string();
+        return utf8Str.substr(first);
+    }
+
+    const unordered_set<char32_t> trimSet = internal::BuildTrimSet(trimChars);
+    return internal::TrimLeftImpl(utf8Str, trimSet);
+}
+
+string Utf8TrimRight(const string& utf8Str, const string& trimChars)
+{
+    if (utf8Str.empty() || trimChars.empty())
+    {
+        return utf8Str;
+    }
+
+    // ASCII 快速路径
+    if (internal::IsAllAscii(utf8Str) && internal::IsAllAscii(trimChars))
+    {
+        size_t last = utf8Str.find_last_not_of(trimChars);
+        if (last == string::npos) return string();
+        return utf8Str.substr(0, last + 1);
+    }
+
+    const unordered_set<char32_t> trimSet = internal::BuildTrimSet(trimChars);
+    return internal::TrimRightImpl(utf8Str, trimSet);
+}
+
+string Utf8Replace(const string& utf8Str, const string& oldValue, const string& newValue, bool caseSensitive)
+{
+    // 空串或空模式：直接返回
+    if (utf8Str.empty() || oldValue.empty())
+    {
+        return utf8Str;
+    }
+
+    // —— 快速路径：ASCII + 大小写敏感 → 按字节替换 —— //
+    if (caseSensitive && internal::IsAllAscii(utf8Str) && internal::IsAllAscii(oldValue) && internal::IsAllAscii(newValue))
+    {
+        string out;
+        out.reserve(utf8Str.size());
+        size_t prev = 0;
+        while (true)
+        {
+            size_t pos = utf8Str.find(oldValue, prev);
+            if (pos == string::npos)
+            {
+                out.append(utf8Str, prev, utf8Str.size() - prev);
+                break;
+            }
+            out.append(utf8Str, prev, pos - prev);
+            out += newValue;
+            prev = pos + oldValue.size();
+        }
+        return out;
+    }
+
+    // —— 通用路径：按“码点”替换，复用 Utf8Find / Utf8Substr —— //
+    const int64_t totalChars = static_cast<int64_t>(GetUtf8Length(utf8Str));
+    const int64_t patLen = static_cast<int64_t>(GetUtf8Length(oldValue));
+
+    string out;
+    int64_t curChar = 0;
+    while (curChar < totalChars)
+    {
+        const int64_t remain = totalChars - curChar;
+        const string suffix = Utf8Substr(utf8Str, curChar, remain);
+        const int64_t rel = Utf8Find(suffix, oldValue, caseSensitive);
+        if (rel < 0)
+        {
+            // 无更多匹配：把余下部分整体追加
+            out += suffix;
+            break;
+        }
+
+        // 追加“匹配之前”的部分（按码点切分，不会截断 UTF-8）
+        if (rel > 0)
+        {
+            out += Utf8Substr(utf8Str, curChar, rel);
+        }
+
+        // 追加替换内容
+        out += newValue;
+
+        // 跳过被替换的那一段，继续向后搜索
+        curChar += rel + patLen;
+    }
+
+    return out;
+}
 
