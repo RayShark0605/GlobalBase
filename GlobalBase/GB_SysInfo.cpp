@@ -1,5 +1,4 @@
 ﻿#include "GB_SysInfo.h"
-#include <stdint.h>
 #include <algorithm>
 #include <set>
 #include <map>
@@ -608,7 +607,7 @@ CpuInfo GetCpuInfo()
 #else
     // ---------- Linux ----------
     // 解析 /proc/cpuinfo
-    ProcCpuInfo pci = internal::ParseProcCpuinfo();
+    internal::ProcCpuInfo pci = internal::ParseProcCpuinfo();
     if (!pci.vendor.empty())
     {
         info.vendor = pci.vendor;
