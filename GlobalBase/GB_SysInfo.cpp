@@ -1,5 +1,4 @@
 ﻿#include "GB_SysInfo.h"
-#include <stdint.h>
 #include <algorithm>
 #include <set>
 #include <map>
