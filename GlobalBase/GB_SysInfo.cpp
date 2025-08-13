@@ -571,11 +571,11 @@ string CpuInfo::Serialize() const
     s += "cpuSerial=" + cpuSerial + ";";
     if (hypervisorPresent)
     {
-        s += "hypervisorPresent=1:";
+        s += "hypervisorPresent=1;";
     }
     else
     {
-		s += "hypervisorPresent=0:";
+		s += "hypervisorPresent=0;";
     }
     s += "features=" + internal::JoinStrings(features, ',');
     return s;

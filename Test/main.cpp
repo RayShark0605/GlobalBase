@@ -1,6 +1,7 @@
 ﻿#include <iostream>
 #include "GlobalBase.h"
 #include "GB_SysInfo.h"
+#include "GB_Crypto.h"
 
 
 using namespace std;
@@ -57,6 +58,44 @@ int main(int argc, char* argv[])
 
 	const CpuInfo info = GetCpuInfo();
 	cout << endl << info.Serialize() << endl;
+	cout << endl;
+
+	const string rawInfo = GB_STR("Hello World! 你好，世界！我爱编程C++！！！！");
+	string base64Str = GB_Base64Encode(rawInfo);
+	string recInfo = GB_Base64Decode(base64Str);
+	cout << "Raw Info: " << rawInfo << endl;
+	cout << "Base64 Encoded: " << base64Str << endl; // SGVsbG8gV29ybGQhIOS9oOWlve+8jOS4lueVjO+8geaIkeeIsee8lueoi0MrK++8ge+8ge+8ge+8gQ==
+	cout << "Base64 Decoded: " << recInfo << endl << endl;
+
+	base64Str = GB_Base64Encode(rawInfo, true);
+	recInfo = GB_Base64Decode(base64Str, true);
+	cout << "Base64 Encoded: " << base64Str << endl; // SGVsbG8gV29ybGQhIOS9oOWlve-8jOS4lueVjO-8geaIkeeIsee8lueoi0MrK--8ge-8ge-8ge-8gQ==
+	cout << "Base64 Decoded: " << recInfo << endl << endl;
+
+	base64Str = GB_Base64Encode(rawInfo, true, true);
+	recInfo = GB_Base64Decode(base64Str, true, true);
+	cout << "Base64 Encoded: " << base64Str << endl; // SGVsbG8gV29ybGQhIOS9oOWlve-8jOS4lueVjO-8geaIkeeIsee8lueoi0MrK--8ge-8ge-8ge-8gQ
+	cout << "Base64 Decoded: " << recInfo << endl << endl;
+
+	base64Str = GB_Base64Encode(rawInfo, true, true); // SGVsbG8gV29ybGQhIOS9oOWlve-8jOS4lueVjO-8geaIkeeIsee8lueoi0MrK--8ge-8ge-8ge-8gQ
+	recInfo = GB_Base64Decode(base64Str, true, true, true);
+	cout << "Base64 Encoded: " << base64Str << endl;
+	cout << "Base64 Decoded: " << recInfo << endl << endl;
+
+	cout << "MD5 Hash: " << GB_GetMd5(rawInfo) << endl; // MD5 Hash: 04c68e5d27eb2b225698d90aeed9e7aa
+	cout << "MD5 Hash: " << GB_GetMd5(GB_GetMd5(rawInfo)) << endl; // MD5 Hash: ba6f28ad0d84f4fdbae7c6e6a3b6893c
+
+	cout << "SHA256 Hash: " << GB_GetSha256("") << endl; // SHA256 Hash: e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+	cout << "SHA256 Hash: " << GB_GetSha256("abc") << endl; // SHA256 Hash: ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad
+	cout << "SHA256 Hash: " << GB_GetSha256(rawInfo) << endl; // SHA256 Hash: 3a79267d8a07e9267749460442751729435129d08695187d9d47f780c190c4c9
+
+	cout << "SHA512 Hash: " << GB_GetSha512("") << endl; // SHA512 Hash: cf83e1357eefb8bdf1542850d66d8007d620e4050b5715dc83f4a921d36ce9ce47d0d13c5d85f2b0ff8318d2877eec2f63b931bd47417a81a538327af927da3e
+	cout << "SHA512 Hash: " << GB_GetSha512("abc") << endl; // SHA512 Hash: ddaf35a193617abacc417349ae20413112e6fa4e89a97ea20a9eeee64b55d39a2192992a274fc1a836ba3c23a3feebbd454d4423643ce80e2a9ac94fa54ca49f
+	cout << "SHA512 Hash: " << GB_GetSha512(rawInfo) << endl; // SHA512 Hash: f607d355f04b2316b6adfdf19122242da587d583309271c73d95d829584581a207183d2e54cb3a95c4b99026bde19015ee8c217cc6bedf947464f31b502edf8d
+	cout << endl;
+
+
+
 	return 0;
 }
 

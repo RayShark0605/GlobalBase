@@ -35,7 +35,11 @@ struct CpuInfo
     GLOBALBASE_PORT std::string Serialize() const;
 };
 
+// 获取CPU信息
 GLOBALBASE_PORT CpuInfo GetCpuInfo();
+
+
+
 
 
 

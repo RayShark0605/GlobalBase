@@ -19,6 +19,7 @@
     </ProjectConfiguration>
   </ItemGroup>
   <ItemGroup>
+    <ClInclude Include="GB_Crypto.h" />
     <ClInclude Include="GB_SysInfo.h" />
     <ClInclude Include="GB_Timer.h" />
     <ClInclude Include="GB_Utf8String.h" />
@@ -27,6 +28,7 @@
     <ClInclude Include="GlobalBasePort.h" />
   </ItemGroup>
   <ItemGroup>
+    <ClCompile Include="GB_Crypto.cpp" />
     <ClCompile Include="GB_SysInfo.cpp" />
     <ClCompile Include="GB_Utf8String.cpp" />
     <ClCompile Include="GB_Utility.cpp" />
