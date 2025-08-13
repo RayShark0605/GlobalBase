@@ -1,5 +1,6 @@
 ﻿#include <iostream>
 #include "GlobalBase.h"
+#include "GB_SysInfo.h"
 
 
 using namespace std;
@@ -53,6 +54,31 @@ int main(int argc, char* argv[])
 	cout << Utf8Replace(GB_STR("世界！My World！こんにちは"), GB_STR("こんに"), GB_STR("你好")) << endl;	// 世界！My World！你好ちは
 	cout << Utf8Replace(GB_STR("世界！My World！こんにちは"), GB_STR("世"), GB_STR("你好")) << endl;	// 你好界！My World！こんにちは
 	cout << endl;
+
+	CpuInfo info = GetCpuInfo();
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 	return 0;
