@@ -3,7 +3,6 @@
 
 #include <string>
 #include <vector>
-#include <stdint.h>
 #include "GlobalBasePort.h"
 
 // CPU 信息
@@ -31,6 +30,8 @@ struct CpuInfo
     // 其他
     bool hypervisorPresent = false; // 是否检测到在虚拟化环境中（CPUID ECX bit31 等）
     std::vector<std::string> features; // 指令集/特性标志（Windows: 子集；Linux: 来自 /proc/cpuinfo）
+
+    GLOBALBASE_PORT std::string Serialize() const;
 };
 
 GLOBALBASE_PORT CpuInfo GetCpuInfo();
