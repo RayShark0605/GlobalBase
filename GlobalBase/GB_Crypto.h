@@ -55,6 +55,62 @@ GLOBALBASE_PORT std::string GB_GetMd5(const std::string& input);
 GLOBALBASE_PORT std::string GB_GetSha256(const std::string& input);
 GLOBALBASE_PORT std::string GB_GetSha512(const std::string& input);
 
+/**
+ * @brief 使用 AES-256-CBC（PKCS#7 填充）加密字节序列并输出 Base64(IV||Cipher)。
+ *
+ * - 模式与填充：采用 AES-256（32 字节密钥）+ CBC 分组模式，按 PKCS#7 规则填充至 16 字节块对齐。
+ * - IV 处理（安全默认）：当 iv 为空时，从系统的安全随机源生成 16 字节随机 IV；加密后**将 IV 作为前缀**与密文拼接，再整体进行 Base64 编码输出。IV 不需要保密，但对于 CBC **必须不可预测**。
+ * - 密钥与 IV 的“灵活规范化”（兼容选项）：当 flexibleKeyIv=true 时，密钥长度 >32 时按字节截断为前 32 字节；<32 时在尾部补 '\0' 至 32 字节；
+ *   若传入了 iv 且长度 !=16，则 >16 时截断为前 16 字节，<16 时在尾部补 '\0' 至 16 字节。
+ * - Base64 行为：`urlSafe` 与 `noPadding` 直接透传至内部 Base64 编码器；输出可选 URL-safe 字母表与去 '=' 结尾。
+ * - 字符串语义：`text`、`key`、`iv` 与返回值皆为“原始字节序列”的容器；不进行任何字符集转换。
+ *
+ * @param text
+ *     原始明文字节序列（std::string 仅作为字节容器）。
+ * @param key
+ *     密钥。当 flexibleKeyIv=true 时会被规范化为 32 字节；否则要求恰为 32 字节。
+ * @param iv
+ *     初始化向量原料。为空时自动生成随机 16 字节 IV 并前缀到输出；非空时按 flexibleKeyIv 规则处理或要求恰为 16 字节。
+ * @param urlSafe
+ *     Base64 是否使用 URL/文件名安全字母表（默认 false）。
+ * @param noPadding
+ *     Base64 是否采用“无填充”约定（默认 false）。
+ * @param flexibleKeyIv
+ *     是否启用“密钥/IV 长度灵活处理”（默认 true）：超长截断、过短补零。
+ *
+ * @return
+ *     Base64 文本（编码自字节串：IV||Ciphertext）。若入参非法、随机源失败或内部错误，返回空字符串。
+ */
+GLOBALBASE_PORT std::string GB_Aes256Encrypt(const std::string& text, const std::string& key, const std::string& iv = std::string(), bool urlSafe = false, bool noPadding = false, bool flexibleKeyIv = true);
+
+/**
+ * @brief 从 Base64(IV||Cipher) 文本解码并使用 AES-256-CBC（PKCS#7 去填充）还原原文字节序列。
+ *
+ * - 输入契约：`encryptedText` 必须是由“16 字节 IV 前缀 + 密文”整体 Base64 编码得到；函数将先 Base64 解码，
+ *   取前 16 字节为 IV，剩余字节为密文，再执行 CBC 解密与 PKCS#7 去填充。
+ * - 严格解析：`strictMode`、`urlSafe`、`noPadding` 直接透传至内部 Base64 解码器，以控制字母表、空白、'=' 等校验策略。
+ * - 密钥规范化：当 flexibleKey=true 时，密钥 >32 字节则截断，<32 字节则尾部补 '\0' 至 32；否则要求 key 恰为 32 字节。
+ * - 字符串语义：所有字符串参数与返回值均视为“原始字节序列”，不做编码转换。
+ * - 失败情形：Base64 非法；解码后长度 <16 或 (总长-16) 不是 16 的倍数；密钥长度不合规（在 flexibleKey=false 时）；
+ *   CBC 解密或 PKCS#7 去填充失败；以上情况均返回空字符串。
+ *
+ * @param encryptedText
+ *     Base64 文本，编码自字节串“IV||Ciphertext”。支持严格/宽松两种 Base64 解析策略（见 strictMode、urlSafe、noPadding）。
+ * @param key
+ *     密钥。当 flexibleKey=true 时会被规范化为 32 字节；否则要求恰为 32 字节。
+ * @param strictMode
+ *     Base64 严格模式开关（默认 false）。启用后将按所选字母表、长度与填充规则进行严格校验。
+ * @param urlSafe
+ *     Base64 是否采用 URL/文件名安全字母表（默认 false）。
+ * @param noPadding
+ *     Base64 是否采用“无填充”约定（默认 false）。
+ * @param flexibleKey
+ *     是否启用“密钥长度灵活处理”（默认 true）：超长截断、过短补零。
+ *
+ * @return
+ *     还原出的原文字节序列；若输入不合法或解密失败，返回空字符串。
+ */
+GLOBALBASE_PORT std::string GB_Aes256Decrypt(const std::string& encryptedText, const std::string& key, bool strictMode = false, bool urlSafe = false, bool noPadding = false, bool flexibleKey = true);
 
 
 

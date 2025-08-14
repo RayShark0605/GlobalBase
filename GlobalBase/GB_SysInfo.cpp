@@ -33,6 +33,7 @@ typedef struct _PROCESSOR_POWER_INFORMATION
 #pragma comment(lib, "wbemuuid.lib")
 #else
 #include <unistd.h>        // sysconf
+#include <sys/utsname.h>
 // 仅 Linux/Unix 系列需要 dirent.h
 #include <dirent.h>        // opendir/readdir/closedir
 #if defined(__x86_64__) || defined(__i386__)
@@ -40,6 +41,7 @@ typedef struct _PROCESSOR_POWER_INFORMATION
 #include <x86intrin.h> // _xgetbv
 #endif
 #endif
+#include "GB_Crypto.h"
 
 using namespace std;
 
@@ -553,6 +555,250 @@ namespace internal
         }
         return result;
     }
+
+    static string JoinKeyValue(const string& k, const string& v)
+    {
+        return k + "=" + v + ";";
+    }
+
+#if defined(_WIN32)
+    // 将 BSTR 转 UTF-8（安全返回空串）
+    static string BstrToUtf8(BSTR b)
+    {
+        if (!b)
+        {
+            return {};
+        }
+        const int len = ::WideCharToMultiByte(CP_UTF8, 0, b, -1, nullptr, 0, nullptr, nullptr);
+        if (len <= 1)
+        {
+            return {};
+        }
+        string out(static_cast<size_t>(len - 1), '\0');
+        ::WideCharToMultiByte(CP_UTF8, 0, b, -1, &out[0], len, nullptr, nullptr);
+        return out;
+    }
+
+    // 执行 WQL 并取首条记录里若干字符串属性（不存在则留空）
+    static bool WmiQueryFirstRowStrings(const wchar_t* wql, const vector<wstring>& props, vector<string>& outStrings)
+    {
+        outStrings.clear();
+
+        ComInit com;
+        if (FAILED(com.hr))
+        {
+            return false;
+        }
+
+        IWbemLocator* pLoc = nullptr;
+        if (FAILED(CoCreateInstance(CLSID_WbemLocator, 0, CLSCTX_INPROC_SERVER, IID_IWbemLocator, (LPVOID*)&pLoc)))
+        {
+            return false;
+        }
+
+        IWbemServices* pSvc = nullptr;
+        HRESULT hr = pLoc->ConnectServer(BSTR(L"ROOT\\CIMV2"), nullptr, nullptr, 0, 0, 0, 0, &pSvc);
+        pLoc->Release();
+        if (FAILED(hr))
+        {
+            return false;
+        }
+
+        CoSetProxyBlanket(pSvc, RPC_C_AUTHN_WINNT, RPC_C_AUTHZ_NONE, nullptr, RPC_C_AUTHN_LEVEL_CALL, RPC_C_IMP_LEVEL_IMPERSONATE, nullptr, EOAC_NONE);
+
+        IEnumWbemClassObject* pEnum = nullptr;
+        hr = pSvc->ExecQuery(BSTR(L"WQL"), BSTR(wql), WBEM_FLAG_FORWARD_ONLY | WBEM_FLAG_RETURN_IMMEDIATELY, nullptr, &pEnum);
+        if (FAILED(hr))
+        {
+            pSvc->Release();
+            return false;
+        }
+
+        IWbemClassObject* pObj = nullptr;
+        ULONG ret = 0;
+        bool ok = false;
+
+        if (SUCCEEDED(pEnum->Next(WBEM_INFINITE, 1, &pObj, &ret)) && ret == 1)
+        {
+            outStrings.reserve(props.size());
+            for (size_t i = 0; i < props.size(); i++)
+            {
+                VARIANT vt;
+                VariantInit(&vt);
+                string v;
+                if (SUCCEEDED(pObj->Get(props[i].c_str(), 0, &vt, nullptr, nullptr)))
+                {
+                    if (vt.vt == VT_BSTR)
+                    {
+                        v = BstrToUtf8(vt.bstrVal);
+                    }
+                    else if (vt.vt == (VT_ARRAY | VT_BSTR))
+                    {
+                        // 某些属性可能是 BSTR 数组：拼接为逗号分隔
+                        SAFEARRAY* psa = vt.parray;
+                        LONG l = 0, u = -1;
+                        SafeArrayGetLBound(psa, 1, &l);
+                        SafeArrayGetUBound(psa, 1, &u);
+                        string cat;
+                        for (LONG i2 = l; i2 <= u; i2++)
+                        {
+                            BSTR bs = nullptr;
+                            if (SUCCEEDED(SafeArrayGetElement(psa, &i2, &bs)) && bs)
+                            {
+                                if (!cat.empty()) cat += ",";
+                                cat += BstrToUtf8(bs);
+                                SysFreeString(bs);
+                            }
+                        }
+                        v = cat;
+                    }
+                }
+                VariantClear(&vt);
+                outStrings.push_back(v);
+            }
+            pObj->Release();
+            ok = true;
+        }
+
+        pEnum->Release();
+        pSvc->Release();
+        return ok;
+    }
+#else
+    // POSIX: 读整个文件，去掉尾部的 '\0' 与空白（有些设备树属性以 NUL 结尾）
+    static string ReadFileTrimAll(const string& path)
+    {
+        ifstream ifs(path.c_str(), ios::binary);
+        if (!ifs)
+        {
+            return {};
+        }
+        string s((istreambuf_iterator<char>(ifs)), istreambuf_iterator<char>());
+        // 去除尾部 NUL
+        while (!s.empty() && s.back() == '\0')
+        {
+            s.pop_back();
+        }
+        // 去除常见空白
+        size_t b = s.find_first_not_of(" \t\r\n");
+        size_t e = s.find_last_not_of(" \t\r\n");
+        if (b == string::npos)
+        {
+            return {};
+        }
+        return s.substr(b, e - b + 1);
+    }
+
+    static string ReadFirstLineTrim(const string& path)
+    {
+        ifstream ifs(path.c_str());
+        if (!ifs)
+        {
+            return {};
+        }
+        string line;
+        getline(ifs, line);
+        return internal::Trim(line);
+    }
+
+    // 读取 DMI 文件（/sys/class/dmi/id），优先首行，失败则 whole-file
+    static string ReadDmi(const string& name)
+    {
+        const string path = string("/sys/class/dmi/id/") + name;
+        string s = ReadFirstLineTrim(path);
+        if (!s.empty())
+        {
+            return s;
+        }
+        return ReadFileTrimAll(path);
+    }
+
+    // 设备树回退（常见路径：/proc/device-tree 与 /sys/firmware/devicetree/base）
+    static string ReadDeviceTree(const string& relPath)
+    {
+        string s = ReadFileTrimAll(string("/proc/device-tree/") + relPath);
+        if (!s.empty())
+        {
+            return s;
+        }
+        return ReadFileTrimAll(string("/sys/firmware/devicetree/base/") + relPath);
+    }
+#endif
+
+    // --- Linux: 解析 os-release ---
+    // 参考规范：/etc/os-release 或 /usr/lib/os-release
+    // Key=Value（Value 可带双引号；可能含转义），本实现做常用健壮解析。
+    static bool ParseOsRelease(map<string, string>& kv)
+    {
+        auto parseFile = [&](const string& path) -> bool
+            {
+                ifstream ifs(path.c_str());
+                if (!ifs)
+                {
+                    return false;
+                }
+                string line;
+                while (getline(ifs, line))
+                {
+                    // 去掉注释
+                    const size_t hashPos = line.find('#');
+                    if (hashPos != string::npos)
+                    {
+                        line = line.substr(0, hashPos);
+                    }
+                    line = Trim(line);
+                    if (line.empty())
+                    {
+                        continue;
+                    }
+                    const size_t eq = line.find('=');
+                    if (eq == string::npos)
+                    {
+                        continue;
+                    }
+                    string key = Trim(line.substr(0, eq));
+                    string val = Trim(line.substr(eq + 1));
+
+                    // 去除包裹引号；支持常见的 "..." 与 '...'
+                    if (!val.empty() && (val.front() == '"' || val.front() == '\'') && val.back() == val.front())
+                    {
+                        val = val.substr(1, val.size() - 2);
+                    }
+                    kv[key] = val;
+                }
+                return !kv.empty();
+            };
+
+        // 规范推荐优先 /etc/os-release，失败再试 /usr/lib/os-release
+        if (parseFile("/etc/os-release"))
+        {
+            return true;
+        }
+        return parseFile("/usr/lib/os-release");
+    }
+
+    // --- Linux: uname ---
+    static void QueryUname(string& sysname, string& nodename, string& release, string& version, string& machine)
+    {
+        sysname.clear();
+        nodename.clear();
+        release.clear();
+        version.clear();
+        machine.clear();
+
+#if !defined(_WIN32)
+        struct utsname u {};
+        if (uname(&u) == 0)
+        {
+            sysname = u.sysname;
+            nodename = u.nodename;
+            release = u.release;
+            version = u.version;
+            machine = u.machine;
+        }
+#endif
+    }
+
 }
 
 string CpuInfo::Serialize() const
@@ -648,6 +894,256 @@ CpuInfo GetCpuInfo()
     if (info.numaNodes == 0)
     {
         info.numaNodes = 1;
+    }
+    return info;
+}
+
+string MotherboardInfo::Serialize() const
+{
+    string s;
+    s += internal::JoinKeyValue("manufacturer", manufacturer);
+    s += internal::JoinKeyValue("product", product);
+    s += internal::JoinKeyValue("version", version);
+    s += internal::JoinKeyValue("serialNumber", serialNumber);
+    s += internal::JoinKeyValue("uuid", uuid);
+    s += internal::JoinKeyValue("biosVendor", biosVendor);
+    s += internal::JoinKeyValue("biosVersion", biosVersion);
+    s += internal::JoinKeyValue("biosDate", biosDate);
+    return s;
+}
+
+MotherboardInfo GetMotherboardInfo()
+{
+    MotherboardInfo info;
+
+#if defined(_WIN32)
+    // 1) BaseBoard：厂商/型号/版本/序列号
+    {
+        const vector<wstring> props = {
+            L"Manufacturer", L"Product", L"Version", L"SerialNumber"
+        };
+        vector<string> vals;
+        const bool ok = internal::WmiQueryFirstRowStrings(
+            L"SELECT Manufacturer, Product, Version, SerialNumber FROM Win32_BaseBoard",
+            props, vals
+        );
+        if (ok && vals.size() == props.size())
+        {
+            info.manufacturer = vals[0];
+            info.product = vals[1];
+            info.version = vals[2];
+            info.serialNumber = vals[3];
+        }
+    }
+
+    // 2) BIOS：厂商/版本/日期
+    {
+        const vector<wstring> props = {
+            L"Manufacturer", L"SMBIOSBIOSVersion", L"ReleaseDate"
+        };
+        vector<string> vals;
+        const bool ok = internal::WmiQueryFirstRowStrings(
+            L"SELECT Manufacturer, SMBIOSBIOSVersion, ReleaseDate FROM Win32_BIOS",
+            props, vals);
+        if (ok && vals.size() == props.size())
+        {
+            info.biosVendor = vals[0];
+            info.biosVersion = vals[1];
+            info.biosDate = vals[2]; // CIM_DATETIME 原样返回，例如 20240101xxxxxx.xxx+xxx
+        }
+    }
+
+    // 3) UUID：Win32_ComputerSystemProduct
+    {
+        const vector<wstring> props = { L"UUID" };
+        vector<string> vals;
+        const bool ok = internal::WmiQueryFirstRowStrings(
+            L"SELECT UUID FROM Win32_ComputerSystemProduct",
+            props, vals);
+        if (ok && !vals.empty())
+        {
+            info.uuid = vals[0];
+        }
+    }
+
+#else
+    // —— Linux: 先读 DMI(/sys/class/dmi/id)，再设备树回退 —— //
+    // DMI: 主板
+    info.manufacturer = internal::ReadDmi("board_vendor");
+    info.product = internal::ReadDmi("board_name");
+    info.version = internal::ReadDmi("board_version");
+    info.serialNumber = internal::ReadDmi("board_serial");
+
+    // DMI: UUID + BIOS
+    info.uuid = internal::ReadDmi("product_uuid");
+    info.biosVendor = internal::ReadDmi("bios_vendor");
+    info.biosVersion = internal::ReadDmi("bios_version");
+    info.biosDate = internal::ReadDmi("bios_date");
+
+    // 设备树回补（常见于树莓派/嵌入式等）
+    if (info.product.empty())
+    {
+        info.product = internal::ReadDeviceTree("model");
+    }
+    if (info.serialNumber.empty())
+    {
+        info.serialNumber = internal::ReadDeviceTree("serial-number");
+    }
+#endif
+
+    // 规范化/兜底
+    if (info.manufacturer.empty())
+    {
+        info.manufacturer = "Unknown";
+    }
+    if (info.product.empty())
+    {
+        info.product = "Unknown";
+    }
+
+    return info;
+}
+
+string OsInfo::Serialize() const
+{
+    string s;
+    s += internal::JoinKeyValue("name", name);
+    s += internal::JoinKeyValue("version", version);
+    s += internal::JoinKeyValue("buildNumber", buildNumber);
+    s += internal::JoinKeyValue("architecture", architecture);
+    s += internal::JoinKeyValue("osArchitecture", osArchitecture);
+    s += internal::JoinKeyValue("kernelName", kernelName);
+    s += internal::JoinKeyValue("kernelRelease", kernelRelease);
+    s += internal::JoinKeyValue("kernelVersion", kernelVersion);
+    s += internal::JoinKeyValue("hostname", hostname);
+    s += internal::JoinKeyValue("id", id);
+    s += internal::JoinKeyValue("idLike", idLike);
+    s += internal::JoinKeyValue("codename", codename);
+    return s;
+}
+
+string GenerateHardwareId()
+{
+    const CpuInfo cpuInfo = GetCpuInfo();
+    const MotherboardInfo motherboardInfo = GetMotherboardInfo();
+
+    const string cpuId = cpuInfo.cpuSerial.empty() ? cpuInfo.processorId : cpuInfo.cpuSerial;
+    const string motherboardId = motherboardInfo.serialNumber.empty() ? motherboardInfo.uuid : motherboardInfo.serialNumber;
+    const string hardwareId = cpuId + "--" + motherboardId;
+    return GB_GetSha256(hardwareId);
+}
+
+// ===== 3) GetOsInfo() 主体 =====
+OsInfo GetOsInfo()
+{
+    OsInfo info;
+    info.architecture = internal::DetectArchitecture();
+
+#if defined(_WIN32)
+    // Windows: 通过 WMI Win32_OperatingSystem 抓取信息
+    info.kernelName = "Windows NT";
+
+    const vector<wstring> props = {
+        L"Caption",        // 0: 友好名称，如 "Microsoft Windows 11 Pro"
+        L"Version",        // 1: 版本号，如 "10.0.22631"
+        L"BuildNumber",    // 2: 内部构建号，如 "22631"
+        L"OSArchitecture", // 3: "64-bit" / "32-bit"
+        L"CSDVersion",     // 4: Service Pack（新系统多为空）
+        L"CSName"          // 5: 主机名
+    };
+    vector<string> vals;
+    if (internal::WmiQueryFirstRowStrings(
+        L"SELECT Caption, Version, BuildNumber, OSArchitecture, CSDVersion, CSName FROM Win32_OperatingSystem",
+        props, vals))
+    {
+        if (vals.size() == props.size())
+        {
+            info.name = vals[0];
+            info.version = vals[1];
+            info.buildNumber = vals[2];
+            info.osArchitecture = vals[3];
+            // CSDVersion 可按需拼接到 name 或 version；此处保留在 Serialize 外部再用
+            info.hostname = vals[5];
+            info.kernelVersion = info.version; // 近似等同
+        }
+    }
+
+#else
+    // -------- Linux --------
+    // 1) uname：内核信息与主机名
+    string sysname, nodename, release, version, machine;
+    internal::QueryUname(sysname, nodename, release, version, machine);
+    info.kernelName = sysname.empty() ? "Linux" : sysname;
+    info.kernelRelease = release;
+    info.kernelVersion = version;
+    info.hostname = nodename;
+
+    // 2) os-release：发行版信息
+    map<string, string> kv;
+    if (internal::ParseOsRelease(kv))
+    {
+        auto get = [&](const char* k) -> string
+            {
+                auto it = kv.find(k);
+                return it == kv.end() ? string() : it->second;
+            };
+
+        const string prettyName = get("PRETTY_NAME");
+        const string nameField = get("NAME");
+        const string versionId = get("VERSION_ID");
+        const string versionStr = get("VERSION");
+        info.id = get("ID");
+        info.idLike = get("ID_LIKE");
+        info.codename = get("VERSION_CODENAME");
+
+        // 展示名：优先 PRETTY_NAME，否则 NAME + " " + VERSION
+        if (!prettyName.empty())
+        {
+            info.name = prettyName;
+        }
+        else if (!nameField.empty() || !versionStr.empty())
+        {
+            info.name = nameField;
+            if (!versionStr.empty())
+            {
+                if (!info.name.empty()) info.name += " ";
+                info.name += versionStr;
+            }
+        }
+
+        // 机读版本：优先 VERSION_ID，否则 VERSION
+        info.version = !versionId.empty() ? versionId : versionStr;
+    }
+
+    // 3) buildNumber：Linux 下使用内核发布号更有参考意义
+    if (!info.kernelRelease.empty())
+    {
+        info.buildNumber = info.kernelRelease;
+    }
+
+    // 4) osArchitecture：可由 uname.machine 粗略映射（可选）
+    if (info.osArchitecture.empty() && !machine.empty())
+    {
+        // 简化映射，仅用于补全展示；真实架构字段（architecture）已由 DetectArchitecture 提供
+        if (machine.find("64") != string::npos || machine == "x86_64" || machine == "aarch64")
+        {
+            info.osArchitecture = "64-bit";
+        }
+        else if (machine == "i386" || machine == "i686" || machine == "armv7l")
+        {
+            info.osArchitecture = "32-bit";
+        }
+    }
+#endif
+
+    // 兜底
+    if (info.name.empty())
+    {
+        info.name = info.kernelName.empty() ? string("Unknown OS") : info.kernelName;
+    }
+    if (info.version.empty())
+    {
+        info.version = "Unknown";
     }
     return info;
 }

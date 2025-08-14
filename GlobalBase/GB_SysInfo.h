@@ -35,14 +35,55 @@ struct CpuInfo
     GLOBALBASE_PORT std::string Serialize() const;
 };
 
-// 获取CPU信息
+// 获取 CPU 信息
 GLOBALBASE_PORT CpuInfo GetCpuInfo();
 
+// 主板信息
+struct MotherboardInfo
+{
+    std::string manufacturer;   // 主板厂商
+    std::string product;        // 主板型号
+    std::string version;        // 主板版本
+    std::string serialNumber;   // 主板序列号，可能为空
+    std::string uuid;           // SMBIOS UUID
 
+    // BIOS 概览（放在主板处方便一次返回）
+    std::string biosVendor;     // BIOS 厂商
+    std::string biosVersion;    // BIOS 版本
+    std::string biosDate;       // BIOS 日期
 
+    GLOBALBASE_PORT std::string Serialize() const;
+};
 
+// 获取当前主板信息
+GLOBALBASE_PORT MotherboardInfo GetMotherboardInfo();
 
+// 生成硬件 ID（基于 CPU 和主板信息）
+GLOBALBASE_PORT std::string GenerateHardwareId();
 
+// 操作系统信息
+struct OsInfo
+{
+    std::string name;               // 例如"Microsoft Windows 11 专业版"
+    std::string version;            // 例如"10.0.26200"
+    std::string buildNumber;        // 例如"26200"
+    std::string architecture;       // "x86_64"/"x86"/"arm64"/...
+    std::string osArchitecture;     // 例如"64 位"
+    std::string kernelName;         // Windows 固定填 "Windows NT"
+    std::string kernelRelease;      // 可能为空
+    std::string kernelVersion;      // 例如"10.0.26200"
+    std::string hostname;           // 例如"DESKTOP-5GB9TLO"
+
+    // Linux 生态常见字段
+    std::string id;                 // /etc/os-release: ID
+    std::string idLike;             // /etc/os-release: ID_LIKE
+    std::string codename;           // /etc/os-release: VERSION_CODENAME
+
+    GLOBALBASE_PORT std::string Serialize() const;
+};
+
+// 获取当前操作系统信息
+GLOBALBASE_PORT OsInfo GetOsInfo();
 
 
 

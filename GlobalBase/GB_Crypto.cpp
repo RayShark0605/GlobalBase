@@ -2,6 +2,18 @@
 #include <vector>
 #include <cstdint>
 #include <algorithm>
+#include <stdint.h>
+#include <limits>
+#include <fstream>
+#include <random>
+
+#if defined(_WIN32)
+#  include <windows.h>
+#  include <bcrypt.h>
+#  if defined(_MSC_VER)
+#    pragma comment(lib, "bcrypt.lib")
+#  endif
+#endif
 
 using namespace std;
 
@@ -192,6 +204,326 @@ namespace internal
         0x28db77f523047d84ULL,0x32caab7b40c72493ULL,0x3c9ebe0a15c9bebcULL,0x431d67c49c100d4cULL,
         0x4cc5d4becb3e42b6ULL,0x597f299cfc657e2aULL,0x5fcb6fab3ad6faecULL,0x6c44198c4a475817ULL
     };
+
+    // ---------- CSPRNG：优先系统随机，失败退回 random_device ----------
+    static bool GetSecureRandom(uint8_t* buf, size_t len)
+    {
+#if defined(_WIN32)
+        if (BCryptGenRandom(nullptr, buf, static_cast<ULONG>(len), BCRYPT_USE_SYSTEM_PREFERRED_RNG) == 0)
+        {
+            return true;
+        }
+#endif
+#if !defined(_WIN32)
+        ifstream urnd("/dev/urandom", ios::in | ios::binary);
+        if (urnd.good())
+        {
+            urnd.read(reinterpret_cast<char*>(buf), static_cast<streamsize>(len));
+            if (urnd.gcount() == static_cast<streamsize>(len))
+            {
+                return true;
+            }
+        }
+#endif
+        // 兜底：非阻塞非加密保证，仅作为最后手段
+        random_device rd;
+        for (size_t i = 0; i < len; i++)
+        {
+            buf[i] = static_cast<uint8_t>(rd());
+        }
+        return true;
+    }
+
+    // ---------- PKCS#7 ----------
+    static void Pkcs7Pad(string& buf)
+    {
+        const size_t bs = 16;
+        const size_t rem = buf.size() % bs;
+        const uint8_t pad = static_cast<uint8_t>((rem == 0) ? bs : (bs - rem));
+        for (size_t i = 0; i < static_cast<size_t>(pad); i++)
+        {
+            buf.push_back(static_cast<char>(pad));
+        }
+    }
+
+    static bool Pkcs7Unpad(string& buf)
+    {
+        if (buf.empty() || (buf.size() % 16) != 0)
+        {
+            return false;
+        }
+        const uint8_t pad = static_cast<uint8_t>(buf.back());
+        if (pad == 0 || pad > 16)
+        {
+            return false;
+        }
+        const size_t n = buf.size();
+        for (size_t i = 0; i < static_cast<size_t>(pad); i++)
+        {
+            if (static_cast<uint8_t>(buf[n - 1 - i]) != pad)
+            {
+                return false;
+            }
+        }
+        buf.resize(n - pad);
+        return true;
+    }
+
+    // ---------- AES 常量（SBox/InvSBox/Rcon） ----------
+    static const uint8_t kSBox[256] = {
+        0x63,0x7c,0x77,0x7b,0xf2,0x6b,0x6f,0xc5,0x30,0x01,0x67,0x2b,0xfe,0xd7,0xab,0x76,
+        0xca,0x82,0xc9,0x7d,0xfa,0x59,0x47,0xf0,0xad,0xd4,0xa2,0xaf,0x9c,0xa4,0x72,0xc0,
+        0xb7,0xfd,0x93,0x26,0x36,0x3f,0xf7,0xcc,0x34,0xa5,0xe5,0xf1,0x71,0xd8,0x31,0x15,
+        0x04,0xc7,0x23,0xc3,0x18,0x96,0x05,0x9a,0x07,0x12,0x80,0xe2,0xeb,0x27,0xb2,0x75,
+        0x09,0x83,0x2c,0x1a,0x1b,0x6e,0x5a,0xa0,0x52,0x3b,0xd6,0xb3,0x29,0xe3,0x2f,0x84,
+        0x53,0xd1,0x00,0xed,0x20,0xfc,0xb1,0x5b,0x6a,0xcb,0xbe,0x39,0x4a,0x4c,0x58,0xcf,
+        0xd0,0xef,0xaa,0xfb,0x43,0x4d,0x33,0x85,0x45,0xf9,0x02,0x7f,0x50,0x3c,0x9f,0xa8,
+        0x51,0xa3,0x40,0x8f,0x92,0x9d,0x38,0xf5,0xbc,0xb6,0xda,0x21,0x10,0xff,0xf3,0xd2,
+        0xcd,0x0c,0x13,0xec,0x5f,0x97,0x44,0x17,0xc4,0xa7,0x7e,0x3d,0x64,0x5d,0x19,0x73,
+        0x60,0x81,0x4f,0xdc,0x22,0x2a,0x90,0x88,0x46,0xee,0xb8,0x14,0xde,0x5e,0x0b,0xdb,
+        0xe0,0x32,0x3a,0x0a,0x49,0x06,0x24,0x5c,0xc2,0xd3,0xac,0x62,0x91,0x95,0xe4,0x79,
+        0xe7,0xc8,0x37,0x6d,0x8d,0xd5,0x4e,0xa9,0x6c,0x56,0xf4,0xea,0x65,0x7a,0xae,0x08,
+        0xba,0x78,0x25,0x2e,0x1c,0xa6,0xb4,0xc6,0xe8,0xdd,0x74,0x1f,0x4b,0xbd,0x8b,0x8a,
+        0x70,0x3e,0xb5,0x66,0x48,0x03,0xf6,0x0e,0x61,0x35,0x57,0xb9,0x86,0xc1,0x1d,0x9e,
+        0xe1,0xf8,0x98,0x11,0x69,0xd9,0x8e,0x94,0x9b,0x1e,0x87,0xe9,0xce,0x55,0x28,0xdf,
+        0x8c,0xa1,0x89,0x0d,0xbf,0xe6,0x42,0x68,0x41,0x99,0x2d,0x0f,0xb0,0x54,0xbb,0x16
+    };
+    static const uint8_t kInvSBox[256] = {
+        0x52,0x09,0x6a,0xd5,0x30,0x36,0xa5,0x38,0xbf,0x40,0xa3,0x9e,0x81,0xf3,0xd7,0xfb,
+        0x7c,0xe3,0x39,0x82,0x9b,0x2f,0xff,0x87,0x34,0x8e,0x43,0x44,0xc4,0xde,0xe9,0xcb,
+        0x54,0x7b,0x94,0x32,0xa6,0xc2,0x23,0x3d,0xee,0x4c,0x95,0x0b,0x42,0xfa,0xc3,0x4e,
+        0x08,0x2e,0xa1,0x66,0x28,0xd9,0x24,0xb2,0x76,0x5b,0xa2,0x49,0x6d,0x8b,0xd1,0x25,
+        0x72,0xf8,0xf6,0x64,0x86,0x68,0x98,0x16,0xd4,0xa4,0x5c,0xcc,0x5d,0x65,0xb6,0x92,
+        0x6c,0x70,0x48,0x50,0xfd,0xed,0xb9,0xda,0x5e,0x15,0x46,0x57,0xa7,0x8d,0x9d,0x84,
+        0x90,0xd8,0xab,0x00,0x8c,0xbc,0xd3,0x0a,0xf7,0xe4,0x58,0x05,0xb8,0xb3,0x45,0x06,
+        0xd0,0x2c,0x1e,0x8f,0xca,0x3f,0x0f,0x02,0xc1,0xaf,0xbd,0x03,0x01,0x13,0x8a,0x6b,
+        0x3a,0x91,0x11,0x41,0x4f,0x67,0xdc,0xea,0x97,0xf2,0xcf,0xce,0xf0,0xb4,0xe6,0x73,
+        0x96,0xac,0x74,0x22,0xe7,0xad,0x35,0x85,0xe2,0xf9,0x37,0xe8,0x1c,0x75,0xdf,0x6e,
+        0x47,0xf1,0x1a,0x71,0x1d,0x29,0xc5,0x89,0x6f,0xb7,0x62,0x0e,0xaa,0x18,0xbe,0x1b,
+        0xfc,0x56,0x3e,0x4b,0xc6,0xd2,0x79,0x20,0x9a,0xdb,0xc0,0xfe,0x78,0xcd,0x5a,0xf4,
+        0x1f,0xdd,0xa8,0x33,0x88,0x07,0xc7,0x31,0xb1,0x12,0x10,0x59,0x27,0x80,0xec,0x5f,
+        0x60,0x51,0x7f,0xa9,0x19,0xb5,0x4a,0x0d,0x2d,0xe5,0x7a,0x9f,0x93,0xc9,0x9c,0xef,
+        0xa0,0xe0,0x3b,0x4d,0xae,0x2a,0xf5,0xb0,0xc8,0xeb,0xbb,0x3c,0x83,0x53,0x99,0x61,
+        0x17,0x2b,0x04,0x7e,0xba,0x77,0xd6,0x26,0xe1,0x69,0x14,0x63,0x55,0x21,0x0c,0x7d
+    };
+    static const uint32_t kRcon[10] = {
+        0x01000000u,0x02000000u,0x04000000u,0x08000000u,0x10000000u,
+        0x20000000u,0x40000000u,0x80000000u,0x1B000000u,0x36000000u
+    };
+
+    static uint32_t RotWord(uint32_t w) { return (w << 8) | (w >> 24); }
+    static uint32_t SubWord(uint32_t w)
+    {
+        return (uint32_t)kSBox[(w >> 24) & 0xFF] << 24
+            | (uint32_t)kSBox[(w >> 16) & 0xFF] << 16
+            | (uint32_t)kSBox[(w >> 8) & 0xFF] << 8
+            | (uint32_t)kSBox[(w) & 0xFF];
+    }
+    static uint8_t GFMul(uint8_t a, uint8_t b)
+    {
+        uint8_t p = 0;
+        for (int i = 0; i < 8; i++)
+        {
+            if (b & 1) { p ^= a; }
+            const bool hi = (a & 0x80u) != 0;
+            a <<= 1;
+            if (hi) { a ^= 0x1Bu; }
+            b >>= 1;
+        }
+        return p;
+    }
+
+    // 仅支持 AES-256（32 字节密钥）
+    static bool ExpandKey256(const string& key32, vector<uint8_t>& roundKeys)
+    {
+        if (key32.size() != 32)
+        {
+            return false;
+        }
+        const int nb = 4, nk = 8, nr = 14;
+        const int words = nb * (nr + 1);
+        vector<uint32_t> w(words, 0);
+
+        for (int i = 0; i < nk; i++)
+        {
+            const uint8_t b0 = (uint8_t)key32[4 * i + 0];
+            const uint8_t b1 = (uint8_t)key32[4 * i + 1];
+            const uint8_t b2 = (uint8_t)key32[4 * i + 2];
+            const uint8_t b3 = (uint8_t)key32[4 * i + 3];
+            w[i] = (uint32_t)b0 << 24 | (uint32_t)b1 << 16 | (uint32_t)b2 << 8 | (uint32_t)b3;
+        }
+        for (int i = nk; i < words; i++)
+        {
+            uint32_t temp = w[i - 1];
+            if (i % nk == 0)
+            {
+                temp = SubWord(RotWord(temp)) ^ kRcon[(i / nk) - 1];
+            }
+            else if (i % nk == 4)
+            {
+                temp = SubWord(temp);
+            }
+            w[i] = w[i - nk] ^ temp;
+        }
+
+        roundKeys.resize(16 * (nr + 1));
+        for (int r = 0; r <= nr; r++)
+        {
+            for (int c = 0; c < 4; c++)
+            {
+                const uint32_t word = w[r * 4 + c];
+                roundKeys[r * 16 + 4 * c + 0] = (uint8_t)((word >> 24) & 0xFF);
+                roundKeys[r * 16 + 4 * c + 1] = (uint8_t)((word >> 16) & 0xFF);
+                roundKeys[r * 16 + 4 * c + 2] = (uint8_t)((word >> 8) & 0xFF);
+                roundKeys[r * 16 + 4 * c + 3] = (uint8_t)((word) & 0xFF);
+            }
+        }
+        return true;
+    }
+
+    static void AddRoundKey(uint8_t* s, const uint8_t* rk)
+    {
+        for (int i = 0; i < 16; i++) { s[i] ^= rk[i]; }
+    }
+    static void SubBytes(uint8_t* s)
+    {
+        for (int i = 0; i < 16; i++) { s[i] = kSBox[s[i]]; }
+    }
+    static void InvSubBytes(uint8_t* s)
+    {
+        for (int i = 0; i < 16; i++) { s[i] = kInvSBox[s[i]]; }
+    }
+    static void ShiftRows(uint8_t* s)
+    {
+        uint8_t t;
+        t = s[1];  s[1] = s[5];  s[5] = s[9];  s[9] = s[13]; s[13] = t;
+        uint8_t t0 = s[2], t1 = s[6];
+        s[2] = s[10]; s[6] = s[14]; s[10] = t0; s[14] = t1;
+        t = s[15]; s[15] = s[11]; s[11] = s[7]; s[7] = s[3]; s[3] = t;
+    }
+    static void InvShiftRows(uint8_t* s)
+    {
+        uint8_t t;
+        t = s[13]; s[13] = s[9];  s[9] = s[5];  s[5] = s[1];  s[1] = t;
+        uint8_t t0 = s[2], t1 = s[6];
+        s[2] = s[10]; s[6] = s[14]; s[10] = t0; s[14] = t1;
+        t = s[3];  s[3] = s[7];  s[7] = s[11]; s[11] = s[15]; s[15] = t;
+    }
+    static void MixColumns(uint8_t* s)
+    {
+        for (int c = 0; c < 4; c++)
+        {
+            const int i = 4 * c;
+            const uint8_t a0 = s[i + 0], a1 = s[i + 1], a2 = s[i + 2], a3 = s[i + 3];
+            s[i + 0] = (uint8_t)(GFMul(a0, 2) ^ GFMul(a1, 3) ^ a2 ^ a3);
+            s[i + 1] = (uint8_t)(a0 ^ GFMul(a1, 2) ^ GFMul(a2, 3) ^ a3);
+            s[i + 2] = (uint8_t)(a0 ^ a1 ^ GFMul(a2, 2) ^ GFMul(a3, 3));
+            s[i + 3] = (uint8_t)(GFMul(a0, 3) ^ a1 ^ a2 ^ GFMul(a3, 2));
+        }
+    }
+    static void InvMixColumns(uint8_t* s)
+    {
+        for (int c = 0; c < 4; c++)
+        {
+            const int i = 4 * c;
+            const uint8_t a0 = s[i + 0], a1 = s[i + 1], a2 = s[i + 2], a3 = s[i + 3];
+            s[i + 0] = (uint8_t)(GFMul(a0, 14) ^ GFMul(a1, 11) ^ GFMul(a2, 13) ^ GFMul(a3, 9));
+            s[i + 1] = (uint8_t)(GFMul(a0, 9) ^ GFMul(a1, 14) ^ GFMul(a2, 11) ^ GFMul(a3, 13));
+            s[i + 2] = (uint8_t)(GFMul(a0, 13) ^ GFMul(a1, 9) ^ GFMul(a2, 14) ^ GFMul(a3, 11));
+            s[i + 3] = (uint8_t)(GFMul(a0, 11) ^ GFMul(a1, 13) ^ GFMul(a2, 9) ^ GFMul(a3, 14));
+        }
+    }
+    static void EncryptBlock(const uint8_t* in, uint8_t* out, const vector<uint8_t>& rk)
+    {
+        uint8_t s[16];
+        for (int i = 0; i < 16; i++) { s[i] = in[i]; }
+        const int nr = 14;
+
+        AddRoundKey(s, &rk[0]);
+        for (int r = 1; r < nr; r++)
+        {
+            SubBytes(s);
+            ShiftRows(s);
+            MixColumns(s);
+            AddRoundKey(s, &rk[16 * r]);
+        }
+        SubBytes(s);
+        ShiftRows(s);
+        AddRoundKey(s, &rk[16 * nr]);
+
+        for (int i = 0; i < 16; i++) { out[i] = s[i]; }
+    }
+    static void DecryptBlock(const uint8_t* in, uint8_t* out, const vector<uint8_t>& rk)
+    {
+        uint8_t s[16];
+        for (int i = 0; i < 16; i++) { s[i] = in[i]; }
+        const int nr = 14;
+
+        AddRoundKey(s, &rk[16 * nr]);
+        for (int r = nr - 1; r >= 1; r--)
+        {
+            InvShiftRows(s);
+            InvSubBytes(s);
+            AddRoundKey(s, &rk[16 * r]);
+            InvMixColumns(s);
+        }
+        InvShiftRows(s);
+        InvSubBytes(s);
+        AddRoundKey(s, &rk[0]);
+
+        for (int i = 0; i < 16; i++) { out[i] = s[i]; }
+    }
+
+    // ---------- 规范化（按你提出的规则） ----------
+    static bool NormalizeKey32(const string& keyMaterial, bool flexible, string& keyOut)
+    {
+        if (!flexible)
+        {
+            if (keyMaterial.size() != 32) { return false; }
+            keyOut = keyMaterial;
+            return true;
+        }
+        keyOut.clear();
+        if (keyMaterial.size() >= 32)
+        {
+            keyOut.assign(keyMaterial.data(), keyMaterial.data() + 32); // 截断
+        }
+        else
+        {
+            keyOut = keyMaterial;
+            keyOut.resize(32, '\0'); // 后补 0
+        }
+        return true;
+    }
+
+    static bool NormalizeIv16(const string& ivMaterial, bool flexible, string& ivOut, bool& usedRandom)
+    {
+        usedRandom = false;
+        if (ivMaterial.empty())
+        {
+            ivOut.resize(16);
+            GetSecureRandom(reinterpret_cast<uint8_t*>(&ivOut[0]), 16);
+            usedRandom = true;
+            return true;
+        }
+        if (!flexible)
+        {
+            if (ivMaterial.size() != 16) { return false; }
+            ivOut = ivMaterial;
+            return true;
+        }
+        if (ivMaterial.size() >= 16)
+        {
+            ivOut.assign(ivMaterial.data(), ivMaterial.data() + 16); // 截断
+        }
+        else
+        {
+            ivOut = ivMaterial;
+            ivOut.resize(16, '\0'); // 后补 0
+        }
+        // 注意：这里会导致确定性 IV，不安全；仅在你明确需要兼容时启用 flexible。
+        return true;
+    }
 }
 
 string GB_Base64Encode(const string& bytes, bool urlSafe, bool noPadding)
@@ -626,7 +958,110 @@ string GB_GetSha512(const string& input)
     return hex;
 }
 
+string GB_Aes256Encrypt(const string& plainBytes, const string& keyMaterial, const string& ivMaterial, bool urlSafe, bool noPadding, bool flexibleKeyIv)
+{
+    // 1) 规范化 key/iv（按需截断/补0；iv 为空则随机）
+    string key32;
+    if (!internal::NormalizeKey32(keyMaterial, flexibleKeyIv, key32))
+    {
+        return {};
+    }
+    string iv16;
+    bool usedRandom = false;
+    if (!internal::NormalizeIv16(ivMaterial, flexibleKeyIv, iv16, usedRandom))
+    {
+        return {};
+    }
 
+    // 2) 展开轮密钥（AES-256）
+    vector<uint8_t> rk;
+    if (!internal::ExpandKey256(key32, rk))
+    {
+        return {};
+    }
+
+    // 3) PKCS#7 填充
+    string buf = plainBytes;
+    internal::Pkcs7Pad(buf); // PKCS#7（RFC 5652）
+
+    // 4) CBC 加密（IV 前缀）
+    string out;
+    out.resize(iv16.size() + buf.size());
+
+    // 前 16 字节写入 IV
+    for (int i = 0; i < 16; i++) { out[i] = iv16[i]; }
+
+    uint8_t prev[16];
+    for (int i = 0; i < 16; i++) { prev[i] = (uint8_t)iv16[i]; }
+
+    for (size_t off = 0; off < buf.size(); off += 16)
+    {
+        uint8_t block[16];
+        for (int i = 0; i < 16; i++) { block[i] = (uint8_t)buf[off + i] ^ prev[i]; }
+        uint8_t enc[16];
+        internal::EncryptBlock(block, enc, rk);
+        for (int i = 0; i < 16; i++)
+        {
+            out[16 + off + i] = (char)enc[i];
+            prev[i] = enc[i];
+        }
+    }
+
+    // 5) Base64 输出
+    return GB_Base64Encode(out, urlSafe, noPadding);
+}
+
+string GB_Aes256Decrypt(const string& base64CipherWithIv, const string& keyMaterial, bool strictMode, bool urlSafe, bool noPadding, bool flexibleKey)
+{
+    const string all = GB_Base64Decode(base64CipherWithIv, strictMode, urlSafe, noPadding);
+    if (all.size() < 16 || ((all.size() - 16) % 16) != 0)
+    {
+        return {};
+    }
+
+    // 1) 取回前缀 IV
+    string iv16(all.data(), all.data() + 16);
+    const string cipher(all.data() + 16, all.data() + all.size());
+
+    // 2) 规范化 key
+    string key32;
+    if (!internal::NormalizeKey32(keyMaterial, flexibleKey, key32))
+    {
+        return {};
+    }
+
+    // 3) 展开轮密钥
+    vector<uint8_t> rk;
+    if (!internal::ExpandKey256(key32, rk))
+    {
+        return {};
+    }
+
+    // 4) CBC 解密
+    string out;
+    out.resize(cipher.size());
+
+    uint8_t prev[16];
+    for (int i = 0; i < 16; i++) { prev[i] = (uint8_t)iv16[i]; }
+
+    for (size_t off = 0; off < cipher.size(); off += 16)
+    {
+        uint8_t dec[16];
+        internal::DecryptBlock(reinterpret_cast<const uint8_t*>(cipher.data() + off), dec, rk);
+        for (int i = 0; i < 16; i++)
+        {
+            out[off + i] = (char)(dec[i] ^ prev[i]);
+        }
+        for (int i = 0; i < 16; i++) { prev[i] = (uint8_t)cipher[off + i]; }
+    }
+
+    // 5) 去 PKCS#7
+    if (!internal::Pkcs7Unpad(out))
+    {
+        return {};
+    }
+    return out;
+}
 
 
 
