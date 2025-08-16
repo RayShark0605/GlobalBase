@@ -72,7 +72,7 @@ int main(int argc, char* argv[])
 	cout << endl << hardwareId << endl;
 	cout << endl;
 
-	const string rawInfo = GB_STR("Hello World! 你好，世界！我爱编程C++！！！！");
+	string rawInfo = GB_STR("Hello World! 你好，世界！我爱编程C++！！！！");
 	string base64Str = GB_Base64Encode(rawInfo);
 	string recInfo = GB_Base64Decode(base64Str);
 	cout << "Raw Info: " << rawInfo << endl;
@@ -111,6 +111,15 @@ int main(int argc, char* argv[])
 	const std::string back = GB_Aes256Decrypt(b64, key);
 	cout << "AES-256-CBC Encrypt: " << b64 << endl; // AES-256-CBC Encrypt: rrVFr02QJVaDulxo88y9RulkZEHWyHX4bosIj6i7pYswrlsEmpcD0nj9Z16bgDAFcXGc1+y6S22esrP1nR1G2g==
 	cout << "AES-256-CBC Decrypt: " << back << endl;
+
+
+	rawInfo = GB_STR("本功能为用户提供一个交互式工具，用于校准无地理参考或位置偏移的栅格影像。通过在影像和当前图形之间建立一系列匹配的控制点，系统将对影像进行非刚性变换，以修正其几何形变，使其与图形中的矢量数据精确对齐。此功能是整合扫描图纸、无坐标航拍像片等数据的关键工具，并支持对已有坐标的影像进行精度提升或纠正。");
+	std::string publicKey, privateKey;
+	GB_RsaGenerateKeyPair(publicKey, privateKey);
+	const std::string encryptionText = GB_RsaEncrypt(rawInfo, publicKey);
+	const std::string decryptedText = GB_RsaDecrypt(encryptionText, privateKey);
+	cout << "encryptionText:" << encryptionText << endl;
+	cout << "decryptedText:" << decryptedText << endl;
 
 
 	return 0;

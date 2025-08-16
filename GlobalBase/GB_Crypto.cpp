@@ -6,6 +6,8 @@
 #include <limits>
 #include <fstream>
 #include <random>
+#include <cassert>
+#include <sstream>
 
 #if defined(_WIN32)
 #  include <windows.h>
@@ -474,7 +476,7 @@ namespace internal
         for (int i = 0; i < 16; i++) { out[i] = s[i]; }
     }
 
-    // ---------- 规范化（按你提出的规则） ----------
+    // ---------- 规范化 ----------
     static bool NormalizeKey32(const string& keyMaterial, bool flexible, string& keyOut)
     {
         if (!flexible)
@@ -523,6 +525,1141 @@ namespace internal
         }
         // 注意：这里会导致确定性 IV，不安全；仅在你明确需要兼容时启用 flexible。
         return true;
+    }
+
+    class BigInt
+    {
+
+    public:
+        typedef unsigned long base_t;
+        static int base_char;
+        static int base;
+        static int basebitnum;
+        static int basebitchar;
+        static int basebit;
+    private:
+        friend class Rsa;
+    public:
+        friend BigInt operator + (const BigInt& a, const BigInt& b);
+        friend BigInt operator - (const BigInt& a, const BigInt& b);
+        friend BigInt operator * (const BigInt& a, const BigInt& b);
+        friend BigInt operator / (const BigInt& a, const BigInt& b);
+        friend BigInt operator % (const BigInt& a, const BigInt& b);
+        friend bool operator < (const BigInt& a, const BigInt& b);
+        friend bool operator <= (const BigInt& a, const BigInt& b);
+        friend bool operator == (const BigInt& a, const BigInt& b);
+        friend bool operator != (const BigInt& a, const BigInt& b) { return !(a == b); }
+        // 重载版本	
+        friend BigInt operator + (const BigInt& a, const long b) { BigInt t(b); return a + t; }
+        friend BigInt operator - (const BigInt& a, const long b) { BigInt t(b); return a - t; }
+        friend BigInt operator * (const BigInt& a, const long b) { BigInt t(b); return a * t; }
+        friend BigInt operator / (const BigInt& a, const long b) { BigInt t(b); return a / t; }
+        friend BigInt operator % (const BigInt& a, const long b) { BigInt t(b); return a % t; }
+        friend bool operator < (const BigInt& a, const long b) { BigInt t(b); return a < t; }
+        friend bool operator <= (const BigInt& a, const  long b) { BigInt t(b); return a <= t; }
+        friend bool operator == (const BigInt& a, const long b) { BigInt t(b); return a == t; }
+        friend bool operator != (const BigInt& a, const long b) { BigInt t(b); return !(a == t); };
+        friend ostream& operator << (ostream& out, const BigInt& a);
+        friend BigInt operator << (const BigInt& a, unsigned int n);
+    public:
+        typedef vector<base_t> data_t;
+
+        typedef const vector<base_t> const_data_t;
+        BigInt& trim()
+        {
+            int count = 0;
+            // 检查不为0的元素的数量
+            for (data_t::reverse_iterator it = _data.rbegin(); it != _data.rend(); it++)
+            {
+                if ((*it) == 0)
+                {
+                    count++;
+                }
+                else
+                {
+                    break;
+                }
+            }
+            if (count == _data.size())// 只有零的情况保留
+            {
+                count--;
+            }
+            for (int i = 0; i < count; i++)
+            {
+                _data.pop_back();
+            }
+            return *this;
+        }
+        friend class bit;
+        class bit
+        {
+        public:
+            size_t size();
+            bool at(size_t i);
+            bit(const BigInt& a);
+        private:
+            vector<base_t> _bitvec;
+            size_t _size;
+        };
+        //大数幂模运算	
+        BigInt moden(const BigInt& exp, const BigInt& p)const;
+        /* 用扩展的欧几里得算法求乘法逆元 */
+        BigInt extendEuclid(const BigInt& m);
+    public:
+        BigInt() :_isnegative(false) { _data.push_back(0); }
+
+        BigInt(const string& num) :_data(), _isnegative(false) { copyFromHexString(num); trim(); }
+
+        BigInt(const long n) :_isnegative(false) { copyFromLong(n); }
+
+        BigInt(const_data_t data) :_data(data), _isnegative(false) { trim(); }
+
+        BigInt& operator =(string s)
+        {
+            _data.clear();
+            _isnegative = false;
+            copyFromHexString(s);
+            trim();
+            return *this;
+        }
+        BigInt(const BigInt& a, bool isnegative) :_data(a._data), _isnegative(isnegative) {}
+        BigInt& operator =(const long n)
+        {
+            _data.clear();
+            copyFromLong(n);
+            return *this;
+        }
+    public:
+        static BigInt Zero;
+        static BigInt One;
+        static BigInt Two;
+
+        uint32_t modUint(uint32_t m) const
+        {
+            if (m == 0)
+            {
+                return 0;
+            }
+            uint64_t r = 0;
+            for (long long i = static_cast<long long>(_data.size()) - 1; i >= 0; --i)
+            {
+                r = ((r << 32) + _data[static_cast<size_t>(i)]) % m; // 每 limb 32 位
+            }
+            return static_cast<uint32_t>(r);
+        }
+    private:
+        bool smallThan(const BigInt& a) const; // 判断绝对值是否小于
+        bool smallOrEquals(const BigInt& a) const; // 判断绝对值是否小于相等
+        bool equals(const BigInt& a) const; // 判断绝对值是否相等
+
+        BigInt& leftShift(const unsigned int n);
+        BigInt& rightShift(const unsigned int n);
+        BigInt& add(const BigInt& b);
+
+        BigInt& sub(const BigInt& b);
+
+        void copyFromHexString(const string& s)
+        {
+            string str(s);
+            if (str.length() && str.at(0) == '-')
+            {
+                if (str.length() > 1)
+                    _isnegative = true;
+                str = str.substr(1);
+            }
+            int count = (8 - (str.length() % 8)) % 8;
+            string temp;
+
+            for (int i = 0; i < count; ++i)
+                temp.push_back(0);
+
+            str = temp + str;
+
+            for (int i = 0; i < str.length(); i += BigInt::base_char)
+            {
+                base_t sum = 0;
+                for (int j = 0; j < base_char; ++j)
+                {
+                    char ch = str[i + j];
+
+                    ch = hex2Uchar(ch);
+                    sum = ((sum << 4) | (ch));
+                }
+                _data.push_back(sum);
+            }
+            reverse(_data.begin(), _data.end());
+        }
+        char hex2Uchar(char ch)
+        {
+            static char table[] = { 0x00,0x01,0x02,0x03,0x04,0x05,0x06,0x07,0x08,0x09,0x0a,0x0b,0x0c,0x0d,0x0e,0x0f };
+            if (isdigit(ch))
+                ch -= '0';
+            else if (islower(ch))
+                ch -= 'a' - 10;
+            else if (isupper(ch))
+                ch -= 'A' - 10;
+
+            return table[ch];
+        }
+
+        void copyFromLong(const long n)
+        {
+            long a = n;
+            if (a < 0)
+            {
+                _isnegative = true;
+                a = -a;
+            }
+            do
+            {
+                BigInt::base_t ch = (a & (BigInt::base));
+                _data.push_back(ch);
+                a = a >> (BigInt::basebitnum);
+            } while (a);
+        }
+        static void div(const BigInt& a, const BigInt& b, BigInt& result, BigInt& ca);
+        
+    private:
+        vector<base_t> _data;
+        //数据存储	
+        bool _isnegative;
+    };
+
+    int BigInt::base_char = 8;
+    int BigInt::base = 0xFFFFFFFF;
+    int BigInt::basebit = 5; // 2^5
+    int BigInt::basebitchar = 0x1F;
+    int BigInt::basebitnum = 32;
+    BigInt BigInt::Zero(0);
+    BigInt BigInt::One(1);
+    BigInt BigInt::Two(2);
+
+    BigInt operator + (const BigInt& a, const BigInt& b)
+    {
+        BigInt ca(a);
+        return ca.add(b);
+    }
+
+    BigInt operator - (const BigInt& a, const BigInt& b)
+    {
+        BigInt ca(a);
+        return ca.sub(b);
+    }
+
+#ifdef small
+#undef small
+#endif
+    BigInt operator * (const BigInt& a, const BigInt& b)
+    {
+        if (a == (BigInt::Zero) || b == (BigInt::Zero))
+            return BigInt::Zero;
+
+        const BigInt& big = a._data.size() > b._data.size() ? a : b;
+        const BigInt& small = (&big) == (&a) ? b : a;
+
+        BigInt result(0);
+
+        BigInt::bit bt(small);
+        for (long long i = bt.size() - 1; i >= 0; i--)
+        {
+            if (bt.at(i))
+            {
+                BigInt temp(big, false);
+                temp.leftShift(static_cast<unsigned int>(i));
+                result.add(temp);
+            }
+        }
+        result._isnegative = !(a._isnegative == b._isnegative);
+        return result;
+    }
+
+    BigInt operator / (const BigInt& a, const BigInt& b)
+    {
+        assert(b != (BigInt::Zero));
+        if (a.equals(b)) // 绝对值相等
+        {
+            return (a._isnegative == b._isnegative) ? BigInt(1) : BigInt(-1);
+        }
+        else if (a.smallThan(b)) // 绝对值小于
+        {
+            return BigInt::Zero;
+        }
+        else
+        {
+            BigInt result, ca;
+            BigInt::div(a, b, result, ca);
+            return result;
+        }
+    }
+
+    BigInt operator % (const BigInt& a, const BigInt& b)
+    {
+        assert(b != (BigInt::Zero));
+        if (a.equals(b))
+        {
+            return BigInt::Zero;
+        }
+        else if (a.smallThan(b))
+        {
+            return a;
+        }
+        else
+        {
+            BigInt result, ca;
+            BigInt::div(a, b, result, ca);
+            return ca;
+        }
+    }
+
+    void BigInt::div(const BigInt& a, const BigInt& b, BigInt& result, BigInt& ca)
+    {
+        // 1.复制a,b
+        BigInt cb(b, false);
+        ca._isnegative = false;
+        ca._data = a._data;
+
+        BigInt::bit bit_b(cb);
+        // 位数对齐
+        while (true) // 绝对值小于
+        {
+            BigInt::bit bit_a(ca);
+            long long len = bit_a.size() - bit_b.size();
+            BigInt temp;
+            // 找到移位的
+            while (len >= 0)
+            {
+                temp = cb << static_cast<unsigned int>(len);
+                if (temp.smallOrEquals(ca))
+                {
+                    break;
+                }
+                len--;
+            }
+            if (len < 0)
+            {
+                break;
+            }
+            BigInt::base_t n = 0;
+            while (temp.smallOrEquals(ca))
+            {
+                ca.sub(temp);
+                n++;
+            }
+            BigInt kk(n);
+            if (len)
+            {
+                kk.leftShift(static_cast<unsigned int>(len));
+            }
+            result.add(kk);
+        }
+        result.trim();
+    }
+
+    bool operator < (const BigInt& a, const BigInt& b)
+    {
+        if (a._isnegative == b._isnegative)
+        {
+            if (!a._isnegative)
+            {
+                return a.smallThan(b);
+            }
+            else
+            {
+                return !(a.smallOrEquals(b));
+            }
+        }
+        else
+        {
+            return !a._isnegative;
+        }
+    }
+
+    bool operator <= (const BigInt& a, const BigInt& b)
+    {
+        if (a._isnegative == b._isnegative)
+        {   // 同号
+            if (!a._isnegative)
+            {
+                return a.smallOrEquals(b);
+            }
+            else
+            {
+                return !(a.smallThan(b));
+            }
+        }
+        else // 异号
+        {
+            return !a._isnegative;
+        }
+    }
+
+    bool operator == (const BigInt& a, const BigInt& b)
+    {
+        return a._data == b._data && a._isnegative == b._isnegative;
+    }
+
+    ostream& operator << (ostream& out, const BigInt& a)
+    {
+        static char hex[] = { '0','1','2','3','4','5','6','7','8','9','A','B','C','D','E','F' };
+        if (a._isnegative)
+        {
+            out << "-";
+        }
+        BigInt::base_t T = 0x0F;
+        string str;
+        for (BigInt::data_t::const_iterator it = a._data.begin(); it != a._data.end(); it++)
+        {
+            BigInt::base_t ch = (*it);
+            for (int j = 0; j < BigInt::base_char; j++)
+            {
+                str.push_back(hex[ch & (T)]);
+                ch = ch >> 4;
+            }
+        }
+        reverse(str.begin(), str.end());
+        out << str;
+        return out;
+    }
+
+    BigInt operator <<(const BigInt& a, unsigned int n)
+    {
+        BigInt ca(a);
+        return ca.leftShift(n);
+    }
+
+    BigInt& BigInt::leftShift(const unsigned int n)
+    {
+        int k = n >> (BigInt::basebit); // 5
+        int off = n & (BigInt::basebitchar); // 0xFF
+
+        int inc = (off == 0) ? k : 1 + k;
+        for (int i = 0; i < inc; i++)
+        {
+            _data.push_back(0);
+        }
+
+        if (k)
+        {
+            inc = (off == 0) ? 1 : 2;
+            for (long long i = _data.size() - inc; i >= k; i--)
+            {
+                _data[i] = _data[i - k];
+            }
+            for (int i = 0; i < k; i++)
+            {
+                _data[i] = 0;
+            }
+        }
+
+        if (off)
+        {
+            BigInt::base_t T = BigInt::base; // 0xffffffff
+            T = T << (BigInt::basebitnum - off); // 32
+            // 左移
+            BigInt::base_t ch = 0;
+            for (size_t i = 0; i < _data.size(); i++)
+            {
+                BigInt::base_t t = _data[i];
+                _data[i] = (t << off) | ch;
+                ch = (t & T) >> (BigInt::basebitnum - off); // 32,最高位
+            }
+        }
+        trim();
+        return *this;
+    }
+
+    BigInt& BigInt::rightShift(const unsigned int n)
+    {
+        int k = n >> (BigInt::basebit); // 5
+        int off = n & (BigInt::basebitchar); // 0xFF
+
+        if (k)
+        {
+            for (int i = 0; i > k; i++)
+            {
+                _data[i] = _data[i + k];
+            }
+            for (int i = 0; i < k; i++)
+            {
+                _data.pop_back();
+            }
+            if (_data.size() == 0)
+            {
+                _data.push_back(0);
+            }
+        }
+
+        if (off)
+        {
+            BigInt::base_t T = BigInt::base; // 0xFFFFFFFF
+            T = T >> (BigInt::basebitnum - off); // 32
+            //左移
+            BigInt::base_t ch = 0;
+            for (long long i = _data.size() - 1; i >= 0; i--)
+            {
+                BigInt::base_t t = _data[i];
+                _data[i] = (t >> off) | ch;
+                ch = (t & T) << (BigInt::basebitnum - off); // 32,最高位
+            }
+        }
+        trim();
+        return *this;
+    }
+
+    BigInt& BigInt::sub(const BigInt& b)
+    {
+        if (b._isnegative == _isnegative)
+        {   // 同号
+            BigInt::data_t& res = _data;
+            if (!smallThan(b)) // 绝对值大于b
+            {
+                int cn = 0; // 借位
+                // 大数减小数
+                for (size_t i = 0; i < b._data.size(); i++)
+                {
+                    BigInt::base_t temp = res[i];
+                    res[i] = (res[i] - b._data[i] - cn);
+                    cn = temp < res[i] ? 1 : temp < b._data[i] ? 1 : 0;
+                }
+
+                for (size_t i = b._data.size(); i < _data.size() && cn != 0; i++)
+                {
+                    BigInt::base_t temp = res[i];
+                    res[i] = res[i] - cn;
+                    cn = temp < static_cast<BigInt::base_t>(cn);
+                }
+                trim();
+            }
+            else // 绝对值小于b
+            {
+                _data = (b - (*this))._data;
+                _isnegative = !_isnegative;
+            }
+        }
+        else
+        {   // 异号的情况
+            bool isnegative = _isnegative;
+            _isnegative = b._isnegative;
+            add(b);
+            _isnegative = isnegative;
+        }
+        return *this;
+    }
+
+    BigInt& BigInt::add(const BigInt& b)
+    {
+        if (_isnegative == b._isnegative)
+        {   // 同号
+            BigInt::data_t& res = _data;
+            long long len = b._data.size() - _data.size();
+
+            while ((len--) > 0) // 高位补0
+            {
+                res.push_back(0);
+            }
+
+            int cn = 0; // 进位
+            for (size_t i = 0; i < b._data.size(); i++)
+            {
+                BigInt::base_t temp = res[i];
+                res[i] = res[i] + b._data[i] + cn;
+                cn = temp > res[i] ? 1 : temp > (temp + b._data[i]) ? 1 : 0; // 0xFFFFFFFF
+            }
+
+            for (size_t i = b._data.size(); i < _data.size() && cn != 0; i++)
+            {
+                BigInt::base_t temp = res[i];
+                res[i] = (res[i] + cn);
+                cn = temp > res[i];
+            }
+
+            if (cn != 0)
+            {
+                res.push_back(cn);
+            }
+
+            trim();
+        }
+        else
+        {   // 异号的情况
+            bool isnegative;
+            if (smallThan(b)) // 绝对值小于b
+            {
+                isnegative = b._isnegative;
+            }
+            else if (equals(b)) // 绝对值等于b
+            {
+                isnegative = false;
+            }
+            else // 绝对值大于b
+            {
+                isnegative = _isnegative;
+            }
+
+            _isnegative = b._isnegative;
+            sub(b);
+            _isnegative = isnegative;
+        }
+        return *this;
+    }
+
+    BigInt BigInt::moden(const BigInt& exp, const BigInt& p)const
+    {   // 模幂运算
+        BigInt::bit t(exp);
+
+        BigInt d(1);
+        for (long long i = t.size() - 1; i >= 0; i--)
+        {
+            d = (d * d) % p;
+            if (t.at(i))
+            {
+                d = (d * (*this)) % p;
+            }
+        }
+        return d;
+    }
+
+    BigInt BigInt::extendEuclid(const BigInt& m)
+    {
+        // 扩展欧几里得算法求乘法逆元
+        assert(m._isnegative == false);// m为正数
+        BigInt a[3], b[3], t[3];
+        a[0] = 1; a[1] = 0; a[2] = m;
+        b[0] = 0; b[1] = 1; b[2] = *this;
+        if (b[2] == BigInt::Zero || b[2] == BigInt::One)
+        {
+            return b[2];
+        }
+
+        while (true)
+        {
+            if (b[2] == BigInt::One)
+            {
+                if (b[1]._isnegative) // 负数
+                {
+                    b[1] = (b[1] % m + m) % m;
+                }
+                return b[1];
+            }
+
+            BigInt q = a[2] / b[2];
+            for (int i = 0; i < 3; i++)
+            {
+                t[i] = a[i] - q * b[i];
+                a[i] = b[i];
+                b[i] = t[i];
+            }
+        }
+    }
+
+    size_t BigInt::bit::size()
+    {
+        return _size;
+    }
+
+    bool BigInt::bit::at(size_t i)
+    {
+        size_t index = i >> (BigInt::basebit);
+        size_t off = i & (BigInt::basebitchar);
+        BigInt::base_t t = _bitvec[index];
+        return (t & (1 << off));
+    }
+
+    BigInt::bit::bit(const BigInt& ba)
+    {
+        _bitvec = ba._data;
+        BigInt::base_t a = _bitvec[_bitvec.size() - 1]; // 最高位
+        _size = _bitvec.size() << (BigInt::basebit);
+        BigInt::base_t t = 1 << (BigInt::basebitnum - 1);
+
+        if (a == 0)
+        {
+            _size -= (BigInt::basebitnum);
+        }
+        else
+        {
+            while (!(a & t))
+            {
+                _size--;
+                t = t >> 1;
+            }
+        }
+    }
+
+    bool BigInt::smallThan(const BigInt& b)const
+    {
+        if (_data.size() == b._data.size())
+        {
+            for (BigInt::data_t::const_reverse_iterator it = _data.rbegin(), it_b = b._data.rbegin(); it != _data.rend(); it++, it_b++)
+            {
+                if ((*it) != (*it_b))
+                {
+                    return (*it) < (*it_b);
+                }
+            }
+            return false; // 相等
+        }
+        else
+        {
+            return _data.size() < b._data.size();
+        }
+    }
+
+    bool BigInt::smallOrEquals(const BigInt& b)const
+    {
+        if (_data.size() == b._data.size())
+        {
+            for (BigInt::data_t::const_reverse_iterator it = _data.rbegin(), it_b = b._data.rbegin(); it != _data.rend(); it++, it_b++)
+            {
+                if ((*it) != (*it_b))
+                {
+                    return (*it) < (*it_b);
+                }
+            }
+
+            return true; // 相等
+        }
+        else
+            return _data.size() < b._data.size();
+    }
+
+    bool BigInt::equals(const BigInt& a)const
+    {
+        return _data == a._data;
+    }
+
+    class Rsa
+    {
+    public:
+        Rsa();
+        ~Rsa();
+        void init(unsigned int n); // 初始化，产生公私钥对
+
+        friend void test();
+    public:
+        BigInt encryptByPu(const BigInt& m); // 私钥加密
+        BigInt decodeByPr(const BigInt& c); // 公钥解密
+
+        BigInt encryptByPr(const BigInt& m); // 公钥加密
+        BigInt decodeByPu(const BigInt& m); // 私钥解密
+    private:
+        BigInt createOddNum(unsigned int n); // 生成长度为n的奇数
+        bool isPrime(const BigInt& a, const unsigned int k); // 判断素数
+        BigInt createPrime(unsigned int n, int it_cout); // 生成长度为n的素数
+        void createExp(const BigInt& ou); // 从一个欧拉数中生成公钥、私钥指数
+        BigInt createRandomSmallThan(const BigInt& a); // 创建小数
+        friend ostream& operator <<(ostream& out, const Rsa& rsa)//输出
+        {
+            out << "N:" << rsa.N << "\n";
+            out << "p:" << rsa._p << "\n";
+            out << "q:" << rsa._q << "\n";
+            out << "e:" << rsa.e << "\n";
+            out << "d:" << rsa._d;
+            return out;
+        }
+
+    public:
+        BigInt e, N; // 公钥
+    private:
+        BigInt _d; // 私钥
+        BigInt _p, _q;
+        BigInt _ol; // 欧拉数
+    };
+
+    Rsa::Rsa()
+    {
+    }
+
+    Rsa::~Rsa()
+    {
+    }
+
+    void Rsa::init(unsigned int n)
+    {
+        //std::srand(static_cast<unsigned int>(std::time(nullptr)));
+        // 产生大素数p、q
+        const unsigned int mrRounds =
+            (n >= 2048) ? 32 :  // 4096 位模数的素数，做 32 轮
+            (n >= 1536) ? 20 :  // 3072 位模数的素数
+            (n >= 1024) ? 16 :  // 2048 位模数的素数
+            12; // 低于 1024 的情形（外层已避免）
+
+        _p = createPrime(n, static_cast<int>(mrRounds));
+
+        do
+        {
+            _q = createPrime(n, static_cast<int>(mrRounds));
+        } while (_q == _p); // 保险：避免 p == q
+
+        N = _p * _q;
+        _ol = (_p - 1) * (_q - 1);
+        createExp(_ol);
+    }
+
+    // 字节串 -> 大写十六进制（供 BigInt 构造使用）
+    static string BytesToHex(const string& be)
+    {
+        static const char* hex = "0123456789ABCDEF";
+        string out;
+        out.resize(be.size() * 2);
+        for (size_t i = 0; i < be.size(); i++)
+        {
+            const uint8_t b = static_cast<uint8_t>(be[i]);
+            out[2 * i + 0] = hex[(b >> 4) & 0x0F];
+            out[2 * i + 1] = hex[b & 0x0F];
+        }
+        // 保证至少 "00"
+        if (out.empty()) { out = "00"; }
+        return out;
+    }
+
+    BigInt Rsa::createOddNum(unsigned int n)
+    {   // n = bit length
+        const unsigned int byteLen = (n + 7) / 8;
+        if (byteLen == 0)
+        {
+            return BigInt::Zero;
+        }
+
+        std::string bytes(byteLen, '\0');
+        if (!GetSecureRandom(reinterpret_cast<unsigned char*>(&bytes[0]), byteLen))
+        {
+            return BigInt::Zero; // 保守失败返回 0
+        }
+
+        // 设最高位，保证位数达到 n
+        const unsigned int topBits = (n - 1u) % 8u;
+        bytes[0] |= static_cast<char>(0x80u >> ((7u - topBits) & 7u));
+
+        // 设最低位为 1，保证奇数
+        bytes[byteLen - 1] |= 0x01;
+
+        // 转 16 进制再喂给 BigInt（你已有 BytesToHex）
+        const std::string hex = BytesToHex(bytes);
+        return BigInt(hex);
+    }
+
+    static const std::vector<uint32_t>& GetSmallPrimes()
+    {
+        static std::vector<uint32_t> primes;
+        if (!primes.empty())
+        {
+            return primes;
+        }
+
+        const uint32_t limit = 20000; // 可按需调高到 20000
+        std::vector<bool> sieve(limit + 1, true);
+        sieve[0] = sieve[1] = false;
+        for (uint32_t p = 2; p * p <= limit; p++)
+        {
+            if (sieve[p])
+            {
+                for (uint32_t q = p * p; q <= limit; q += p)
+                {
+                    sieve[q] = false;
+                }
+            }
+        }
+        for (uint32_t i = 2; i <= limit; i++)
+        {
+            if (sieve[i]) { primes.push_back(i); }
+        }
+        return primes;
+    }
+
+    static bool DivisibleBySmallPrimes(const BigInt& n)
+    {
+        const auto& primes = GetSmallPrimes();
+        for (uint32_t p : primes)
+        {
+            const uint32_t r = n.modUint(p);
+            if (r == 0)
+            {
+                // 允许 n 就是这个小素数本身
+                return !(n == BigInt(static_cast<long>(p)));
+            }
+        }
+        return false;
+    }
+
+    bool Rsa::isPrime(const BigInt& n, const unsigned int k)
+    {   // 判断素数
+        // 处理小数与偶数
+        if (n == BigInt::Two)
+        {
+            return true;
+        }
+        if (n < BigInt::Two || n.modUint(2) == 0)
+        {
+            return false;
+        }
+
+        // 小素数快速试除（极大幅减少进入 MR 的次数）
+        if (DivisibleBySmallPrimes(n))
+        {
+            return false;
+        }
+
+        // n-1 = 2^s * d
+        BigInt d = n - BigInt::One;
+        unsigned int s = 0;
+        while (d.modUint(2) == 0)
+        {
+            d.rightShift(1);
+            s++;
+        }
+
+        // k 轮 Miller–Rabin
+        for (unsigned int i = 0; i < k; i++)
+        {
+            // 选 64-bit 随机底数 a in [2, n-2]；对 1024+ 位 n 这是严格 < n 的。
+            uint64_t a64 = 0;
+            GetSecureRandom(reinterpret_cast<unsigned char*>(&a64), sizeof(a64));
+            a64 = 2 + (a64 % (UINT64_C(0x7fffffffffffffff) - 3));
+            BigInt a(static_cast<long>(a64));
+
+            BigInt x = a.moden(d, n);             // x = a^d mod n
+            if (x == BigInt::One || x == (n - BigInt::One))
+            {
+                continue;
+            }
+
+            bool maybePrime = false;
+            for (unsigned int r = 1; r < s; r++)
+            {
+                x = (x * x) % n;                  // x = x^2 mod n
+                if (x == (n - BigInt::One))
+                {
+                    maybePrime = true;
+                    break;
+                }
+            }
+            if (!maybePrime)
+            {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    BigInt Rsa::createRandomSmallThan(const BigInt& a)
+    {
+        unsigned long t = 0;
+        do
+        {
+            t = rand();
+        } while (t == 0);
+
+        BigInt mod(t);
+        BigInt r = mod % a;
+        if (r == BigInt::Zero)
+        {
+            r = a - BigInt::One;
+        }
+        return r;
+    }
+
+    BigInt Rsa::createPrime(unsigned int n, int it_count)
+    {   // 生成长度为 n 的素数
+        assert(it_count > 0);
+        BigInt res = createOddNum(n);
+        while (!isPrime(res, it_count))
+        {
+            res.add(BigInt::Two);
+        }
+        return res;
+    }
+
+    void Rsa::createExp(const BigInt& ou)
+    {   // 从一个欧拉数中生成公钥、私钥指数
+        e = 65537;
+        _d = e.extendEuclid(ou);
+    }
+
+    BigInt Rsa::encryptByPu(const BigInt& m)
+    {   // 公钥加密
+        return m.moden(e, N);
+    }
+
+    BigInt Rsa::decodeByPr(const BigInt& c)
+    {   // 私钥解密
+        return c.moden(_d, N);
+    }
+
+    BigInt Rsa::encryptByPr(const BigInt& m)
+    {   // 私钥加密
+        return decodeByPr(m);
+    }
+
+    BigInt Rsa::decodeByPu(const BigInt& c)
+    {   // 公钥解密
+        return encryptByPu(c);
+    }
+
+    // 读 DER 长度（支持短/长形式）
+    static bool DerReadLen(const uint8_t*& p, const uint8_t* end, size_t& len)
+    {
+        if (p >= end)
+        {
+            return false;
+        }
+        uint8_t b = *p++;
+        if ((b & 0x80) == 0)
+        {
+            len = b;
+            return (p + len <= end) || (len == 0);
+        }
+        uint8_t nbytes = b & 0x7F;
+        if (nbytes == 0 || nbytes > 8 || p + nbytes > end)
+        {
+            return false;
+        }
+        size_t v = 0;
+        for (uint8_t i = 0; i < nbytes; i++)
+        {
+            v = (v << 8) | *p++;
+        }
+        len = v;
+        return p + len <= end;
+    }
+
+    static bool DerExpectTag(const uint8_t*& p, const uint8_t* end, uint8_t tag)
+    {
+        if (p >= end || *p != tag)
+        {
+            return false;
+        }
+        p++;
+        return true;
+    }
+
+    // 读取一个 INTEGER（以原始大端字节返回，去掉符号扩展 0x00）
+    static bool DerReadInteger(const uint8_t*& p, const uint8_t* end, string& outBe)
+    {
+        if (!DerExpectTag(p, end, 0x02))
+        {
+            return false;
+        }
+        size_t len = 0;
+        if (!DerReadLen(p, end, len))
+        {
+            return false;
+        }
+        if (p + len > end)
+        {
+            return false;
+        }
+        const uint8_t* q = p;
+        p += len;
+
+        // 去除前导 0x00（仅用于正数的符号保护）
+        size_t i = 0;
+        while (i + 1 < len && q[i] == 0x00)
+        {
+            i++;
+        }
+        outBe.assign(reinterpret_cast<const char*>(q + i), reinterpret_cast<const char*>(q + len));
+        if (outBe.empty())
+        {
+            outBe.assign(1, '\0');
+        }
+        return true;
+    }
+
+    // 解析 RSAPublicKey ::= SEQUENCE { n INTEGER, e INTEGER }
+    static bool ParseRsaPublicKeyDer(const string& der, string& nBe, string& eBe)
+    {
+        const uint8_t* p = reinterpret_cast<const uint8_t*>(der.data());
+        const uint8_t* end = p + der.size();
+
+        if (!DerExpectTag(p, end, 0x30))
+        {
+            return false;
+        }
+        size_t seqlen = 0;
+        if (!DerReadLen(p, end, seqlen))
+        {
+            return false;
+        }
+        const uint8_t* seqEnd = p + seqlen;
+        if (seqEnd > end)
+        {
+            return false;
+        }
+
+        if (!DerReadInteger(p, seqEnd, nBe))
+        {
+            return false;
+        }
+        if (!DerReadInteger(p, seqEnd, eBe))
+        {
+            return false;
+        }
+        return (p == seqEnd);
+    }
+
+    // 解析 RSAPrivateKey ::= SEQUENCE { version, n, e, d, p, q, dp, dq, qi, ... }
+    static bool ParseRsaPrivateKeyDer(const string& der, string& nBe, string& dBe)
+    {
+        const uint8_t* p = reinterpret_cast<const uint8_t*>(der.data());
+        const uint8_t* end = p + der.size();
+
+        if (!DerExpectTag(p, end, 0x30)) { return false; }
+        size_t seqlen = 0;
+        if (!DerReadLen(p, end, seqlen)) { return false; }
+        const uint8_t* seqEnd = p + seqlen;
+        if (seqEnd > end) { return false; }
+
+        string tmp;
+        // version
+        if (!DerReadInteger(p, seqEnd, tmp)) { return false; }
+        // n
+        if (!DerReadInteger(p, seqEnd, nBe)) { return false; }
+        // e
+        if (!DerReadInteger(p, seqEnd, tmp)) { return false; }
+        // d
+        if (!DerReadInteger(p, seqEnd, dBe)) { return false; }
+
+        // 后续 p,q,dp,dq,qi 可不解析
+        return true;
+    }
+
+    
+
+    // 十六进制 -> 字节串（容忍前导 0）
+    static string HexToBytesCompat(string hex)
+    {
+        auto fix = [](char c) -> int
+            {
+                if (c >= '0' && c <= '9') { return c - '0'; }
+                if (c >= 'a' && c <= 'f') { return 10 + (c - 'a'); }
+                if (c >= 'A' && c <= 'F') { return 10 + (c - 'A'); }
+                return 0;
+            };
+        // 去前导 0
+        size_t k = 0;
+        while (k + 1 < hex.size() && hex[k] == '0') { k++; }
+        hex.erase(0, k);
+        if (hex.empty()) { return string(1, '\0'); }
+        if (hex.size() & 1) { hex.insert(hex.begin(), '0'); }
+
+        string out(hex.size() / 2, '\0');
+        for (size_t i = 0; i < out.size(); i++)
+        {
+            out[i] = static_cast<char>((fix(hex[2 * i]) << 4) | fix(hex[2 * i + 1]));
+        }
+        return out;
+    }
+
+    // 生成非零随机字节串（用于 PS）
+    static void FillRandomNonZero(string& buf)
+    {
+        if (buf.empty()) { return; }
+        internal::GetSecureRandom(reinterpret_cast<uint8_t*>(&buf[0]), buf.size());
+        for (size_t i = 0; i < buf.size(); i++)
+        {
+            if (static_cast<uint8_t>(buf[i]) == 0) { buf[i] = 1; }
+        }
     }
 }
 
@@ -1063,10 +2200,360 @@ string GB_Aes256Decrypt(const string& base64CipherWithIv, const string& keyMater
     return out;
 }
 
+bool GB_RsaGenerateKeyPair(string& publicKey, string& privateKey, int keySize)
+{
+    // 参数与边界
+    if (keySize < 1024) { keySize = 1024; } // 最低兜底；建议≥2048
+    const int primeBits = keySize / 2;
 
+    // 1) 生成 (p, q, n, e, d)
+    internal::Rsa rsa;
+    rsa.init(static_cast<unsigned int>(primeBits)); // 你的 Rsa::init 接受“素数位数”而非模数位数
 
+    // 2) 通过友元输出抓取 n/e/d/p/q（十六进制大写）
+    ostringstream oss;
+    oss << rsa;
+    const string dump = oss.str();
 
+    auto getHex = [&](const char* tag) -> string
+        {
+            // 行形如： "N:ABCDEF...\n"
+            const string prefix(tag);
+            const size_t pos = dump.find(prefix);
+            if (pos == string::npos) { return {}; }
+            size_t i = pos + prefix.size();
+            while (i < dump.size() && (dump[i] == ':' || dump[i] == ' ')) { i++; }
+            size_t j = i;
+            while (j < dump.size() && dump[j] != '\r' && dump[j] != '\n') { j++; }
+            string h = dump.substr(i, j - i);
+            // 清理前导空白、去掉可能的前导+号
+            h.erase(remove_if(h.begin(), h.end(), [](char c) { return isspace((unsigned char)c); }), h.end());
+            if (!h.empty() && (h[0] == '+')) { h.erase(h.begin()); }
+            return h;
+        };
 
+    const string nHex = getHex("N");
+    const string pHex = getHex("p");
+    const string qHex = getHex("q");
+    const string eHex = getHex("e");
+    const string dHex = getHex("d");
+    if (nHex.empty() || pHex.empty() || qHex.empty() || eHex.empty() || dHex.empty())
+    {
+        return false;
+    }
 
+    // 3) 简易 HEX->bytes（大端）
+    auto HexToBytes = [](const string& hex) -> string
+        {
+            auto hex2 = hex;
+            auto fix = [](char c)->char
+                {
+                    if (c >= '0' && c <= '9') return c - '0';
+                    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+                    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+                    return 0;
+                };
+            // 去掉前导 0
+            size_t k = 0;
+            while (k < hex2.size() && hex2[k] == '0') { k++; }
+            hex2.erase(0, k);
+            if (hex2.empty()) { return string(1, '\0'); }
+            if (hex2.size() & 1) { hex2.insert(hex2.begin(), '0'); }
+            string out;
+            out.resize(hex2.size() / 2);
+            for (size_t i = 0; i < out.size(); i++)
+            {
+                const char hi = fix(hex2[2 * i + 0]);
+                const char lo = fix(hex2[2 * i + 1]);
+                out[i] = static_cast<char>((hi << 4) | lo);
+            }
+            return out;
+        };
 
+    const string nBytes = HexToBytes(nHex);
+    const string pBytes = HexToBytes(pHex);
+    const string qBytes = HexToBytes(qHex);
+    const string eBytes = HexToBytes(eHex);
+    const string dBytes = HexToBytes(dHex);
 
+    // 4) 计算 dp = d mod (p-1), dq = d mod (q-1), qi = q^{-1} mod p  —— 用 BigInt 做（已支持 % 与求逆）
+    auto ToBig = [](const string& hex) -> internal::BigInt
+        {
+            // BigInt(string) 构造就是按十六进制解析（你的实现）
+            return internal::BigInt(hex);
+        };
+    const internal::BigInt p = ToBig(pHex);
+    internal::BigInt q = ToBig(qHex);
+    const internal::BigInt d = ToBig(dHex);
+
+    const internal::BigInt dpBI = d % (p - 1);
+    const internal::BigInt dqBI = d % (q - 1);
+    const internal::BigInt qiBI = q.extendEuclid(p); // q^{-1} mod p
+
+    ostringstream ossDp, ossDq, ossQi;
+    ossDp << dpBI; ossDq << dqBI; ossQi << qiBI;
+
+    const string dpBytes = HexToBytes(ossDp.str());
+    const string dqBytes = HexToBytes(ossDq.str());
+    const string qiBytes = HexToBytes(ossQi.str());
+
+    // 5) ASN.1/DER 编码工具
+    auto EncodeLen = [](size_t len) -> string
+        {
+            if (len < 128) { return string(1, static_cast<char>(len)); }
+            string tmp;
+            size_t v = len;
+            while (v)
+            {
+                tmp.push_back(static_cast<char>(v & 0xFF));
+                v >>= 8;
+            }
+            reverse(tmp.begin(), tmp.end());
+            string out;
+            out.push_back(static_cast<char>(0x80 | tmp.size()));
+            out += tmp;
+            return out;
+        };
+
+    auto EncodeInteger = [&](const string& be) -> string
+        {
+            string v = be;
+            // 去除无意义前导 0x00
+            size_t i = 0;
+            while (i + 1 < v.size() && v[i] == '\0') { i++; }
+            v.erase(0, i);
+            if (v.empty()) { v.assign(1, '\0'); }
+            // 若最高位为 1，前置 0x00 避免被认为是负数
+            const unsigned char msb = static_cast<unsigned char>(v[0]);
+            if (msb & 0x80) { v.insert(v.begin(), '\0'); }
+
+            string out;
+            out.push_back(0x02);                // INTEGER
+            const string len = EncodeLen(v.size());
+            out += len;
+            out += v;
+            return out;
+        };
+
+    auto EncodeSequence = [&](const string& content) -> string
+        {
+            string out;
+            out.push_back(0x30);                // SEQUENCE
+            out += EncodeLen(content.size());
+            out += content;
+            return out;
+        };
+
+    auto ToPem = [&](const string& der) -> string
+        {
+            const string b64 = GB_Base64Encode(der, false, false);
+            string body;
+            body.reserve(b64.size() + b64.size() / 64 + 16);
+            for (size_t i = 0; i < b64.size(); i += 64)
+            {
+                const size_t n = min<size_t>(64, b64.size() - i);
+                body.append(b64.data() + i, n);
+            }
+            return body;
+        };
+
+    // 6) 组装 RSAPrivateKey (PKCS#1)
+    const string derVer = EncodeInteger(string(1, '\0')); // version = 0
+    const string derN = EncodeInteger(nBytes);
+    const string derE = EncodeInteger(eBytes);
+    const string derD = EncodeInteger(dBytes);
+    const string derP = EncodeInteger(pBytes);
+    const string derQ = EncodeInteger(qBytes);
+    const string derDp = EncodeInteger(dpBytes);
+    const string derDq = EncodeInteger(dqBytes);
+    const string derQi = EncodeInteger(qiBytes);
+
+    string privSeqContent;
+    privSeqContent.reserve(derVer.size() + derN.size() + derE.size() + derD.size() +
+        derP.size() + derQ.size() + derDp.size() + derDq.size() + derQi.size());
+    privSeqContent += derVer; privSeqContent += derN; privSeqContent += derE; privSeqContent += derD;
+    privSeqContent += derP;   privSeqContent += derQ; privSeqContent += derDp; privSeqContent += derDq; privSeqContent += derQi;
+
+    const string derPrivate = EncodeSequence(privSeqContent);
+
+    // 7) 组装 RSAPublicKey (PKCS#1)
+    const string derPublic = EncodeSequence(derN + derE);
+
+    // 8) PEM 封装
+    privateKey = ToPem(derPrivate);
+    publicKey = ToPem(derPublic);
+    return true;
+}
+
+#ifdef min
+#undef min
+#endif
+string GB_RsaEncrypt(const string& plainText, const string& encryptionKey)
+{
+    using internal::BigInt;
+
+    if (encryptionKey.empty())
+    {
+        return {};
+    }
+
+    // 1) 解析公钥（Base64 -> DER -> n,e）
+    const string der = GB_Base64Decode(encryptionKey, false, false, false);
+    if (der.empty())
+    {
+        return {};
+    }
+    string nBe, eBe;
+    if (!internal::ParseRsaPublicKeyDer(der, nBe, eBe))
+    {
+        return {};
+    }
+    // 模长（字节）
+    const size_t k = nBe.size();
+    if (k < 11) // RFC: k >= 11
+    {
+        return {};
+    }
+
+    // 2) BigInt 准备
+    const BigInt n(internal::BytesToHex(nBe));
+    const BigInt e(internal::BytesToHex(eBe));
+
+    // 3) 分块填充并加密：EM = 0x00 || 0x02 || PS(nonzero) || 0x00 || M
+    const size_t maxBlock = k - 11; // RFC 8017 / 3447
+    string cipherAll;
+    cipherAll.reserve((plainText.size() / maxBlock + 1) * k);
+
+    size_t pos = 0;
+    while (pos < plainText.size())
+    {
+        const size_t mLen = min(plainText.size() - pos, maxBlock);
+
+        string em;
+        em.resize(k);
+        em[0] = 0x00;
+        em[1] = 0x02;
+        const size_t psLen = k - 3 - mLen;
+        string ps(psLen, '\0');
+        internal::FillRandomNonZero(ps); // PS 必须全非零，且 len >= 8（当 mLen <= k-11 时天然满足）
+        memcpy(&em[2], ps.data(), psLen);
+        em[2 + psLen] = 0x00;
+        memcpy(&em[3 + psLen], &plainText[pos], mLen);
+
+        // m^e mod n
+        const BigInt m(internal::BytesToHex(em));
+        const BigInt c = m.moden(e, n);
+
+        // 定长 k 输出
+        ostringstream oss;
+        oss << c; // 十六进制（可能无前导 0）
+        string cBytes = internal::HexToBytesCompat(oss.str());
+        if (cBytes.size() < k)
+        {
+            string pad(k - cBytes.size(), '\0');
+            cipherAll.append(pad);
+        }
+        else if (cBytes.size() > k)
+        {
+            // 极端情况下（理论不应发生），保守取末尾 k 字节
+            cBytes.erase(0, cBytes.size() - k);
+        }
+        cipherAll.append(cBytes);
+
+        pos += mLen;
+    }
+
+    // 4) 整体 Base64 输出（与你现有 AES 输出风格一致：无 URL-safe，含 '='）
+    return GB_Base64Encode(cipherAll, false, false);
+}
+
+string GB_RsaDecrypt(const string& encryptedText, const string& decryptionKey)
+{
+    using internal::BigInt;
+
+    if (encryptedText.empty() || decryptionKey.empty())
+    {
+        return {};
+    }
+
+    // 1) 密钥解析（Base64 -> DER -> n,d）
+    const string der = GB_Base64Decode(decryptionKey, false, false, false);
+    if (der.empty())
+    {
+        return {};
+    }
+    string nBe, dBe;
+    if (!internal::ParseRsaPrivateKeyDer(der, nBe, dBe))
+    {
+        return {};
+    }
+    const size_t k = nBe.size();
+    if (k == 0) { return {}; }
+
+    // 2) 解码密文
+    const string all = GB_Base64Decode(encryptedText, false, false, false);
+    if (all.empty() || (all.size() % k) != 0)
+    {
+        return {};
+    }
+
+    const BigInt n(internal::BytesToHex(nBe));
+    const BigInt d(internal::BytesToHex(dBe));
+
+    string plainAll;
+
+    for (size_t off = 0; off < all.size(); off += k)
+    {
+        string cBytes = all.substr(off, k);
+
+        // c^d mod n -> k 字节
+        const BigInt c(internal::BytesToHex(cBytes));
+        const BigInt m = c.moden(d, n);
+
+        ostringstream oss;
+        oss << m;
+        string em = internal::HexToBytesCompat(oss.str());
+        if (em.size() < k)
+        {
+            string pad(k - em.size(), '\0');
+            em.insert(em.begin(), pad.begin(), pad.end());
+        }
+        else if (em.size() > k)
+        {
+            em.erase(0, em.size() - k);
+        }
+
+        // 3) 去 PKCS#1 v1.5 填充：00 02 PS 00 M
+        if (em.size() < 11 || static_cast<uint8_t>(em[0]) != 0x00 || static_cast<uint8_t>(em[1]) != 0x02)
+        {
+            return {};
+        }
+        // 找分隔 0x00，且保证 PS >= 8 且全非零
+        size_t i = 2;
+        size_t psCount = 0;
+        while (i < em.size())
+        {
+            if (em[i] == '\0') { break; }
+            if (static_cast<uint8_t>(em[i]) == 0x00)
+            {
+                // 不会走到这里，上面已判断
+                return {};
+            }
+            psCount++;
+            i++;
+        }
+        if (i >= em.size() || psCount < 8) // 无分隔或 PS 太短
+        {
+            return {};
+        }
+        // i 指向 0x00 分隔
+        i++;
+        if (i > em.size())
+        {
+            return {};
+        }
+        plainAll.append(em.data() + i, em.data() + em.size());
+    }
+
+    return plainAll;
+}

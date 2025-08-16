@@ -112,16 +112,69 @@ GLOBALBASE_PORT std::string GB_Aes256Encrypt(const std::string& text, const std:
  */
 GLOBALBASE_PORT std::string GB_Aes256Decrypt(const std::string& encryptedText, const std::string& key, bool strictMode = false, bool urlSafe = false, bool noPadding = false, bool flexibleKey = true);
 
+/**
+ * @brief 生成一对 RSA 密钥，并以 Base64(PKCS#1/DER) 的裸文本返回。
+ *
+ * - 密钥格式（非常重要）：
+ *   1) 私钥按 PKCS#1 RSAPrivateKey 的 ASN.1 结构：version(=0)、n、e、d、p、q、dp、dq、qi，
+ *      再按 DER 编码；公钥按 PKCS#1 RSAPublicKey：SEQUENCE{ n, e }，再按 DER 编码。
+ *   2) 本函数返回的是 **DER 的 Base64 主体**（不带“-----BEGIN …----- / -----END …-----”头尾，
+ *      也不插入换行），便于与现有接口保持一致。
+ *
+ * - 生成策略：
+ *   1) keySize 表示 n 的目标比特数；内部按 keySize/2 生成等长素数 p、q，再构造 n=p*q。
+ *   2) 当 keySize<1024 时自动提升到 1024；建议实际使用 ≥2048。
+ *   3) 公钥指数 e 固定为 65537（0x10001），再计算 d 使得 e·d ≡ 1 (mod φ(n))。
+ *
+ * - 返回值：成功返回 true 且
+ *      publicKey = Base64(DER(RSAPublicKey{n,e})),
+ *      privateKey = Base64(DER(RSAPrivateKey{version,n,e,d,p,q,dp,dq,qi}))；
+ *   失败返回 false，输出参数不修改或为空。
+ *
+ * - 兼容性提示：
+ *   返回值不是 X.509 SubjectPublicKeyInfo/SPKI，也不是 PKCS#8；如需在外部库中使用，
+ *   请确认对方能接受 **PKCS#1 裸 DER 的 Base64 主体**。
+ */
+GLOBALBASE_PORT bool GB_RsaGenerateKeyPair(std::string& publicKey, std::string& privateKey, int keySize = 2048);
 
+/**
+ * @brief 使用 PKCS#1 v1.5（RSAES-PKCS1-v1_5）对明文进行分块加密，并整体 Base64 输出。
+ *
+ * - 密钥格式：参数 encryptionKey 必须是 Base64( DER(RSAPublicKey{ n, e }) ) 的 **主体文本**。
+ *   函数会先 Base64 解码，再解析 DER 取出 n、e。
+ *
+ * - 分块与填充：
+ *   设 k = 模长（字节数）。单块最大明文长度 mLen = k - 11；对每个明文分块 M 生成
+ *   编码块 EM = 0x00 || 0x02 || PS || 0x00 || M，其中 PS 为长度 ≥8 的**全非零**随机字节串。
+ *   然后计算 C = EM^e mod n，并将 C 以**定长 k 字节**拼接。
+ *
+ * - 输出：将所有密文块按原顺序拼接为字节串，再做 Base64（标准字母表、含‘=’，不 URL-safe）输出。
+ *
+ * - 失败返回空字符串：包含但不限于 Base64/DER 非法、公钥解析失败、k<11、或内部错误。
+ *
+ * - 安全特性：由于 v1.5 填充包含随机 PS，同一明文多次加密会得到不同密文；但 v1.5 方案在新设计中
+ *   已被认为弱于 OAEP，除非为协议兼容，否则建议优先使用 OAEP。
+ */
+GLOBALBASE_PORT std::string GB_RsaEncrypt(const std::string& plainText, const std::string& encryptionKey);
 
-
-
-
-
-
-
-
-
+/**
+ * @brief 使用 PKCS#1 v1.5（RSAES-PKCS1-v1_5）解密 Base64(拼接的 k 字节密文块)，并返回原文字节序列。
+ *
+ * - 密钥格式：参数 decryptionKey 必须是 Base64( DER(RSAPrivateKey{ version=0,n,e,d,p,q,dp,dq,qi }) )
+ *   的**主体文本**。函数会先 Base64 解码，再解析 DER 取出 n、d。
+ *
+ * - 输入密文：encryptedText 是整体 Base64 文本；解码后必须能被 k 整除（每块 k 字节）。
+ *
+ * - 解密与去填充：
+ *   对每个密文块 C 执行 m = C^d mod n，并将 m 左填充至 k 字节作为 EM；
+ *   检查 EM 是否形如 0x00 || 0x02 || PS(全非零, 长度≥8) || 0x00 || M，
+ *   找到分隔 0x00 后将其后的 M 追加到最终明文。
+ *
+ * - 输出：返回拼接后的原文字节序列（按原样字节，不做编码转换）。
+ *
+ * - 失败返回空字符串：例如 Base64/DER 非法、密文长度非法、去填充失败等。
+ */
+GLOBALBASE_PORT std::string GB_RsaDecrypt(const std::string& encryptedText, const std::string& decryptionKey);
 
 
 #endif
