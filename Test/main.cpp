@@ -60,6 +60,18 @@ int main(int argc, char* argv[])
 	cout << endl << info.Serialize() << endl;
 	cout << endl;
 
+	const MotherboardInfo motherboardInfo = GetMotherboardInfo();
+	cout << endl << motherboardInfo.Serialize() << endl;
+	cout << endl;
+
+	const OsInfo osInfo = GetOsInfo();
+	cout << endl << osInfo.Serialize() << endl;
+	cout << endl;
+
+	const string hardwareId = GenerateHardwareId();
+	cout << endl << hardwareId << endl;
+	cout << endl;
+
 	const string rawInfo = GB_STR("Hello World! 你好，世界！我爱编程C++！！！！");
 	string base64Str = GB_Base64Encode(rawInfo);
 	string recInfo = GB_Base64Decode(base64Str);
@@ -94,6 +106,11 @@ int main(int argc, char* argv[])
 	cout << "SHA512 Hash: " << GB_GetSha512(rawInfo) << endl; // SHA512 Hash: f607d355f04b2316b6adfdf19122242da587d583309271c73d95d829584581a207183d2e54cb3a95c4b99026bde19015ee8c217cc6bedf947464f31b502edf8d
 	cout << endl;
 
+	const string key = "我爱世界，世界爱我";
+	const std::string b64 = GB_Aes256Encrypt(text1_Utf8, key);
+	const std::string back = GB_Aes256Decrypt(b64, key);
+	cout << "AES-256-CBC Encrypt: " << b64 << endl; // AES-256-CBC Encrypt: rrVFr02QJVaDulxo88y9RulkZEHWyHX4bosIj6i7pYswrlsEmpcD0nj9Z16bgDAFcXGc1+y6S22esrP1nR1G2g==
+	cout << "AES-256-CBC Decrypt: " << back << endl;
 
 
 	return 0;
