@@ -1047,6 +1047,109 @@ int64_t Utf8Find(const string& text, const string& needle, bool caseSensitive)
     return -1;
 }
 
+int64_t Utf8FindLast(const string& text, const string& needle, bool caseSensitive)
+{
+    if (needle.empty())
+    {
+        return static_cast<int64_t>(GetUtf8Length(text));
+    }
+
+    // —— ASCII + 大小写敏感：字节级快速路径（ASCII 下“字节偏移 == 码点偏移”）—— //
+    if (caseSensitive && internal::IsAllAscii(text) && internal::IsAllAscii(needle))
+    {
+        const size_t pos = text.rfind(needle);
+        if (pos == string::npos)
+        {
+            return -1;
+        }
+        return static_cast<int64_t>(pos);
+    }
+
+    // 1) 预解码模式串为码点序列，并按需做 ASCII 折叠
+    vector<char32_t> pat;
+    {
+        size_t pos = 0;
+        while (pos < needle.size())
+        {
+            char32_t cp = 0;
+            size_t nextPos = pos;
+            internal::DecodeOneOrReplacement(needle, pos, cp, nextPos);
+            if (!caseSensitive)
+            {
+                cp = internal::ToLowerAscii(cp);
+            }
+            pat.push_back(cp);
+            pos = nextPos;
+        }
+    }
+
+    const size_t m = pat.size();
+    if (m == 0)
+    {
+        // 理论上不会走到（非法字节也会转为 U+FFFD），兜底与上面保持一致
+        return static_cast<int64_t>(GetUtf8Length(text));
+    }
+
+    // 2) 计算 KMP 的 LPS（最长真前后缀）表
+    vector<size_t> lps(m, 0);
+    {
+        size_t len = 0;
+        for (size_t i = 1; i < m; )
+        {
+            if (pat[i] == pat[len])
+            {
+                lps[i++] = ++len;
+            }
+            else if (len != 0)
+            {
+                len = lps[len - 1];
+            }
+            else
+            {
+                lps[i++] = 0;
+            }
+        }
+    }
+
+    // 3) 前向扫描 text，记录“最后一次命中”的起始码点索引
+    size_t j = 0;                   // 已匹配 pat[0..j-1]
+    size_t textBytePos = 0;         // 当前字节位置
+    int64_t textCharIndex = 0;      // 已消费的码点数（当前码点索引）
+    int64_t lastMatchIndex = -1;    // 结果：最后一次命中的起始码点索引
+
+    while (textBytePos < text.size())
+    {
+        char32_t cp = 0;
+        size_t nextPos = textBytePos;
+        internal::DecodeOneOrReplacement(text, textBytePos, cp, nextPos);
+        if (!caseSensitive)
+        {
+            cp = internal::ToLowerAscii(cp);
+        }
+
+        while (j > 0 && cp != pat[j])
+        {
+            j = lps[j - 1];
+        }
+        if (cp == pat[j])
+        {
+            j++;
+            if (j == m)
+            {
+                // 记录命中位置（起始码点偏移）
+                lastMatchIndex = textCharIndex - static_cast<int64_t>(m) + 1;
+                // 继续搜索以支持重叠匹配
+                j = lps[j - 1];
+            }
+        }
+
+        textBytePos = nextPos;
+        textCharIndex++;
+    }
+
+    return lastMatchIndex;
+}
+
 string Utf8Trim(const string& utf8Str, const string& trimChars)
 {
     if (utf8Str.empty() || trimChars.empty())

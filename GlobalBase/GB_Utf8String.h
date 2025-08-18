@@ -65,6 +65,9 @@ GLOBALBASE_PORT bool Utf8EndsWith(const std::string& textUtf8, const std::string
 // 查找子串：返回第一个匹配的起始位置（UTF-8 字符偏移），未找到返回 -1
 GLOBALBASE_PORT int64_t Utf8Find(const std::string& text, const std::string& needle, bool caseSensitive = true);
 
+// 查找子串：返回最后一个匹配的起始位置（UTF-8 字符偏移），未找到返回 -1
+GLOBALBASE_PORT int64_t Utf8FindLast(const std::string& text, const std::string& needle, bool caseSensitive = true);
+
 // 删除 UTF-8 字符串两端的指定字符（默认空白字符、Tab、\r和\n）
 GLOBALBASE_PORT std::string Utf8Trim(const std::string& utf8Str, const std::string& trimChars = " \t\r\n");
 GLOBALBASE_PORT std::string Utf8TrimLeft(const std::string& utf8Str, const std::string& trimChars = " \t\r\n");

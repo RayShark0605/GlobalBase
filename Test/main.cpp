@@ -2,6 +2,8 @@
 #include "GlobalBase.h"
 #include "GB_SysInfo.h"
 #include "GB_Crypto.h"
+#include "GB_Config.h"
+#include "GB_FileSystem.h"
 
 
 using namespace std;
@@ -113,14 +115,33 @@ int main(int argc, char* argv[])
 	cout << "AES-256-CBC Decrypt: " << back << endl;
 
 
-	rawInfo = GB_STR("本功能为用户提供一个交互式工具，用于校准无地理参考或位置偏移的栅格影像。通过在影像和当前图形之间建立一系列匹配的控制点，系统将对影像进行非刚性变换，以修正其几何形变，使其与图形中的矢量数据精确对齐。此功能是整合扫描图纸、无坐标航拍像片等数据的关键工具，并支持对已有坐标的影像进行精度提升或纠正。");
-	std::string publicKey, privateKey;
-	GB_RsaGenerateKeyPair(publicKey, privateKey);
-	const std::string encryptionText = GB_RsaEncrypt(rawInfo, publicKey);
-	const std::string decryptedText = GB_RsaDecrypt(encryptionText, privateKey);
-	cout << "encryptionText:" << encryptionText << endl;
-	cout << "decryptedText:" << decryptedText << endl;
+	cout << GetGbConfigPath() << endl;
+	bool ret = IsExistsGbConfig(GB_STR("GB_EnableLog"));
+	ret = SetGbConfig(GB_STR("GB_EnableLog"), GB_STR("1"));
+	ret = SetGbConfig(GB_STR("GB_LogLevel"), GB_STR("FATAL"));
+	ret = SetGbConfig(GB_STR("测试中文配置"), GB_STR("测试值"));
+	string value = "";
+	ret = GetGbConfig(GB_STR("GB_EnableLog"), value);
+	cout << value << endl;
+	ret = GetGbConfig(GB_STR("GB_LogLevel"), value);
+	cout << value << endl;
+	ret = GetGbConfig(GB_STR("测试中文配置"), value);
+	cout << value << endl;
+	cout << endl;
 
+	std::unordered_map<std::string, std::string> configs = GetAllGbConfig();
+	for (const auto& config : configs)
+	{
+		cout << config.first << "=" << config.second << endl;
+	}
+	cout << endl;
+
+	DeleteGbConfig(GB_STR("GB_LogLevel"));
+	configs = GetAllGbConfig();
+	for (const auto& config : configs)
+	{
+		cout << config.first << "=" << config.second << endl;
+	}
 
 	return 0;
 }

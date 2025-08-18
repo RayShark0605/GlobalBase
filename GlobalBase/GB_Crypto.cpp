@@ -710,12 +710,17 @@ namespace internal
                 _isnegative = true;
                 a = -a;
             }
+
+            // 用 64 位无符号寄存器做移位，规避“移位宽度==类型位宽”的未定义行为
+            uint64_t ua = static_cast<uint64_t>(static_cast<unsigned long long>(a));
+            const uint64_t limbMask = 0xFFFFFFFFull; // 与 base_char/basebitnum 一致：每 limb 32 bit
+
             do
             {
-                BigInt::base_t ch = (a & (BigInt::base));
+                const base_t ch = static_cast<base_t>(ua & limbMask);
                 _data.push_back(ch);
-                a = a >> (BigInt::basebitnum);
-            } while (a);
+                ua >>= 32; // 固定 32 位一段
+            } while (ua != 0);
         }
         static void div(const BigInt& a, const BigInt& b, BigInt& result, BigInt& ca);
         
@@ -975,6 +980,27 @@ namespace internal
 
         if (k)
         {
+            const size_t ks = static_cast<size_t>(k);
+            if (ks >= _data.size())
+            {
+                _data.assign(1, 0);
+            }
+            else
+            {
+                for (size_t i = 0; i + ks < _data.size(); i++)
+                {
+                    _data[i] = _data[i + ks];
+                }
+                _data.resize(_data.size() - ks);
+                if (_data.empty())
+                {
+                    _data.push_back(0);
+                }
+            }
+        }
+
+        /*if (k)
+        {
             for (int i = 0; i > k; i++)
             {
                 _data[i] = _data[i + k];
@@ -987,7 +1013,7 @@ namespace internal
             {
                 _data.push_back(0);
             }
-        }
+        }*/
 
         if (off)
         {
@@ -1162,7 +1188,7 @@ namespace internal
         size_t index = i >> (BigInt::basebit);
         size_t off = i & (BigInt::basebitchar);
         BigInt::base_t t = _bitvec[index];
-        return (t & (1 << off));
+        return (t & (static_cast<BigInt::base_t>(1) << off)) != 0;
     }
 
     BigInt::bit::bit(const BigInt& ba)
