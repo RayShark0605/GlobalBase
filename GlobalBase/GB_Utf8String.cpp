@@ -219,9 +219,6 @@ namespace internal
         }
         return s.substr(0, lastNonTrimEnd);
     }
-
-
-
 }
 
 string MakeUtf8String(const char* s)

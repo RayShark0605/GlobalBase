@@ -516,11 +516,11 @@ namespace internal
     }
 
     // 平台无关：获取文件大小（字节），仅常规文件。成功返回 true 并写入 sizeOut。
-    static bool TryGetFileSize64(const std::string& filePathUtf8, uint64_t& sizeOut)
+    static bool TryGetFileSize64(const string& filePathUtf8, uint64_t& sizeOut)
     {
 #if defined(_WIN32)
         // 先排除不存在或目录
-        const std::wstring w = Utf8ToWide(filePathUtf8);
+        const wstring w = Utf8ToWide(filePathUtf8);
         if (w.empty())
         {
             return false;
@@ -562,7 +562,7 @@ namespace internal
         sizeOut = static_cast<uint64_t>(li.QuadPart);
         return true;
 #else
-        std::string native = ReplaceSlashes(filePathUtf8, '/');
+        string native = ReplaceSlashes(filePathUtf8, '/');
         struct stat st;
         if (stat(native.c_str(), &st) != 0)
         {
@@ -581,6 +581,34 @@ namespace internal
         return true;
     }
 #endif
+    }
+
+    static void NormalizeToUnixDir(string& path)
+    {
+        for (size_t i = 0; i < path.size(); i++)
+        {
+            if (path[i] == '\\')
+            {
+                path[i] = '/';
+            }
+        }
+        // 去掉所有尾部斜杠，最后补一个，保证“有且仅有一个”
+        while (!path.empty() && path.back() == '/')
+        {
+            path.pop_back();
+        }
+        path.push_back('/');
+    }
+
+    static void ReplaceBackslashWithSlash(std::string& s)
+    {
+        for (size_t i = 0; i < s.size(); i++)
+        {
+            if (s[i] == '\\')
+            {
+                s[i] = '/';
+            }
+        }
     }
 }
 
@@ -808,14 +836,14 @@ string GB_GetDirectoryPath(const string& rawFilePathUtf8)
 	return Utf8Substr(filePathUtf8, 0, pos + 1);
 }
 
-GLOBALBASE_PORT size_t GB_GetFileSizeByte(const std::string& filePathUtf8)
+size_t GB_GetFileSizeByte(const string& filePathUtf8)
 {
     uint64_t size64 = 0;
     if (!internal::TryGetFileSize64(filePathUtf8, size64))
     {
         return 0;
     }
-    const uint64_t maxSizeT = static_cast<uint64_t>(std::numeric_limits<size_t>::max());
+    constexpr static uint64_t maxSizeT = static_cast<uint64_t>(numeric_limits<size_t>::max());
     if (size64 > maxSizeT)
     {
         return static_cast<size_t>(maxSizeT); // 截断以适配 32 位构建
@@ -823,7 +851,7 @@ GLOBALBASE_PORT size_t GB_GetFileSizeByte(const std::string& filePathUtf8)
     return static_cast<size_t>(size64);
 }
 
-GLOBALBASE_PORT double GB_GetFileSizeKB(const std::string& filePathUtf8)
+double GB_GetFileSizeKB(const string& filePathUtf8)
 {
     uint64_t size64 = 0;
     if (!internal::TryGetFileSize64(filePathUtf8, size64))
@@ -834,7 +862,7 @@ GLOBALBASE_PORT double GB_GetFileSizeKB(const std::string& filePathUtf8)
     return static_cast<double>(size64) / oneKB;
 }
 
-GLOBALBASE_PORT double GB_GetFileSizeMB(const std::string& filePathUtf8)
+double GB_GetFileSizeMB(const string& filePathUtf8)
 {
     uint64_t size64 = 0;
     if (!internal::TryGetFileSize64(filePathUtf8, size64))
@@ -845,7 +873,7 @@ GLOBALBASE_PORT double GB_GetFileSizeMB(const std::string& filePathUtf8)
     return static_cast<double>(size64) / oneMB;
 }
 
-GLOBALBASE_PORT double GB_GetFileSizeGB(const std::string& filePathUtf8)
+double GB_GetFileSizeGB(const string& filePathUtf8)
 {
     uint64_t size64 = 0;
     if (!internal::TryGetFileSize64(filePathUtf8, size64))
@@ -854,4 +882,184 @@ GLOBALBASE_PORT double GB_GetFileSizeGB(const std::string& filePathUtf8)
     }
     constexpr static double oneGB = 1024.0 * 1024.0 * 1024.0; // GiB
     return static_cast<double>(size64) / oneGB;
+}
+
+string GB_GetExeDirectory()
+{
+#if defined(_WIN32)
+    // 处理可能超出 MAX_PATH 的路径：循环扩容
+    vector<wchar_t> buf(512);
+    for (;;)
+    {
+        DWORD len = ::GetModuleFileNameW(nullptr, buf.data(), static_cast<DWORD>(buf.size()));
+        if (len == 0)
+        {
+            return string(); // 失败
+        }
+        if (len < buf.size() - 1)
+        {
+            buf[len] = L'\0';
+            break; // 成功
+        }
+        // len == nSize（被截断），扩大缓冲区
+        buf.resize(buf.size() * 2);
+    }
+
+    wstring fullWs(buf.data());
+    // 去掉文件名，得到目录
+    size_t pos = fullWs.find_last_of(L"\\/");
+    if (pos == wstring::npos)
+    {
+        return string();
+    }
+    wstring dirWs = fullWs.substr(0, pos);
+    string dirUtf8 = internal::WideToUtf8(dirWs);
+    internal::NormalizeToUnixDir(dirUtf8);
+    return dirUtf8;
+
+#else
+    // Linux: readlink("/proc/self/exe")，注意：返回长度不含NUL，需要手动补
+    vector<char> buf(256);
+    for (;;)
+    {
+        ssize_t n = ::readlink("/proc/self/exe", buf.data(), buf.size() - 1);
+        if (n < 0)
+        {
+            return string(); // 失败
+        }
+        if (static_cast<size_t>(n) < buf.size() - 1)
+        {
+            buf[static_cast<size_t>(n)] = '\0';
+            break; // 成功
+        }
+        // 缓冲区被截断，扩容重试
+        buf.resize(buf.size() * 2);
+    }
+
+    string full(buf.data());
+    // 某些发行版在可执行文件被删除时，路径末尾可能带" (deleted)"标记，这里去掉
+    const string deletedTag = " (deleted)";
+    if (full.size() > deletedTag.size() && full.compare(full.size() - deletedTag.size(), deletedTag.size(), deletedTag) == 0)
+    {
+        full.erase(full.size() - deletedTag.size());
+    }
+
+    // 去掉文件名，得到目录
+    size_t pos = full.find_last_of('/');
+    if (pos == string::npos)
+    {
+        return string();
+    }
+    string dir = full.substr(0, pos);
+    NormalizeToUnixDir(dir);
+    return dir;
+#endif
+}
+
+bool GB_CreateFileRecursive(const std::string& filePathUtf8, bool overwriteIfExists)
+{
+    if (filePathUtf8.empty())
+    {
+        return false;
+    }
+
+    // 统一分隔符
+    std::string normPath = filePathUtf8;
+    for (size_t i = 0; i < normPath.size(); i++)
+    {
+        if (normPath[i] == '\\')
+        {
+            normPath[i] = '/';
+        }
+    }
+
+    // 末尾是分隔符 => 视为目录，拒绝
+    {
+        const char lastCh = normPath.back();
+        if (lastCh == '/' || lastCh == '\\')
+        {
+            return false;
+        }
+    }
+
+    // 先确保父目录存在
+    const std::string dirPathUtf8 = GB_GetDirectoryPath(normPath);
+    if (!dirPathUtf8.empty())
+    {
+        if (!GB_CreateDirectory(dirPathUtf8))
+        {
+            return false;
+        }
+    }
+
+    // 存在性与非覆盖策略
+    if (!overwriteIfExists)
+    {
+        if (GB_IsFileExists(normPath))
+        {
+            const size_t sizeByte = GB_GetFileSizeByte(normPath);
+            return sizeByte == 0; // 已存在且已为空 ⇒ OK；否则拒绝
+        }
+    }
+
+#if defined(_WIN32)
+    // UTF-8 -> UTF-16
+    auto Utf8ToWide = [](const std::string& utf8) -> std::wstring
+        {
+            if (utf8.empty())
+            {
+                return std::wstring();
+            }
+            const int need = ::MultiByteToWideChar(CP_UTF8, 0, utf8.c_str(),
+                static_cast<int>(utf8.size()),
+                nullptr, 0);
+            if (need <= 0)
+            {
+                return std::wstring();
+            }
+            std::wstring ws(static_cast<size_t>(need), L'\0');
+            const int wrote = ::MultiByteToWideChar(CP_UTF8, 0, utf8.c_str(),
+                static_cast<int>(utf8.size()),
+                &ws[0], need);
+            if (wrote != need)
+            {
+                return std::wstring();
+            }
+            return ws;
+        };
+
+    const std::wstring wPath = Utf8ToWide(normPath);
+    if (wPath.empty())
+    {
+        return false;
+    }
+
+    const DWORD creationDisposition = overwriteIfExists ? CREATE_ALWAYS : CREATE_NEW; // 见备注
+    HANDLE h = ::CreateFileW(
+        wPath.c_str(),
+        GENERIC_WRITE,
+        FILE_SHARE_READ,        // 允许其他进程读
+        nullptr,
+        creationDisposition,
+        FILE_ATTRIBUTE_NORMAL,
+        nullptr);
+
+    if (h == INVALID_HANDLE_VALUE)
+    {
+        return false;
+    }
+    ::CloseHandle(h);
+    return true;
+
+#else
+    // Linux/Unix：确保只在“不存在时创建”或“截断创建”
+    int flags = O_WRONLY | O_CREAT | (overwriteIfExists ? O_TRUNC : O_EXCL);
+    const int fd = ::open(normPath.c_str(), flags, 0644); // 最终权限受 umask 影响
+    if (fd < 0)
+    {
+        return false;
+    }
+    (void)::close(fd);
+    return true;
+#endif
 }

@@ -4,6 +4,8 @@
 #include "GB_Crypto.h"
 #include "GB_Config.h"
 #include "GB_FileSystem.h"
+#include "GB_IO.h"
+#include "GB_Timer.h"
 
 
 using namespace std;
@@ -143,6 +145,9 @@ int main(int argc, char* argv[])
 		cout << config.first << "=" << config.second << endl;
 	}
 
+	cout << GB_GetExeDirectory() << endl;
+	cout << GetLocalTimeStr() << endl;
+	
 	return 0;
 }
 
