@@ -35,6 +35,10 @@ struct GB_LogItem
 
 std::string LogLevelToString(GB_LogLevel level);
 
+#ifdef _MSC_VER
+#  pragma warning(push)
+#  pragma warning(disable: 4251)
+#endif
 class GLOBALBASE_PORT GB_Logger
 {
 public:
@@ -65,6 +69,9 @@ private:
 
 	void LogThreadFunc(); // 日志处理线程函数
 };
+#ifdef _MSC_VER
+#  pragma warning(pop)
+#endif
 
 #define GBLOG_TRACE(msg) do { GB_Logger::GetInstance().LogTrace(msg, __FILE__, __LINE__); } while (0)
 #define GBLOG_DEBUG(msg) do { GB_Logger::GetInstance().LogDebug(msg, __FILE__, __LINE__); } while (0)
