@@ -24,6 +24,7 @@
     <ClInclude Include="GB_FileSystem.h" />
     <ClInclude Include="GB_IO.h" />
     <ClInclude Include="GB_Logger.h" />
+    <ClInclude Include="GB_ReadWriteLock.h" />
     <ClInclude Include="GB_SysInfo.h" />
     <ClInclude Include="GB_Timer.h" />
     <ClInclude Include="GB_Utf8String.h" />
@@ -37,6 +38,7 @@
     <ClCompile Include="GB_FileSystem.cpp" />
     <ClCompile Include="GB_IO.cpp" />
     <ClCompile Include="GB_Logger.cpp" />
+    <ClCompile Include="GB_ReadWriteLock.cpp" />
     <ClCompile Include="GB_SysInfo.cpp" />
     <ClCompile Include="GB_Timer.cpp" />
     <ClCompile Include="GB_Utf8String.cpp" />
