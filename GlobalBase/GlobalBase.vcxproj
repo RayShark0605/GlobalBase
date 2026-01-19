@@ -21,6 +21,7 @@
   <ItemGroup>
     <ClInclude Include="GB_Config.h" />
     <ClInclude Include="GB_Crypto.h" />
+    <ClInclude Include="GB_DataCache.h" />
     <ClInclude Include="GB_FileSystem.h" />
     <ClInclude Include="GB_IO.h" />
     <ClInclude Include="GB_Logger.h" />
@@ -35,6 +36,7 @@
   <ItemGroup>
     <ClCompile Include="GB_Config.cpp" />
     <ClCompile Include="GB_Crypto.cpp" />
+    <ClCompile Include="GB_DataCache.cpp" />
     <ClCompile Include="GB_FileSystem.cpp" />
     <ClCompile Include="GB_IO.cpp" />
     <ClCompile Include="GB_Logger.cpp" />

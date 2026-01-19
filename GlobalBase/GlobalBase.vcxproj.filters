@@ -51,6 +51,9 @@
     <ClInclude Include="GB_ReadWriteLock.h">
       <Filter>头文件</Filter>
     </ClInclude>
+    <ClInclude Include="GB_DataCache.h">
+      <Filter>头文件</Filter>
+    </ClInclude>
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="GB_Utf8String.cpp">
@@ -81,6 +84,9 @@
       <Filter>源文件</Filter>
     </ClCompile>
     <ClCompile Include="GB_ReadWriteLock.cpp">
+      <Filter>源文件</Filter>
+    </ClCompile>
+    <ClCompile Include="GB_DataCache.cpp">
       <Filter>源文件</Filter>
     </ClCompile>
   </ItemGroup>
