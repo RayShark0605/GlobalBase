@@ -2,57 +2,57 @@
 
 #include <algorithm>
 
-GB_Cache::GB_Cache(const Options& options) : options_(options), stats_(), currentBytes_(0), entries_(), orderList_(),
+GB_DataCache::GB_DataCache(const Options& options) : options_(options), stats_(), currentBytes_(0), entries_(), orderList_(),
     freqToKeys_(), minFreq_(0), rng_(options.randomSeed)
 {
 }
 
-GB_Cache::~GB_Cache()
+GB_DataCache::~GB_DataCache()
 {
 }
 
-GB_Cache::Policy GB_Cache::GetPolicy() const
+GB_DataCache::Policy GB_DataCache::GetPolicy() const
 {
     return options_.policy;
 }
 
-size_t GB_Cache::Size() const
+size_t GB_DataCache::Size() const
 {
     return entries_.size();
 }
 
-size_t GB_Cache::GetCurrentBytes() const
+size_t GB_DataCache::GetCurrentBytes() const
 {
     return currentBytes_;
 }
 
-size_t GB_Cache::GetMaxBytes() const
+size_t GB_DataCache::GetMaxBytes() const
 {
     return options_.maxBytes;
 }
 
-void GB_Cache::SetMaxBytes(size_t maxBytes)
+void GB_DataCache::SetMaxBytes(size_t maxBytes)
 {
     options_.maxBytes = maxBytes;
     EnsureCapacityFor(0, nullptr);
 }
 
-GB_Cache::Stats GB_Cache::GetStats() const
+GB_DataCache::Stats GB_DataCache::GetStats() const
 {
     return stats_;
 }
 
-void GB_Cache::ResetStats()
+void GB_DataCache::ResetStats()
 {
     stats_ = Stats();
 }
 
-bool GB_Cache::Contains(const std::string& key) const
+bool GB_DataCache::Contains(const std::string& key) const
 {
     return entries_.find(key) != entries_.end();
 }
 
-bool GB_Cache::TryGetValueBytes(const std::string& key, size_t& valueBytes) const
+bool GB_DataCache::TryGetValueBytes(const std::string& key, size_t& valueBytes) const
 {
     const auto it = entries_.find(key);
     if (it == entries_.end())
@@ -64,7 +64,7 @@ bool GB_Cache::TryGetValueBytes(const std::string& key, size_t& valueBytes) cons
     return true;
 }
 
-bool GB_Cache::PutRaw(const std::string& key, void* rawPtr, size_t valueBytes, const std::function<void(void*)>& deleter)
+bool GB_DataCache::PutRaw(const std::string& key, void* rawPtr, size_t valueBytes, const std::function<void(void*)>& deleter)
 {
     if (rawPtr != nullptr && !deleter)
     {
@@ -87,7 +87,7 @@ bool GB_Cache::PutRaw(const std::string& key, void* rawPtr, size_t valueBytes, c
     return Put(key, value, valueBytes);
 }
 
-bool GB_Cache::Put(const std::string& key, const std::shared_ptr<void>& value, size_t valueBytes)
+bool GB_DataCache::Put(const std::string& key, const std::shared_ptr<void>& value, size_t valueBytes)
 {
     if (options_.maxBytes != 0 && valueBytes > options_.maxBytes)
     {
@@ -169,7 +169,7 @@ bool GB_Cache::Put(const std::string& key, const std::shared_ptr<void>& value, s
     }
 }
 
-std::shared_ptr<void> GB_Cache::Peek(const std::string& key) const
+std::shared_ptr<void> GB_DataCache::Peek(const std::string& key) const
 {
     const auto it = entries_.find(key);
     if (it == entries_.end())
@@ -180,7 +180,7 @@ std::shared_ptr<void> GB_Cache::Peek(const std::string& key) const
     return it->second.value;
 }
 
-std::shared_ptr<void> GB_Cache::Get(const std::string& key)
+std::shared_ptr<void> GB_DataCache::Get(const std::string& key)
 {
     const auto it = entries_.find(key);
     if (it == entries_.end())
@@ -196,7 +196,7 @@ std::shared_ptr<void> GB_Cache::Get(const std::string& key)
     return entry.value;
 }
 
-bool GB_Cache::Erase(const std::string& key)
+bool GB_DataCache::Erase(const std::string& key)
 {
     const auto it = entries_.find(key);
     if (it == entries_.end())
@@ -209,7 +209,7 @@ bool GB_Cache::Erase(const std::string& key)
     return true;
 }
 
-void GB_Cache::Clear()
+void GB_DataCache::Clear()
 {
     OnClear();
     entries_.clear();
@@ -217,7 +217,7 @@ void GB_Cache::Clear()
     stats_.erases += 0; // 不强行累加，避免误导；需要的话你可以自定义为 entries_.size()
 }
 
-void GB_Cache::OnInsert(const std::string& key, Entry& entry)
+void GB_DataCache::OnInsert(const std::string& key, Entry& entry)
 {
     if (options_.policy == Policy::Lru)
     {
@@ -246,7 +246,7 @@ void GB_Cache::OnInsert(const std::string& key, Entry& entry)
     }
 }
 
-void GB_Cache::OnAccess(const std::string& key, Entry& entry)
+void GB_DataCache::OnAccess(const std::string& key, Entry& entry)
 {
     if (options_.policy == Policy::Lru)
     {
@@ -302,7 +302,7 @@ void GB_Cache::OnAccess(const std::string& key, Entry& entry)
     }
 }
 
-void GB_Cache::OnErase(const std::string& key, Entry& entry)
+void GB_DataCache::OnErase(const std::string& key, Entry& entry)
 {
     if (options_.policy == Policy::Lru || options_.policy == Policy::Fifo)
     {
@@ -349,14 +349,14 @@ void GB_Cache::OnErase(const std::string& key, Entry& entry)
     }
 }
 
-void GB_Cache::OnClear()
+void GB_DataCache::OnClear()
 {
     orderList_.clear();
     freqToKeys_.clear();
     minFreq_ = 0;
 }
 
-bool GB_Cache::PickVictimKey(std::string& victimKey, const std::string* protectedKey)
+bool GB_DataCache::PickVictimKey(std::string& victimKey, const std::string* protectedKey)
 {
     if (entries_.empty())
     {
@@ -497,7 +497,7 @@ bool GB_Cache::PickVictimKey(std::string& victimKey, const std::string* protecte
     }
 }
 
-bool GB_Cache::EvictOne(const std::string* protectedKey)
+bool GB_DataCache::EvictOne(const std::string* protectedKey)
 {
     std::string victimKey;
     if (!PickVictimKey(victimKey, protectedKey))
@@ -510,7 +510,7 @@ bool GB_Cache::EvictOne(const std::string* protectedKey)
     return true;
 }
 
-bool GB_Cache::EnsureCapacityFor(size_t incomingBytes, const std::string* protectedKey)
+bool GB_DataCache::EnsureCapacityFor(size_t incomingBytes, const std::string* protectedKey)
 {
     if (options_.maxBytes == 0)
     {
@@ -533,7 +533,7 @@ bool GB_Cache::EnsureCapacityFor(size_t incomingBytes, const std::string* protec
     return true;
 }
 
-void GB_Cache::RemoveEntry(const std::string& key)
+void GB_DataCache::RemoveEntry(const std::string& key)
 {
     auto it = entries_.find(key);
     if (it == entries_.end())

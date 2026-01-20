@@ -11,7 +11,7 @@
 #include <string>
 #include <unordered_map>
 
-class GB_Cache
+class GB_DataCache
 {
 public:
     enum class Policy
@@ -40,8 +40,8 @@ public:
     };
 
 public:
-    explicit GB_Cache(const Options& options);
-    ~GB_Cache();
+    explicit GB_DataCache(const Options& options);
+    ~GB_DataCache();
 
 public:
     // Put：直接放 shared_ptr<void>（类型擦除）
@@ -141,18 +141,18 @@ private:
 };
 
 template<typename T>
-bool GB_Cache::PutShared(const std::string& key, const std::shared_ptr<T>& value, size_t valueBytes)
+bool GB_DataCache::PutShared(const std::string& key, const std::shared_ptr<T>& value, size_t valueBytes)
 {
-    static_assert(!std::is_array<T>::value, "GB_Cache::PutShared does not support array types. Use containers instead.");
+    static_assert(!std::is_array<T>::value, "GB_DataCache::PutShared does not support array types. Use containers instead.");
 
     const std::shared_ptr<void> erasedValue = std::static_pointer_cast<void>(value);
     return Put(key, erasedValue, valueBytes);
 }
 
 template<typename T>
-bool GB_Cache::PutNew(const std::string& key, T* rawPtr, size_t valueBytes)
+bool GB_DataCache::PutNew(const std::string& key, T* rawPtr, size_t valueBytes)
 {
-    static_assert(!std::is_array<T>::value, "GB_Cache::PutNew does not support array types. Use containers instead.");
+    static_assert(!std::is_array<T>::value, "GB_DataCache::PutNew does not support array types. Use containers instead.");
 
     if (rawPtr == nullptr)
     {
@@ -164,9 +164,9 @@ bool GB_Cache::PutNew(const std::string& key, T* rawPtr, size_t valueBytes)
 }
 
 template<typename T, typename Deleter>
-bool GB_Cache::PutNew(const std::string& key, T* rawPtr, size_t valueBytes, Deleter deleter)
+bool GB_DataCache::PutNew(const std::string& key, T* rawPtr, size_t valueBytes, Deleter deleter)
 {
-    static_assert(!std::is_array<T>::value, "GB_Cache::PutNew does not support array types. Use containers instead.");
+    static_assert(!std::is_array<T>::value, "GB_DataCache::PutNew does not support array types. Use containers instead.");
 
     if (rawPtr == nullptr)
     {
@@ -178,9 +178,9 @@ bool GB_Cache::PutNew(const std::string& key, T* rawPtr, size_t valueBytes, Dele
 }
 
 template<typename T, typename Deleter>
-bool GB_Cache::PutUnique(const std::string& key, std::unique_ptr<T, Deleter> uniquePtr, size_t valueBytes)
+bool GB_DataCache::PutUnique(const std::string& key, std::unique_ptr<T, Deleter> uniquePtr, size_t valueBytes)
 {
-    static_assert(!std::is_array<T>::value, "GB_Cache::PutUnique does not support array types. Use containers instead.");
+    static_assert(!std::is_array<T>::value, "GB_DataCache::PutUnique does not support array types. Use containers instead.");
 
     if (!uniquePtr)
     {
@@ -192,9 +192,9 @@ bool GB_Cache::PutUnique(const std::string& key, std::unique_ptr<T, Deleter> uni
 }
 
 template<typename T>
-std::shared_ptr<T> GB_Cache::GetAs(const std::string& key)
+std::shared_ptr<T> GB_DataCache::GetAs(const std::string& key)
 {
-    static_assert(!std::is_array<T>::value, "GB_Cache::GetAs does not support array types.");
+    static_assert(!std::is_array<T>::value, "GB_DataCache::GetAs does not support array types.");
 
     const std::shared_ptr<void> erasedValue = Get(key);
 
