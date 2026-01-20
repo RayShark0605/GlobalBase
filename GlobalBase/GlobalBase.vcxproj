@@ -28,6 +28,7 @@
     <ClInclude Include="GB_ReadWriteLock.h" />
     <ClInclude Include="GB_SmbAccessor.h" />
     <ClInclude Include="GB_SysInfo.h" />
+    <ClInclude Include="GB_ThreadPool.h" />
     <ClInclude Include="GB_Timer.h" />
     <ClInclude Include="GB_Utf8String.h" />
     <ClInclude Include="GB_Utility.h" />
@@ -44,6 +45,7 @@
     <ClCompile Include="GB_ReadWriteLock.cpp" />
     <ClCompile Include="GB_SmbAccessor.cpp" />
     <ClCompile Include="GB_SysInfo.cpp" />
+    <ClCompile Include="GB_ThreadPool.cpp" />
     <ClCompile Include="GB_Timer.cpp" />
     <ClCompile Include="GB_Utf8String.cpp" />
     <ClCompile Include="GB_Utility.cpp" />
