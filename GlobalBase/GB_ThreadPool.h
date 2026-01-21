@@ -1,5 +1,5 @@
-﻿#ifndef THREAD_POOL_H
-#define THREAD_POOL_H
+﻿#ifndef GLOBALBASE_THREAD_POOL_H
+#define GLOBALBASE_THREAD_POOL_H
 
 #include <chrono>
 #include <cstddef>
