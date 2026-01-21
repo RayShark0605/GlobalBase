@@ -1,5 +1,6 @@
 ﻿#include "GB_SmbAccessor.h"
 #include "GB_ThreadPool.h"
+#ifdef _WIN32
 #include <algorithm>
 #include <atomic>
 #include <memory>
@@ -2815,3 +2816,6 @@ std::wstring GB_SmbAccessor::ConvertIpv6LiteralToUncHost(const std::wstring& ipv
     out += L".ipv6-literal.net";
     return out;
 }
+
+
+#endif

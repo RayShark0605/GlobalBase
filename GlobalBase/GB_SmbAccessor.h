@@ -8,6 +8,8 @@
 #define _UNICODE
 #endif
 
+#ifdef _WIN32
+
 #include "GlobalBasePort.h"
 #include <winsock2.h>
 #include <ws2tcpip.h>
@@ -155,7 +157,6 @@ private:
 
     static std::wstring ConvertIpv6LiteralToUncHost(const std::wstring& ipv6Literal);
 
-
     bool CopyFileFromLocalInternal(const std::wstring& localPath, const std::wstring& shareName, const std::wstring& remoteRelativePath,
         bool overwrite, bool skipEnsureParentDir, std::wstring* errorMessage) const;
 
@@ -180,6 +181,8 @@ private:
 
 #ifdef _MSC_VER
 #  pragma warning(pop)
+#endif
+
 #endif
 
 #endif
