@@ -91,19 +91,44 @@ public:
     bool CopyFileFromLocal(const std::wstring& localPath, const std::wstring& shareName, const std::wstring& remoteRelativePath,
         bool overwrite, std::wstring* errorMessage) const;
 
+    // 复制“单个文件”：本地 -> 远端（并行版）。
+    // 说明：
+    // - 本接口内部自建线程池并在返回前完成所有任务，外部无需管理线程池。
+    // - 并行策略以“分段并行拷贝”为主：仅在文件足够大且 threadCount>1 时启用；否则退化为 CopyFileFromLocal。
+    // - threadCount==0 表示自动选择（通常为 2~8 之间的一个值）。
+    bool CopyFileFromLocalParallel(const std::wstring& localPath, const std::wstring& shareName, const std::wstring& remoteRelativePath,
+        bool overwrite, std::wstring* errorMessage, size_t threadCount = 0) const;
+
     // 复制“单个文件”：远端 -> 本地。会在需要时递归创建 localPath 的上级目录。
     bool CopyFileToLocal(const std::wstring& shareName, const std::wstring& remoteRelativePath, const std::wstring& localPath,
         bool overwrite, std::wstring* errorMessage) const;
+
+    // 复制“单个文件”：远端 -> 本地（并行版）。
+    // 说明同 CopyFileFromLocalParallel。
+    bool CopyFileToLocalParallel(const std::wstring& shareName, const std::wstring& remoteRelativePath, const std::wstring& localPath,
+        bool overwrite, std::wstring* errorMessage, size_t threadCount = 0) const;
 
     // 复制“目录（含子目录）”：本地 -> 远端。
     // 会在需要时递归创建 remoteRelativePath（以及其上级目录）。
     bool CopyDirectoryFromLocal(const std::wstring& localDirectory, const std::wstring& shareName, const std::wstring& remoteRelativePath,
         bool overwrite, std::wstring* errorMessage) const;
 
+    // 复制“目录（含子目录）”：本地 -> 远端（并行版）。
+    // 说明：
+    // - 内部自建线程池，将“文件拷贝”任务并行化；目录创建仍在主线程顺序进行。
+    // - threadCount==0 表示自动选择（通常为 2~8 之间的一个值）。
+    bool CopyDirectoryFromLocalParallel(const std::wstring& localDirectory, const std::wstring& shareName, const std::wstring& remoteRelativePath,
+        bool overwrite, std::wstring* errorMessage, size_t threadCount = 0) const;
+
     // 复制“目录（含子目录）”：远端 -> 本地。
     // 会在需要时递归创建 localDirectory（以及其上级目录）。
     bool CopyDirectoryToLocal(const std::wstring& shareName, const std::wstring& remoteRelativePath, const std::wstring& localDirectory,
         bool overwrite, std::wstring* errorMessage) const;
+
+    // 复制“目录（含子目录）”：远端 -> 本地（并行版）。
+    // 说明同 CopyDirectoryFromLocalParallel。
+    bool CopyDirectoryToLocalParallel(const std::wstring& shareName, const std::wstring& remoteRelativePath, const std::wstring& localDirectory,
+        bool overwrite, std::wstring* errorMessage, size_t threadCount = 0) const;
 
     bool GetFileSizeRemote(const std::wstring& shareName, const std::wstring& remoteRelativePath, uint64_t* fileSize, std::wstring* errorMessage) const;
 

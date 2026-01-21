@@ -1,5 +1,7 @@
 ﻿#include "GB_SmbAccessor.h"
+#include "GB_ThreadPool.h"
 #include <algorithm>
+#include <atomic>
 #include <memory>
 #include <mutex>
 
@@ -445,21 +447,350 @@ namespace
     }
 
     static const uint64_t kLargeFileNoBufferingThresholdBytes = 1ull << 30; // 1 GiB
+
+    // 对“单文件分段并行拷贝”而言，太小的文件并行开销大于收益；
+    // 这里给一个保守阈值，避免把 4KB/1MB 之类的小文件拆成很多线程任务。
+    static const uint64_t kParallelFileMinBytes = 64ull << 20; // 64 MiB
+
+    // 分段大小：在 SMB / 本地磁盘上通常 4~16 MiB 都比较常见；取 8 MiB 作为折中。
+    static const uint32_t kParallelChunkBytes = 8u << 20; // 8 MiB
+
+    static size_t NormalizeParallelThreadCount(size_t threadCount)
+    {
+        if (threadCount == 0)
+        {
+            unsigned int hw = std::thread::hardware_concurrency();
+            if (hw == 0)
+            {
+                hw = 4;
+            }
+            size_t out = static_cast<size_t>(hw);
+            out = std::max<size_t>(2, std::min<size_t>(8, out));
+            return out;
+        }
+
+        return std::max<size_t>(1, threadCount);
+    }
+
+    static size_t NormalizeParallelMaxQueueSize(size_t threadCount)
+    {
+        // 让枚举线程能够提前生产一点任务，但又避免一次性把“几十万文件”全塞进队列。
+        // 经验上 32x 线程数的队列深度对 I/O 工作负载比较稳。
+        const size_t maxQueueSize = threadCount * 32;
+        return std::max<size_t>(64, std::min<size_t>(4096, maxQueueSize));
+    }
+
+    class WinHandleGuard
+    {
+    public:
+        explicit WinHandleGuard(HANDLE handle = INVALID_HANDLE_VALUE) : handle_(handle)
+        {
+        }
+
+        ~WinHandleGuard()
+        {
+            Close();
+        }
+
+        WinHandleGuard(const WinHandleGuard&) = delete;
+        WinHandleGuard& operator=(const WinHandleGuard&) = delete;
+
+        WinHandleGuard(WinHandleGuard&& other) noexcept : handle_(other.handle_)
+        {
+            other.handle_ = INVALID_HANDLE_VALUE;
+        }
+
+        WinHandleGuard& operator=(WinHandleGuard&& other) noexcept
+        {
+            if (this == &other)
+            {
+                return *this;
+            }
+
+            Close();
+            handle_ = other.handle_;
+            other.handle_ = INVALID_HANDLE_VALUE;
+            return *this;
+        }
+
+        HANDLE Get() const
+        {
+            return handle_;
+        }
+
+        bool IsValid() const
+        {
+            return handle_ != INVALID_HANDLE_VALUE && handle_ != nullptr;
+        }
+
+        void Reset(HANDLE handle)
+        {
+            if (handle_ == handle)
+            {
+                return;
+            }
+            Close();
+            handle_ = handle;
+        }
+
+        void Close()
+        {
+            if (IsValid())
+            {
+                ::CloseHandle(handle_);
+                handle_ = INVALID_HANDLE_VALUE;
+            }
+        }
+
+    private:
+        HANDLE handle_;
+    };
+
+    struct ParallelFirstError
+    {
+        std::atomic<bool> hasError{ false };
+        std::mutex mutex;
+        std::wstring message;
+
+        void SetOnce(const std::wstring& msg)
+        {
+            bool expected = false;
+            if (!hasError.compare_exchange_strong(expected, true))
+            {
+                return;
+            }
+
+            std::lock_guard<std::mutex> lock(mutex);
+            message = msg;
+        }
+    };
+
+    static bool TryCloneFileTimesAndAttributes(const std::wstring& sourcePath, const std::wstring& destPath)
+    {
+        WIN32_FILE_ATTRIBUTE_DATA data;
+        ::ZeroMemory(&data, sizeof(data));
+
+        if (!::GetFileAttributesExW(sourcePath.c_str(), GetFileExInfoStandard, &data))
+        {
+            return true;
+        }
+
+        // 先设置时间（需要句柄），再设置属性（只读属性如果先设置可能影响写入）。
+        {
+            const DWORD shareMode = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
+            WinHandleGuard destHandle(::CreateFileW(destPath.c_str(), FILE_WRITE_ATTRIBUTES, shareMode, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr));
+            if (destHandle.IsValid())
+            {
+                (void)::SetFileTime(destHandle.Get(), &data.ftCreationTime, &data.ftLastAccessTime, &data.ftLastWriteTime);
+            }
+        }
+
+        (void)::SetFileAttributesW(destPath.c_str(), data.dwFileAttributes);
+        return true;
+    }
+
+    static bool SetFileSizeByHandle(HANDLE handle, uint64_t fileSize, std::wstring* errorMessage, const wchar_t* context)
+    {
+        LARGE_INTEGER li;
+        li.QuadPart = static_cast<LONGLONG>(fileSize);
+        if (!::SetFilePointerEx(handle, li, nullptr, FILE_BEGIN))
+        {
+            const DWORD err = ::GetLastError();
+            if (errorMessage != nullptr)
+            {
+                *errorMessage = std::wstring(context) + L" SetFilePointerEx failed: " + FormatWin32ErrorMessageLocal(err);
+            }
+            return false;
+        }
+
+        if (!::SetEndOfFile(handle))
+        {
+            const DWORD err = ::GetLastError();
+            if (errorMessage != nullptr)
+            {
+                *errorMessage = std::wstring(context) + L" SetEndOfFile failed: " + FormatWin32ErrorMessageLocal(err);
+            }
+            return false;
+        }
+
+        return true;
+    }
+
+    static bool CopyFileBySegmentsParallel(const std::wstring& sourcePath, const std::wstring& destPath, bool overwrite,
+        size_t threadCount, std::wstring* errorMessage, const wchar_t* context)
+    {
+        if (errorMessage != nullptr)
+        {
+            errorMessage->clear();
+        }
+
+        uint64_t fileSize = 0;
+        const bool gotSize = TryGetFileSizeByPath(sourcePath, &fileSize);
+        if (!gotSize)
+        {
+            // 获取大小失败则退回系统拷贝。
+            return CopyFileBestEffort(sourcePath, destPath, overwrite, false, errorMessage, context);
+        }
+
+        if (threadCount <= 1 || fileSize < kParallelFileMinBytes)
+        {
+            return CopyFileBestEffort(sourcePath, destPath, overwrite, false, errorMessage, context);
+        }
+
+        const DWORD shareMode = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
+
+        // 先创建/截断目标文件并预设大小（避免 worker 竞争创建）。
+        {
+            const DWORD disposition = overwrite ? CREATE_ALWAYS : CREATE_NEW;
+            WinHandleGuard destHandle(::CreateFileW(destPath.c_str(), GENERIC_WRITE, shareMode, nullptr, disposition, FILE_ATTRIBUTE_NORMAL, nullptr));
+            if (!destHandle.IsValid())
+            {
+                const DWORD err = ::GetLastError();
+                if (errorMessage != nullptr)
+                {
+                    *errorMessage = std::wstring(context) + L" CreateFileW(dest) failed: " + FormatWin32ErrorMessageLocal(err);
+                }
+                return false;
+            }
+
+            const bool sized = SetFileSizeByHandle(destHandle.Get(), fileSize, errorMessage, context);
+            if (!sized)
+            {
+                return false;
+            }
+        }
+
+        ParallelFirstError firstError;
+        std::atomic<uint64_t> nextChunkIndex{ 0 };
+
+        const size_t maxQueueSize = NormalizeParallelMaxQueueSize(threadCount);
+        GB_ThreadPool pool(threadCount, maxQueueSize);
+
+        for (size_t workerId = 0; workerId < threadCount; workerId++)
+        {
+            pool.Post([&, workerId]() {
+                (void)workerId;
+                if (firstError.hasError.load(std::memory_order_acquire))
+                {
+                    return;
+                }
+            
+                WinHandleGuard sourceHandle(::CreateFileW(sourcePath.c_str(), GENERIC_READ, shareMode, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr));
+                if (!sourceHandle.IsValid())
+                {
+                    const DWORD err = ::GetLastError();
+                    firstError.SetOnce(std::wstring(context) + L" CreateFileW(source) failed: " + FormatWin32ErrorMessageLocal(err));
+                    return;
+                }
+            
+                WinHandleGuard destHandle(::CreateFileW(destPath.c_str(), GENERIC_WRITE, shareMode, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr));
+                if (!destHandle.IsValid())
+                {
+                    const DWORD err = ::GetLastError();
+                    firstError.SetOnce(std::wstring(context) + L" CreateFileW(dest worker) failed: " + FormatWin32ErrorMessageLocal(err));
+                    return;
+                }
+            
+                std::vector<uint8_t> buffer;
+                buffer.resize(static_cast<size_t>(kParallelChunkBytes));
+            
+                while (!firstError.hasError.load(std::memory_order_acquire))
+                {
+                    const uint64_t chunkIndex = nextChunkIndex.fetch_add(1, std::memory_order_acq_rel);
+                    const uint64_t offset = chunkIndex * static_cast<uint64_t>(kParallelChunkBytes);
+                    if (offset >= fileSize)
+                    {
+                        break;
+                    }
+            
+                    const uint32_t bytesToCopy = static_cast<uint32_t>(std::min<uint64_t>(kParallelChunkBytes, fileSize - offset));
+            
+                    LARGE_INTEGER li;
+                    li.QuadPart = static_cast<LONGLONG>(offset);
+                    if (!::SetFilePointerEx(sourceHandle.Get(), li, nullptr, FILE_BEGIN))
+                    {
+                        const DWORD err = ::GetLastError();
+                        firstError.SetOnce(std::wstring(context) + L" SetFilePointerEx(source) failed: " + FormatWin32ErrorMessageLocal(err));
+                        break;
+                    }
+            
+                    uint32_t totalRead = 0;
+                    while (totalRead < bytesToCopy && !firstError.hasError.load(std::memory_order_acquire))
+                    {
+                        DWORD readBytes = 0;
+                        const BOOL ok = ::ReadFile(sourceHandle.Get(), buffer.data() + totalRead, bytesToCopy - totalRead, &readBytes, nullptr);
+                        if (!ok)
+                        {
+                            const DWORD err = ::GetLastError();
+                            firstError.SetOnce(std::wstring(context) + L" ReadFile failed: " + FormatWin32ErrorMessageLocal(err));
+                            break;
+                        }
+                        if (readBytes == 0)
+                        {
+                            firstError.SetOnce(std::wstring(context) + L" ReadFile returned 0 before expected EOF");
+                            break;
+                        }
+                        totalRead += static_cast<uint32_t>(readBytes);
+                    }
+            
+                    if (firstError.hasError.load(std::memory_order_acquire))
+                    {
+                        break;
+                    }
+            
+                    li.QuadPart = static_cast<LONGLONG>(offset);
+                    if (!::SetFilePointerEx(destHandle.Get(), li, nullptr, FILE_BEGIN))
+                    {
+                        const DWORD err = ::GetLastError();
+                        firstError.SetOnce(std::wstring(context) + L" SetFilePointerEx(dest) failed: " + FormatWin32ErrorMessageLocal(err));
+                        break;
+                    }
+            
+                    uint32_t totalWritten = 0;
+                    while (totalWritten < bytesToCopy && !firstError.hasError.load(std::memory_order_acquire))
+                    {
+                        DWORD writtenBytes = 0;
+                        const BOOL ok = ::WriteFile(destHandle.Get(), buffer.data() + totalWritten, bytesToCopy - totalWritten, &writtenBytes, nullptr);
+                        if (!ok)
+                        {
+                            const DWORD err = ::GetLastError();
+                            firstError.SetOnce(std::wstring(context) + L" WriteFile failed: " + FormatWin32ErrorMessageLocal(err));
+                            break;
+                        }
+                        if (writtenBytes == 0)
+                        {
+                            firstError.SetOnce(std::wstring(context) + L" WriteFile returned 0 unexpectedly");
+                            break;
+                        }
+                        totalWritten += static_cast<uint32_t>(writtenBytes);
+                    }
+                }
+            });
+        }
+
+        pool.WaitIdle();
+
+        if (firstError.hasError.load(std::memory_order_acquire))
+        {
+            if (errorMessage != nullptr)
+            {
+                std::lock_guard<std::mutex> lock(firstError.mutex);
+                *errorMessage = firstError.message;
+            }
+            return false;
+        }
+
+        (void)TryCloneFileTimesAndAttributes(sourcePath, destPath);
+        return true;
+    }
 }
 
-GB_SmbAccessor::GB_SmbAccessor(const std::wstring& hostOrIp, AddressType addressType)
-    : hostOrIp_(hostOrIp),
-    addressType_(addressType),
-    credentials_(),
-    useLongPathPrefix_(false)
+GB_SmbAccessor::GB_SmbAccessor(const std::wstring& hostOrIp, AddressType addressType): hostOrIp_(hostOrIp), addressType_(addressType), credentials_(), useLongPathPrefix_(false)
 {
 }
 
 GB_SmbAccessor::GB_SmbAccessor(const std::wstring& hostOrIp, AddressType addressType, const Credentials& credentials)
-    : hostOrIp_(hostOrIp),
-    addressType_(addressType),
-    credentials_(credentials),
-    useLongPathPrefix_(false)
+    : hostOrIp_(hostOrIp), addressType_(addressType), credentials_(credentials), useLongPathPrefix_(false)
 {
 }
 
@@ -512,9 +843,9 @@ bool GB_SmbAccessor::TestTcp445(int timeoutMs, std::wstring* errorMessage) const
     hints.ai_socktype = SOCK_STREAM;
     hints.ai_protocol = IPPROTO_TCP;
 
-    const std::wstring port = L"445";
+    const static std::wstring port = L"445";
     addrinfoW* resultList = nullptr;
-    const std::wstring hostForSocket = hostOrIp_; // 这里直接用原始 host/ip；IPv6 literal 在 getaddrinfo 里是合法的
+    const std::wstring hostForSocket = hostOrIp_; // 直接用原始 host/ip；IPv6 literal 在 getaddrinfo 里是合法的
 
     const int gaiResult = ::GetAddrInfoW(hostForSocket.c_str(), port.c_str(), &hints, &resultList);
     if (gaiResult != 0)
@@ -618,7 +949,7 @@ bool GB_SmbAccessor::TestSmbConnection(std::wstring* errorMessage) const
     const bool ok = ConnectShare(L"IPC$", false, errorMessage);
     if (ok)
     {
-        // 不强制断开：有时上层希望保持会话；这里给个“尽力而为”断开
+        // 不强制断开：有时上层希望保持会话
         std::wstring dummy;
         DisconnectShare(L"IPC$", true, &dummy);
     }
@@ -801,12 +1132,7 @@ bool GB_SmbAccessor::DisconnectShare(const std::wstring& shareName, bool force, 
     return true;
 }
 
-bool GB_SmbAccessor::ListDirectory(const std::wstring& shareName,
-    const std::wstring& relativeDir,
-    std::vector<std::wstring>* childNames,
-    bool includeDirectories,
-    bool includeFiles,
-    std::wstring* errorMessage) const
+bool GB_SmbAccessor::ListDirectory(const std::wstring& shareName, const std::wstring& relativeDir, std::vector<std::wstring>* childNames, bool includeDirectories, bool includeFiles, std::wstring* errorMessage) const
 {
     if (errorMessage != nullptr)
     {
@@ -990,9 +1316,7 @@ bool GB_SmbAccessor::CreateDirectoryRecursive(const std::wstring& shareName, con
     while (pos < fullDir.size())
     {
         const size_t nextSep = fullDir.find(L'\\', pos);
-        const std::wstring segment = (nextSep == std::wstring::npos)
-            ? fullDir.substr(pos)
-            : fullDir.substr(pos, nextSep - pos);
+        const std::wstring segment = (nextSep == std::wstring::npos) ? fullDir.substr(pos) : fullDir.substr(pos, nextSep - pos);
 
         if (!segment.empty())
         {
@@ -1126,6 +1450,529 @@ bool GB_SmbAccessor::CopyFileToLocal(const std::wstring& shareName, const std::w
 }
 
 
+bool GB_SmbAccessor::CopyFileFromLocalParallel(const std::wstring& localPath, const std::wstring& shareName, const std::wstring& remoteRelativePath,
+    bool overwrite, std::wstring* errorMessage, size_t threadCount) const
+{
+    if (errorMessage != nullptr)
+    {
+        errorMessage->clear();
+    }
+
+    // 先确保远端父目录存在（与 CopyFileFromLocalInternal 的行为一致）。
+    const std::wstring parentDir = GetParentPath(remoteRelativePath);
+    if (!parentDir.empty())
+    {
+        const bool ok = CreateDirectoryRecursive(shareName, parentDir, errorMessage);
+        if (!ok)
+        {
+            return false;
+        }
+    }
+
+    const std::wstring remotePath = BuildUncPathInternal(shareName, remoteRelativePath, useLongPathPrefix_);
+
+    // 超大文件场景：优先沿用现有 CopyFile2 + COPY_FILE_NO_BUFFERING 的路径。
+    uint64_t fileSize = 0;
+    if (TryGetFileSizeByPath(localPath, &fileSize) && fileSize >= kLargeFileNoBufferingThresholdBytes)
+    {
+        return CopyFileBestEffort(localPath, remotePath, overwrite, true, errorMessage, L"CopyFileParallel(local->remote)");
+    }
+
+    const size_t normalizedThreadCount = NormalizeParallelThreadCount(threadCount);
+    return CopyFileBySegmentsParallel(localPath, remotePath, overwrite, normalizedThreadCount, errorMessage, L"CopyFileParallel(local->remote)");
+}
+
+
+bool GB_SmbAccessor::CopyFileToLocalParallel(const std::wstring& shareName, const std::wstring& remoteRelativePath, const std::wstring& localPath,
+    bool overwrite, std::wstring* errorMessage, size_t threadCount) const
+{
+    if (errorMessage != nullptr)
+    {
+        errorMessage->clear();
+    }
+
+    // 先确保本地父目录存在（与 CopyFileToLocalInternal 的行为一致）。
+    const std::wstring localParentDir = GetParentPath(localPath);
+    if (!localParentDir.empty())
+    {
+        const bool ok = CreateLocalDirectoryRecursive(localParentDir, errorMessage);
+        if (!ok)
+        {
+            return false;
+        }
+    }
+
+    const std::wstring remotePath = BuildUncPathInternal(shareName, remoteRelativePath, useLongPathPrefix_);
+
+    // 超大文件场景：优先沿用现有 CopyFile2 + COPY_FILE_NO_BUFFERING 的路径。
+    uint64_t fileSize = 0;
+    if (TryGetFileSizeByPath(remotePath, &fileSize) && fileSize >= kLargeFileNoBufferingThresholdBytes)
+    {
+        return CopyFileBestEffort(remotePath, localPath, overwrite, true, errorMessage, L"CopyFileParallel(remote->local)");
+    }
+
+    const size_t normalizedThreadCount = NormalizeParallelThreadCount(threadCount);
+    return CopyFileBySegmentsParallel(remotePath, localPath, overwrite, normalizedThreadCount, errorMessage, L"CopyFileParallel(remote->local)");
+}
+
+
+bool GB_SmbAccessor::CopyDirectoryFromLocalParallel(const std::wstring& localDirectory, const std::wstring& shareName, const std::wstring& remoteRelativePath,
+    bool overwrite, std::wstring* errorMessage, size_t threadCount) const
+{
+    if (errorMessage != nullptr)
+    {
+        errorMessage->clear();
+    }
+
+    std::wstring localDir = NormalizeSlashes(localDirectory);
+    while (!localDir.empty() && localDir.back() == L'\\')
+    {
+        localDir.pop_back();
+    }
+
+    const DWORD attrs = ::GetFileAttributesW(localDir.c_str());
+    if (attrs == INVALID_FILE_ATTRIBUTES || (attrs & FILE_ATTRIBUTE_DIRECTORY) == 0)
+    {
+        if (errorMessage != nullptr)
+        {
+            *errorMessage = L"Local directory not found: " + localDir;
+        }
+        return false;
+    }
+
+    // 只对“根目标目录”做一次递归创建（保证中间目录存在）。
+    const bool createdRemoteDir = CreateDirectoryRecursive(shareName, remoteRelativePath, errorMessage);
+    if (!createdRemoteDir)
+    {
+        return false;
+    }
+
+    const size_t normalizedThreadCount = NormalizeParallelThreadCount(threadCount);
+    const size_t maxQueueSize = NormalizeParallelMaxQueueSize(normalizedThreadCount);
+    GB_ThreadPool pool(normalizedThreadCount, maxQueueSize);
+
+    ParallelFirstError firstError;
+
+    struct DirTask
+    {
+        std::wstring localDir;
+        std::wstring remoteRel;
+        bool skipEnsureRemoteDir = false;
+    };
+
+    auto EnsureRemoteDirOneLevel = [&](const std::wstring& remoteRel, std::wstring* ensureErrorMessage) -> bool {
+        if (remoteRel.empty())
+        {
+            return true;
+        }
+    
+        std::wstring fullDir = BuildUncPathInternal(shareName, remoteRel, useLongPathPrefix_);
+        fullDir = NormalizeSlashes(fullDir);
+        while (!fullDir.empty() && fullDir.back() == L'\\')
+        {
+            fullDir.pop_back();
+        }
+    
+        const BOOL ok = ::CreateDirectoryW(fullDir.c_str(), nullptr);
+        if (ok)
+        {
+            return true;
+        }
+    
+        const DWORD err = ::GetLastError();
+        if (err == ERROR_ALREADY_EXISTS)
+        {
+            const DWORD attrs = ::GetFileAttributesW(fullDir.c_str());
+            if (attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_DIRECTORY) != 0)
+            {
+                return true;
+            }
+            if (ensureErrorMessage != nullptr)
+            {
+                *ensureErrorMessage = L"Destination path exists but is not a directory: " + fullDir;
+            }
+            return false;
+        }
+    
+        if (ensureErrorMessage != nullptr)
+        {
+            *ensureErrorMessage = L"CreateDirectoryW(remote) failed: " + FormatWin32ErrorMessage(err);
+        }
+        return false;
+    };
+
+    std::vector<DirTask> taskStack;
+    taskStack.reserve(64);
+    {
+        DirTask root;
+        root.localDir = localDir;
+        root.remoteRel = remoteRelativePath;
+        root.skipEnsureRemoteDir = true; // 根目录已递归创建
+        taskStack.push_back(root);
+    }
+
+    while (!taskStack.empty())
+    {
+        if (firstError.hasError.load(std::memory_order_acquire))
+        {
+            break;
+        }
+
+        const DirTask task = taskStack.back();
+        taskStack.pop_back();
+
+        if (!task.skipEnsureRemoteDir)
+        {
+            const bool ensured = EnsureRemoteDirOneLevel(task.remoteRel, errorMessage);
+            if (!ensured)
+            {
+                firstError.SetOnce(errorMessage != nullptr ? *errorMessage : L"EnsureRemoteDirOneLevel failed");
+                break;
+            }
+        }
+
+        std::wstring searchPath = NormalizeSlashes(task.localDir);
+        if (!searchPath.empty() && searchPath.back() != L'\\')
+        {
+            searchPath += L"\\";
+        }
+        searchPath += L"*";
+
+        WIN32_FIND_DATAW findData;
+        ::ZeroMemory(&findData, sizeof(findData));
+
+        HANDLE handle = FindFirstFileExCompatible(searchPath, &findData, false);
+        if (handle == INVALID_HANDLE_VALUE)
+        {
+            const DWORD err = ::GetLastError();
+            if (errorMessage != nullptr)
+            {
+                *errorMessage = L"FindFirstFileExW(local) failed: " + FormatWin32ErrorMessage(err);
+            }
+            firstError.SetOnce(errorMessage != nullptr ? *errorMessage : L"FindFirstFileExW(local) failed");
+            break;
+        }
+
+        FindHandleGuard guard(handle);
+
+        while (true)
+        {
+            if (firstError.hasError.load(std::memory_order_acquire))
+            {
+                break;
+            }
+
+            const std::wstring name = findData.cFileName;
+            if (name != L"." && name != L"..")
+            {
+                const DWORD attrs = findData.dwFileAttributes;
+                const bool isDirectory = (attrs & FILE_ATTRIBUTE_DIRECTORY) != 0;
+                const bool isReparsePoint = (attrs & FILE_ATTRIBUTE_REPARSE_POINT) != 0;
+
+                const std::wstring childLocalPath = JoinPath(task.localDir, name);
+                const std::wstring childRemoteRel = task.remoteRel.empty() ? name : JoinPath(task.remoteRel, name);
+
+                if (isDirectory)
+                {
+                    if (!isReparsePoint)
+                    {
+                        DirTask child;
+                        child.localDir = childLocalPath;
+                        child.remoteRel = childRemoteRel;
+                        child.skipEnsureRemoteDir = false;
+                        taskStack.push_back(child);
+                    }
+                    else
+                    {
+                        const bool ensured = EnsureRemoteDirOneLevel(childRemoteRel, errorMessage);
+                        if (!ensured)
+                        {
+                            firstError.SetOnce(errorMessage != nullptr ? *errorMessage : L"EnsureRemoteDirOneLevel failed");
+                            break;
+                        }
+                    }
+                }
+                else
+                {
+                    const std::wstring localPathCopy = childLocalPath;
+                    const std::wstring remoteRelCopy = childRemoteRel;
+                    pool.Post([&, localPathCopy, remoteRelCopy]() {
+                        if (firstError.hasError.load(std::memory_order_acquire))
+                        {
+                            return;
+                        }
+
+                        std::wstring localError;
+                        const bool ok = CopyFileFromLocalInternal(localPathCopy, shareName, remoteRelCopy, overwrite, true, &localError);
+                        if (!ok)
+                        {
+                            firstError.SetOnce(localError);
+                        }
+                    });
+                }
+            }
+
+            const BOOL ok = ::FindNextFileW(handle, &findData);
+            if (!ok)
+            {
+                const DWORD err = ::GetLastError();
+                if (err == ERROR_NO_MORE_FILES)
+                {
+                    break;
+                }
+                if (errorMessage != nullptr)
+                {
+                    *errorMessage = L"FindNextFileW(local) failed: " + FormatWin32ErrorMessage(err);
+                }
+                firstError.SetOnce(errorMessage != nullptr ? *errorMessage : L"FindNextFileW(local) failed");
+                break;
+            }
+        }
+    }
+
+    pool.WaitIdle();
+
+    if (firstError.hasError.load(std::memory_order_acquire))
+    {
+        if (errorMessage != nullptr)
+        {
+            std::lock_guard<std::mutex> lock(firstError.mutex);
+            *errorMessage = firstError.message;
+        }
+        return false;
+    }
+
+    return true;
+}
+
+
+bool GB_SmbAccessor::CopyDirectoryToLocalParallel(const std::wstring& shareName, const std::wstring& remoteRelativePath, const std::wstring& localDirectory,
+    bool overwrite, std::wstring* errorMessage, size_t threadCount) const
+{
+    if (errorMessage != nullptr)
+    {
+        errorMessage->clear();
+    }
+
+    std::wstring localDir = NormalizeSlashes(localDirectory);
+    while (!localDir.empty() && localDir.back() == L'\\')
+    {
+        localDir.pop_back();
+    }
+
+    const bool createdLocalDir = CreateLocalDirectoryRecursive(localDir, errorMessage);
+    if (!createdLocalDir)
+    {
+        return false;
+    }
+
+    const std::wstring remoteDirPath = BuildUncPathInternal(shareName, remoteRelativePath, useLongPathPrefix_);
+    const DWORD attrs = ::GetFileAttributesW(remoteDirPath.c_str());
+    if (attrs == INVALID_FILE_ATTRIBUTES || (attrs & FILE_ATTRIBUTE_DIRECTORY) == 0)
+    {
+        if (errorMessage != nullptr)
+        {
+            *errorMessage = L"Remote directory not found: " + remoteDirPath;
+        }
+        return false;
+    }
+
+    const size_t normalizedThreadCount = NormalizeParallelThreadCount(threadCount);
+    const size_t maxQueueSize = NormalizeParallelMaxQueueSize(normalizedThreadCount);
+    GB_ThreadPool pool(normalizedThreadCount, maxQueueSize);
+
+    ParallelFirstError firstError;
+
+    struct DirTask
+    {
+        std::wstring remoteRel;
+        std::wstring localDir;
+        bool skipEnsureLocalDir = false;
+    };
+
+    auto EnsureLocalDirOneLevel = [&](const std::wstring& fullLocalDir, std::wstring* ensureErrorMessage) -> bool {
+        std::wstring dirPath = NormalizeSlashes(fullLocalDir);
+        while (!dirPath.empty() && dirPath.back() == L'\\')
+        {
+            dirPath.pop_back();
+        }
+
+        const BOOL ok = ::CreateDirectoryW(dirPath.c_str(), nullptr);
+        if (ok)
+        {
+            return true;
+        }
+
+        const DWORD err = ::GetLastError();
+        if (err == ERROR_ALREADY_EXISTS)
+        {
+            const DWORD attrs = ::GetFileAttributesW(dirPath.c_str());
+            if (attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_DIRECTORY) != 0)
+            {
+                return true;
+            }
+            if (ensureErrorMessage != nullptr)
+            {
+                *ensureErrorMessage = L"Destination path exists but is not a directory: " + dirPath;
+            }
+            return false;
+        }
+
+        if (ensureErrorMessage != nullptr)
+        {
+            *ensureErrorMessage = L"CreateDirectoryW(local) failed: " + FormatWin32ErrorMessage(err);
+        }
+        return false;
+    };
+
+    std::vector<DirTask> taskStack;
+    taskStack.reserve(64);
+    {
+        DirTask root;
+        root.remoteRel = remoteRelativePath;
+        root.localDir = localDir;
+        root.skipEnsureLocalDir = true;
+        taskStack.push_back(root);
+    }
+
+    while (!taskStack.empty())
+    {
+        if (firstError.hasError.load(std::memory_order_acquire))
+        {
+            break;
+        }
+
+        const DirTask task = taskStack.back();
+        taskStack.pop_back();
+
+        if (!task.skipEnsureLocalDir)
+        {
+            const bool ensured = EnsureLocalDirOneLevel(task.localDir, errorMessage);
+            if (!ensured)
+            {
+                firstError.SetOnce(errorMessage != nullptr ? *errorMessage : L"EnsureLocalDirOneLevel failed");
+                break;
+            }
+        }
+
+        const std::wstring currentRemoteDirPath = BuildUncPathInternal(shareName, task.remoteRel, useLongPathPrefix_);
+
+        std::wstring searchPath = NormalizeSlashes(currentRemoteDirPath);
+        if (!searchPath.empty() && searchPath.back() != L'\\')
+        {
+            searchPath += L"\\";
+        }
+        searchPath += L"*";
+
+        WIN32_FIND_DATAW findData;
+        ::ZeroMemory(&findData, sizeof(findData));
+
+        HANDLE handle = FindFirstFileExCompatible(searchPath, &findData, true);
+        if (handle == INVALID_HANDLE_VALUE)
+        {
+            const DWORD err = ::GetLastError();
+            if (errorMessage != nullptr)
+            {
+                *errorMessage = L"FindFirstFileExW(remote) failed: " + FormatWin32ErrorMessage(err);
+            }
+            firstError.SetOnce(errorMessage != nullptr ? *errorMessage : L"FindFirstFileExW(remote) failed");
+            break;
+        }
+
+        FindHandleGuard guard(handle);
+
+        while (true)
+        {
+            if (firstError.hasError.load(std::memory_order_acquire))
+            {
+                break;
+            }
+
+            const std::wstring name = findData.cFileName;
+            if (name != L"." && name != L"..")
+            {
+                const DWORD attrs = findData.dwFileAttributes;
+                const bool isDirectory = (attrs & FILE_ATTRIBUTE_DIRECTORY) != 0;
+                const bool isReparsePoint = (attrs & FILE_ATTRIBUTE_REPARSE_POINT) != 0;
+
+                const std::wstring childLocalPath = JoinPath(task.localDir, name);
+                const std::wstring childRemoteRel = task.remoteRel.empty() ? name : JoinPath(task.remoteRel, name);
+
+                if (isDirectory)
+                {
+                    if (!isReparsePoint)
+                    {
+                        DirTask child;
+                        child.remoteRel = childRemoteRel;
+                        child.localDir = childLocalPath;
+                        child.skipEnsureLocalDir = false;
+                        taskStack.push_back(child);
+                    }
+                    else
+                    {
+                        const bool ensured = EnsureLocalDirOneLevel(childLocalPath, errorMessage);
+                        if (!ensured)
+                        {
+                            firstError.SetOnce(errorMessage != nullptr ? *errorMessage : L"EnsureLocalDirOneLevel failed");
+                            break;
+                        }
+                    }
+                }
+                else
+                {
+                    const std::wstring localPathCopy = childLocalPath;
+                    const std::wstring remoteRelCopy = childRemoteRel;
+                    pool.Post([&, localPathCopy, remoteRelCopy]()
+                        {
+                            if (firstError.hasError.load(std::memory_order_acquire))
+                            {
+                                return;
+                            }
+
+                            std::wstring localError;
+                            const bool ok = CopyFileToLocalInternal(shareName, remoteRelCopy, localPathCopy, overwrite, true, &localError);
+                            if (!ok)
+                            {
+                                firstError.SetOnce(localError);
+                            }
+                        });
+                }
+            }
+
+            const BOOL ok = ::FindNextFileW(handle, &findData);
+            if (!ok)
+            {
+                const DWORD err = ::GetLastError();
+                if (err == ERROR_NO_MORE_FILES)
+                {
+                    break;
+                }
+                if (errorMessage != nullptr)
+                {
+                    *errorMessage = L"FindNextFileW(remote) failed: " + FormatWin32ErrorMessage(err);
+                }
+                firstError.SetOnce(errorMessage != nullptr ? *errorMessage : L"FindNextFileW(remote) failed");
+                break;
+            }
+        }
+    }
+
+    pool.WaitIdle();
+
+    if (firstError.hasError.load(std::memory_order_acquire))
+    {
+        if (errorMessage != nullptr)
+        {
+            std::lock_guard<std::mutex> lock(firstError.mutex);
+            *errorMessage = firstError.message;
+        }
+        return false;
+    }
+
+    return true;
+}
+
+
 bool GB_SmbAccessor::CopyDirectoryFromLocal(const std::wstring& localDirectory, const std::wstring& shareName, const std::wstring& remoteRelativePath, bool overwrite, std::wstring* errorMessage) const
 {
     if (errorMessage != nullptr)
@@ -1164,48 +2011,47 @@ bool GB_SmbAccessor::CopyDirectoryFromLocal(const std::wstring& localDirectory, 
         bool skipEnsureRemoteDir = false;
     };
 
-    auto EnsureRemoteDirOneLevel = [&](const std::wstring& remoteRel, std::wstring* ensureErrorMessage) -> bool
+    auto EnsureRemoteDirOneLevel = [&](const std::wstring& remoteRel, std::wstring* ensureErrorMessage) -> bool {
+        if (remoteRel.empty())
         {
-            if (remoteRel.empty())
+            // share 根目录无需创建
+            return true;
+        }
+
+        std::wstring fullDir = BuildUncPathInternal(shareName, remoteRel, useLongPathPrefix_);
+        fullDir = NormalizeSlashes(fullDir);
+        while (!fullDir.empty() && fullDir.back() == L'\\')
+        {
+            fullDir.pop_back();
+        }
+
+        const BOOL ok = ::CreateDirectoryW(fullDir.c_str(), nullptr);
+        if (ok)
+        {
+            return true;
+        }
+
+        const DWORD err = ::GetLastError();
+        if (err == ERROR_ALREADY_EXISTS)
+        {
+            const DWORD attrs = ::GetFileAttributesW(fullDir.c_str());
+            if (attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_DIRECTORY) != 0)
             {
-                // share 根目录无需创建
                 return true;
             }
-
-            std::wstring fullDir = BuildUncPathInternal(shareName, remoteRel, useLongPathPrefix_);
-            fullDir = NormalizeSlashes(fullDir);
-            while (!fullDir.empty() && fullDir.back() == L'\\')
-            {
-                fullDir.pop_back();
-            }
-
-            const BOOL ok = ::CreateDirectoryW(fullDir.c_str(), nullptr);
-            if (ok)
-            {
-                return true;
-            }
-
-            const DWORD err = ::GetLastError();
-            if (err == ERROR_ALREADY_EXISTS)
-            {
-                const DWORD attrs = ::GetFileAttributesW(fullDir.c_str());
-                if (attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_DIRECTORY) != 0)
-                {
-                    return true;
-                }
-                if (ensureErrorMessage != nullptr)
-                {
-                    *ensureErrorMessage = L"Destination path exists but is not a directory: " + fullDir;
-                }
-                return false;
-            }
-
             if (ensureErrorMessage != nullptr)
             {
-                *ensureErrorMessage = L"CreateDirectoryW(remote) failed: " + FormatWin32ErrorMessage(err);
+                *ensureErrorMessage = L"Destination path exists but is not a directory: " + fullDir;
             }
             return false;
-        };
+        }
+
+        if (ensureErrorMessage != nullptr)
+        {
+            *ensureErrorMessage = L"CreateDirectoryW(remote) failed: " + FormatWin32ErrorMessage(err);
+        }
+        return false;
+    };
 
     std::vector<DirTask> taskStack;
     taskStack.reserve(64);
@@ -1356,41 +2202,40 @@ bool GB_SmbAccessor::CopyDirectoryToLocal(const std::wstring& shareName, const s
         bool skipEnsureLocalDir = false;
     };
 
-    auto EnsureLocalDirOneLevel = [&](const std::wstring& fullLocalDir, std::wstring* ensureErrorMessage) -> bool
+    auto EnsureLocalDirOneLevel = [&](const std::wstring& fullLocalDir, std::wstring* ensureErrorMessage) -> bool {
+        std::wstring dirPath = NormalizeSlashes(fullLocalDir);
+        while (!dirPath.empty() && dirPath.back() == L'\\')
         {
-            std::wstring dirPath = NormalizeSlashes(fullLocalDir);
-            while (!dirPath.empty() && dirPath.back() == L'\\')
-            {
-                dirPath.pop_back();
-            }
+            dirPath.pop_back();
+        }
 
-            const BOOL ok = ::CreateDirectoryW(dirPath.c_str(), nullptr);
-            if (ok)
+        const BOOL ok = ::CreateDirectoryW(dirPath.c_str(), nullptr);
+        if (ok)
+        {
+            return true;
+        }
+
+        const DWORD err = ::GetLastError();
+        if (err == ERROR_ALREADY_EXISTS)
+        {
+            const DWORD attrs = ::GetFileAttributesW(dirPath.c_str());
+            if (attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_DIRECTORY) != 0)
             {
                 return true;
             }
-
-            const DWORD err = ::GetLastError();
-            if (err == ERROR_ALREADY_EXISTS)
-            {
-                const DWORD attrs = ::GetFileAttributesW(dirPath.c_str());
-                if (attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_DIRECTORY) != 0)
-                {
-                    return true;
-                }
-                if (ensureErrorMessage != nullptr)
-                {
-                    *ensureErrorMessage = L"Destination path exists but is not a directory: " + dirPath;
-                }
-                return false;
-            }
-
             if (ensureErrorMessage != nullptr)
             {
-                *ensureErrorMessage = L"CreateDirectoryW(local) failed: " + FormatWin32ErrorMessage(err);
+                *ensureErrorMessage = L"Destination path exists but is not a directory: " + dirPath;
             }
             return false;
-        };
+        }
+
+        if (ensureErrorMessage != nullptr)
+        {
+            *ensureErrorMessage = L"CreateDirectoryW(local) failed: " + FormatWin32ErrorMessage(err);
+        }
+        return false;
+    };
 
     std::vector<DirTask> taskStack;
     taskStack.reserve(64);
