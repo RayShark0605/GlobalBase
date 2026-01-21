@@ -1777,9 +1777,14 @@ bool GB_SmbAccessor::CopyDirectoryToLocalParallel(const std::wstring& shareName,
         return false;
     }
 
+    // 目录拷贝的“自动并发”不宜太激进：SMB 多流并发可能会触发更多往返/竞争，导致吞吐下降。
+    // 若外部显式指定 threadCount，则尊重；否则把自动并发上限收敛到 4。
+    const size_t requestedThreadCount = threadCount;
     const size_t normalizedThreadCount = NormalizeParallelThreadCount(threadCount);
-    const size_t maxQueueSize = NormalizeParallelMaxQueueSize(normalizedThreadCount);
-    GB_ThreadPool pool(normalizedThreadCount, maxQueueSize);
+    const size_t poolThreadCount = (requestedThreadCount == 0) ? std::min<size_t>(normalizedThreadCount, 4) : normalizedThreadCount;
+
+    const size_t maxQueueSize = NormalizeParallelMaxQueueSize(poolThreadCount);
+    GB_ThreadPool pool(poolThreadCount, maxQueueSize);
 
     ParallelFirstError firstError;
 
@@ -1823,7 +1828,71 @@ bool GB_SmbAccessor::CopyDirectoryToLocalParallel(const std::wstring& shareName,
             *ensureErrorMessage = L"CreateDirectoryW(local) failed: " + FormatWin32ErrorMessage(err);
         }
         return false;
-    };
+        };
+
+    // 目录拷贝的“文件任务”中避免再调用 GetFileAttributesExW(UNC) 做远端元数据探测：
+    // - 枚举阶段的 WIN32_FIND_DATAW 已经带了文件大小；
+    // - 直接走 CopyFile2/CopyFileW 的拷贝路径即可，减少一次 SMB 往返。
+    auto CopyFileRemoteToLocalFast = [&](const std::wstring& remoteRel, const std::wstring& localPath, uint64_t fileSizeBytes,
+        std::wstring* localErrorMessage) -> bool
+        {
+            const std::wstring sourcePath = BuildUncPathInternal(shareName, remoteRel, useLongPathPrefix_);
+            const std::wstring destPath = NormalizeSlashes(localPath);
+
+            // 超大文件：保留原先的 NO_BUFFERING 优化尝试（若不支持会自动回退）。
+            const bool useNoBuffering = (fileSizeBytes >= kLargeFileNoBufferingThresholdBytes);
+
+            bool triedCopyFile2 = false;
+            CopyFile2Func copyFile2 = GetCopyFile2Func();
+            if (copyFile2 != nullptr)
+            {
+                triedCopyFile2 = true;
+
+                COPYFILE2_EXTENDED_PARAMETERS params;
+                ::ZeroMemory(&params, sizeof(params));
+                params.dwSize = sizeof(params);
+                params.dwCopyFlags = 0;
+                if (!overwrite)
+                {
+                    params.dwCopyFlags |= COPY_FILE_FAIL_IF_EXISTS;
+                }
+                if (useNoBuffering)
+                {
+                    params.dwCopyFlags |= COPY_FILE_NO_BUFFERING;
+                }
+
+                const HRESULT hr = copyFile2(sourcePath.c_str(), destPath.c_str(), &params);
+                if (SUCCEEDED(hr))
+                {
+                    (void)TryCloneFileTimesAndAttributes(sourcePath, destPath);
+                    return true;
+                }
+            }
+
+            const BOOL ok = ::CopyFileW(sourcePath.c_str(), destPath.c_str(), overwrite ? FALSE : TRUE);
+            if (!ok)
+            {
+                const DWORD err = ::GetLastError();
+                if (localErrorMessage != nullptr)
+                {
+                    std::wstring msg = L"CopyFile(remote->local) failed: ";
+                    msg += sourcePath;
+                    msg += L" -> ";
+                    msg += destPath;
+                    msg += L", ";
+                    msg += FormatWin32ErrorMessageLocal(err);
+                    if (triedCopyFile2)
+                    {
+                        msg += L" (CopyFile2 attempt was made)";
+                    }
+                    *localErrorMessage = msg;
+                }
+                return false;
+            }
+
+            (void)TryCloneFileTimesAndAttributes(sourcePath, destPath);
+            return true;
+        };
 
     std::vector<DirTask> taskStack;
     taskStack.reserve(64);
@@ -1920,9 +1989,13 @@ bool GB_SmbAccessor::CopyDirectoryToLocalParallel(const std::wstring& shareName,
                 }
                 else
                 {
+                    const uint64_t high = static_cast<uint64_t>(findData.nFileSizeHigh);
+                    const uint64_t low = static_cast<uint64_t>(findData.nFileSizeLow);
+                    const uint64_t fileSizeBytes = (high << 32) | low;
+
                     const std::wstring localPathCopy = childLocalPath;
                     const std::wstring remoteRelCopy = childRemoteRel;
-                    pool.Post([&, localPathCopy, remoteRelCopy]()
+                    pool.Post([&, localPathCopy, remoteRelCopy, fileSizeBytes]()
                         {
                             if (firstError.hasError.load(std::memory_order_acquire))
                             {
@@ -1930,7 +2003,7 @@ bool GB_SmbAccessor::CopyDirectoryToLocalParallel(const std::wstring& shareName,
                             }
 
                             std::wstring localError;
-                            const bool ok = CopyFileToLocalInternal(shareName, remoteRelCopy, localPathCopy, overwrite, true, &localError);
+                            const bool ok = CopyFileRemoteToLocalFast(remoteRelCopy, localPathCopy, fileSizeBytes, &localError);
                             if (!ok)
                             {
                                 firstError.SetOnce(localError);
