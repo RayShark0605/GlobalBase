@@ -17,7 +17,6 @@
 
 #include "GlobalBasePort.h"
 
-
 // 获取当前控制台编码
 GLOBALBASE_PORT void GetConsoleEncodingString(std::string& encodingString);
 GLOBALBASE_PORT void GetConsoleEncodingCode(unsigned int& codePageId); // 未知编码则返回UINT_MAX

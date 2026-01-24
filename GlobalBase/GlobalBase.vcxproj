@@ -25,6 +25,7 @@
     <ClInclude Include="GB_FileSystem.h" />
     <ClInclude Include="GB_IO.h" />
     <ClInclude Include="GB_Logger.h" />
+    <ClInclude Include="GB_Math.h" />
     <ClInclude Include="GB_ReadWriteLock.h" />
     <ClInclude Include="GB_SmbAccessor.h" />
     <ClInclude Include="GB_SysInfo.h" />
@@ -32,7 +33,11 @@
     <ClInclude Include="GB_Timer.h" />
     <ClInclude Include="GB_Utf8String.h" />
     <ClInclude Include="GB_Utility.h" />
-    <ClInclude Include="GlobalBase.h" />
+    <ClInclude Include="Geometry\GB_GeometryInterface.h" />
+    <ClInclude Include="Geometry\GB_Matrix3x3.h" />
+    <ClInclude Include="Geometry\GB_Point2d.h" />
+    <ClInclude Include="Geometry\GB_Vector2d.h" />
+    <ClInclude Include="GB_BaseTypes.h" />
     <ClInclude Include="GlobalBasePort.h" />
   </ItemGroup>
   <ItemGroup>
@@ -49,6 +54,10 @@
     <ClCompile Include="GB_Timer.cpp" />
     <ClCompile Include="GB_Utf8String.cpp" />
     <ClCompile Include="GB_Utility.cpp" />
+    <ClCompile Include="Geometry\GB_GeometryInterface.cpp" />
+    <ClCompile Include="Geometry\GB_Matrix3x3.cpp" />
+    <ClCompile Include="Geometry\GB_Point2d.cpp" />
+    <ClCompile Include="Geometry\GB_Vector2d.cpp" />
   </ItemGroup>
   <PropertyGroup Label="Globals">
     <VCProjectVersion>17.0</VCProjectVersion>
@@ -143,7 +152,9 @@
       <PrecompiledHeader>NotUsing</PrecompiledHeader>
       <PrecompiledHeaderFile>
       </PrecompiledHeaderFile>
-      <LanguageStandard />
+      <LanguageStandard>
+      </LanguageStandard>
+      <OpenMPSupport>true</OpenMPSupport>
     </ClCompile>
     <Link>
       <SubSystem>Windows</SubSystem>
@@ -162,7 +173,9 @@
       <PrecompiledHeader>NotUsing</PrecompiledHeader>
       <PrecompiledHeaderFile>
       </PrecompiledHeaderFile>
-      <LanguageStandard />
+      <LanguageStandard>
+      </LanguageStandard>
+      <OpenMPSupport>true</OpenMPSupport>
     </ClCompile>
     <Link>
       <SubSystem>Windows</SubSystem>

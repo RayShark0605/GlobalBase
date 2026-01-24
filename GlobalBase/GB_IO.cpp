@@ -2,6 +2,7 @@
 #include "GB_FileSystem.h"
 #include <fstream>
 #include <limits>
+#include <cstring>
 
 #ifdef _WIN32
 #define NOMINMAX
@@ -219,8 +220,7 @@ std::vector<unsigned char> ReadFileToBinary(const std::string& filePathUtf8)
         return {};
     }
 
-    std::vector<unsigned char> buffer;
-    buffer.resize(static_cast<size_t>(fileSize64));
+    GB_ByteBuffer buffer(static_cast<size_t>(fileSize64));
 
     unsigned char* writePtr = buffer.data();
     size_t remaining = buffer.size();
@@ -316,7 +316,7 @@ std::vector<unsigned char> ReadFileToBinary(const std::string& filePathUtf8)
 #endif
 }
 
-bool WriteBinaryToFile(const std::vector<unsigned char>& data, const std::string& filePathUtf8)
+bool WriteBinaryToFile(const GB_ByteBuffer& data, const std::string& filePathUtf8)
 {
     if (filePathUtf8.empty())
     {
@@ -530,7 +530,100 @@ bool WriteBinaryToFile(const std::vector<unsigned char>& data, const std::string
 #endif
 }
 
+void GB_ByteBufferIO::AppendUInt16LE(GB_ByteBuffer& buffer, uint16_t value)
+{
+    buffer.push_back(static_cast<unsigned char>((value >> 0) & 0xFF));
+    buffer.push_back(static_cast<unsigned char>((value >> 8) & 0xFF));
+}
 
+void GB_ByteBufferIO::AppendUInt32LE(GB_ByteBuffer& buffer, uint32_t value)
+{
+    buffer.push_back(static_cast<unsigned char>((value >> 0) & 0xFF));
+    buffer.push_back(static_cast<unsigned char>((value >> 8) & 0xFF));
+    buffer.push_back(static_cast<unsigned char>((value >> 16) & 0xFF));
+    buffer.push_back(static_cast<unsigned char>((value >> 24) & 0xFF));
+}
+
+void GB_ByteBufferIO::AppendUInt64LE(GB_ByteBuffer& buffer, uint64_t value)
+{
+    buffer.push_back(static_cast<unsigned char>((value >> 0) & 0xFF));
+    buffer.push_back(static_cast<unsigned char>((value >> 8) & 0xFF));
+    buffer.push_back(static_cast<unsigned char>((value >> 16) & 0xFF));
+    buffer.push_back(static_cast<unsigned char>((value >> 24) & 0xFF));
+    buffer.push_back(static_cast<unsigned char>((value >> 32) & 0xFF));
+    buffer.push_back(static_cast<unsigned char>((value >> 40) & 0xFF));
+    buffer.push_back(static_cast<unsigned char>((value >> 48) & 0xFF));
+    buffer.push_back(static_cast<unsigned char>((value >> 56) & 0xFF));
+}
+
+void GB_ByteBufferIO::AppendDoubleLE(GB_ByteBuffer& buffer, double value)
+{
+    uint64_t bits = 0;
+    static_assert(sizeof(double) == sizeof(uint64_t), "Unexpected double size.");
+    std::memcpy(&bits, &value, sizeof(bits));
+    AppendUInt64LE(buffer, bits);
+}
+
+bool GB_ByteBufferIO::ReadUInt16LE(const GB_ByteBuffer& buffer, size_t& offset, uint16_t& value)
+{
+    if (offset + 2 > buffer.size())
+    {
+        return false;
+    }
+
+    value = static_cast<uint16_t>(buffer[offset]) | (static_cast<uint16_t>(buffer[offset + 1]) << 8);
+
+    offset += 2;
+    return true;
+}
+
+bool GB_ByteBufferIO::ReadUInt32LE(const GB_ByteBuffer& buffer, size_t& offset, uint32_t& value)
+{
+    if (offset + 4 > buffer.size())
+    {
+        return false;
+    }
+
+    value = static_cast<uint32_t>(buffer[offset]) 
+        | (static_cast<uint32_t>(buffer[offset + 1]) << 8) 
+        | (static_cast<uint32_t>(buffer[offset + 2]) << 16) 
+        | (static_cast<uint32_t>(buffer[offset + 3]) << 24);
+
+    offset += 4;
+    return true;
+}
+
+bool GB_ByteBufferIO::ReadUInt64LE(const GB_ByteBuffer& buffer, size_t& offset, uint64_t& value)
+{
+    if (offset + 8 > buffer.size())
+    {
+        return false;
+    }
+
+    value = static_cast<uint64_t>(buffer[offset])
+        | (static_cast<uint64_t>(buffer[offset + 1]) << 8)
+        | (static_cast<uint64_t>(buffer[offset + 2]) << 16)
+        | (static_cast<uint64_t>(buffer[offset + 3]) << 24)
+        | (static_cast<uint64_t>(buffer[offset + 4]) << 32)
+        | (static_cast<uint64_t>(buffer[offset + 5]) << 40)
+        | (static_cast<uint64_t>(buffer[offset + 6]) << 48)
+        | (static_cast<uint64_t>(buffer[offset + 7]) << 56);
+
+    offset += 8;
+    return true;
+}
+
+bool GB_ByteBufferIO::ReadDoubleLE(const GB_ByteBuffer& buffer, size_t& offset, double& value)
+{
+    uint64_t bits = 0;
+    if (!ReadUInt64LE(buffer, offset, bits))
+    {
+        return false;
+    }
+
+    std::memcpy(&value, &bits, sizeof(value));
+    return true;
+}
 
 
 

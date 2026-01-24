@@ -13,9 +13,15 @@
       <UniqueIdentifier>{67DA6AB6-F800-4c08-8B7A-83BB121AAD01}</UniqueIdentifier>
       <Extensions>rc;ico;cur;bmp;dlg;rc2;rct;bin;rgs;gif;jpg;jpeg;jpe;resx;tiff;tif;png;wav;mfcribbon-ms</Extensions>
     </Filter>
+    <Filter Include="头文件\Geometry">
+      <UniqueIdentifier>{46fb263f-d5e0-44ea-9fbf-357200a593d5}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="源文件\Geometry">
+      <UniqueIdentifier>{0cbb106f-8501-4381-b21f-321df6f0aa56}</UniqueIdentifier>
+    </Filter>
   </ItemGroup>
   <ItemGroup>
-    <ClInclude Include="GlobalBase.h">
+    <ClInclude Include="GB_BaseTypes.h">
       <Filter>头文件</Filter>
     </ClInclude>
     <ClInclude Include="GB_Utility.h">
@@ -60,6 +66,21 @@
     <ClInclude Include="GB_ThreadPool.h">
       <Filter>头文件</Filter>
     </ClInclude>
+    <ClInclude Include="Geometry\GB_Vector2d.h">
+      <Filter>头文件\Geometry</Filter>
+    </ClInclude>
+    <ClInclude Include="GB_Math.h">
+      <Filter>头文件</Filter>
+    </ClInclude>
+    <ClInclude Include="Geometry\GB_GeometryInterface.h">
+      <Filter>头文件\Geometry</Filter>
+    </ClInclude>
+    <ClInclude Include="Geometry\GB_Matrix3x3.h">
+      <Filter>头文件\Geometry</Filter>
+    </ClInclude>
+    <ClInclude Include="Geometry\GB_Point2d.h">
+      <Filter>头文件\Geometry</Filter>
+    </ClInclude>
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="GB_Utf8String.cpp">
@@ -100,6 +121,18 @@
     </ClCompile>
     <ClCompile Include="GB_ThreadPool.cpp">
       <Filter>源文件</Filter>
+    </ClCompile>
+    <ClCompile Include="Geometry\GB_Vector2d.cpp">
+      <Filter>源文件\Geometry</Filter>
+    </ClCompile>
+    <ClCompile Include="Geometry\GB_GeometryInterface.cpp">
+      <Filter>源文件\Geometry</Filter>
+    </ClCompile>
+    <ClCompile Include="Geometry\GB_Matrix3x3.cpp">
+      <Filter>源文件\Geometry</Filter>
+    </ClCompile>
+    <ClCompile Include="Geometry\GB_Point2d.cpp">
+      <Filter>源文件\Geometry</Filter>
     </ClCompile>
   </ItemGroup>
 </Project>
