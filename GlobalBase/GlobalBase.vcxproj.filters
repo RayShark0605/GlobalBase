@@ -81,6 +81,9 @@
     <ClInclude Include="Geometry\GB_Point2d.h">
       <Filter>头文件\Geometry</Filter>
     </ClInclude>
+    <ClInclude Include="Geometry\GB_Rectangle.h">
+      <Filter>头文件\Geometry</Filter>
+    </ClInclude>
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="GB_Utf8String.cpp">
@@ -132,6 +135,9 @@
       <Filter>源文件\Geometry</Filter>
     </ClCompile>
     <ClCompile Include="Geometry\GB_Point2d.cpp">
+      <Filter>源文件\Geometry</Filter>
+    </ClCompile>
+    <ClCompile Include="Geometry\GB_Rectangle.cpp">
       <Filter>源文件\Geometry</Filter>
     </ClCompile>
   </ItemGroup>

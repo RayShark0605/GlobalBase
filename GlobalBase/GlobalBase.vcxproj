@@ -36,6 +36,7 @@
     <ClInclude Include="Geometry\GB_GeometryInterface.h" />
     <ClInclude Include="Geometry\GB_Matrix3x3.h" />
     <ClInclude Include="Geometry\GB_Point2d.h" />
+    <ClInclude Include="Geometry\GB_Rectangle.h" />
     <ClInclude Include="Geometry\GB_Vector2d.h" />
     <ClInclude Include="GB_BaseTypes.h" />
     <ClInclude Include="GlobalBasePort.h" />
@@ -57,6 +58,7 @@
     <ClCompile Include="Geometry\GB_GeometryInterface.cpp" />
     <ClCompile Include="Geometry\GB_Matrix3x3.cpp" />
     <ClCompile Include="Geometry\GB_Point2d.cpp" />
+    <ClCompile Include="Geometry\GB_Rectangle.cpp" />
     <ClCompile Include="Geometry\GB_Vector2d.cpp" />
   </ItemGroup>
   <PropertyGroup Label="Globals">
