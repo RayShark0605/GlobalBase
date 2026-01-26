@@ -65,7 +65,7 @@ const std::string& GB_Rectangle::GetClassType() const
 
 uint64_t GB_Rectangle::GetClassTypeId() const
 {
-    static const uint64_t classTypeId = GB_GenerateClassTypeId(GetClassType());
+    static const uint64_t classTypeId = GB_GenerateClassTypeId(GetClassType()); // 7893821985628433498
     return classTypeId;
 }
 

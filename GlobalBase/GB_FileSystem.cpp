@@ -600,7 +600,7 @@ namespace internal
         path.push_back('/');
     }
 
-    static void ReplaceBackslashWithSlash(std::string& s)
+    static void ReplaceBackslashWithSlash(string& s)
     {
         for (size_t i = 0; i < s.size(); i++)
         {
@@ -609,6 +609,452 @@ namespace internal
                 s[i] = '/';
             }
         }
+    }
+
+    struct ParsedPath
+    {
+        string root;                  // Windows: "c:", "//server/share"; Linux: "/"; relative: ""
+        vector<string> segments; // 不包含 root 的各段
+        bool isAbsolute = false;
+    };
+
+    static inline bool IsAsciiAlpha(char ch)
+    {
+        return (ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z');
+    }
+
+    static inline char AsciiToLower(char ch)
+    {
+        if (ch >= 'A' && ch <= 'Z')
+        {
+            return static_cast<char>(ch - 'A' + 'a');
+        }
+        return ch;
+    }
+
+    static string AsciiToLowerString(const string& s)
+    {
+        string out = s;
+        for (size_t i = 0; i < out.size(); i++)
+        {
+            out[i] = AsciiToLower(out[i]);
+        }
+        return out;
+    }
+
+    static bool EqualRoot(const string& a, const string& b)
+    {
+#if defined(_WIN32)
+        return AsciiToLowerString(a) == AsciiToLowerString(b);
+#else
+        return a == b;
+#endif
+    }
+
+    static bool EqualSegment(const string& a, const string& b)
+    {
+#if defined(_WIN32)
+        // Windows 通常大小写不敏感；这里做 ASCII 级别的宽松比较（非 ASCII 字符保持原样）。
+        if (a.size() != b.size())
+        {
+            return false;
+        }
+        for (size_t i = 0; i < a.size(); i++)
+        {
+            if (AsciiToLower(a[i]) != AsciiToLower(b[i]))
+            {
+                return false;
+            }
+        }
+        return true;
+#else
+        return a == b;
+#endif
+    }
+
+    static void SplitPathSegments(const string& path, size_t startIndex, vector<string>& segmentsOut)
+    {
+        segmentsOut.clear();
+        size_t i = startIndex;
+        while (i < path.size())
+        {
+            // 跳过连续 '/'
+            while (i < path.size() && path[i] == '/')
+            {
+                i++;
+            }
+            if (i >= path.size())
+            {
+                break;
+            }
+            const size_t j = path.find('/', i);
+            if (j == string::npos)
+            {
+                segmentsOut.push_back(path.substr(i));
+                break;
+            }
+            segmentsOut.push_back(path.substr(i, j - i));
+            i = j + 1;
+        }
+    }
+
+    static void NormalizeSegmentsLexical(vector<string>& segments, bool isAbsolute)
+    {
+        vector<string> out;
+        out.reserve(segments.size());
+        for (size_t i = 0; i < segments.size(); i++)
+        {
+            const string& seg = segments[i];
+            if (seg.empty() || seg == ".")
+            {
+                continue;
+            }
+            if (seg == "..")
+            {
+                if (!out.empty() && out.back() != "..")
+                {
+                    out.pop_back();
+                }
+                else
+                {
+                    // 绝对路径不能越过根；相对路径则保留 ".."
+                    if (!isAbsolute)
+                    {
+                        out.push_back("..");
+                    }
+                }
+                continue;
+            }
+            out.push_back(seg);
+        }
+        segments.swap(out);
+    }
+
+    static ParsedPath ParseAndNormalizePathLexical(const string& rawPathUtf8)
+    {
+        ParsedPath out;
+        string path = ToOutputNorm(rawPathUtf8);
+
+#if defined(_WIN32)
+        // 处理 Windows 扩展前缀："\\\\?\\" -> "//?/"、"\\\\.\\" -> "//./"（在 ToOutputNorm 后）
+        if (path.rfind("//?/", 0) == 0)
+        {
+            // "\\\\?\\UNC\\server\\share\\..." -> "//?/UNC/server/share/..."
+            if (path.rfind("//?/UNC/", 0) == 0)
+            {
+                path = "//" + path.substr(8); // len("//?/UNC/") == 8
+            }
+            else
+            {
+                path = path.substr(4); // len("//?/") == 4
+            }
+        }
+        else if (path.rfind("//./", 0) == 0)
+        {
+            path = path.substr(4);
+        }
+
+        size_t startIndex = 0;
+        if (path.size() >= 2 && IsAsciiAlpha(path[0]) && path[1] == ':')
+        {
+            // Drive root (e.g. C:/ or C:)
+            out.root = string(1, AsciiToLower(path[0])) + ":";
+            out.isAbsolute = true;
+            startIndex = 2;
+            if (startIndex < path.size() && path[startIndex] == '/')
+            {
+                startIndex++;
+            }
+        }
+        else if (path.rfind("//", 0) == 0)
+        {
+            // UNC root: //server/share
+            size_t serverEnd = path.find('/', 2);
+            if (serverEnd == string::npos)
+            {
+                out.root = AsciiToLowerString(path);
+                out.isAbsolute = true;
+                return out;
+            }
+            size_t shareEnd = path.find('/', serverEnd + 1);
+            if (shareEnd == string::npos)
+            {
+                out.root = AsciiToLowerString(path);
+                out.isAbsolute = true;
+                return out;
+            }
+            out.root = AsciiToLowerString(path.substr(0, shareEnd));
+            out.isAbsolute = true;
+            startIndex = shareEnd + 1;
+        }
+        else if (!path.empty() && path[0] == '/')
+        {
+            out.root = "/";
+            out.isAbsolute = true;
+            startIndex = 1;
+        }
+        else
+        {
+            out.root.clear();
+            out.isAbsolute = false;
+            startIndex = 0;
+        }
+
+        SplitPathSegments(path, startIndex, out.segments);
+        NormalizeSegmentsLexical(out.segments, out.isAbsolute);
+        return out;
+#else
+        size_t startIndex = 0;
+        if (!path.empty() && path[0] == '/')
+        {
+            out.root = "/";
+            out.isAbsolute = true;
+            startIndex = 1;
+        }
+        SplitPathSegments(path, startIndex, out.segments);
+        NormalizeSegmentsLexical(out.segments, out.isAbsolute);
+        return out;
+#endif
+    }
+
+    static string JoinSegmentsWithSlash(const vector<string>& segments)
+    {
+        if (segments.empty())
+        {
+            return string();
+        }
+        string out;
+        // 预估容量：每段 + 分隔符
+        size_t total = 0;
+        for (size_t i = 0; i < segments.size(); i++)
+        {
+            total += segments[i].size() + 1;
+        }
+        out.reserve(total);
+
+        for (size_t i = 0; i < segments.size(); i++)
+        {
+            if (i > 0)
+            {
+                out.push_back('/');
+            }
+            out.append(segments[i]);
+        }
+        return out;
+    }
+
+    static bool EndsWithDotOrDotDot(const string& pathUtf8)
+    {
+        if (pathUtf8.empty())
+        {
+            return false;
+        }
+
+        string s = pathUtf8;
+        ReplaceBackslashWithSlash(s);
+
+        // 去尾斜杠后判断最后一个片段
+        while (!s.empty() && s.back() == '/')
+        {
+            s.pop_back();
+        }
+        if (s.empty())
+        {
+            return false;
+        }
+
+        const size_t pos = s.find_last_of('/');
+        const string last = (pos == string::npos) ? s : s.substr(pos + 1);
+        return last == "." || last == "..";
+    }
+
+    struct LexicalPath
+    {
+        string root;
+        bool isAbsolute = false;
+        bool isDrive = false;
+        bool isUnc = false;
+        vector<string> segments;
+    };
+
+    static LexicalPath ParseLexicalPath(const string& rawPathUtf8)
+    {
+        LexicalPath path;
+        string s = rawPathUtf8;
+        ReplaceBackslashWithSlash(s);
+
+        size_t index = 0;
+
+        // Drive: "C:" or "C:/..." or "C:..."  -> treat as rooted at drive.
+        if (s.size() >= 2 && IsAsciiAlpha(s[0]) && s[1] == ':')
+        {
+            path.isAbsolute = true;
+            path.isDrive = true;
+            path.root = s.substr(0, 2);
+            index = 2;
+            if (index < s.size() && s[index] == '/')
+            {
+                index++;
+            }
+        }
+        // UNC: //server/share/...
+        else if (s.size() >= 2 && s[0] == '/' && s[1] == '/')
+        {
+            path.isAbsolute = true;
+            path.isUnc = true;
+
+            // root = //server/share
+            const size_t serverEnd = s.find('/', 2);
+            if (serverEnd == string::npos)
+            {
+                path.root = s;
+                index = s.size();
+            }
+            else
+            {
+                const size_t shareEnd = s.find('/', serverEnd + 1);
+                if (shareEnd == string::npos)
+                {
+                    path.root = s;
+                    index = s.size();
+                }
+                else
+                {
+                    path.root = s.substr(0, shareEnd);
+                    index = shareEnd + 1;
+                }
+            }
+        }
+        // Unix absolute: /...
+        else if (!s.empty() && s[0] == '/')
+        {
+            path.isAbsolute = true;
+            path.root = "/";
+            index = 1;
+        }
+
+        // Parse segments (skip empty segments caused by duplicate slashes)
+        string current;
+        for (size_t i = index; i <= s.size(); i++)
+        {
+            const char ch = (i < s.size()) ? s[i] : '/';
+            if (ch == '/')
+            {
+                if (!current.empty())
+                {
+                    path.segments.push_back(current);
+                    current.clear();
+                }
+            }
+            else
+            {
+                current.push_back(ch);
+            }
+        }
+        return path;
+    }
+
+    static void NormalizeDotSegments(LexicalPath& path)
+    {
+        vector<string> out;
+        out.reserve(path.segments.size());
+
+        for (size_t i = 0; i < path.segments.size(); i++)
+        {
+            const string& seg = path.segments[i];
+            if (seg.empty() || seg == ".")
+            {
+                continue;
+            }
+            if (seg == "..")
+            {
+                if (!out.empty() && out.back() != "..")
+                {
+                    out.pop_back();
+                }
+                else
+                {
+                    if (!path.isAbsolute)
+                    {
+                        out.push_back("..");
+                    }
+                }
+                continue;
+            }
+            out.push_back(seg);
+        }
+
+        path.segments.swap(out);
+    }
+
+    static string BuildPathString(const LexicalPath& path, bool forceDir)
+    {
+        string out;
+
+        if (path.isAbsolute)
+        {
+            if (path.isDrive)
+            {
+                out = path.root;
+                out.push_back('/');
+            }
+            else if (path.isUnc)
+            {
+                out = path.root;
+                out.push_back('/');
+            }
+            else
+            {
+                out = "/";
+            }
+        }
+
+        for (size_t i = 0; i < path.segments.size(); i++)
+        {
+            if (!out.empty() && out.back() != '/')
+            {
+                out.push_back('/');
+            }
+            out += path.segments[i];
+        }
+
+        if (out.empty())
+        {
+            out = ".";
+        }
+
+        if (forceDir)
+        {
+            if (out == ".")
+            {
+                out = "./";
+            }
+            else if (out == "..")
+            {
+                out = "../";
+            }
+            else if (out.back() != '/')
+            {
+                out.push_back('/');
+            }
+        }
+        else
+        {
+            // 若是根目录（"/", "C:/", "//server/share/"），保留末尾 '/'
+            const bool isRootUnix = out == "/";
+            const bool isRootDrive = (out.size() == 3 && IsAsciiAlpha(out[0]) && out[1] == ':' && out[2] == '/');
+            const bool isRootUnc = (path.isUnc && out == path.root + "/");
+
+            if (!isRootUnix && !isRootDrive && !isRootUnc)
+            {
+                while (out.size() > 1 && out.back() == '/')
+                {
+                    out.pop_back();
+                }
+            }
+        }
+
+        return out;
     }
 }
 
@@ -956,7 +1402,7 @@ string GB_GetExeDirectory()
 #endif
 }
 
-bool GB_CreateFileRecursive(const std::string& filePathUtf8, bool overwriteIfExists)
+bool GB_CreateFileRecursive(const string& filePathUtf8, bool overwriteIfExists)
 {
     if (filePathUtf8.empty())
     {
@@ -964,7 +1410,7 @@ bool GB_CreateFileRecursive(const std::string& filePathUtf8, bool overwriteIfExi
     }
 
     // 统一分隔符
-    std::string normPath = filePathUtf8;
+    string normPath = filePathUtf8;
     for (size_t i = 0; i < normPath.size(); i++)
     {
         if (normPath[i] == '\\')
@@ -983,7 +1429,7 @@ bool GB_CreateFileRecursive(const std::string& filePathUtf8, bool overwriteIfExi
     }
 
     // 先确保父目录存在
-    const std::string dirPathUtf8 = GB_GetDirectoryPath(normPath);
+    const string dirPathUtf8 = GB_GetDirectoryPath(normPath);
     if (!dirPathUtf8.empty())
     {
         if (!GB_CreateDirectory(dirPathUtf8))
@@ -1004,31 +1450,31 @@ bool GB_CreateFileRecursive(const std::string& filePathUtf8, bool overwriteIfExi
 
 #if defined(_WIN32)
     // UTF-8 -> UTF-16
-    auto Utf8ToWide = [](const std::string& utf8) -> std::wstring
+    auto Utf8ToWide = [](const string& utf8) -> wstring
         {
             if (utf8.empty())
             {
-                return std::wstring();
+                return wstring();
             }
             const int need = ::MultiByteToWideChar(CP_UTF8, 0, utf8.c_str(),
                 static_cast<int>(utf8.size()),
                 nullptr, 0);
             if (need <= 0)
             {
-                return std::wstring();
+                return wstring();
             }
-            std::wstring ws(static_cast<size_t>(need), L'\0');
+            wstring ws(static_cast<size_t>(need), L'\0');
             const int wrote = ::MultiByteToWideChar(CP_UTF8, 0, utf8.c_str(),
                 static_cast<int>(utf8.size()),
                 &ws[0], need);
             if (wrote != need)
             {
-                return std::wstring();
+                return wstring();
             }
             return ws;
         };
 
-    const std::wstring wPath = Utf8ToWide(normPath);
+    const wstring wPath = Utf8ToWide(normPath);
     if (wPath.empty())
     {
         return false;
@@ -1062,4 +1508,186 @@ bool GB_CreateFileRecursive(const std::string& filePathUtf8, bool overwriteIfExi
     (void)::close(fd);
     return true;
 #endif
+}
+
+string GB_GetRelativePath(const string& pathAUtf8, const string& pathBUtf8)
+{
+    if (pathAUtf8.empty())
+    {
+        return "";
+    }
+
+    // 1) 判定 A 是否目录：优先相信用户输入形态（末尾分隔符），其次才查文件系统。
+    bool pathAIsDir = false;
+    if (!pathAUtf8.empty() && (pathAUtf8.back() == '/' || pathAUtf8.back() == '\\'))
+    {
+        pathAIsDir = true;
+    }
+    else
+    {
+        pathAIsDir = GB_IsDirectoryExists(pathAUtf8);
+    }
+
+    // 2) 基准路径：若 B 是文件，则以其父目录作为 base；若 B 是目录，则以 B 本身作为 base。
+    bool pathBIsDir = false;
+    if (!pathBUtf8.empty() && (pathBUtf8.back() == '/' || pathBUtf8.back() == '\\'))
+    {
+        pathBIsDir = true;
+    }
+    else
+    {
+        pathBIsDir = GB_IsDirectoryExists(pathBUtf8);
+    }
+
+    string baseDirUtf8 = "";
+    if (pathBUtf8.empty())
+    {
+        baseDirUtf8 = ".";
+    }
+    else if (pathBIsDir)
+    {
+        baseDirUtf8 = pathBUtf8;
+    }
+    else
+    {
+        baseDirUtf8 = GB_GetDirectoryPath(pathBUtf8);
+        if (baseDirUtf8.empty())
+        {
+            baseDirUtf8 = ".";
+        }
+    }
+
+    // 3) 纯字符串（lexical）解析与标准化
+    const internal::ParsedPath target = internal::ParseAndNormalizePathLexical(pathAUtf8);
+    const internal::ParsedPath base = internal::ParseAndNormalizePathLexical(baseDirUtf8);
+
+    // Windows：不同盘符/不同 UNC share 无法构造相对路径；此处回退为“规范化后的 A”。
+    // 参考：Win32 PathRelativePathToW 要求两者有共同前缀，否则失败。
+    if (!internal::EqualRoot(target.root, base.root) || target.isAbsolute != base.isAbsolute)
+    {
+        string out = internal::ToOutputNorm(pathAUtf8);
+        if (pathAIsDir)
+        {
+            out = internal::EnsureTrailingSlash(out);
+        }
+        return out;
+    }
+
+    // 4) 计算公共前缀
+    size_t common = 0;
+    const size_t minCount = min(target.segments.size(), base.segments.size());
+    for (; common < minCount; common++)
+    {
+        if (!internal::EqualSegment(target.segments[common], base.segments[common]))
+        {
+            break;
+        }
+    }
+
+    // 5) base -> common：补 ".."；common -> target：补余下片段
+    vector<string> relSegments;
+    relSegments.reserve((base.segments.size() - common) + (target.segments.size() - common));
+
+    for (size_t i = common; i < base.segments.size(); i++)
+    {
+        relSegments.push_back("..");
+    }
+    for (size_t i = common; i < target.segments.size(); i++)
+    {
+        relSegments.push_back(target.segments[i]);
+    }
+
+    string relPath = internal::JoinSegmentsWithSlash(relSegments);
+    if (relPath.empty())
+    {
+        relPath = ".";
+    }
+
+    // 6) 若 A 为目录，保证结果末尾带 '/'
+    if (pathAIsDir)
+    {
+        relPath = internal::EnsureTrailingSlash(relPath);
+    }
+
+    return relPath;
+}
+
+string GB_JoinPath(const string& leftPathUtf8, const string& rightPathUtf8)
+{
+    bool outputIsDir = false;
+    if (!rightPathUtf8.empty())
+    {
+        outputIsDir = internal::IsSlash(rightPathUtf8.back()) || internal::EndsWithDotOrDotDot(rightPathUtf8);
+    }
+    else
+    {
+        if (!leftPathUtf8.empty() && internal::IsSlash(leftPathUtf8.back()))
+        {
+            outputIsDir = true;
+        }
+        else if (GB_IsDirectoryExists(leftPathUtf8))
+        {
+            outputIsDir = true;
+        }
+    }
+
+    // 统一分隔符
+    string leftNorm = leftPathUtf8;
+    string rightNorm = rightPathUtf8;
+    internal::ReplaceBackslashWithSlash(leftNorm);
+    internal::ReplaceBackslashWithSlash(rightNorm);
+
+    // right 为空：直接规范化 left
+    if (rightNorm.empty())
+    {
+        internal::LexicalPath path = internal::ParseLexicalPath(leftNorm);
+        internal::NormalizeDotSegments(path);
+
+        // 若文件系统中存在且为目录，也认为是目录
+        if (!outputIsDir)
+        {
+            const string tmp = internal::BuildPathString(path, false);
+            bool exists = false;
+            bool isDir = false;
+            if (internal::IsDirByStat(tmp, exists, isDir) && exists && isDir)
+            {
+                outputIsDir = true;
+            }
+        }
+        return internal::BuildPathString(path, outputIsDir);
+    }
+
+    // left + right：尽量把 left 当作目录（除非明确是文件）
+    string base = leftNorm;
+    if (!base.empty())
+    {
+        bool leftExists = false;
+        bool leftIsDir = false;
+        if (internal::IsDirByStat(base, leftExists, leftIsDir) && leftExists && !leftIsDir)
+        {
+            base = GB_GetDirectoryPath(base);
+        }
+
+        // 作为目录拼接时，确保 base 末尾有 '/'
+        if (!base.empty() && base.back() != '/')
+        {
+            base.push_back('/');
+        }
+    }
+
+    const string combined = base + rightNorm;
+    internal::LexicalPath combinedParsed = internal::ParseLexicalPath(combined);
+    internal::NormalizeDotSegments(combinedParsed);
+
+    if (!outputIsDir)
+    {
+        const string tmp = internal::BuildPathString(combinedParsed, false);
+        bool exists = false;
+        bool isDir = false;
+        if (internal::IsDirByStat(tmp, exists, isDir) && exists && isDir)
+        {
+            outputIsDir = true;
+        }
+    }
+    return internal::BuildPathString(combinedParsed, outputIsDir);
 }

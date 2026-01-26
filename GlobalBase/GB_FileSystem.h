@@ -170,4 +170,47 @@ GLOBALBASE_PORT std::string GB_GetExeDirectory();
  */
 GLOBALBASE_PORT bool GB_CreateFileRecursive(const std::string& filePathUtf8, bool overwriteIfExists = true);
 
+/**
+ * @brief 计算路径 A 相对于路径 B 的相对路径（UTF-8）。
+ *
+ * @param pathAUtf8 目标路径 A（文件或目录，UTF-8）。Windows 下允许混用“/”与“\\”作为分隔符。
+ * @param pathBUtf8 基准路径 B（文件或目录，UTF-8）。Windows 下允许混用“/”与“\\”作为分隔符。
+ * @return std::string 相对路径（UTF-8），统一使用“/”作为分隔符。
+ *
+ * @details
+ *  - 若 pathBUtf8 为空，则以 "." 作为基准目录。
+ *  - 若 pathBUtf8 指向文件（或被视作文件），则以其父目录作为基准目录（等价于“相对于该文件所在目录”）。
+ *  - 相对路径计算为 lexical（字符串）层面：会标准化分隔符、消解多余的 "." 与 ".." 片段，但不会解析符号链接。
+ *  - 若 A 与 B 处于不同根（Windows 不同盘符 / 不同 UNC share），无法构造相对路径时，返回规范化后的 A（仍使用“/”）。
+ *  - 若 A 被判定为目录（路径末尾带分隔符，或在文件系统中存在且为目录），返回结果末尾保证带“/”。
+ *
+ * @remarks
+ *  - 为判定 A/B 是否目录，函数可能会访问文件系统（GB_IsDirectoryExists）。若希望完全避免访问文件系统，
+ *    请在目录路径末尾显式追加分隔符（如 "a/b/" 或 "a\\b\\"）。
+ */
+GLOBALBASE_PORT std::string GB_GetRelativePath(const std::string& pathAUtf8, const std::string& pathBUtf8);
+
+/**
+ * @brief 拼接两个路径并进行 lexical 规范化（UTF-8）。
+ *
+ * @param leftPathUtf8  左侧路径（UTF-8）。Windows 下允许混用“/”与“\\”作为分隔符。
+ * @param rightPathUtf8 右侧路径（UTF-8）。Windows 下允许混用“/”与“\\”作为分隔符。
+ * @return std::string  拼接并规范化后的路径（UTF-8），统一使用“/”作为分隔符。
+ *
+ * @details
+ *  - 若 rightPathUtf8 为空：返回 leftPathUtf8 的规范化结果。
+ *  - 若 rightPathUtf8 为绝对路径：忽略 leftPathUtf8，直接返回 rightPathUtf8 的规范化结果。
+ *  - 若 leftPathUtf8 存在且为文件，则将其父目录作为拼接基准（等价于“相对于该文件所在目录进行拼接”）。
+ *  - 规范化会消解多余的 "." 与 ".." 片段（lexical），但不会解析符号链接。
+ *  - Windows 输入允许“/”与“\\”，输出统一使用“/”。
+ *  - 若输出路径表示目录（例如 rightPathUtf8 以分隔符结尾、或最后一个片段为 "."/".."，
+ *    或输出路径在文件系统中存在且为目录），则返回结果末尾保证带“/”。
+ *
+ * @remarks
+ *  - 为了更准确地区分“文件/目录”，函数可能会访问文件系统做存在性与类型判断（stat / GetFileAttributesW）。
+ *    若希望完全避免访问文件系统，请在“目录路径”末尾显式追加分隔符（如 "a/b/" 或 "a\\b\\"）。
+ */
+GLOBALBASE_PORT std::string GB_JoinPath(const std::string& leftPathUtf8, const std::string& rightPathUtf8);
+
+
 #endif
