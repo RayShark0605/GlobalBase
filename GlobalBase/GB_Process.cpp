@@ -2,11 +2,13 @@
 #include "GB_Utf8String.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdlib>
 #include <cctype>
 #include <cstring>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <vector>
 
 #ifdef _WIN32
@@ -25,6 +27,7 @@
 #  include <dirent.h>
 #  include <unistd.h>
 #  include <errno.h>
+#  include <signal.h>
 #  include <fstream>
 #  include <iterator>
 #  include <pwd.h>
@@ -1073,6 +1076,182 @@ namespace
         return true;
     }
 #endif
+
+    static std::string NormalizeForCompare(const std::string& textUtf8, bool caseSensitive)
+    {
+        if (caseSensitive)
+        {
+            return textUtf8;
+        }
+
+        // 仅 ASCII 大小写转换，足够覆盖绝大多数进程名（通常是 ASCII 文件名）。
+        return Utf8ToLower(textUtf8);
+    }
+
+#ifdef _WIN32
+    static bool HasExeSuffix(const std::string& nameLower)
+    {
+        const std::string suffix = ".exe";
+        if (nameLower.size() < suffix.size())
+        {
+            return false;
+        }
+        return nameLower.compare(nameLower.size() - suffix.size(), suffix.size(), suffix) == 0;
+    }
+
+    static std::string RemoveExeSuffixIfPresent(const std::string& nameLower)
+    {
+        if (HasExeSuffix(nameLower))
+        {
+            return nameLower.substr(0, nameLower.size() - 4);
+        }
+        return nameLower;
+    }
+#endif
+
+    static bool IsProcessNameMatched(const std::string& candidateNameUtf8, const std::string& targetNameUtf8, bool allowSubstringMatch, bool caseSensitive)
+    {
+        if (targetNameUtf8.empty())
+        {
+            return false;
+        }
+
+        const std::string candidate = NormalizeForCompare(candidateNameUtf8, caseSensitive);
+        const std::string target = NormalizeForCompare(targetNameUtf8, caseSensitive);
+
+        if (allowSubstringMatch)
+        {
+            if (candidate.find(target) != std::string::npos)
+            {
+                return true;
+            }
+
+#ifdef _WIN32
+            // Windows 下常见场景：用户输入 "notepad" 也希望匹配 "notepad.exe"。
+            const std::string candidateNoExe = RemoveExeSuffixIfPresent(candidate);
+            const std::string targetNoExe = RemoveExeSuffixIfPresent(target);
+            if (!targetNoExe.empty() && candidateNoExe.find(targetNoExe) != std::string::npos)
+            {
+                return true;
+            }
+#endif
+
+            return false;
+        }
+
+#ifdef _WIN32
+        if (candidate == target)
+        {
+            return true;
+        }
+
+        // 同上：允许忽略 .exe 的精确匹配。
+        return RemoveExeSuffixIfPresent(candidate) == RemoveExeSuffixIfPresent(target);
+#else
+        return candidate == target;
+#endif
+    }
+
+#ifdef _WIN32
+    struct CloseWindowsContext
+    {
+        DWORD processId = 0;
+        bool closePosted = false;
+    };
+
+    static BOOL CALLBACK EnumWindowsCloseProc(HWND hwnd, LPARAM lParam)
+    {
+        CloseWindowsContext* context = reinterpret_cast<CloseWindowsContext*>(lParam);
+        if (context == nullptr)
+        {
+            return TRUE;
+        }
+
+        DWORD windowPid = 0;
+        ::GetWindowThreadProcessId(hwnd, &windowPid);
+        if (windowPid == context->processId)
+        {
+            // 使用 PostMessage 避免跨进程 SendMessage 卡死。
+            if (::PostMessageW(hwnd, WM_CLOSE, 0, 0))
+            {
+                context->closePosted = true;
+            }
+        }
+
+        return TRUE;
+    }
+
+    static bool TryRequestCloseWindows(DWORD processId)
+    {
+        CloseWindowsContext context;
+        context.processId = processId;
+        ::EnumWindows(EnumWindowsCloseProc, reinterpret_cast<LPARAM>(&context));
+        return context.closePosted;
+    }
+
+    static bool IsProcessRunningWindows(HANDLE processHandle)
+    {
+        DWORD exitCode = 0;
+        if (!::GetExitCodeProcess(processHandle, &exitCode))
+        {
+            return false;
+        }
+        return (exitCode == STILL_ACTIVE);
+    }
+#else
+    static bool IsZombieLinux(int pid)
+    {
+        const std::string statPath = "/proc/" + std::to_string(pid) + "/stat";
+        std::string statContent;
+        if (!ReadFileToString(statPath, statContent) || statContent.empty())
+        {
+            // 读不到时无法判断；保守起见不当作 zombie
+            return false;
+        }
+
+        // /proc/<pid>/stat 格式：pid (comm) state ...
+        const size_t rightParen = statContent.rfind(')');
+        if (rightParen == std::string::npos || rightParen + 2 >= statContent.size())
+        {
+            return false;
+        }
+
+        // 约定：')' 后面通常是空格，再后面 1 个字符就是 state
+        const char stateChar = statContent[rightParen + 2];
+        return stateChar == 'Z';
+    }
+
+    static bool IsProcessAliveLinux(int pid)
+    {
+        if (pid <= 0)
+        {
+            return false;
+        }
+
+        // kill(pid, 0) 不发送信号，只做存在性/权限检查
+        if (::kill(pid, 0) == 0)
+        {
+            // Zombie 已经退出，不应当被当作“仍存活”
+            if (IsZombieLinux(pid))
+            {
+                return false;
+            }
+            return true;
+        }
+
+        if (errno == EPERM)
+        {
+            // 无权限但进程存在；仍尝试判断 zombie（读不到就当作存在）
+            if (IsZombieLinux(pid))
+            {
+                return false;
+            }
+            return true;
+        }
+
+        return false;
+    }
+#endif
 }
 
 bool GB_IsRunningAsAdmin()
@@ -1417,4 +1596,524 @@ std::vector<GB_ProcessInfo> GB_GetAllProcessesInfo()
 #endif
 
     return processesInfo;
+}
+
+std::vector<int> GB_FindProcessIdsByName(const std::string& processNameUtf8, bool allowSubstringMatch, bool caseSensitive)
+{
+    std::vector<int> processIds;
+    if (processNameUtf8.empty())
+    {
+        return processIds;
+    }
+
+#ifdef _WIN32
+    HandleGuard snapshot(::CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0));
+    if (snapshot.handle == INVALID_HANDLE_VALUE)
+    {
+        return processIds;
+    }
+
+    PROCESSENTRY32W pe;
+    ::ZeroMemory(&pe, sizeof(pe));
+    pe.dwSize = sizeof(pe);
+    if (!::Process32FirstW(snapshot.handle, &pe))
+    {
+        return processIds;
+    }
+
+    do
+    {
+        const std::string candidateNameUtf8 = WStringToUtf8(std::wstring(pe.szExeFile));
+        if (IsProcessNameMatched(candidateNameUtf8, processNameUtf8, allowSubstringMatch, caseSensitive))
+        {
+            processIds.push_back(static_cast<int>(pe.th32ProcessID));
+        }
+    } while (::Process32NextW(snapshot.handle, &pe));
+
+#else
+    DIR* procDir = ::opendir("/proc");
+    if (procDir == nullptr)
+    {
+        return processIds;
+    }
+
+    struct DirGuard
+    {
+        DIR* dir = nullptr;
+        explicit DirGuard(DIR* d) : dir(d) {}
+        ~DirGuard()
+        {
+            if (dir != nullptr)
+            {
+                ::closedir(dir);
+                dir = nullptr;
+            }
+        }
+    } dirGuard(procDir);
+
+    struct dirent* entry = nullptr;
+    while ((entry = ::readdir(procDir)) != nullptr)
+    {
+        if (!IsAllDigits(entry->d_name))
+        {
+            continue;
+        }
+
+        const int pid = std::atoi(entry->d_name);
+        if (pid <= 0)
+        {
+            continue;
+        }
+
+        std::string comm;
+        if (!ReadProcComm(pid, comm))
+        {
+            continue;
+        }
+
+        if (IsProcessNameMatched(comm, processNameUtf8, allowSubstringMatch, caseSensitive))
+        {
+            processIds.push_back(pid);
+        }
+    }
+#endif
+
+    std::sort(processIds.begin(), processIds.end());
+    processIds.erase(std::unique(processIds.begin(), processIds.end()), processIds.end());
+    return processIds;
+}
+
+bool GB_GetProcessInfo(int processId, GB_ProcessInfo& info)
+{
+    info = GB_ProcessInfo();
+    if (processId <= 0)
+    {
+        return false;
+    }
+
+#ifdef _WIN32
+    HandleGuard snapshot(::CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0));
+    if (snapshot.handle == INVALID_HANDLE_VALUE)
+    {
+        return false;
+    }
+
+    PROCESSENTRY32W pe;
+    ::ZeroMemory(&pe, sizeof(pe));
+    pe.dwSize = sizeof(pe);
+    if (!::Process32FirstW(snapshot.handle, &pe))
+    {
+        return false;
+    }
+
+    bool found = false;
+    do
+    {
+        if (static_cast<int>(pe.th32ProcessID) == processId)
+        {
+            found = true;
+            info.processId = processId;
+            info.parentProcessId = static_cast<int>(pe.th32ParentProcessID);
+            info.threadCount = static_cast<unsigned int>(pe.cntThreads);
+            info.processNameUtf8 = WStringToUtf8(std::wstring(pe.szExeFile));
+            break;
+        }
+    } while (::Process32NextW(snapshot.handle, &pe));
+
+    if (!found)
+    {
+        return false;
+    }
+
+    const DWORD desiredAccess = PROCESS_QUERY_LIMITED_INFORMATION;
+    HandleGuard processHandle(::OpenProcess(desiredAccess, FALSE, static_cast<DWORD>(processId)));
+    if (processHandle.handle != nullptr)
+    {
+        FillProcessBitness(processHandle.handle, info);
+
+        std::string exePath;
+        if (FillProcessExePath(processHandle.handle, exePath))
+        {
+            info.executablePathUtf8 = exePath;
+            info.hasExecutablePath = true;
+        }
+
+        std::string userName;
+        if (FillProcessUserName(processHandle.handle, userName))
+        {
+            info.userNameUtf8 = userName;
+            info.hasUserName = true;
+        }
+
+        bool elevated = false;
+        if (IsProcessElevated(processHandle.handle, elevated))
+        {
+            info.isElevated = elevated;
+        }
+
+        DWORD handleCount = 0;
+        if (::GetProcessHandleCount(processHandle.handle, &handleCount))
+        {
+            info.handleCount = static_cast<unsigned int>(handleCount);
+        }
+
+        const DWORD priority = ::GetPriorityClass(processHandle.handle);
+        if (priority != 0)
+        {
+            info.priorityClass = static_cast<unsigned int>(priority);
+        }
+
+        FillProcessTimes(processHandle.handle, info);
+        FillProcessMemory(processHandle.handle, info);
+    }
+
+    // Windows 下没有公开的“读取任意进程命令行/工作目录”API；仅对当前进程填充。
+    FillCurrentProcessCommandLineIfMatch(info);
+    FillCurrentProcessWorkingDirectoryIfMatch(info);
+
+    return true;
+
+#else
+    struct stat st;
+    const std::string procDirPath = "/proc/" + std::to_string(processId);
+    if (::stat(procDirPath.c_str(), &st) != 0)
+    {
+        return false;
+    }
+
+    info.processId = processId;
+
+    const long long bootTimeSeconds = ReadBootTimeUnixSeconds();
+
+    std::string comm;
+    if (ReadProcComm(processId, comm))
+    {
+        info.processNameUtf8 = comm;
+    }
+
+    std::string statContent;
+    if (ReadFileToString("/proc/" + std::to_string(processId) + "/stat", statContent))
+    {
+        ParseProcStat(statContent, info, bootTimeSeconds);
+    }
+
+    std::string cmdline;
+    if (ReadProcCmdline(processId, cmdline))
+    {
+        info.commandLineUtf8 = cmdline;
+        info.hasCommandLine = true;
+    }
+
+    std::string exePath;
+    if (ReadLinkUtf8("/proc/" + std::to_string(processId) + "/exe", exePath))
+    {
+        info.executablePathUtf8 = exePath;
+        info.hasExecutablePath = true;
+
+        bool is64Bit = false;
+        if (IsElf64Bit(exePath, is64Bit))
+        {
+            info.is64Bit = is64Bit;
+        }
+    }
+
+    std::string cwdPath;
+    if (ReadLinkUtf8("/proc/" + std::to_string(processId) + "/cwd", cwdPath))
+    {
+        info.workingDirectoryUtf8 = cwdPath;
+        info.hasWorkingDirectory = true;
+    }
+
+    std::string statusContent;
+    if (ReadFileToString("/proc/" + std::to_string(processId) + "/status", statusContent))
+    {
+        ProcStatusParsed parsed;
+        ParseProcStatusContent(statusContent, parsed);
+
+        if (parsed.hasUids)
+        {
+            std::string userName;
+            if (FillUserNameFromUid(parsed.effectiveUid, userName))
+            {
+                info.userNameUtf8 = userName;
+                info.hasUserName = true;
+            }
+            info.isElevated = (parsed.effectiveUid == 0);
+        }
+
+        if (parsed.hasVmHwm)
+        {
+            info.peakResidentSetBytes = parsed.vmHwmBytes;
+            info.hasMemoryInfo = true;
+        }
+        if (parsed.hasRssAnon)
+        {
+            info.privateMemoryBytes = parsed.rssAnonBytes;
+            info.hasMemoryInfo = true;
+        }
+
+        if (info.virtualMemoryBytes == 0 && parsed.hasVmSize)
+        {
+            info.virtualMemoryBytes = parsed.vmSizeBytes;
+        }
+        if (info.residentSetBytes == 0 && parsed.hasVmRss)
+        {
+            info.residentSetBytes = parsed.vmRssBytes;
+        }
+
+        if ((parsed.hasVmSize || parsed.hasVmRss) && (info.virtualMemoryBytes != 0 || info.residentSetBytes != 0))
+        {
+            info.hasMemoryInfo = true;
+        }
+    }
+
+    unsigned int fdCount = 0;
+    if (GetOpenFileDescriptorCountLinux(processId, fdCount))
+    {
+        info.handleCount = fdCount;
+    }
+
+    return true;
+#endif
+}
+
+bool GB_StartProcess(const std::string& executablePathUtf8, int* outProcessId)
+{
+    return GB_StartProcess(executablePathUtf8, std::vector<std::string>(), std::string(), outProcessId);
+}
+
+bool GB_StartProcess(const std::string& executablePathUtf8, const std::vector<std::string>& argsUtf8, const std::string& workingDirectoryUtf8, int* outProcessId)
+{
+    if (outProcessId != nullptr)
+    {
+        *outProcessId = 0;
+    }
+
+    if (executablePathUtf8.empty())
+    {
+        return false;
+    }
+
+#ifdef _WIN32
+    const std::wstring exePathW = Utf8ToWString(executablePathUtf8);
+    if (exePathW.empty())
+    {
+        return false;
+    }
+
+    std::wstring cmdLine = QuoteWindowsArg(exePathW);
+    for (const std::string& argUtf8 : argsUtf8)
+    {
+        const std::wstring argW = Utf8ToWString(argUtf8);
+        cmdLine.push_back(L' ');
+        cmdLine += QuoteWindowsArg(argW);
+    }
+
+    STARTUPINFOW si;
+    ::ZeroMemory(&si, sizeof(si));
+    si.cb = sizeof(si);
+
+    PROCESS_INFORMATION pi;
+    ::ZeroMemory(&pi, sizeof(pi));
+
+    std::wstring workingDirW;
+    const wchar_t* workingDirPtr = nullptr;
+    if (!workingDirectoryUtf8.empty())
+    {
+        workingDirW = Utf8ToWString(workingDirectoryUtf8);
+        if (!workingDirW.empty())
+        {
+            workingDirPtr = workingDirW.c_str();
+        }
+    }
+
+    // CreateProcessW 需要可写的 commandLine 缓冲区。
+    std::vector<wchar_t> cmdLineBuffer(cmdLine.begin(), cmdLine.end());
+    cmdLineBuffer.push_back(L'\0');
+
+    const BOOL ok = ::CreateProcessW(exePathW.c_str(), cmdLineBuffer.data(), nullptr, nullptr, FALSE, 0, nullptr, workingDirPtr, &si, &pi);
+
+    if (!ok)
+    {
+        return false;
+    }
+
+    if (outProcessId != nullptr)
+    {
+        *outProcessId = static_cast<int>(pi.dwProcessId);
+    }
+
+    ::CloseHandle(pi.hThread);
+    ::CloseHandle(pi.hProcess);
+    return true;
+
+#else
+    pid_t child = ::fork();
+    if (child < 0)
+    {
+        return false;
+    }
+
+    if (child == 0)
+    {
+        if (!workingDirectoryUtf8.empty())
+        {
+            ::chdir(workingDirectoryUtf8.c_str());
+        }
+
+        std::vector<std::string> argvStrings;
+        argvStrings.reserve(argsUtf8.size() + 1);
+        argvStrings.push_back(executablePathUtf8);
+        for (const std::string& a : argsUtf8)
+        {
+            argvStrings.push_back(a);
+        }
+
+        std::vector<char*> argv;
+        argv.reserve(argvStrings.size() + 1);
+        for (std::string& s : argvStrings)
+        {
+            argv.push_back(const_cast<char*>(s.c_str()));
+        }
+        argv.push_back(nullptr);
+
+        // 如果路径中包含 '/', 则按指定路径执行；否则允许通过 PATH 查找。
+        if (executablePathUtf8.find('/') != std::string::npos)
+        {
+            ::execv(executablePathUtf8.c_str(), argv.data());
+        }
+        else
+        {
+            ::execvp(executablePathUtf8.c_str(), argv.data());
+        }
+
+        ::_exit(127);
+    }
+
+    if (outProcessId != nullptr)
+    {
+        *outProcessId = static_cast<int>(child);
+    }
+    return true;
+#endif
+}
+
+bool GB_TerminateProcessById(int processId, unsigned int waitMs, bool allowForceKill)
+{
+    if (processId <= 0)
+    {
+        return false;
+    }
+
+#ifdef _WIN32
+    const DWORD pid = static_cast<DWORD>(processId);
+    const bool closeRequested = TryRequestCloseWindows(pid);
+
+    HandleGuard processHandle(::OpenProcess(SYNCHRONIZE | PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid));
+    if (processHandle.handle == nullptr)
+    {
+        // 至少能发出 WM_CLOSE 请求时认为“关闭请求已发出”。
+        return closeRequested;
+    }
+
+    // 已退出
+    if (!IsProcessRunningWindows(processHandle.handle))
+    {
+        return true;
+    }
+
+    if (waitMs > 0)
+    {
+        const DWORD waitResult = ::WaitForSingleObject(processHandle.handle, waitMs);
+        if (waitResult == WAIT_OBJECT_0)
+        {
+            return true;
+        }
+    }
+
+    if (allowForceKill)
+    {
+        if (IsProcessRunningWindows(processHandle.handle))
+        {
+            ::TerminateProcess(processHandle.handle, 1);
+            if (waitMs > 0)
+            {
+                ::WaitForSingleObject(processHandle.handle, waitMs);
+            }
+        }
+    }
+
+    // 最终以“是否仍在运行”作为判断。
+    return !IsProcessRunningWindows(processHandle.handle) || closeRequested;
+
+#else
+    const int pid = processId;
+
+    if (!IsProcessAliveLinux(pid))
+    {
+        return true;
+    }
+
+    if (::kill(pid, SIGTERM) != 0)
+    {
+        if (errno == ESRCH)
+        {
+            return true;
+        }
+        return false;
+    }
+
+    if (waitMs == 0)
+    {
+        return true;
+    }
+
+    const auto startTime = std::chrono::steady_clock::now();
+    while (true)
+    {
+        if (!IsProcessAliveLinux(pid))
+        {
+            return true;
+        }
+
+        const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - startTime).count();
+        if (elapsed >= static_cast<long long>(waitMs))
+        {
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+
+    if (allowForceKill)
+    {
+        ::kill(pid, SIGKILL);
+
+        const auto killStart = std::chrono::steady_clock::now();
+        while (IsProcessAliveLinux(pid))
+        {
+            const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - killStart).count();
+            if (elapsed >= static_cast<long long>(waitMs))
+            {
+                break;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+    }
+
+    return !IsProcessAliveLinux(pid);
+#endif
+}
+
+size_t GB_TerminateProcessesByName(const std::string& processNameUtf8, bool allowSubstringMatch, bool caseSensitive, unsigned int waitMs, bool allowForceKill)
+{
+    const std::vector<int> processIds = GB_FindProcessIdsByName(processNameUtf8, allowSubstringMatch, caseSensitive);
+    size_t count = 0;
+    for (int pid : processIds)
+    {
+        if (GB_TerminateProcessById(pid, waitMs, allowForceKill))
+        {
+            count++;
+        }
+    }
+    return count;
 }
