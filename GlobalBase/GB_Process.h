@@ -160,16 +160,21 @@ GLOBALBASE_PORT bool GB_TerminateProcessById(int processId, unsigned int waitMs 
  */
 GLOBALBASE_PORT size_t GB_TerminateProcessesByName(const std::string& processNameUtf8, bool allowSubstringMatch = false, bool caseSensitive = false, unsigned int waitMs = 0, bool allowForceKill = true);
 
+/**
+ * @brief 获取某个可执行文件/动态库导出的函数符号。
+ *
+ * @param filePathUtf8      目标文件路径（UTF-8）。
+ * @return 导出函数符号列表。Windows 下通常返回修饰名/装饰名（例如 MSVC 的 ?Func@@...），Linux 下返回 ELF 符号名（可能为 Itanium ABI 的 _Z...）。
+ */
+GLOBALBASE_PORT std::vector<std::string> GB_GetExportedFunctionSignatures(const std::string& filePathUtf8);
 
-
-
-
-
-
-
-
-
-
+/**
+ * @brief 获取某个可执行文件/动态库依赖的外部函数。
+ *
+ * @param filePathUtf8 目标文件路径（UTF-8）。
+ * @return 外部函数列表。Windows 返回形如 "KERNEL32.dll!CreateFileW" 或 "xxx.dll!#123"；Linux 返回未定义函数符号名（例如 pthread_create）。
+ */
+GLOBALBASE_PORT std::vector<std::string> GB_GetImportedFunctionSignatures(const std::string& filePathUtf8);
 
 
 #endif

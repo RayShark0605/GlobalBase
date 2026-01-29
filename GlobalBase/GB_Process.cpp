@@ -10,6 +10,9 @@
 #include <string>
 #include <thread>
 #include <vector>
+#include <cstdint>
+#include <fstream>
+#include <unordered_set>
 
 #ifdef _WIN32
 #  define NOMINMAX
@@ -2116,4 +2119,1060 @@ size_t GB_TerminateProcessesByName(const std::string& processNameUtf8, bool allo
         }
     }
     return count;
+}
+
+namespace
+{
+    bool ReadAllBytesUtf8Path(const std::string& filePathUtf8, std::vector<unsigned char>* outBytes)
+    {
+        if (outBytes == nullptr)
+        {
+            return false;
+        }
+
+        outBytes->clear();
+
+#ifdef _WIN32
+        if (filePathUtf8.empty())
+        {
+            return false;
+        }
+
+        const int wideLen = ::MultiByteToWideChar(CP_UTF8, 0, filePathUtf8.c_str(), -1, nullptr, 0);
+        if (wideLen <= 0)
+        {
+            return false;
+        }
+
+        std::wstring widePath;
+        widePath.resize(static_cast<size_t>(wideLen - 1));
+        ::MultiByteToWideChar(CP_UTF8, 0, filePathUtf8.c_str(), -1, &widePath[0], wideLen);
+
+        FILE* file = _wfopen(widePath.c_str(), L"rb");
+        if (file == nullptr)
+        {
+            return false;
+        }
+
+        fseek(file, 0, SEEK_END);
+        const long fileSizeLong = ftell(file);
+        fseek(file, 0, SEEK_SET);
+
+        if (fileSizeLong <= 0)
+        {
+            fclose(file);
+            return false;
+        }
+
+        const size_t fileSize = static_cast<size_t>(fileSizeLong);
+        outBytes->resize(fileSize);
+
+        const size_t readSize = fread(outBytes->data(), 1, fileSize, file);
+        fclose(file);
+
+        return readSize == fileSize;
+#else
+        std::ifstream file(filePathUtf8.c_str(), std::ios::binary);
+        if (!file)
+        {
+            return false;
+        }
+
+        file.seekg(0, std::ios::end);
+        const std::streamoff fileSize = file.tellg();
+        if (fileSize <= 0)
+        {
+            return false;
+        }
+
+        file.seekg(0, std::ios::beg);
+
+        outBytes->resize(static_cast<size_t>(fileSize));
+        file.read(reinterpret_cast<char*>(outBytes->data()), fileSize);
+
+        return file.good();
+#endif
+    }
+
+    bool IsElfFile(const std::vector<unsigned char>& bytes)
+    {
+        if (bytes.size() < 4)
+        {
+            return false;
+        }
+
+        return bytes[0] == 0x7F && bytes[1] == 'E' && bytes[2] == 'L' && bytes[3] == 'F';
+    }
+
+    bool IsPeFile(const std::vector<unsigned char>& bytes)
+    {
+        if (bytes.size() < 2)
+        {
+            return false;
+        }
+
+        return bytes[0] == 'M' && bytes[1] == 'Z';
+    }
+
+    uint16_t ReadU16Le(const std::vector<unsigned char>& bytes, size_t offset, bool* ok)
+    {
+        if (ok != nullptr) *ok = false;
+        if (offset + 2 > bytes.size())
+        {
+            return 0;
+        }
+
+        const uint16_t v = static_cast<uint16_t>(bytes[offset]) |
+            (static_cast<uint16_t>(bytes[offset + 1]) << 8);
+
+        if (ok != nullptr) *ok = true;
+        return v;
+    }
+
+    uint32_t ReadU32Le(const std::vector<unsigned char>& bytes, size_t offset, bool* ok)
+    {
+        if (ok != nullptr) *ok = false;
+        if (offset + 4 > bytes.size())
+        {
+            return 0;
+        }
+
+        const uint32_t v = static_cast<uint32_t>(bytes[offset]) |
+            (static_cast<uint32_t>(bytes[offset + 1]) << 8) |
+            (static_cast<uint32_t>(bytes[offset + 2]) << 16) |
+            (static_cast<uint32_t>(bytes[offset + 3]) << 24);
+
+        if (ok != nullptr) *ok = true;
+        return v;
+    }
+
+    uint64_t ReadU64Le(const std::vector<unsigned char>& bytes, size_t offset, bool* ok)
+    {
+        if (ok != nullptr) *ok = false;
+        if (offset + 8 > bytes.size())
+        {
+            return 0;
+        }
+
+        uint64_t v = 0;
+        for (int i = 0; i < 8; i++)
+        {
+            v |= (static_cast<uint64_t>(bytes[offset + static_cast<size_t>(i)]) << (8ULL * static_cast<uint64_t>(i)));
+        }
+
+        if (ok != nullptr) *ok = true;
+        return v;
+    }
+
+    std::string ReadCString(const std::vector<unsigned char>& bytes, size_t offset)
+    {
+        if (offset >= bytes.size())
+        {
+            return std::string();
+        }
+
+        size_t end = offset;
+        while (end < bytes.size() && bytes[end] != 0)
+        {
+            end++;
+        }
+
+        return std::string(reinterpret_cast<const char*>(&bytes[offset]), end - offset);
+    }
+
+    std::string ToLowerAscii(std::string s)
+    {
+        for (size_t i = 0; i < s.size(); i++)
+        {
+            const unsigned char c = static_cast<unsigned char>(s[i]);
+            if (c >= 'A' && c <= 'Z')
+            {
+                s[i] = static_cast<char>(c - 'A' + 'a');
+            }
+        }
+        return s;
+    }
+
+    // -------------------------
+    // PE parsing (portable)
+    // -------------------------
+
+#pragma pack(push, 1)
+    struct PeCoffFileHeader
+    {
+        uint16_t machine;
+        uint16_t numberOfSections;
+        uint32_t timeDateStamp;
+        uint32_t pointerToSymbolTable;
+        uint32_t numberOfSymbols;
+        uint16_t sizeOfOptionalHeader;
+        uint16_t characteristics;
+    };
+
+    struct PeDataDirectory
+    {
+        uint32_t virtualAddress;
+        uint32_t size;
+    };
+
+    struct PeSectionHeader
+    {
+        char     name[8];
+        uint32_t virtualSize;
+        uint32_t virtualAddress;
+        uint32_t sizeOfRawData;
+        uint32_t pointerToRawData;
+        uint32_t pointerToRelocations;
+        uint32_t pointerToLinenumbers;
+        uint16_t numberOfRelocations;
+        uint16_t numberOfLinenumbers;
+        uint32_t characteristics;
+    };
+#pragma pack(pop)
+
+    bool RvaToFileOffsetPe(const std::vector<PeSectionHeader>& sections, uint32_t rva, uint32_t* outOffset)
+    {
+        if (outOffset == nullptr)
+        {
+            return false;
+        }
+
+        for (size_t i = 0; i < sections.size(); i++)
+        {
+            const PeSectionHeader& sec = sections[i];
+            const uint32_t secVa = sec.virtualAddress;
+            const uint32_t secSize = std::max(sec.virtualSize, sec.sizeOfRawData);
+
+            if (rva >= secVa && rva < secVa + secSize)
+            {
+                const uint32_t delta = rva - secVa;
+                *outOffset = sec.pointerToRawData + delta;
+                return true;
+            }
+        }
+
+        // Some RVAs can be within headers; treat RVA as file offset in that case.
+        *outOffset = rva;
+        return true;
+    }
+
+    void ParsePeExports(const std::vector<unsigned char>& bytes, std::vector<std::string>* outExports)
+    {
+        if (outExports == nullptr)
+        {
+            return;
+        }
+
+        outExports->clear();
+
+        if (bytes.size() < 0x40)
+        {
+            return;
+        }
+
+        bool ok = false;
+        const uint32_t e_lfanew = ReadU32Le(bytes, 0x3C, &ok);
+        if (!ok || e_lfanew + 4 + sizeof(PeCoffFileHeader) > bytes.size())
+        {
+            return;
+        }
+
+        if (!(bytes[e_lfanew] == 'P' && bytes[e_lfanew + 1] == 'E' && bytes[e_lfanew + 2] == 0 && bytes[e_lfanew + 3] == 0))
+        {
+            return;
+        }
+
+        const size_t coffOffset = static_cast<size_t>(e_lfanew + 4);
+        PeCoffFileHeader coff = {};
+        std::memcpy(&coff, &bytes[coffOffset], sizeof(PeCoffFileHeader));
+
+        const size_t optionalOffset = coffOffset + sizeof(PeCoffFileHeader);
+        if (optionalOffset + coff.sizeOfOptionalHeader > bytes.size())
+        {
+            return;
+        }
+
+        // Optional header magic: 0x10B (PE32), 0x20B (PE32+)
+        const uint16_t optMagic = ReadU16Le(bytes, optionalOffset, &ok);
+        if (!ok)
+        {
+            return;
+        }
+
+        const bool isPe32Plus = (optMagic == 0x20B);
+        const size_t dataDirOffset = isPe32Plus ? (optionalOffset + 112) : (optionalOffset + 96); // Standard PE offsets
+        if (dataDirOffset + sizeof(PeDataDirectory) * 16 > bytes.size())
+        {
+            return;
+        }
+
+        PeDataDirectory exportDir = {};
+        std::memcpy(&exportDir, &bytes[dataDirOffset + sizeof(PeDataDirectory) * 0], sizeof(PeDataDirectory));
+
+        if (exportDir.virtualAddress == 0 || exportDir.size == 0)
+        {
+            return;
+        }
+
+        const size_t sectionTableOffset = optionalOffset + coff.sizeOfOptionalHeader;
+        const size_t needSectionBytes = static_cast<size_t>(coff.numberOfSections) * sizeof(PeSectionHeader);
+        if (sectionTableOffset + needSectionBytes > bytes.size())
+        {
+            return;
+        }
+
+        std::vector<PeSectionHeader> sections;
+        sections.resize(coff.numberOfSections);
+        std::memcpy(sections.data(), &bytes[sectionTableOffset], needSectionBytes);
+
+        uint32_t exportDirFileOffset = 0;
+        if (!RvaToFileOffsetPe(sections, exportDir.virtualAddress, &exportDirFileOffset))
+        {
+            return;
+        }
+
+        // IMAGE_EXPORT_DIRECTORY is 40 bytes (per winnt.h; structure described in PE format docs)
+        if (static_cast<size_t>(exportDirFileOffset) + 40 > bytes.size())
+        {
+            return;
+        }
+
+        const uint32_t base = ReadU32Le(bytes, exportDirFileOffset + 16, &ok);
+        if (!ok)
+        {
+            return;
+        }
+
+        const uint32_t numberOfFunctions = ReadU32Le(bytes, exportDirFileOffset + 20, &ok);
+        const uint32_t numberOfNames = ReadU32Le(bytes, exportDirFileOffset + 24, &ok);
+        const uint32_t addressOfFunctionsRva = ReadU32Le(bytes, exportDirFileOffset + 28, &ok);
+        const uint32_t addressOfNamesRva = ReadU32Le(bytes, exportDirFileOffset + 32, &ok);
+        const uint32_t addressOfNameOrdinalsRva = ReadU32Le(bytes, exportDirFileOffset + 36, &ok);
+
+        if (!ok || numberOfFunctions == 0 || numberOfNames == 0)
+        {
+            return;
+        }
+
+        uint32_t functionsOffset = 0;
+        uint32_t namesOffset = 0;
+        uint32_t ordinalsOffset = 0;
+
+        if (!RvaToFileOffsetPe(sections, addressOfFunctionsRva, &functionsOffset) ||
+            !RvaToFileOffsetPe(sections, addressOfNamesRva, &namesOffset) ||
+            !RvaToFileOffsetPe(sections, addressOfNameOrdinalsRva, &ordinalsOffset))
+        {
+            return;
+        }
+
+        const size_t functionsBytes = static_cast<size_t>(numberOfFunctions) * 4;
+        const size_t namesBytes = static_cast<size_t>(numberOfNames) * 4;
+        const size_t ordinalsBytes = static_cast<size_t>(numberOfNames) * 2;
+
+        if (static_cast<size_t>(functionsOffset) + functionsBytes > bytes.size() ||
+            static_cast<size_t>(namesOffset) + namesBytes > bytes.size() ||
+            static_cast<size_t>(ordinalsOffset) + ordinalsBytes > bytes.size())
+        {
+            return;
+        }
+
+        std::unordered_set<std::string> uniqueSet;
+        uniqueSet.reserve(static_cast<size_t>(numberOfNames));
+
+        for (uint32_t i = 0; i < numberOfNames; i++)
+        {
+            const uint32_t nameRva = ReadU32Le(bytes, static_cast<size_t>(namesOffset) + static_cast<size_t>(i) * 4, &ok);
+            if (!ok)
+            {
+                continue;
+            }
+
+            uint32_t nameFileOffset = 0;
+            if (!RvaToFileOffsetPe(sections, nameRva, &nameFileOffset))
+            {
+                continue;
+            }
+
+            const std::string funcName = ReadCString(bytes, nameFileOffset);
+            if (funcName.empty())
+            {
+                continue;
+            }
+
+            const uint16_t ordinalIndex = ReadU16Le(bytes, static_cast<size_t>(ordinalsOffset) + static_cast<size_t>(i) * 2, &ok);
+            if (!ok)
+            {
+                continue;
+            }
+
+            if (ordinalIndex >= numberOfFunctions)
+            {
+                continue;
+            }
+
+            const uint32_t funcRva = ReadU32Le(bytes, static_cast<size_t>(functionsOffset) + static_cast<size_t>(ordinalIndex) * 4, &ok);
+            if (!ok)
+            {
+                continue;
+            }
+
+            // Build a dumpbin-ish line: Ordinal Hint RVA Name
+            std::ostringstream oss;
+            oss << (base + static_cast<uint32_t>(ordinalIndex)) << " "
+                << i << " ";
+
+            oss.setf(std::ios::hex, std::ios::basefield);
+            oss << "0x" << funcRva;
+            oss.setf(std::ios::dec, std::ios::basefield);
+            oss << " " << funcName;
+
+            // Forwarder (func RVA points back into export directory range)
+            if (funcRva >= exportDir.virtualAddress && funcRva < exportDir.virtualAddress + exportDir.size)
+            {
+                uint32_t forwarderOffset = 0;
+                if (RvaToFileOffsetPe(sections, funcRva, &forwarderOffset))
+                {
+                    const std::string forwarder = ReadCString(bytes, forwarderOffset);
+                    if (!forwarder.empty())
+                    {
+                        oss << " -> " << forwarder;
+                    }
+                }
+            }
+
+            const std::string line = oss.str();
+            if (uniqueSet.insert(line).second)
+            {
+                outExports->push_back(line);
+            }
+        }
+
+        std::sort(outExports->begin(), outExports->end());
+    }
+
+    void ParsePeImports(const std::vector<unsigned char>& bytes, std::vector<std::string>* outImports)
+    {
+        if (outImports == nullptr)
+        {
+            return;
+        }
+
+        outImports->clear();
+
+        if (bytes.size() < 0x40)
+        {
+            return;
+        }
+
+        bool ok = false;
+        const uint32_t e_lfanew = ReadU32Le(bytes, 0x3C, &ok);
+        if (!ok || e_lfanew + 4 + sizeof(PeCoffFileHeader) > bytes.size())
+        {
+            return;
+        }
+
+        if (!(bytes[e_lfanew] == 'P' && bytes[e_lfanew + 1] == 'E' && bytes[e_lfanew + 2] == 0 && bytes[e_lfanew + 3] == 0))
+        {
+            return;
+        }
+
+        const size_t coffOffset = static_cast<size_t>(e_lfanew + 4);
+        PeCoffFileHeader coff = {};
+        std::memcpy(&coff, &bytes[coffOffset], sizeof(PeCoffFileHeader));
+
+        const size_t optionalOffset = coffOffset + sizeof(PeCoffFileHeader);
+        if (optionalOffset + coff.sizeOfOptionalHeader > bytes.size())
+        {
+            return;
+        }
+
+        const uint16_t optMagic = ReadU16Le(bytes, optionalOffset, &ok);
+        if (!ok)
+        {
+            return;
+        }
+
+        const bool isPe32Plus = (optMagic == 0x20B);
+        const size_t dataDirOffset = isPe32Plus ? (optionalOffset + 112) : (optionalOffset + 96);
+        if (dataDirOffset + sizeof(PeDataDirectory) * 16 > bytes.size())
+        {
+            return;
+        }
+
+        PeDataDirectory importDir = {};
+        std::memcpy(&importDir, &bytes[dataDirOffset + sizeof(PeDataDirectory) * 1], sizeof(PeDataDirectory));
+
+        if (importDir.virtualAddress == 0 || importDir.size == 0)
+        {
+            return;
+        }
+
+        const size_t sectionTableOffset = optionalOffset + coff.sizeOfOptionalHeader;
+        const size_t needSectionBytes = static_cast<size_t>(coff.numberOfSections) * sizeof(PeSectionHeader);
+        if (sectionTableOffset + needSectionBytes > bytes.size())
+        {
+            return;
+        }
+
+        std::vector<PeSectionHeader> sections;
+        sections.resize(coff.numberOfSections);
+        std::memcpy(sections.data(), &bytes[sectionTableOffset], needSectionBytes);
+
+        uint32_t importDirFileOffset = 0;
+        if (!RvaToFileOffsetPe(sections, importDir.virtualAddress, &importDirFileOffset))
+        {
+            return;
+        }
+
+        // IMAGE_IMPORT_DESCRIPTOR is 20 bytes, array terminated by all-zeros entry.
+        std::unordered_set<std::string> uniqueSet;
+        uniqueSet.reserve(256);
+
+        size_t descOffset = static_cast<size_t>(importDirFileOffset);
+        while (descOffset + 20 <= bytes.size())
+        {
+            const uint32_t originalFirstThunk = ReadU32Le(bytes, descOffset + 0, &ok);
+            const uint32_t timeDateStamp = ReadU32Le(bytes, descOffset + 4, &ok);
+            const uint32_t forwarderChain = ReadU32Le(bytes, descOffset + 8, &ok);
+            const uint32_t nameRva = ReadU32Le(bytes, descOffset + 12, &ok);
+            const uint32_t firstThunk = ReadU32Le(bytes, descOffset + 16, &ok);
+
+            (void)timeDateStamp;
+            (void)forwarderChain;
+
+            if (!ok)
+            {
+                break;
+            }
+
+            if (originalFirstThunk == 0 && nameRva == 0 && firstThunk == 0)
+            {
+                break;
+            }
+
+            uint32_t dllNameOffset = 0;
+            if (!RvaToFileOffsetPe(sections, nameRva, &dllNameOffset))
+            {
+                descOffset += 20;
+                continue;
+            }
+
+            std::string dllName = ReadCString(bytes, dllNameOffset);
+            if (dllName.empty())
+            {
+                descOffset += 20;
+                continue;
+            }
+
+            const uint32_t thunkRva = (originalFirstThunk != 0) ? originalFirstThunk : firstThunk;
+            uint32_t thunkOffset = 0;
+            if (!RvaToFileOffsetPe(sections, thunkRva, &thunkOffset))
+            {
+                descOffset += 20;
+                continue;
+            }
+
+            const bool is64 = isPe32Plus;
+            size_t thunkEntryOffset = static_cast<size_t>(thunkOffset);
+
+            while (true)
+            {
+                if (is64)
+                {
+                    if (thunkEntryOffset + 8 > bytes.size())
+                    {
+                        break;
+                    }
+
+                    const uint64_t thunkValue = ReadU64Le(bytes, thunkEntryOffset, &ok);
+                    if (!ok || thunkValue == 0)
+                    {
+                        break;
+                    }
+
+                    const uint64_t isOrdinal = (thunkValue & 0x8000000000000000ULL);
+                    if (isOrdinal != 0)
+                    {
+                        const uint16_t ordinal = static_cast<uint16_t>(thunkValue & 0xFFFFULL);
+                        std::ostringstream oss;
+                        oss << dllName << "!#" << ordinal;
+                        uniqueSet.insert(oss.str());
+                    }
+                    else
+                    {
+                        const uint32_t importByNameRva = static_cast<uint32_t>(thunkValue & 0xFFFFFFFFULL);
+                        uint32_t importByNameOffset = 0;
+                        if (RvaToFileOffsetPe(sections, importByNameRva, &importByNameOffset))
+                        {
+                            // IMAGE_IMPORT_BY_NAME: WORD hint + ASCII name
+                            const std::string funcName = ReadCString(bytes, static_cast<size_t>(importByNameOffset) + 2);
+                            if (!funcName.empty())
+                            {
+                                std::ostringstream oss;
+                                oss << dllName << "!" << funcName;
+                                uniqueSet.insert(oss.str());
+                            }
+                        }
+                    }
+
+                    thunkEntryOffset += 8;
+                }
+                else
+                {
+                    if (thunkEntryOffset + 4 > bytes.size())
+                    {
+                        break;
+                    }
+
+                    const uint32_t thunkValue = ReadU32Le(bytes, thunkEntryOffset, &ok);
+                    if (!ok || thunkValue == 0)
+                    {
+                        break;
+                    }
+
+                    const uint32_t isOrdinal = (thunkValue & 0x80000000UL);
+                    if (isOrdinal != 0)
+                    {
+                        const uint16_t ordinal = static_cast<uint16_t>(thunkValue & 0xFFFFUL);
+                        std::ostringstream oss;
+                        oss << dllName << "!#" << ordinal;
+                        uniqueSet.insert(oss.str());
+                    }
+                    else
+                    {
+                        const uint32_t importByNameRva = thunkValue;
+                        uint32_t importByNameOffset = 0;
+                        if (RvaToFileOffsetPe(sections, importByNameRva, &importByNameOffset))
+                        {
+                            const std::string funcName = ReadCString(bytes, static_cast<size_t>(importByNameOffset) + 2);
+                            if (!funcName.empty())
+                            {
+                                std::ostringstream oss;
+                                oss << dllName << "!" << funcName;
+                                uniqueSet.insert(oss.str());
+                            }
+                        }
+                    }
+
+                    thunkEntryOffset += 4;
+                }
+            }
+
+            descOffset += 20;
+        }
+
+        outImports->assign(uniqueSet.begin(), uniqueSet.end());
+        std::sort(outImports->begin(), outImports->end(), [](const std::string& a, const std::string& b)
+            {
+                return ToLowerAscii(a) < ToLowerAscii(b);
+            });
+    }
+
+    // -------------------------
+    // ELF parsing (little-endian)
+    // -------------------------
+
+#pragma pack(push, 1)
+    struct Elf64_Ehdr
+    {
+        unsigned char e_ident[16];
+        uint16_t e_type;
+        uint16_t e_machine;
+        uint32_t e_version;
+        uint64_t e_entry;
+        uint64_t e_phoff;
+        uint64_t e_shoff;
+        uint32_t e_flags;
+        uint16_t e_ehsize;
+        uint16_t e_phentsize;
+        uint16_t e_phnum;
+        uint16_t e_shentsize;
+        uint16_t e_shnum;
+        uint16_t e_shstrndx;
+    };
+
+    struct Elf64_Shdr
+    {
+        uint32_t sh_name;
+        uint32_t sh_type;
+        uint64_t sh_flags;
+        uint64_t sh_addr;
+        uint64_t sh_offset;
+        uint64_t sh_size;
+        uint32_t sh_link;
+        uint32_t sh_info;
+        uint64_t sh_addralign;
+        uint64_t sh_entsize;
+    };
+
+    struct Elf64_Sym
+    {
+        uint32_t st_name;
+        unsigned char st_info;
+        unsigned char st_other;
+        uint16_t st_shndx;
+        uint64_t st_value;
+        uint64_t st_size;
+    };
+
+    struct Elf32_Ehdr
+    {
+        unsigned char e_ident[16];
+        uint16_t e_type;
+        uint16_t e_machine;
+        uint32_t e_version;
+        uint32_t e_entry;
+        uint32_t e_phoff;
+        uint32_t e_shoff;
+        uint32_t e_flags;
+        uint16_t e_ehsize;
+        uint16_t e_phentsize;
+        uint16_t e_phnum;
+        uint16_t e_shentsize;
+        uint16_t e_shnum;
+        uint16_t e_shstrndx;
+    };
+
+    struct Elf32_Shdr
+    {
+        uint32_t sh_name;
+        uint32_t sh_type;
+        uint32_t sh_flags;
+        uint32_t sh_addr;
+        uint32_t sh_offset;
+        uint32_t sh_size;
+        uint32_t sh_link;
+        uint32_t sh_info;
+        uint32_t sh_addralign;
+        uint32_t sh_entsize;
+    };
+
+    struct Elf32_Sym
+    {
+        uint32_t st_name;
+        uint32_t st_value;
+        uint32_t st_size;
+        unsigned char st_info;
+        unsigned char st_other;
+        uint16_t st_shndx;
+    };
+#pragma pack(pop)
+
+    unsigned char ElfStType(unsigned char stInfo)
+    {
+        return static_cast<unsigned char>(stInfo & 0x0F);
+    }
+
+    unsigned char ElfStBind(unsigned char stInfo)
+    {
+        return static_cast<unsigned char>((stInfo >> 4) & 0x0F);
+    }
+
+    unsigned char ElfStVis(unsigned char stOther)
+    {
+        return static_cast<unsigned char>(stOther & 0x03);
+    }
+
+    void ParseElfDynSymbols(const std::vector<unsigned char>& bytes, bool wantExports, std::vector<std::string>* outList)
+    {
+        if (outList == nullptr)
+        {
+            return;
+        }
+
+        outList->clear();
+
+        if (bytes.size() < 16)
+        {
+            return;
+        }
+
+        const unsigned char elfClass = bytes[4]; // 1=32, 2=64
+        const unsigned char elfData = bytes[5];  // 1=little, 2=big
+        if (elfData != 1)
+        {
+            return; // Only little-endian handled for now
+        }
+
+        const uint32_t SHT_DYNSYM = 11;
+        const uint16_t SHN_UNDEF = 0;
+        const unsigned char STT_FUNC = 2;
+        const unsigned char STB_GLOBAL = 1;
+        const unsigned char STB_WEAK = 2;
+        const unsigned char STV_DEFAULT = 0;
+
+        std::unordered_set<std::string> uniqueSet;
+
+        if (elfClass == 2)
+        {
+            if (bytes.size() < sizeof(Elf64_Ehdr))
+            {
+                return;
+            }
+
+            Elf64_Ehdr eh = {};
+            std::memcpy(&eh, bytes.data(), sizeof(Elf64_Ehdr));
+
+            if (eh.e_shoff == 0 || eh.e_shnum == 0 || eh.e_shentsize != sizeof(Elf64_Shdr))
+            {
+                return;
+            }
+
+            const size_t shTableSize = static_cast<size_t>(eh.e_shnum) * sizeof(Elf64_Shdr);
+            if (static_cast<size_t>(eh.e_shoff) + shTableSize > bytes.size())
+            {
+                return;
+            }
+
+            const Elf64_Shdr* shdrs = reinterpret_cast<const Elf64_Shdr*>(&bytes[static_cast<size_t>(eh.e_shoff)]);
+
+            for (uint16_t i = 0; i < eh.e_shnum; i++)
+            {
+                const Elf64_Shdr& symSh = shdrs[i];
+                if (symSh.sh_type != SHT_DYNSYM)
+                {
+                    continue;
+                }
+
+                if (symSh.sh_entsize == 0 || symSh.sh_offset + symSh.sh_size > bytes.size())
+                {
+                    continue;
+                }
+
+                const uint32_t strIndex = symSh.sh_link;
+                if (strIndex >= eh.e_shnum)
+                {
+                    continue;
+                }
+
+                const Elf64_Shdr& strSh = shdrs[strIndex];
+                if (strSh.sh_offset + strSh.sh_size > bytes.size())
+                {
+                    continue;
+                }
+
+                const char* strBase = reinterpret_cast<const char*>(&bytes[static_cast<size_t>(strSh.sh_offset)]);
+                const size_t strSize = static_cast<size_t>(strSh.sh_size);
+
+                const size_t symCount = static_cast<size_t>(symSh.sh_size / symSh.sh_entsize);
+                const Elf64_Sym* syms = reinterpret_cast<const Elf64_Sym*>(&bytes[static_cast<size_t>(symSh.sh_offset)]);
+
+                for (size_t s = 0; s < symCount; s++)
+                {
+                    const Elf64_Sym& sym = syms[s];
+
+                    const unsigned char type = ElfStType(sym.st_info);
+                    if (type != STT_FUNC)
+                    {
+                        continue;
+                    }
+
+                    const unsigned char bind = ElfStBind(sym.st_info);
+                    if (!(bind == STB_GLOBAL || bind == STB_WEAK))
+                    {
+                        continue;
+                    }
+
+                    const unsigned char vis = ElfStVis(sym.st_other);
+                    if (vis != STV_DEFAULT)
+                    {
+                        continue;
+                    }
+
+                    const bool isUndef = (sym.st_shndx == SHN_UNDEF);
+                    if (wantExports)
+                    {
+                        if (isUndef)
+                        {
+                            continue;
+                        }
+                    }
+                    else
+                    {
+                        if (!isUndef)
+                        {
+                            continue;
+                        }
+                    }
+
+                    if (sym.st_name >= strSize)
+                    {
+                        continue;
+                    }
+
+                    const char* namePtr = strBase + sym.st_name;
+                    if (namePtr == nullptr || namePtr[0] == '\0')
+                    {
+                        continue;
+                    }
+
+                    uniqueSet.insert(std::string(namePtr));
+                }
+            }
+        }
+        else if (elfClass == 1)
+        {
+            if (bytes.size() < sizeof(Elf32_Ehdr))
+            {
+                return;
+            }
+
+            Elf32_Ehdr eh = {};
+            std::memcpy(&eh, bytes.data(), sizeof(Elf32_Ehdr));
+
+            if (eh.e_shoff == 0 || eh.e_shnum == 0 || eh.e_shentsize != sizeof(Elf32_Shdr))
+            {
+                return;
+            }
+
+            const size_t shTableSize = static_cast<size_t>(eh.e_shnum) * sizeof(Elf32_Shdr);
+            if (static_cast<size_t>(eh.e_shoff) + shTableSize > bytes.size())
+            {
+                return;
+            }
+
+            const Elf32_Shdr* shdrs = reinterpret_cast<const Elf32_Shdr*>(&bytes[static_cast<size_t>(eh.e_shoff)]);
+
+            for (uint16_t i = 0; i < eh.e_shnum; i++)
+            {
+                const Elf32_Shdr& symSh = shdrs[i];
+                if (symSh.sh_type != SHT_DYNSYM)
+                {
+                    continue;
+                }
+
+                if (symSh.sh_entsize == 0 || static_cast<size_t>(symSh.sh_offset) + static_cast<size_t>(symSh.sh_size) > bytes.size())
+                {
+                    continue;
+                }
+
+                const uint32_t strIndex = symSh.sh_link;
+                if (strIndex >= eh.e_shnum)
+                {
+                    continue;
+                }
+
+                const Elf32_Shdr& strSh = shdrs[strIndex];
+                if (static_cast<size_t>(strSh.sh_offset) + static_cast<size_t>(strSh.sh_size) > bytes.size())
+                {
+                    continue;
+                }
+
+                const char* strBase = reinterpret_cast<const char*>(&bytes[static_cast<size_t>(strSh.sh_offset)]);
+                const size_t strSize = static_cast<size_t>(strSh.sh_size);
+
+                const size_t symCount = static_cast<size_t>(symSh.sh_size / symSh.sh_entsize);
+                const Elf32_Sym* syms = reinterpret_cast<const Elf32_Sym*>(&bytes[static_cast<size_t>(symSh.sh_offset)]);
+
+                for (size_t s = 0; s < symCount; s++)
+                {
+                    const Elf32_Sym& sym = syms[s];
+
+                    const unsigned char type = ElfStType(sym.st_info);
+                    if (type != STT_FUNC)
+                    {
+                        continue;
+                    }
+
+                    const unsigned char bind = ElfStBind(sym.st_info);
+                    if (!(bind == STB_GLOBAL || bind == STB_WEAK))
+                    {
+                        continue;
+                    }
+
+                    const unsigned char vis = ElfStVis(sym.st_other);
+                    if (vis != STV_DEFAULT)
+                    {
+                        continue;
+                    }
+
+                    const bool isUndef = (sym.st_shndx == SHN_UNDEF);
+                    if (wantExports)
+                    {
+                        if (isUndef)
+                        {
+                            continue;
+                        }
+                    }
+                    else
+                    {
+                        if (!isUndef)
+                        {
+                            continue;
+                        }
+                    }
+
+                    if (sym.st_name >= strSize)
+                    {
+                        continue;
+                    }
+
+                    const char* namePtr = strBase + sym.st_name;
+                    if (namePtr == nullptr || namePtr[0] == '\0')
+                    {
+                        continue;
+                    }
+
+                    uniqueSet.insert(std::string(namePtr));
+                }
+            }
+        }
+        else
+        {
+            return;
+        }
+
+        outList->assign(uniqueSet.begin(), uniqueSet.end());
+        std::sort(outList->begin(), outList->end());
+    }
+}
+
+std::vector<std::string> GB_GetExportedFunctionSignatures(const std::string& filePathUtf8)
+{
+    std::vector<unsigned char> bytes;
+    if (!ReadAllBytesUtf8Path(filePathUtf8, &bytes))
+    {
+        return std::vector<std::string>();
+    }
+
+    std::vector<std::string> result;
+
+    if (IsPeFile(bytes))
+    {
+        ParsePeExports(bytes, &result);
+        return result;
+    }
+
+    if (IsElfFile(bytes))
+    {
+        ParseElfDynSymbols(bytes, true, &result);
+        return result;
+    }
+
+    return std::vector<std::string>();
+}
+
+std::vector<std::string> GB_GetImportedFunctionSignatures(const std::string& filePathUtf8)
+{
+    std::vector<unsigned char> bytes;
+    if (!ReadAllBytesUtf8Path(filePathUtf8, &bytes))
+    {
+        return std::vector<std::string>();
+    }
+
+    std::vector<std::string> result;
+
+    if (IsPeFile(bytes))
+    {
+        ParsePeImports(bytes, &result);
+        return result;
+    }
+
+    if (IsElfFile(bytes))
+    {
+        ParseElfDynSymbols(bytes, false, &result);
+        return result;
+    }
+
+    return std::vector<std::string>();
 }
