@@ -5,11 +5,11 @@
 #include "GB_BaseTypes.h"
 #include <string>
 
-GLOBALBASE_PORT bool WriteUtf8ToFile(const std::string& filePathUtf8, const std::string& utf8Content, bool appendMode = true, bool addBomIfNewFile = false);
+GLOBALBASE_PORT bool GB_WriteUtf8ToFile(const std::string& filePathUtf8, const std::string& utf8Content, bool appendMode = true, bool addBomIfNewFile = false);
 
-GLOBALBASE_PORT GB_ByteBuffer ReadFileToBinary(const std::string& filePathUtf8);
+GLOBALBASE_PORT GB_ByteBuffer GB_ReadFileToBinary(const std::string& filePathUtf8);
 
-GLOBALBASE_PORT bool WriteBinaryToFile(const GB_ByteBuffer& data, const std::string& filePathUtf8);
+GLOBALBASE_PORT bool GB_WriteBinaryToFile(const GB_ByteBuffer& data, const std::string& filePathUtf8);
 
 class GLOBALBASE_PORT GB_ByteBufferIO
 {

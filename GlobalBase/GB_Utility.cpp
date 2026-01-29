@@ -12,7 +12,7 @@
 
 using namespace std;
 
-void GetConsoleEncodingCode(unsigned int& code)
+void GB_GetConsoleEncodingCode(unsigned int& code)
 {
 #if defined(_WIN32)
     UINT cp = ::GetConsoleOutputCP();
@@ -86,7 +86,7 @@ void GetConsoleEncodingCode(unsigned int& code)
 #endif
 }
 
-void GetConsoleEncodingString(string& encodingString)
+void GB_GetConsoleEncodingString(string& encodingString)
 {
 #if defined(_WIN32)
 	UINT cp = ::GetConsoleOutputCP();
@@ -133,7 +133,7 @@ void GetConsoleEncodingString(string& encodingString)
 #endif
 }
 
-bool SetConsoleEncoding(unsigned int codePageId)
+bool GB_SetConsoleEncoding(unsigned int codePageId)
 {
 #if defined(_WIN32)
     if (!::SetConsoleOutputCP(codePageId)) // 同时设置输出与输入码页
@@ -251,8 +251,8 @@ bool SetConsoleEncoding(unsigned int codePageId)
 #endif
 }
 
-bool SetConsoleEncodingToUtf8()
+bool GB_SetConsoleEncodingToUtf8()
 {
-    return SetConsoleEncoding(65001);
+    return GB_SetConsoleEncoding(65001);
 }
 

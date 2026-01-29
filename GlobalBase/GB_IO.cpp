@@ -17,7 +17,7 @@
 
 using namespace std;
 
-bool WriteUtf8ToFile(const string& filePathUtf8, const string& utf8Content, bool appendMode, bool addBomIfNewFile)
+bool GB_WriteUtf8ToFile(const string& filePathUtf8, const string& utf8Content, bool appendMode, bool addBomIfNewFile)
 {
     const bool existedBefore = GB_IsFileExists(filePathUtf8);
 	if (!existedBefore)
@@ -161,7 +161,7 @@ bool WriteUtf8ToFile(const string& filePathUtf8, const string& utf8Content, bool
 #endif
 }
 
-std::vector<unsigned char> ReadFileToBinary(const std::string& filePathUtf8)
+std::vector<unsigned char> GB_ReadFileToBinary(const std::string& filePathUtf8)
 {
     if (filePathUtf8.empty())
     {
@@ -316,7 +316,7 @@ std::vector<unsigned char> ReadFileToBinary(const std::string& filePathUtf8)
 #endif
 }
 
-bool WriteBinaryToFile(const GB_ByteBuffer& data, const std::string& filePathUtf8)
+bool GB_WriteBinaryToFile(const GB_ByteBuffer& data, const std::string& filePathUtf8)
 {
     if (filePathUtf8.empty())
     {

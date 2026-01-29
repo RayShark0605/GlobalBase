@@ -426,7 +426,7 @@ namespace
         }
         full.append(nameBuffer.data(), nameLen);
 
-        userNameUtf8 = WStringToUtf8(full);
+        userNameUtf8 = GB_WStringToUtf8(full);
         return !userNameUtf8.empty();
     }
 
@@ -461,7 +461,7 @@ namespace
         }
 
         buffer.resize(size);
-        exePathUtf8 = WStringToUtf8(buffer);
+        exePathUtf8 = GB_WStringToUtf8(buffer);
         return !exePathUtf8.empty();
     }
 
@@ -570,7 +570,7 @@ namespace
             return;
         }
 
-        info.commandLineUtf8 = WStringToUtf8(std::wstring(cmdLine));
+        info.commandLineUtf8 = GB_WStringToUtf8(std::wstring(cmdLine));
         info.hasCommandLine = !info.commandLineUtf8.empty();
     }
 
@@ -596,7 +596,7 @@ namespace
         }
 
         buffer.resize(len);
-        info.workingDirectoryUtf8 = WStringToUtf8(buffer);
+        info.workingDirectoryUtf8 = GB_WStringToUtf8(buffer);
         info.hasWorkingDirectory = !info.workingDirectoryUtf8.empty();
     }
 
@@ -1085,7 +1085,7 @@ namespace
         }
 
         // 仅 ASCII 大小写转换，足够覆盖绝大多数进程名（通常是 ASCII 文件名）。
-        return Utf8ToLower(textUtf8);
+        return GB_Utf8ToLower(textUtf8);
     }
 
 #ifdef _WIN32
@@ -1406,7 +1406,7 @@ std::vector<GB_ProcessInfo> GB_GetAllProcessesInfo()
         info.processId = static_cast<int>(pe.th32ProcessID);
         info.parentProcessId = static_cast<int>(pe.th32ParentProcessID);
         info.threadCount = static_cast<unsigned int>(pe.cntThreads);
-        info.processNameUtf8 = WStringToUtf8(std::wstring(pe.szExeFile));
+        info.processNameUtf8 = GB_WStringToUtf8(std::wstring(pe.szExeFile));
 
         const DWORD desiredAccess = PROCESS_QUERY_LIMITED_INFORMATION;
         HandleGuard processHandle(::OpenProcess(desiredAccess, FALSE, pe.th32ProcessID));
@@ -1623,7 +1623,7 @@ std::vector<int> GB_FindProcessIdsByName(const std::string& processNameUtf8, boo
 
     do
     {
-        const std::string candidateNameUtf8 = WStringToUtf8(std::wstring(pe.szExeFile));
+        const std::string candidateNameUtf8 = GB_WStringToUtf8(std::wstring(pe.szExeFile));
         if (IsProcessNameMatched(candidateNameUtf8, processNameUtf8, allowSubstringMatch, caseSensitive))
         {
             processIds.push_back(static_cast<int>(pe.th32ProcessID));
@@ -1715,7 +1715,7 @@ bool GB_GetProcessInfo(int processId, GB_ProcessInfo& info)
             info.processId = processId;
             info.parentProcessId = static_cast<int>(pe.th32ParentProcessID);
             info.threadCount = static_cast<unsigned int>(pe.cntThreads);
-            info.processNameUtf8 = WStringToUtf8(std::wstring(pe.szExeFile));
+            info.processNameUtf8 = GB_WStringToUtf8(std::wstring(pe.szExeFile));
             break;
         }
     } while (::Process32NextW(snapshot.handle, &pe));
@@ -1895,7 +1895,7 @@ bool GB_StartProcess(const std::string& executablePathUtf8, const std::vector<st
     }
 
 #ifdef _WIN32
-    const std::wstring exePathW = Utf8ToWString(executablePathUtf8);
+    const std::wstring exePathW = GB_Utf8ToWString(executablePathUtf8);
     if (exePathW.empty())
     {
         return false;
@@ -1904,7 +1904,7 @@ bool GB_StartProcess(const std::string& executablePathUtf8, const std::vector<st
     std::wstring cmdLine = QuoteWindowsArg(exePathW);
     for (const std::string& argUtf8 : argsUtf8)
     {
-        const std::wstring argW = Utf8ToWString(argUtf8);
+        const std::wstring argW = GB_Utf8ToWString(argUtf8);
         cmdLine.push_back(L' ');
         cmdLine += QuoteWindowsArg(argW);
     }
@@ -1920,7 +1920,7 @@ bool GB_StartProcess(const std::string& executablePathUtf8, const std::vector<st
     const wchar_t* workingDirPtr = nullptr;
     if (!workingDirectoryUtf8.empty())
     {
-        workingDirW = Utf8ToWString(workingDirectoryUtf8);
+        workingDirW = GB_Utf8ToWString(workingDirectoryUtf8);
         if (!workingDirW.empty())
         {
             workingDirPtr = workingDirW.c_str();

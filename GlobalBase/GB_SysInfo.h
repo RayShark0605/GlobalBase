@@ -4,10 +4,11 @@
 #include <string>
 #include <vector>
 #include <cstdint>
+#include <unordered_map>
 #include "GlobalBasePort.h"
 
 // CPU 信息
-struct CpuInfo
+struct GB_CpuInfo
 {
     // 标识信息
     std::string vendor;           // 厂商，如 GenuineIntel / AuthenticAMD / ARM / ...
@@ -36,10 +37,10 @@ struct CpuInfo
 };
 
 // 获取 CPU 信息
-GLOBALBASE_PORT CpuInfo GetCpuInfo();
+GLOBALBASE_PORT GB_CpuInfo GB_GetCpuInfo();
 
 // 主板信息
-struct MotherboardInfo
+struct GB_MotherboardInfo
 {
     std::string manufacturer;   // 主板厂商
     std::string product;        // 主板型号
@@ -56,13 +57,13 @@ struct MotherboardInfo
 };
 
 // 获取当前主板信息
-GLOBALBASE_PORT MotherboardInfo GetMotherboardInfo();
+GLOBALBASE_PORT GB_MotherboardInfo GB_GetMotherboardInfo();
 
 // 生成硬件 ID（基于 CPU 和主板信息）
-GLOBALBASE_PORT std::string GenerateHardwareId();
+GLOBALBASE_PORT std::string GB_GenerateHardwareId();
 
 // 操作系统信息
-struct OsInfo
+struct GB_OsInfo
 {
     std::string name;               // 例如"Microsoft Windows 11 专业版"
     std::string version;            // 例如"10.0.26200"
@@ -83,9 +84,17 @@ struct OsInfo
 };
 
 // 获取当前操作系统信息
-GLOBALBASE_PORT OsInfo GetOsInfo();
+GLOBALBASE_PORT GB_OsInfo GB_GetOsInfo();
 
+// 获取 Windows 当前用户环境变量（用户变量）
+// - 仅在 Windows 上有效；非 Windows 平台返回空 map。
+// - 返回 <变量名, 变量值>，均为 UTF-8。
+GLOBALBASE_PORT std::unordered_map<std::string, std::string> GB_GetWindowsUserEnvironmentVariables();
 
+// 获取 Windows 系统环境变量（系统变量）
+// - 仅在 Windows 上有效；非 Windows 平台返回空 map。
+// - 返回 <变量名, 变量值>，均为 UTF-8。
+GLOBALBASE_PORT std::unordered_map<std::string, std::string> GB_GetWindowsSystemEnvironmentVariables();
 
 
 

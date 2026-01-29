@@ -1237,49 +1237,49 @@ vector<string> GB_GetFilesList(const string& dirPathUtf8, bool recursive)
 
 string GB_GetFileName(const string& rawFilePathUtf8, bool withExt)
 {
-    string filePathUtf8 = Utf8Replace(rawFilePathUtf8, GB_STR("\\\\"), GB_STR("\\"));
-    filePathUtf8 = Utf8Replace(filePathUtf8, GB_STR("\\"), GB_STR("/"));
-    const int64_t pos1 = Utf8FindLast(filePathUtf8, GB_STR("/"));
+    string filePathUtf8 = GB_Utf8Replace(rawFilePathUtf8, GB_STR("\\\\"), GB_STR("\\"));
+    filePathUtf8 = GB_Utf8Replace(filePathUtf8, GB_STR("\\"), GB_STR("/"));
+    const int64_t pos1 = GB_Utf8FindLast(filePathUtf8, GB_STR("/"));
     if (pos1 < 0)
     {
         return filePathUtf8;
 	}
-    const string fileNameWithExt = Utf8Substr(filePathUtf8, pos1 + 1);
+    const string fileNameWithExt = GB_Utf8Substr(filePathUtf8, pos1 + 1);
     if (withExt)
     {
         return fileNameWithExt;
 	}
 
-    const int64_t pos2 = Utf8FindLast(fileNameWithExt, GB_STR("."));
+    const int64_t pos2 = GB_Utf8FindLast(fileNameWithExt, GB_STR("."));
     if (pos2 < 0)
     {
         return fileNameWithExt;
     }
-	return Utf8Substr(fileNameWithExt, 0, pos2);
+	return GB_Utf8Substr(fileNameWithExt, 0, pos2);
 }
 
 string GB_GetFileExt(const string& filePathUtf8)
 {
-    const int64_t pos = Utf8FindLast(filePathUtf8, GB_STR("."));
+    const int64_t pos = GB_Utf8FindLast(filePathUtf8, GB_STR("."));
     if (pos < 0)
     {
         return "";
     }
 
-	return Utf8Substr(filePathUtf8, pos);
+	return GB_Utf8Substr(filePathUtf8, pos);
 }
 
 string GB_GetDirectoryPath(const string& rawFilePathUtf8)
 {
-    string filePathUtf8 = Utf8Replace(rawFilePathUtf8, GB_STR("\\\\"), GB_STR("\\"));
-    filePathUtf8 = Utf8Replace(filePathUtf8, GB_STR("\\"), GB_STR("/"));
-    const int64_t pos = Utf8FindLast(filePathUtf8, GB_STR("/"));
+    string filePathUtf8 = GB_Utf8Replace(rawFilePathUtf8, GB_STR("\\\\"), GB_STR("\\"));
+    filePathUtf8 = GB_Utf8Replace(filePathUtf8, GB_STR("\\"), GB_STR("/"));
+    const int64_t pos = GB_Utf8FindLast(filePathUtf8, GB_STR("/"));
     if (pos < 0)
     {
         return "";
     }
 
-	return Utf8Substr(filePathUtf8, 0, pos + 1);
+	return GB_Utf8Substr(filePathUtf8, 0, pos + 1);
 }
 
 size_t GB_GetFileSizeByte(const string& filePathUtf8)

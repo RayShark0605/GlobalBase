@@ -18,14 +18,14 @@
 #include "GlobalBasePort.h"
 
 // 获取当前控制台编码
-GLOBALBASE_PORT void GetConsoleEncodingString(std::string& encodingString);
-GLOBALBASE_PORT void GetConsoleEncodingCode(unsigned int& codePageId); // 未知编码则返回UINT_MAX
+GLOBALBASE_PORT void GB_GetConsoleEncodingString(std::string& encodingString);
+GLOBALBASE_PORT void GB_GetConsoleEncodingCode(unsigned int& codePageId); // 未知编码则返回UINT_MAX
 
 // 设置控制台编码
-GLOBALBASE_PORT bool SetConsoleEncoding(unsigned int codePageId);
+GLOBALBASE_PORT bool GB_SetConsoleEncoding(unsigned int codePageId);
 
 // 设置控制台编码为 UTF-8
-GLOBALBASE_PORT bool SetConsoleEncodingToUtf8();
+GLOBALBASE_PORT bool GB_SetConsoleEncodingToUtf8();
 
 
 

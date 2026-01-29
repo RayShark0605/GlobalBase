@@ -1,4 +1,6 @@
 ﻿#include "GB_SysInfo.h"
+#include "GB_Config.h"
+#include "GB_Utf8String.h"
 #include <algorithm>
 #include <set>
 #include <map>
@@ -15,7 +17,7 @@
 #include <powerbase.h>
 #include <powrprof.h>
 #pragma comment(lib, "PowrProf.lib")
-// 某些 SDK 里可能没有这个结构体——做个兼容兜底
+
 #ifndef PROCESSOR_POWER_INFORMATION_DEFINED
 #define PROCESSOR_POWER_INFORMATION_DEFINED
 typedef struct _PROCESSOR_POWER_INFORMATION
@@ -26,8 +28,9 @@ typedef struct _PROCESSOR_POWER_INFORMATION
     ULONG MhzLimit;
     ULONG MaxIdleState;
     ULONG CurrentIdleState;
-} PROCESSOR_POWER_INFORMATION, *PPROCESSOR_POWER_INFORMATION;
+} PROCESSOR_POWER_INFORMATION, * PPROCESSOR_POWER_INFORMATION;
 #endif
+
 #include <intrin.h>        // __cpuid, __cpuidex
 #include <wbemidl.h>
 #pragma comment(lib, "wbemuuid.lib")
@@ -312,6 +315,167 @@ namespace internal
         add(zmmEnabled && (ebx7 & (1u << 16)), "avx512f");
         add(ebx7 & (1u << 3), "bmi1");
         add(ebx7 & (1u << 8), "bmi2");
+    }
+
+    static wstring Utf8ToWide(const string& s)
+    {
+        if (s.empty())
+        {
+            return wstring();
+        }
+
+        const int len = ::MultiByteToWideChar(
+            CP_UTF8,
+            MB_ERR_INVALID_CHARS,
+            s.data(),
+            static_cast<int>(s.size()),
+            nullptr,
+            0);
+        if (len <= 0)
+        {
+            return wstring();
+        }
+
+        wstring ws(static_cast<size_t>(len), L'\0');
+        const int written = ::MultiByteToWideChar(
+            CP_UTF8,
+            MB_ERR_INVALID_CHARS,
+            s.data(),
+            static_cast<int>(s.size()),
+            &ws[0],
+            len);
+        if (written <= 0)
+        {
+            return wstring();
+        }
+
+        return ws;
+    }
+
+    static string WideToUtf8(const wstring& ws)
+    {
+        if (ws.empty())
+        {
+            return string();
+        }
+
+        const int len = ::WideCharToMultiByte(
+            CP_UTF8,
+            0,
+            ws.data(),
+            static_cast<int>(ws.size()),
+            nullptr,
+            0,
+            nullptr,
+            nullptr);
+        if (len <= 0)
+        {
+            return string();
+        }
+
+        string s(static_cast<size_t>(len), '\0');
+        const int written = ::WideCharToMultiByte(
+            CP_UTF8,
+            0,
+            ws.data(),
+            static_cast<int>(ws.size()),
+            &s[0],
+            len,
+            nullptr,
+            nullptr);
+        if (written <= 0)
+        {
+            return string();
+        }
+
+        return s;
+    }
+
+    static string ExpandEnvironmentStringsUtf8(const string& valueUtf8)
+    {
+        if (valueUtf8.empty())
+        {
+            return valueUtf8;
+        }
+
+        const wstring srcW = Utf8ToWide(valueUtf8);
+        if (srcW.empty())
+        {
+            return valueUtf8;
+        }
+
+        const DWORD needed = ::ExpandEnvironmentStringsW(srcW.c_str(), nullptr, 0);
+        if (needed == 0)
+        {
+            return valueUtf8;
+        }
+
+        wstring dstW(static_cast<size_t>(needed), L'\0'); // 包含结尾 NUL
+        const DWORD written = ::ExpandEnvironmentStringsW(srcW.c_str(), &dstW[0], needed);
+        if (written == 0 || written > needed)
+        {
+            return valueUtf8;
+        }
+
+        // written 含结尾 NUL
+        dstW.resize(wcslen(dstW.c_str()));
+        return WideToUtf8(dstW);
+    }
+
+    static unordered_map<string, string> ReadEnvVarsFromRegistryPath(const string& configPathUtf8)
+    {
+        unordered_map<string, string> result;
+
+        GB_ConfigItem configItem;
+        if (!GB_GetConfigItem(configPathUtf8, configItem, false))
+        {
+            return result;
+        }
+
+        for (const GB_ConfigValue& value : configItem.values)
+        {
+            if (value.nameUtf8.empty())
+            {
+                // 环境变量不关心默认值
+                continue;
+            }
+
+            switch (value.valueType)
+            {
+            case GB_ConfigValueType::GbConfigValueType_String:
+                result[value.nameUtf8] = value.valueUtf8;
+                break;
+            case GB_ConfigValueType::GbConfigValueType_ExpandString:
+                result[value.nameUtf8] = ExpandEnvironmentStringsUtf8(value.valueUtf8);
+                break;
+            case GB_ConfigValueType::GbConfigValueType_MultiString:
+            {
+                // 罕见情况：多字符串环境变量，按 ';' 拼接（PATH 语义更贴近）
+                string joined;
+                for (size_t i = 0; i < value.multiStringValuesUtf8.size(); i++)
+                {
+                    if (i > 0)
+                    {
+                        joined.push_back(';');
+                    }
+                    joined += value.multiStringValuesUtf8[i];
+                }
+                result[value.nameUtf8] = joined;
+                break;
+            }
+            case GB_ConfigValueType::GbConfigValueType_DWord:
+                result[value.nameUtf8] = to_string(value.dwordValue);
+                break;
+            case GB_ConfigValueType::GbConfigValueType_QWord:
+                result[value.nameUtf8] = to_string(value.qwordValue);
+                break;
+            default:
+                // 其他类型不是“环境变量”的常见形态，直接跳过
+                break;
+            }
+        }
+
+        return result;
     }
 
 #endif // _WIN32
@@ -799,9 +963,12 @@ namespace internal
 #endif
     }
 
+
+
+
 }
 
-string CpuInfo::Serialize() const
+string GB_CpuInfo::Serialize() const
 {
     string s;
     s += "vendor=" + vendor + ";";
@@ -827,9 +994,9 @@ string CpuInfo::Serialize() const
     return s;
 }
 
-CpuInfo GetCpuInfo()
+GB_CpuInfo GB_GetCpuInfo()
 {
-    CpuInfo info;
+    GB_CpuInfo info;
     info.architecture = internal::DetectArchitecture();
 
 #if defined(_WIN32)
@@ -898,7 +1065,7 @@ CpuInfo GetCpuInfo()
     return info;
 }
 
-string MotherboardInfo::Serialize() const
+string GB_MotherboardInfo::Serialize() const
 {
     string s;
     s += internal::JoinKeyValue("manufacturer", manufacturer);
@@ -912,9 +1079,9 @@ string MotherboardInfo::Serialize() const
     return s;
 }
 
-MotherboardInfo GetMotherboardInfo()
+GB_MotherboardInfo GB_GetMotherboardInfo()
 {
-    MotherboardInfo info;
+    GB_MotherboardInfo info;
 
 #if defined(_WIN32)
     // 1) BaseBoard：厂商/型号/版本/序列号
@@ -1004,7 +1171,7 @@ MotherboardInfo GetMotherboardInfo()
     return info;
 }
 
-string OsInfo::Serialize() const
+string GB_OsInfo::Serialize() const
 {
     string s;
     s += internal::JoinKeyValue("name", name);
@@ -1022,10 +1189,10 @@ string OsInfo::Serialize() const
     return s;
 }
 
-string GenerateHardwareId()
+string GB_GenerateHardwareId()
 {
-    const CpuInfo cpuInfo = GetCpuInfo();
-    const MotherboardInfo motherboardInfo = GetMotherboardInfo();
+    const GB_CpuInfo cpuInfo = GB_GetCpuInfo();
+    const GB_MotherboardInfo motherboardInfo = GB_GetMotherboardInfo();
 
     const string cpuId = cpuInfo.cpuSerial.empty() ? cpuInfo.processorId : cpuInfo.cpuSerial;
     const string motherboardId = motherboardInfo.serialNumber.empty() ? motherboardInfo.uuid : motherboardInfo.serialNumber;
@@ -1033,10 +1200,10 @@ string GenerateHardwareId()
     return GB_GetSha256(hardwareId);
 }
 
-// ===== 3) GetOsInfo() 主体 =====
-OsInfo GetOsInfo()
+// ===== 3) GB_GetOsInfo() 主体 =====
+GB_OsInfo GB_GetOsInfo()
 {
-    OsInfo info;
+    GB_OsInfo info;
     info.architecture = internal::DetectArchitecture();
 
 #if defined(_WIN32)
@@ -1147,3 +1314,27 @@ OsInfo GetOsInfo()
     }
     return info;
 }
+
+std::unordered_map<std::string, std::string> GB_GetWindowsUserEnvironmentVariables()
+{
+#if defined(_WIN32)
+    // 用户变量：系统“环境变量”面板中的“用户变量”一般落在此处
+    const static string configPathUtf8 = GB_STR("计算机\\HKEY_CURRENT_USER\\Environment");
+    return internal::ReadEnvVarsFromRegistryPath(configPathUtf8);
+#else
+    return unordered_map<string, string>();
+#endif
+}
+
+std::unordered_map<std::string, std::string> GB_GetWindowsSystemEnvironmentVariables()
+{
+#if defined(_WIN32)
+    // 系统变量：系统“环境变量”面板中的“系统变量”一般落在此处
+    const static string configPathUtf8 = GB_STR("计算机\\HKEY_LOCAL_MACHINE\\SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Environment");
+    return internal::ReadEnvVarsFromRegistryPath(configPathUtf8);
+#else
+    return unordered_map<string, string>();
+#endif
+}
+
+

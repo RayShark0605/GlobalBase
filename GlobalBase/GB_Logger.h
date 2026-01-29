@@ -80,16 +80,16 @@ private:
 #define GBLOG_ERROR(msg) do { GB_Logger::GetInstance().LogError(msg, __FILE__, __LINE__); } while (0)
 #define GBLOG_FATAL(msg) do { GB_Logger::GetInstance().LogFatal(msg, __FILE__, __LINE__); } while (0)
 
-GLOBALBASE_PORT bool IsLogEnabled();
-GLOBALBASE_PORT bool SetLogEnabled(bool enable);
+GLOBALBASE_PORT bool GB_IsLogEnabled();
+GLOBALBASE_PORT bool GB_SetLogEnabled(bool enable);
 
-GLOBALBASE_PORT bool IsLogToConsole();
-GLOBALBASE_PORT bool SetLogToConsole(bool enable);
+GLOBALBASE_PORT bool GB_IsLogToConsole();
+GLOBALBASE_PORT bool GB_SetLogToConsole(bool enable);
 
-GLOBALBASE_PORT GB_LogLevel GetLogFilterLevel();
-GLOBALBASE_PORT bool CheckLogLevel(GB_LogLevel level);
+GLOBALBASE_PORT GB_LogLevel GB_GetLogFilterLevel();
+GLOBALBASE_PORT bool GB_CheckLogLevel(GB_LogLevel level);
 
-GLOBALBASE_PORT void InstallCrashHandlers();
-GLOBALBASE_PORT void RemoveCrashHandlers();
+GLOBALBASE_PORT void GB_InstallCrashHandlers();
+GLOBALBASE_PORT void GB_RemoveCrashHandlers();
 
 #endif

@@ -221,7 +221,7 @@ namespace internal
     }
 }
 
-string MakeUtf8String(const char* s)
+string GB_MakeUtf8String(const char* s)
 {
     if (!s)
     {
@@ -230,7 +230,7 @@ string MakeUtf8String(const char* s)
 	return string(s);
 }
 
-string MakeUtf8String(char32_t utf8Char)
+string GB_MakeUtf8String(char32_t utf8Char)
 {
     uint32_t u = static_cast<uint32_t>(utf8Char);
     string out;
@@ -267,7 +267,7 @@ string MakeUtf8String(char32_t utf8Char)
     return out;
 }
 
-string Utf8ToAnsi(const string& utf8Str)
+string GB_Utf8ToAnsi(const string& utf8Str)
 {
     if (utf8Str.empty())
     {
@@ -381,7 +381,7 @@ string Utf8ToAnsi(const string& utf8Str)
 #endif
 }
 
-string AnsiToUtf8(const string& ansiStr)
+string GB_AnsiToUtf8(const string& ansiStr)
 {
     if (ansiStr.empty())
     {
@@ -488,7 +488,7 @@ string AnsiToUtf8(const string& ansiStr)
 #endif
 }
 
-bool IsUtf8(const string& text)
+bool GB_IsUtf8(const string& text)
 {
     size_t pos = 0;
     while (pos < text.size())
@@ -505,7 +505,7 @@ bool IsUtf8(const string& text)
     return true;
 }
 
-string WStringToUtf8(const wstring& ws)
+string GB_WStringToUtf8(const wstring& ws)
 {
 #if defined(_WIN32)
     if (ws.empty())
@@ -559,12 +559,12 @@ string WStringToUtf8(const wstring& ws)
     }
     catch (const range_error&)
     {
-        throw runtime_error("WStringToUtf8 conversion failed.");
+        throw runtime_error("GB_WStringToUtf8 conversion failed.");
     }
 #endif
 }
 
-wstring Utf8ToWString(const string& utf8Str)
+wstring GB_Utf8ToWString(const string& utf8Str)
 {
 #if defined(_WIN32)
     if (utf8Str.empty())
@@ -614,7 +614,7 @@ wstring Utf8ToWString(const string& utf8Str)
     }
     catch (const range_error&)
     {
-        throw runtime_error("Utf8ToWString conversion failed.");
+        throw runtime_error("GB_Utf8ToWString conversion failed.");
     }
 #endif
 }
@@ -635,7 +635,7 @@ size_t GetUtf8Length(const string& utf8Str)
     return len;
 }
 
-char32_t GetUtf8Char(const string& utf8Str, int64_t index)
+char32_t GB_GetUtf8Char(const string& utf8Str, int64_t index)
 {
     // 不抛异常，不用可选类型：失败返回一个不可能出现的值 0x110000（> U+10FFFF）
     static constexpr char32_t kInvalidCodePoint = 0x110000;
@@ -669,7 +669,7 @@ char32_t GetUtf8Char(const string& utf8Str, int64_t index)
     return kInvalidCodePoint;
 }
 
-string Utf8Substr(const string& utf8Str, int64_t start, int64_t length)
+string GB_Utf8Substr(const string& utf8Str, int64_t start, int64_t length)
 {
     if (start < 0 || length < 0)
     {
@@ -715,7 +715,7 @@ string Utf8Substr(const string& utf8Str, int64_t start, int64_t length)
     return utf8Str.substr(startByte, endByte - startByte);
 }
 
-string Utf8ToLower(const string& utf8Str)
+string GB_Utf8ToLower(const string& utf8Str)
 {
     string out;
     out.reserve(utf8Str.size()); // 最终长度不会超过原串
@@ -746,7 +746,7 @@ string Utf8ToLower(const string& utf8Str)
     return out;
 }
 
-string Utf8ToUpper(const string& utf8Str)
+string GB_Utf8ToUpper(const string& utf8Str)
 {
     string out;
     out.reserve(utf8Str.size());
@@ -775,7 +775,7 @@ string Utf8ToUpper(const string& utf8Str)
     return out;
 }
 
-vector<string> Utf8Split(const string& textUtf8, char32_t delimiter)
+vector<string> GB_Utf8Split(const string& textUtf8, char32_t delimiter)
 {
 	vector<string> parts;
 
@@ -805,7 +805,7 @@ vector<string> Utf8Split(const string& textUtf8, char32_t delimiter)
     return parts;
 }
 
-bool Utf8StartsWith(const string& textUtf8, const string& targetUtf8, bool caseSensitive)
+bool GB_Utf8StartsWith(const string& textUtf8, const string& targetUtf8, bool caseSensitive)
 {
     // 与 string::rfind("",0)==0 的语义一致：空目标串恒为 true
     if (targetUtf8.empty())
@@ -870,7 +870,7 @@ bool Utf8StartsWith(const string& textUtf8, const string& targetUtf8, bool caseS
     return true;
 }
 
-bool Utf8EndsWith(const string& textUtf8, const string& targetUtf8, bool caseSensitive)
+bool GB_Utf8EndsWith(const string& textUtf8, const string& targetUtf8, bool caseSensitive)
 {
     // 1) 空目标：恒真
     if (targetUtf8.empty())
@@ -961,7 +961,7 @@ bool Utf8EndsWith(const string& textUtf8, const string& targetUtf8, bool caseSen
     return true;
 }
 
-int64_t Utf8Find(const string& text, const string& needle, bool caseSensitive)
+int64_t GB_Utf8Find(const string& text, const string& needle, bool caseSensitive)
 {
     // 1) 预解码模式串到码点数组（并可选 ASCII 折叠）
     vector<char32_t> pat;
@@ -1044,7 +1044,7 @@ int64_t Utf8Find(const string& text, const string& needle, bool caseSensitive)
     return -1;
 }
 
-int64_t Utf8FindLast(const string& text, const string& needle, bool caseSensitive)
+int64_t GB_Utf8FindLast(const string& text, const string& needle, bool caseSensitive)
 {
     if (needle.empty())
     {
@@ -1147,7 +1147,7 @@ int64_t Utf8FindLast(const string& text, const string& needle, bool caseSensitiv
     return lastMatchIndex;
 }
 
-string Utf8Trim(const string& utf8Str, const string& trimChars)
+string GB_Utf8Trim(const string& utf8Str, const string& trimChars)
 {
     if (utf8Str.empty() || trimChars.empty())
     {
@@ -1168,7 +1168,7 @@ string Utf8Trim(const string& utf8Str, const string& trimChars)
     return internal::TrimRightImpl(internal::TrimLeftImpl(utf8Str, trimSet), trimSet);
 }
 
-string Utf8TrimLeft(const string& utf8Str, const string& trimChars)
+string GB_Utf8TrimLeft(const string& utf8Str, const string& trimChars)
 {
     if (utf8Str.empty() || trimChars.empty())
     {
@@ -1187,7 +1187,7 @@ string Utf8TrimLeft(const string& utf8Str, const string& trimChars)
     return internal::TrimLeftImpl(utf8Str, trimSet);
 }
 
-string Utf8TrimRight(const string& utf8Str, const string& trimChars)
+string GB_Utf8TrimRight(const string& utf8Str, const string& trimChars)
 {
     if (utf8Str.empty() || trimChars.empty())
     {
@@ -1206,7 +1206,7 @@ string Utf8TrimRight(const string& utf8Str, const string& trimChars)
     return internal::TrimRightImpl(utf8Str, trimSet);
 }
 
-string Utf8Replace(const string& utf8Str, const string& oldValue, const string& newValue, bool caseSensitive)
+string GB_Utf8Replace(const string& utf8Str, const string& oldValue, const string& newValue, bool caseSensitive)
 {
     // 空串或空模式：直接返回
     if (utf8Str.empty() || oldValue.empty())
@@ -1244,8 +1244,8 @@ string Utf8Replace(const string& utf8Str, const string& oldValue, const string& 
     while (curChar < totalChars)
     {
         const int64_t remain = totalChars - curChar;
-        const string suffix = Utf8Substr(utf8Str, curChar, remain);
-        const int64_t rel = Utf8Find(suffix, oldValue, caseSensitive);
+        const string suffix = GB_Utf8Substr(utf8Str, curChar, remain);
+        const int64_t rel = GB_Utf8Find(suffix, oldValue, caseSensitive);
         if (rel < 0)
         {
             // 无更多匹配：把余下部分整体追加
@@ -1256,7 +1256,7 @@ string Utf8Replace(const string& utf8Str, const string& oldValue, const string& 
         // 追加“匹配之前”的部分（按码点切分，不会截断 UTF-8）
         if (rel > 0)
         {
-            out += Utf8Substr(utf8Str, curChar, rel);
+            out += GB_Utf8Substr(utf8Str, curChar, rel);
         }
 
         // 追加替换内容

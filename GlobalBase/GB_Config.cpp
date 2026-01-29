@@ -265,7 +265,7 @@ namespace internal
         subKeyW.clear();
 
         // 修剪与 UTF-8 → UTF-16
-        const string trimmed = Utf8Trim(regPathUtf8);
+        const string trimmed = GB_Utf8Trim(regPathUtf8);
         if (trimmed.empty())
         {
             return false;
@@ -360,7 +360,7 @@ namespace internal
 
     static string GetLeafNameFromPathUtf8(const string& pathUtf8, char slash1 = '\\', char slash2 = '/')
     {
-        const string trimmed = Utf8Trim(pathUtf8);
+        const string trimmed = GB_Utf8Trim(pathUtf8);
         if (trimmed.empty())
         {
             return string();
@@ -383,7 +383,7 @@ namespace internal
         const char* home = getenv("HOME");
         if (home && *home)
         {
-            return MakeUtf8String(home);
+            return GB_MakeUtf8String(home);
         }
         return ""; // 极少见：无 HOME
     }
@@ -625,7 +625,7 @@ namespace internal
 
     static string NormalizePosixDir(const string& pathUtf8)
     {
-        string s = Utf8Trim(pathUtf8);
+        string s = GB_Utf8Trim(pathUtf8);
         if (s.empty())
         {
             return s;
@@ -649,7 +649,7 @@ namespace internal
 #endif
 }
 
-string GetGbConfigPath()
+string GB_GetGbConfigPath()
 {
 #if defined(_WIN32)
     // 提示性的“注册表路径”描述字符串
@@ -659,7 +659,7 @@ string GetGbConfigPath()
 #endif
 }
 
-bool IsExistsGbConfig(const string& keyUtf8)
+bool GB_IsExistsGbConfig(const string& keyUtf8)
 {
     if (keyUtf8.empty())
     {
@@ -680,7 +680,7 @@ bool IsExistsGbConfig(const string& keyUtf8)
 #endif
 }
 
-bool GetGbConfig(const string& keyUtf8, string& valueUtf8)
+bool GB_GetGbConfig(const string& keyUtf8, string& valueUtf8)
 {
     if (keyUtf8.empty())
     {
@@ -707,7 +707,7 @@ bool GetGbConfig(const string& keyUtf8, string& valueUtf8)
 
 }
 
-bool SetGbConfig(const string& keyUtf8, const string& valueUtf8)
+bool GB_SetGbConfig(const string& keyUtf8, const string& valueUtf8)
 {
     if (keyUtf8.empty())
     {
@@ -727,7 +727,7 @@ bool SetGbConfig(const string& keyUtf8, const string& valueUtf8)
 #endif
 }
 
-bool DeleteGbConfig(const string& keyUtf8)
+bool GB_DeleteGbConfig(const string& keyUtf8)
 {
     if (keyUtf8.empty())
     {
@@ -751,7 +751,7 @@ bool DeleteGbConfig(const string& keyUtf8)
 #endif
 }
 
-unordered_map<string, string> GetAllGbConfig()
+unordered_map<string, string> GB_GetAllGbConfig()
 {
 #if defined(_WIN32)
     return internal::WinEnumAll();
@@ -763,7 +763,7 @@ unordered_map<string, string> GetAllGbConfig()
 #endif
 }
 
-bool IsExistsConfigPath(const string& configPathUtf8)
+bool GB_IsExistsConfigPath(const string& configPathUtf8)
 {
 #if defined(_WIN32)
     if (configPathUtf8.empty())
@@ -807,7 +807,7 @@ bool IsExistsConfigPath(const string& configPathUtf8)
 #endif
 }
 
-bool CreateConfigPath(const string& configPathUtf8, bool recursive)
+bool GB_CreateConfigPath(const string& configPathUtf8, bool recursive)
 {
 #if defined(_WIN32)
     if (configPathUtf8.empty())
@@ -983,14 +983,14 @@ bool CreateConfigPath(const string& configPathUtf8, bool recursive)
 #endif
 }
 
-bool IsExistsConfigValue(const string& configPathUtf8, const string& keyNameUtf8)
+bool GB_IsExistsConfigValue(const string& configPathUtf8, const string& keyNameUtf8)
 {
-    GbConfigItem item;
-    if (!GetConfigItem(configPathUtf8, item, false))
+    GB_ConfigItem item;
+    if (!GB_GetConfigItem(configPathUtf8, item, false))
     {
 		return false;
     }
-    for (const GbConfigValue& value : item.values)
+    for (const GB_ConfigValue& value : item.values)
     {
         if (value.nameUtf8 == keyNameUtf8)
         {
@@ -1000,14 +1000,14 @@ bool IsExistsConfigValue(const string& configPathUtf8, const string& keyNameUtf8
     return false;
 }
 
-bool IsExistsChildConfig(const string& configPathUtf8, const string& childConfigNameUtf8)
+bool GB_IsExistsChildConfig(const string& configPathUtf8, const string& childConfigNameUtf8)
 {
-    GbConfigItem item;
-    if (!GetConfigItem(configPathUtf8, item, false))
+    GB_ConfigItem item;
+    if (!GB_GetConfigItem(configPathUtf8, item, false))
     {
         return false;
     }
-    for (const GbConfigItem& childItem : item.childenItems)
+    for (const GB_ConfigItem& childItem : item.childenItems)
     {
         if (childItem.nameUtf8 == childConfigNameUtf8)
         {
@@ -1017,10 +1017,10 @@ bool IsExistsChildConfig(const string& configPathUtf8, const string& childConfig
     return false;
 }
 
-bool AddChildConfig(const string& configPathUtf8, const string& childConfigNameUtf8)
+bool GB_AddChildConfig(const string& configPathUtf8, const string& childConfigNameUtf8)
 {
-    const string trimmedPath = Utf8Trim(configPathUtf8);
-    const string trimmedChild = Utf8Trim(childConfigNameUtf8);
+    const string trimmedPath = GB_Utf8Trim(configPathUtf8);
+    const string trimmedChild = GB_Utf8Trim(childConfigNameUtf8);
     if (trimmedPath.empty() || trimmedChild.empty())
     {
         return false;
@@ -1057,7 +1057,7 @@ bool AddChildConfig(const string& configPathUtf8, const string& childConfigNameU
     }
 
     // 创建子键
-    const wstring childW = Utf8ToWString(trimmedChild);
+    const wstring childW = GB_Utf8ToWString(trimmedChild);
     HKEY hChild = nullptr;
     DWORD disp = 0;
 #if defined(KEY_WOW64_64KEY)
@@ -1110,7 +1110,7 @@ bool AddChildConfig(const string& configPathUtf8, const string& childConfigNameU
     // 已存在（任意一个以 childPrefix/ 开头的键即认为子项存在）
     for (const auto& kv : m)
     {
-        if (Utf8StartsWith(kv.first, childPrefixSlash, true))
+        if (GB_Utf8StartsWith(kv.first, childPrefixSlash, true))
         {
             return false;
         }
@@ -1124,10 +1124,10 @@ bool AddChildConfig(const string& configPathUtf8, const string& childConfigNameU
 #endif
 }
 
-bool DeleteChildConfig(const string& configPathUtf8, const string& childConfigNameUtf8)
+bool GB_DeleteChildConfig(const string& configPathUtf8, const string& childConfigNameUtf8)
 {
-    const string trimmedPath = Utf8Trim(configPathUtf8);
-    const string trimmedChild = Utf8Trim(childConfigNameUtf8);
+    const string trimmedPath = GB_Utf8Trim(configPathUtf8);
+    const string trimmedChild = GB_Utf8Trim(childConfigNameUtf8);
     if (trimmedPath.empty() || trimmedChild.empty())
     {
         return false;
@@ -1161,7 +1161,7 @@ bool DeleteChildConfig(const string& configPathUtf8, const string& childConfigNa
         return false;
     }
 
-    const wstring childW = Utf8ToWString(trimmedChild);
+    const wstring childW = GB_Utf8ToWString(trimmedChild);
     // 递归删除子键
     LONG lr = ::RegDeleteTreeW(hParent, childW.c_str());
 
@@ -1194,7 +1194,7 @@ bool DeleteChildConfig(const string& configPathUtf8, const string& childConfigNa
     bool erasedAny = false;
     for (auto it = m.begin(); it != m.end(); )
     {
-        if (Utf8StartsWith(it->first, childPrefixSlash, true))
+        if (GB_Utf8StartsWith(it->first, childPrefixSlash, true))
         {
             it = m.erase(it);
             erasedAny = true;
@@ -1210,11 +1210,11 @@ bool DeleteChildConfig(const string& configPathUtf8, const string& childConfigNa
 #endif
 }
 
-bool RenameChildConfig(const string& configPathUtf8, const string& childConfigNameUtf8, const string& newNameUtf8)
+bool GB_RenameChildConfig(const string& configPathUtf8, const string& childConfigNameUtf8, const string& newNameUtf8)
 {
-    const string trimmedPath = Utf8Trim(configPathUtf8);
-    const string oldName = Utf8Trim(childConfigNameUtf8);
-    const string newName = Utf8Trim(newNameUtf8);
+    const string trimmedPath = GB_Utf8Trim(configPathUtf8);
+    const string oldName = GB_Utf8Trim(childConfigNameUtf8);
+    const string newName = GB_Utf8Trim(newNameUtf8);
 
     if (trimmedPath.empty() || oldName.empty() || newName.empty())
     {
@@ -1251,8 +1251,8 @@ bool RenameChildConfig(const string& configPathUtf8, const string& childConfigNa
         return false;
     }
 
-    const wstring oldW = Utf8ToWString(oldName);
-    const wstring newW = Utf8ToWString(newName);
+    const wstring oldW = GB_Utf8ToWString(oldName);
+    const wstring newW = GB_Utf8ToWString(newName);
 
     // 1) 优先尝试 RegRenameKey（Win7+）
     using PFN_RegRenameKey = LONG(WINAPI*)(HKEY, LPCWSTR, LPCWSTR);
@@ -1383,7 +1383,7 @@ bool RenameChildConfig(const string& configPathUtf8, const string& childConfigNa
     // 目的前缀已存在则失败，避免不小心覆盖
     for (const auto& kv : m)
     {
-        if (Utf8StartsWith(kv.first, newPrefixSlash, true))
+        if (GB_Utf8StartsWith(kv.first, newPrefixSlash, true))
         {
             return false;
         }
@@ -1398,7 +1398,7 @@ bool RenameChildConfig(const string& configPathUtf8, const string& childConfigNa
         const string& key = kv.first;
         const string& val = kv.second;
 
-        if (Utf8StartsWith(key, oldPrefixSlash, true))
+        if (GB_Utf8StartsWith(key, oldPrefixSlash, true))
         {
             // oldPrefix/.... -> newPrefix/....
             const string suffix = key.substr(oldPrefixSlash.size());
@@ -1419,14 +1419,14 @@ bool RenameChildConfig(const string& configPathUtf8, const string& childConfigNa
 #endif
 }
 
-bool GetConfigValue(const string& configPathUtf8, const string& keyNameUtf8, GbConfigValue& configValue)
+bool GB_GetConfigValue(const string& configPathUtf8, const string& keyNameUtf8, GB_ConfigValue& configValue)
 {
-    GbConfigItem item;
-    if (!GetConfigItem(configPathUtf8, item, false))
+    GB_ConfigItem item;
+    if (!GB_GetConfigItem(configPathUtf8, item, false))
     {
         return false;
     }
-    for (const GbConfigValue& value : item.values)
+    for (const GB_ConfigValue& value : item.values)
     {
         if (value.nameUtf8 == keyNameUtf8)
         {
@@ -1437,10 +1437,10 @@ bool GetConfigValue(const string& configPathUtf8, const string& keyNameUtf8, GbC
     return false;
 }
 
-bool SetConfigValue(const string& configPathUtf8, const string& keyNameUtf8, const GbConfigValue& configValue)
+bool GB_SetConfigValue(const string& configPathUtf8, const string& keyNameUtf8, const GB_ConfigValue& configValue)
 {
-    const string trimmedPath = Utf8Trim(configPathUtf8);
-    const string trimmedKey = Utf8Trim(keyNameUtf8);
+    const string trimmedPath = GB_Utf8Trim(configPathUtf8);
+    const string trimmedKey = GB_Utf8Trim(keyNameUtf8);
     if (trimmedPath.empty() || trimmedKey.empty())
     {
         return false;
@@ -1467,7 +1467,7 @@ bool SetConfigValue(const string& configPathUtf8, const string& keyNameUtf8, con
         if (!internal::OpenKeyAnyView(root, subKeyW, KEY_SET_VALUE | KEY_QUERY_VALUE, hKey))
         {
             // 尝试递归创建后再打开
-            (void)CreateConfigPath(trimmedPath, true);
+            (void)GB_CreateConfigPath(trimmedPath, true);
             if (!internal::OpenKeyAnyView(root, subKeyW, KEY_SET_VALUE | KEY_QUERY_VALUE, hKey))
             {
                 return false;
@@ -1476,7 +1476,7 @@ bool SetConfigValue(const string& configPathUtf8, const string& keyNameUtf8, con
         needClose = true;
     }
 
-    const wstring valueNameW = Utf8ToWString(trimmedKey);
+    const wstring valueNameW = GB_Utf8ToWString(trimmedKey);
 
     DWORD type = REG_NONE;
     const BYTE* data = nullptr;
@@ -1486,25 +1486,25 @@ bool SetConfigValue(const string& configPathUtf8, const string& keyNameUtf8, con
 
     switch (configValue.valueType)
     {
-    case GbConfigValueType::GbConfigValueType_String:
-    case GbConfigValueType::GbConfigValueType_ExpandString:
+    case GB_ConfigValueType::GbConfigValueType_String:
+    case GB_ConfigValueType::GbConfigValueType_ExpandString:
     {
-        const wstring ws = Utf8ToWString(configValue.valueUtf8);
+        const wstring ws = GB_Utf8ToWString(configValue.valueUtf8);
         const size_t bytes = (ws.size() + 1) * sizeof(wchar_t); // 包含终止\0
         buf.resize(bytes);
         memcpy(buf.data(), ws.c_str(), bytes);
-        type = (configValue.valueType == GbConfigValueType::GbConfigValueType_ExpandString) ? REG_EXPAND_SZ : REG_SZ;
+        type = (configValue.valueType == GB_ConfigValueType::GbConfigValueType_ExpandString) ? REG_EXPAND_SZ : REG_SZ;
         data = buf.data();
         cbData = static_cast<DWORD>(buf.size());
         break;
     } // 这些类型写入时需包含结尾的NUL字节
 
-    case GbConfigValueType::GbConfigValueType_MultiString:
+    case GB_ConfigValueType::GbConfigValueType_MultiString:
     {
         // REG_MULTI_SZ：多个以\0结尾的字符串，整体以额外的\0终止（双\0）
         for (size_t i = 0; i < configValue.multiStringValuesUtf8.size(); i++)
         {
-            const wstring ws = Utf8ToWString(configValue.multiStringValuesUtf8[i]);
+            const wstring ws = GB_Utf8ToWString(configValue.multiStringValuesUtf8[i]);
             wstrMultiBuffer.insert(wstrMultiBuffer.end(), ws.begin(), ws.end());
             wstrMultiBuffer.push_back(L'\0');
         }
@@ -1518,7 +1518,7 @@ bool SetConfigValue(const string& configPathUtf8, const string& keyNameUtf8, con
         break;
     } // REG_MULTI_SZ 的格式要求见文档：以双NUL结尾
 
-    case GbConfigValueType::GbConfigValueType_DWord:
+    case GB_ConfigValueType::GbConfigValueType_DWord:
     {
         const DWORD v = static_cast<DWORD>(configValue.dwordValue);
         type = REG_DWORD;
@@ -1527,7 +1527,7 @@ bool SetConfigValue(const string& configPathUtf8, const string& keyNameUtf8, con
         break;
     }
 
-    case GbConfigValueType::GbConfigValueType_QWord:
+    case GB_ConfigValueType::GbConfigValueType_QWord:
     {
         const ULONGLONG v = static_cast<ULONGLONG>(configValue.qwordValue);
         type = REG_QWORD;
@@ -1536,7 +1536,7 @@ bool SetConfigValue(const string& configPathUtf8, const string& keyNameUtf8, con
         break;
     } // QWORD = 64 位整数类型
 
-    case GbConfigValueType::GbConfigValueType_Binary:
+    case GB_ConfigValueType::GbConfigValueType_Binary:
     {
         buf.assign(configValue.binaryValue.begin(), configValue.binaryValue.end());
         type = REG_BINARY;
@@ -1548,7 +1548,7 @@ bool SetConfigValue(const string& configPathUtf8, const string& keyNameUtf8, con
     default:
     {
         // 未知类型：按普通字符串兜底
-        const wstring ws = Utf8ToWString(configValue.valueUtf8);
+        const wstring ws = GB_Utf8ToWString(configValue.valueUtf8);
         const size_t bytes = (ws.size() + 1) * sizeof(wchar_t);
         buf.resize(bytes);
         memcpy(buf.data(), ws.c_str(), bytes);
@@ -1570,7 +1570,7 @@ bool SetConfigValue(const string& configPathUtf8, const string& keyNameUtf8, con
     // —— POSIX：写入到 ~/.config/globalbase/config.kv 的“逻辑路径/键名” —— //
     auto Normalize = [](string s) -> string
         {
-            s = Utf8Trim(s);
+            s = GB_Utf8Trim(s);
             for (size_t i = 0; i < s.size(); i++)
             {
                 if (s[i] == '\\')
@@ -1656,10 +1656,10 @@ bool SetConfigValue(const string& configPathUtf8, const string& keyNameUtf8, con
 #endif
 }
 
-bool DeleteConfigValue(const string& configPathUtf8, const string& keyNameUtf8)
+bool GB_DeleteConfigValue(const string& configPathUtf8, const string& keyNameUtf8)
 {
-    const string trimmedPath = Utf8Trim(configPathUtf8);
-    const string trimmedKey = Utf8Trim(keyNameUtf8);
+    const string trimmedPath = GB_Utf8Trim(configPathUtf8);
+    const string trimmedKey = GB_Utf8Trim(keyNameUtf8);
     if (trimmedPath.empty() || trimmedKey.empty())
     {
         return false;
@@ -1689,7 +1689,7 @@ bool DeleteConfigValue(const string& configPathUtf8, const string& keyNameUtf8)
         needClose = true;
     }
 
-    const wstring valueNameW = Utf8ToWString(trimmedKey);
+    const wstring valueNameW = GB_Utf8ToWString(trimmedKey);
     const LONG lr = ::RegDeleteValueW(hKey, valueNameW.empty() ? nullptr : valueNameW.c_str());
 
     if (needClose && hKey)
@@ -1732,9 +1732,9 @@ bool DeleteConfigValue(const string& configPathUtf8, const string& keyNameUtf8)
 #endif
 }
 
-bool ClearConfigValue(const string& configPathUtf8)
+bool GB_ClearConfigValue(const string& configPathUtf8)
 {
-    const string trimmedPath = Utf8Trim(configPathUtf8);
+    const string trimmedPath = GB_Utf8Trim(configPathUtf8);
     if (trimmedPath.empty())
     {
         return false;
@@ -1839,7 +1839,7 @@ bool ClearConfigValue(const string& configPathUtf8)
         const string& full = kv.first;
         if (!prefix.empty())
         {
-            if (!Utf8StartsWith(full, prefixSlash, true))
+            if (!GB_Utf8StartsWith(full, prefixSlash, true))
             {
                 continue;
             }
@@ -1869,11 +1869,11 @@ bool ClearConfigValue(const string& configPathUtf8)
 #endif
 }
 
-bool RenameConfigValue(const string& configPathUtf8, const string& keyNameUtf8, const string& newNameUtf8)
+bool GB_RenameConfigValue(const string& configPathUtf8, const string& keyNameUtf8, const string& newNameUtf8)
 {
-    const string trimmedPath = Utf8Trim(configPathUtf8);
-    const string oldName = Utf8Trim(keyNameUtf8);
-    const string newName = Utf8Trim(newNameUtf8);
+    const string trimmedPath = GB_Utf8Trim(configPathUtf8);
+    const string oldName = GB_Utf8Trim(keyNameUtf8);
+    const string newName = GB_Utf8Trim(newNameUtf8);
 
     if (trimmedPath.empty() || oldName.empty() || newName.empty())
     {
@@ -1910,8 +1910,8 @@ bool RenameConfigValue(const string& configPathUtf8, const string& keyNameUtf8, 
         needClose = true;
     }
 
-    const wstring oldW = Utf8ToWString(oldName);
-    const wstring newW = Utf8ToWString(newName);
+    const wstring oldW = GB_Utf8ToWString(oldName);
+    const wstring newW = GB_Utf8ToWString(newName);
 
     // 若目标名已存在，则失败以免覆盖
     DWORD typeNew = 0;
@@ -1997,10 +1997,10 @@ bool RenameConfigValue(const string& configPathUtf8, const string& keyNameUtf8, 
 #endif
 }
 
-bool GetConfigItem(const string& configPathUtf8, GbConfigItem& configItem, bool recursive)
+bool GB_GetConfigItem(const string& configPathUtf8, GB_ConfigItem& configItem, bool recursive)
 {
-    configItem = GbConfigItem{};
-    const string trimmed = Utf8Trim(configPathUtf8);
+    configItem = GB_ConfigItem{};
+    const string trimmed = GB_Utf8Trim(configPathUtf8);
     if (trimmed.empty())
     {
         return false;
@@ -2019,23 +2019,23 @@ bool GetConfigItem(const string& configPathUtf8, GbConfigItem& configItem, bool 
     configItem.nameUtf8 = internal::GetLeafNameFromPathUtf8(trimmed, '\\', '/');
 
     // 小工具：把 Windows REG_* 类型映射到 GbConfigValueType
-    auto MapRegType = [](DWORD t) -> GbConfigValueType
+    auto MapRegType = [](DWORD t) -> GB_ConfigValueType
         {
             switch (t)
             {
-            case REG_SZ:          return GbConfigValueType::GbConfigValueType_String;
-            case REG_EXPAND_SZ:   return GbConfigValueType::GbConfigValueType_ExpandString;
-            case REG_MULTI_SZ:    return GbConfigValueType::GbConfigValueType_MultiString;
-            case REG_DWORD:       return GbConfigValueType::GbConfigValueType_DWord;
-            case REG_QWORD:       return GbConfigValueType::GbConfigValueType_QWord;
-            case REG_BINARY:      return GbConfigValueType::GbConfigValueType_Binary;
-            default:              return GbConfigValueType::GbConfigValueType_Unknown;
+            case REG_SZ:          return GB_ConfigValueType::GbConfigValueType_String;
+            case REG_EXPAND_SZ:   return GB_ConfigValueType::GbConfigValueType_ExpandString;
+            case REG_MULTI_SZ:    return GB_ConfigValueType::GbConfigValueType_MultiString;
+            case REG_DWORD:       return GB_ConfigValueType::GbConfigValueType_DWord;
+            case REG_QWORD:       return GB_ConfigValueType::GbConfigValueType_QWord;
+            case REG_BINARY:      return GB_ConfigValueType::GbConfigValueType_Binary;
+            default:              return GB_ConfigValueType::GbConfigValueType_Unknown;
             }
         };
 
     // 递归函数：给定 root/subKeyW，填充 outItem
-    function<bool(HKEY, const wstring&, GbConfigItem&)> Recurse;
-    Recurse = [&](HKEY rootKey, const wstring& keyPathW, GbConfigItem& outItem) -> bool
+    function<bool(HKEY, const wstring&, GB_ConfigItem&)> Recurse;
+    Recurse = [&](HKEY rootKey, const wstring& keyPathW, GB_ConfigItem& outItem) -> bool
         {
             // 打开当前键（尽量 64 位视图，不行回退）
             HKEY hKey = nullptr;
@@ -2114,7 +2114,7 @@ bool GetConfigItem(const string& configPathUtf8, GbConfigItem& configItem, bool 
                     continue;
                 }
 
-                GbConfigValue one;
+                GB_ConfigValue one;
                 one.nameUtf8 = internal::WideToUtf8(wstring(valueNameBuf.data()));
                 one.valueType = MapRegType(type);
 
@@ -2179,7 +2179,7 @@ bool GetConfigItem(const string& configPathUtf8, GbConfigItem& configItem, bool 
                     continue;
                 }
 
-                GbConfigItem child;
+                GB_ConfigItem child;
                 child.nameUtf8 = internal::WideToUtf8(wstring(subKeyNameBuf.data()));
                 if (!recursive)
                 {
@@ -2218,7 +2218,7 @@ bool GetConfigItem(const string& configPathUtf8, GbConfigItem& configItem, bool 
     // 2) 归一化前缀：把 '\' → '/'，去掉首尾 '/'
     auto Normalize = [](string s) -> string
         {
-            s = Utf8Trim(s);
+            s = GB_Utf8Trim(s);
             for (size_t i = 0; i < s.size(); i++)
             {
                 if (s[i] == '\\')

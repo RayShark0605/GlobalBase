@@ -138,10 +138,10 @@ namespace internal
 	static void ConsoleWriteColoredUtf8(const std::string& textUtf8, GB_LogLevel level)
 	{
 		unsigned int originCodePage = 0;
-		GetConsoleEncodingCode(originCodePage);
+		GB_GetConsoleEncodingCode(originCodePage);
 		if (originCodePage != 65001)
 		{
-			SetConsoleEncodingToUtf8();
+			GB_SetConsoleEncodingToUtf8();
 		}
 
 #if defined(_WIN32)
@@ -174,7 +174,7 @@ namespace internal
 
 		if (originCodePage != 65001)
 		{
-			SetConsoleEncoding(originCodePage);
+			GB_SetConsoleEncoding(originCodePage);
 		}
 	}
 }
@@ -301,11 +301,11 @@ void GB_Logger::LogTrace(const std::string& msgUtf8, const char* file, int line)
 	}
 
 #if defined(_WIN32)
-	string fileStrUtf8 = AnsiToUtf8(file);
+	string fileStrUtf8 = GB_AnsiToUtf8(file);
 #else
 	string fileStrUtf8 = file;
 #endif
-	fileStrUtf8 = Utf8Replace(fileStrUtf8, GB_STR("\\"), GB_STR("/"));
+	fileStrUtf8 = GB_Utf8Replace(fileStrUtf8, GB_STR("\\"), GB_STR("/"));
 	Log(GB_LogLevel::GBLOGLEVEL_TRACE, msgUtf8, fileStrUtf8, line);
 }
 
@@ -318,11 +318,11 @@ void GB_Logger::LogDebug(const std::string& msgUtf8, const char* file, int line)
 	}
 
 #if defined(_WIN32)
-	string fileStrUtf8 = AnsiToUtf8(file);
+	string fileStrUtf8 = GB_AnsiToUtf8(file);
 #else
 	string fileStrUtf8 = file;
 #endif
-	fileStrUtf8 = Utf8Replace(fileStrUtf8, GB_STR("\\"), GB_STR("/"));
+	fileStrUtf8 = GB_Utf8Replace(fileStrUtf8, GB_STR("\\"), GB_STR("/"));
 	Log(GB_LogLevel::GBLOGLEVEL_DEBUG, msgUtf8, fileStrUtf8, line);
 }
 
@@ -335,11 +335,11 @@ void GB_Logger::LogInfo(const std::string& msgUtf8, const char* file, int line)
 	}
 
 #if defined(_WIN32)
-	string fileStrUtf8 = AnsiToUtf8(file);
+	string fileStrUtf8 = GB_AnsiToUtf8(file);
 #else
 	string fileStrUtf8 = file;
 #endif
-	fileStrUtf8 = Utf8Replace(fileStrUtf8, GB_STR("\\"), GB_STR("/"));
+	fileStrUtf8 = GB_Utf8Replace(fileStrUtf8, GB_STR("\\"), GB_STR("/"));
 	Log(GB_LogLevel::GBLOGLEVEL_INFO, msgUtf8, fileStrUtf8, line);
 }
 
@@ -352,11 +352,11 @@ void GB_Logger::LogWarning(const std::string& msgUtf8, const char* file, int lin
 	}
 
 #if defined(_WIN32)
-	string fileStrUtf8 = AnsiToUtf8(file);
+	string fileStrUtf8 = GB_AnsiToUtf8(file);
 #else
 	string fileStrUtf8 = file;
 #endif
-	fileStrUtf8 = Utf8Replace(fileStrUtf8, GB_STR("\\"), GB_STR("/"));
+	fileStrUtf8 = GB_Utf8Replace(fileStrUtf8, GB_STR("\\"), GB_STR("/"));
 	Log(GB_LogLevel::GBLOGLEVEL_WARNING, msgUtf8, fileStrUtf8, line);
 }
 
@@ -369,11 +369,11 @@ void GB_Logger::LogError(const std::string& msgUtf8, const char* file, int line)
 	}
 
 #if defined(_WIN32)
-	string fileStrUtf8 = AnsiToUtf8(file);
+	string fileStrUtf8 = GB_AnsiToUtf8(file);
 #else
 	string fileStrUtf8 = file;
 #endif
-	fileStrUtf8 = Utf8Replace(fileStrUtf8, GB_STR("\\"), GB_STR("/"));
+	fileStrUtf8 = GB_Utf8Replace(fileStrUtf8, GB_STR("\\"), GB_STR("/"));
 	Log(GB_LogLevel::GBLOGLEVEL_ERROR, msgUtf8, fileStrUtf8, line);
 }
 
@@ -386,11 +386,11 @@ void GB_Logger::LogFatal(const std::string& msgUtf8, const char* file, int line)
 	}
 
 #if defined(_WIN32)
-	string fileStrUtf8 = AnsiToUtf8(file);
+	string fileStrUtf8 = GB_AnsiToUtf8(file);
 #else
 	string fileStrUtf8 = file;
 #endif
-	fileStrUtf8 = Utf8Replace(fileStrUtf8, GB_STR("\\"), GB_STR("/"));
+	fileStrUtf8 = GB_Utf8Replace(fileStrUtf8, GB_STR("\\"), GB_STR("/"));
 	Log(GB_LogLevel::GBLOGLEVEL_FATAL, msgUtf8, fileStrUtf8, line);
 }
 
@@ -461,18 +461,18 @@ void GB_Logger::LogThreadFunc()
 				return;
 			}
 
-			if (!IsLogEnabled())
+			if (!GB_IsLogEnabled())
 			{
 				continue;
 			}
 
 			const string logJsonUtf8 = logItem.ToJsonString();
-			WriteUtf8ToFile(allLogFilePath, logJsonUtf8);
+			GB_WriteUtf8ToFile(allLogFilePath, logJsonUtf8);
 
-			if (CheckLogLevel(logItem.level))
+			if (GB_CheckLogLevel(logItem.level))
 			{
-				WriteUtf8ToFile(outputLogFilePath, logJsonUtf8);
-				if (IsLogToConsole())
+				GB_WriteUtf8ToFile(outputLogFilePath, logJsonUtf8);
+				if (GB_IsLogToConsole())
 				{
 					const string logTextUtf8 = logItem.ToPlainTextString();
 					internal::ConsoleWriteColoredUtf8(logTextUtf8, logItem.level);
@@ -482,61 +482,61 @@ void GB_Logger::LogThreadFunc()
 	}
 }
 
-bool IsLogEnabled()
+bool GB_IsLogEnabled()
 {
 	const static string targetKey = GB_STR("GB_EnableLog");
 
-	if (!IsExistsGbConfig(targetKey))
+	if (!GB_IsExistsGbConfig(targetKey))
 	{
 		return false;
 	}
 
 	string value;
-	return (GetGbConfig(targetKey, value) && "1" == value);
+	return (GB_GetGbConfig(targetKey, value) && "1" == value);
 }
 
-bool SetLogEnabled(bool enable)
+bool GB_SetLogEnabled(bool enable)
 {
 	const static string targetKey = GB_STR("GB_EnableLog");
 	const string value = enable ? GB_STR("1") : GB_STR("0");
-	return SetGbConfig(targetKey, value);
+	return GB_SetGbConfig(targetKey, value);
 }
 
-bool IsLogToConsole()
+bool GB_IsLogToConsole()
 {
 	const static string targetKey = GB_STR("GB_IsLogToConsole");
 
-	if (!IsExistsGbConfig(targetKey))
+	if (!GB_IsExistsGbConfig(targetKey))
 	{
 		return false;
 	}
 
 	string value;
-	return (GetGbConfig(targetKey, value) && "1" == value);
+	return (GB_GetGbConfig(targetKey, value) && "1" == value);
 }
 
-bool SetLogToConsole(bool enable)
+bool GB_SetLogToConsole(bool enable)
 {
 	const static string targetKey = GB_STR("GB_IsLogToConsole");
 	const string value = enable ? GB_STR("1") : GB_STR("0");
-	return SetGbConfig(targetKey, value);
+	return GB_SetGbConfig(targetKey, value);
 }
 
-GB_LogLevel GetLogFilterLevel()
+GB_LogLevel GB_GetLogFilterLevel()
 {
 	const static string targetKey = GB_STR("GB_LogLevel");
 
-	if (!IsLogEnabled())
+	if (!GB_IsLogEnabled())
 	{
 		return GB_LogLevel::GBLOGLEVEL_DISABLELOG;
 	}
 
-	if (!IsExistsGbConfig(targetKey))
+	if (!GB_IsExistsGbConfig(targetKey))
 	{
 		return GB_LogLevel::GBLOGLEVEL_TRACE;
 	}
 	string value;
-	if (!GetGbConfig(targetKey, value))
+	if (!GB_GetGbConfig(targetKey, value))
 	{
 		return GB_LogLevel::GBLOGLEVEL_TRACE;
 	}
@@ -571,9 +571,9 @@ GB_LogLevel GetLogFilterLevel()
 	return GB_LogLevel::GBLOGLEVEL_TRACE;
 }
 
-bool CheckLogLevel(GB_LogLevel level)
+bool GB_CheckLogLevel(GB_LogLevel level)
 {
-	const GB_LogLevel filterLevel = GetLogFilterLevel();
+	const GB_LogLevel filterLevel = GB_GetLogFilterLevel();
 	return (level >= filterLevel && filterLevel != GB_LogLevel::GBLOGLEVEL_DISABLELOG);
 }
 
@@ -696,7 +696,7 @@ namespace crashlog
 #endif
 }
 
-void InstallCrashHandlers()
+void GB_InstallCrashHandlers()
 {
 	if (crashlog::installed.exchange(true))
 	{
@@ -824,7 +824,7 @@ void InstallCrashHandlers()
 #endif
 }
 
-void RemoveCrashHandlers()
+void GB_RemoveCrashHandlers()
 {
 	// 轻实现：当前仅用于关闭重复安装；详细还原可按平台补充
 	crashlog::installed.store(false);
