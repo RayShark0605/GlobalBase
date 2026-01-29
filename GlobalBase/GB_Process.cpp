@@ -13,6 +13,7 @@
 #include <cstdint>
 #include <fstream>
 #include <unordered_set>
+#include <limits>
 
 #ifdef _WIN32
 #  define NOMINMAX
@@ -2138,33 +2139,70 @@ namespace
             return false;
         }
 
-        const int wideLen = ::MultiByteToWideChar(CP_UTF8, 0, filePathUtf8.c_str(), -1, nullptr, 0);
+        // Windows: UTF-8 -> UTF-16，用于宽字符路径 API。
+        // 注意：MultiByteToWideChar 返回值包含结尾的 \0。
+        const int wideLen = ::MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, filePathUtf8.c_str(), -1, nullptr, 0);
         if (wideLen <= 0)
         {
             return false;
         }
 
         std::wstring widePath;
-        widePath.resize(static_cast<size_t>(wideLen - 1));
-        ::MultiByteToWideChar(CP_UTF8, 0, filePathUtf8.c_str(), -1, &widePath[0], wideLen);
+        widePath.resize(static_cast<size_t>(wideLen));
 
-        FILE* file = _wfopen(widePath.c_str(), L"rb");
-        if (file == nullptr)
+        const int converted = ::MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, filePathUtf8.c_str(), -1, &widePath[0], wideLen);
+        if (converted != wideLen)
         {
             return false;
         }
 
-        fseek(file, 0, SEEK_END);
-        const long fileSizeLong = ftell(file);
-        fseek(file, 0, SEEK_SET);
+        if (!widePath.empty() && widePath.back() == L'\0')
+        {
+            widePath.pop_back();
+        }
 
-        if (fileSizeLong <= 0)
+        // 使用 *_s 版本避免 C4996 警告
+        FILE* file = nullptr;
+        const errno_t openErr = _wfopen_s(&file, widePath.c_str(), L"rb");
+        if (openErr != 0 || file == nullptr)
+        {
+            return false;
+        }
+
+        // 使用 64 位文件定位 API，避免 ftell(long) 在大文件上溢出。
+        if (_fseeki64(file, 0, SEEK_END) != 0)
         {
             fclose(file);
             return false;
         }
 
-        const size_t fileSize = static_cast<size_t>(fileSizeLong);
+        const long long fileSize64 = _ftelli64(file);
+        if (fileSize64 < 0)
+        {
+            fclose(file);
+            return false;
+        }
+
+        if (_fseeki64(file, 0, SEEK_SET) != 0)
+        {
+            fclose(file);
+            return false;
+        }
+
+        if (fileSize64 == 0)
+        {
+            outBytes->clear();
+            fclose(file);
+            return true;
+        }
+
+        const size_t fileSize = static_cast<size_t>(fileSize64);
+        if (static_cast<long long>(fileSize) != fileSize64)
+        {
+            fclose(file);
+            return false;
+        }
+
         outBytes->resize(fileSize);
 
         const size_t readSize = fread(outBytes->data(), 1, fileSize, file);
@@ -2187,10 +2225,15 @@ namespace
 
         file.seekg(0, std::ios::beg);
 
-        outBytes->resize(static_cast<size_t>(fileSize));
-        file.read(reinterpret_cast<char*>(outBytes->data()), fileSize);
+        if (fileSize > static_cast<std::streamoff>(std::numeric_limits<size_t>::max()))
+        {
+            return false;
+        }
 
-        return file.good();
+        outBytes->resize(static_cast<size_t>(fileSize));
+        file.read(reinterpret_cast<char*>(outBytes->data()), static_cast<std::streamsize>(fileSize));
+
+        return static_cast<std::streamoff>(file.gcount()) == fileSize;
 #endif
     }
 
@@ -2280,6 +2323,29 @@ namespace
         return std::string(reinterpret_cast<const char*>(&bytes[offset]), end - offset);
     }
 
+    std::string ReadCStringLimited(const std::vector<unsigned char>& bytes, size_t offset, size_t maxLen)
+    {
+        if (offset >= bytes.size() || maxLen == 0)
+        {
+            return std::string();
+        }
+
+        const size_t limit = std::min(bytes.size(), offset + maxLen);
+        size_t end = offset;
+        while (end < limit && bytes[end] != 0)
+        {
+            end++;
+        }
+
+        // 如果在 maxLen 范围内没有找到 '\0' 终止符，认为字符串无效（避免恶意/损坏文件导致超长分配）。
+        if (end == limit && bytes[end - 1] != 0)
+        {
+            return std::string();
+        }
+
+        return std::string(reinterpret_cast<const char*>(&bytes[offset]), end - offset);
+    }
+
     std::string ToLowerAscii(std::string s)
     {
         for (size_t i = 0; i < s.size(); i++)
@@ -2330,6 +2396,47 @@ namespace
     };
 #pragma pack(pop)
 
+    static bool ReadPeDataDirectory(const std::vector<unsigned char>& bytes,
+        size_t optionalOffset,
+        uint16_t sizeOfOptionalHeader,
+        bool isPe32Plus,
+        uint32_t directoryIndex,
+        PeDataDirectory& outDir)
+    {
+        // IMAGE_OPTIONAL_HEADER: NumberOfRvaAndSizes 在 DataDirectory 之前。
+        // PE32:  offset 92 (0x5C)
+        // PE32+: offset 108 (0x6C)
+        bool ok = false;
+        const size_t optionalEnd = optionalOffset + static_cast<size_t>(sizeOfOptionalHeader);
+        if (optionalEnd > bytes.size())
+        {
+            return false;
+        }
+
+        const size_t numberOfRvaAndSizesOffset = isPe32Plus ? (optionalOffset + 108) : (optionalOffset + 92);
+        if (numberOfRvaAndSizesOffset + 4 > optionalEnd)
+        {
+            return false;
+        }
+
+        const uint32_t numberOfRvaAndSizes = ReadU32Le(bytes, numberOfRvaAndSizesOffset, &ok);
+        if (!ok || numberOfRvaAndSizes == 0 || directoryIndex >= numberOfRvaAndSizes)
+        {
+            return false;
+        }
+
+        const size_t dataDirOffset = isPe32Plus ? (optionalOffset + 112) : (optionalOffset + 96);
+        const size_t needBytes = (static_cast<size_t>(directoryIndex) + 1u) * sizeof(PeDataDirectory);
+        if (dataDirOffset + needBytes > optionalEnd)
+        {
+            return false;
+        }
+
+        std::memcpy(&outDir, &bytes[dataDirOffset + sizeof(PeDataDirectory) * static_cast<size_t>(directoryIndex)], sizeof(PeDataDirectory));
+        return true;
+    }
+
+
     bool RvaToFileOffsetPe(const std::vector<PeSectionHeader>& sections, uint32_t rva, uint32_t* outOffset)
     {
         if (outOffset == nullptr)
@@ -2356,7 +2463,7 @@ namespace
         return true;
     }
 
-    void ParsePeExports(const std::vector<unsigned char>& bytes, std::vector<std::string>* outExports)
+    void ParsePeExports(const std::vector<unsigned char>& bytes, bool onlyFunctionNames, std::vector<std::string>* outExports)
     {
         if (outExports == nullptr)
         {
@@ -2372,7 +2479,7 @@ namespace
 
         bool ok = false;
         const uint32_t e_lfanew = ReadU32Le(bytes, 0x3C, &ok);
-        if (!ok || e_lfanew + 4 + sizeof(PeCoffFileHeader) > bytes.size())
+        if (!ok || static_cast<size_t>(e_lfanew) + 4 + sizeof(PeCoffFileHeader) > bytes.size())
         {
             return;
         }
@@ -2387,12 +2494,12 @@ namespace
         std::memcpy(&coff, &bytes[coffOffset], sizeof(PeCoffFileHeader));
 
         const size_t optionalOffset = coffOffset + sizeof(PeCoffFileHeader);
-        if (optionalOffset + coff.sizeOfOptionalHeader > bytes.size())
+        const size_t optionalEnd = optionalOffset + static_cast<size_t>(coff.sizeOfOptionalHeader);
+        if (optionalEnd > bytes.size())
         {
             return;
         }
 
-        // Optional header magic: 0x10B (PE32), 0x20B (PE32+)
         const uint16_t optMagic = ReadU16Le(bytes, optionalOffset, &ok);
         if (!ok)
         {
@@ -2400,21 +2507,24 @@ namespace
         }
 
         const bool isPe32Plus = (optMagic == 0x20B);
-        const size_t dataDirOffset = isPe32Plus ? (optionalOffset + 112) : (optionalOffset + 96); // Standard PE offsets
-        if (dataDirOffset + sizeof(PeDataDirectory) * 16 > bytes.size())
+        const bool isPe32 = (optMagic == 0x10B);
+        if (!isPe32Plus && !isPe32)
         {
             return;
         }
 
         PeDataDirectory exportDir = {};
-        std::memcpy(&exportDir, &bytes[dataDirOffset + sizeof(PeDataDirectory) * 0], sizeof(PeDataDirectory));
+        if (!ReadPeDataDirectory(bytes, optionalOffset, coff.sizeOfOptionalHeader, isPe32Plus, 0u, exportDir))
+        {
+            return;
+        }
 
         if (exportDir.virtualAddress == 0 || exportDir.size == 0)
         {
             return;
         }
 
-        const size_t sectionTableOffset = optionalOffset + coff.sizeOfOptionalHeader;
+        const size_t sectionTableOffset = optionalOffset + static_cast<size_t>(coff.sizeOfOptionalHeader);
         const size_t needSectionBytes = static_cast<size_t>(coff.numberOfSections) * sizeof(PeSectionHeader);
         if (sectionTableOffset + needSectionBytes > bytes.size())
         {
@@ -2431,108 +2541,135 @@ namespace
             return;
         }
 
-        // IMAGE_EXPORT_DIRECTORY is 40 bytes (per winnt.h; structure described in PE format docs)
+        // IMAGE_EXPORT_DIRECTORY is 40 bytes.
         if (static_cast<size_t>(exportDirFileOffset) + 40 > bytes.size())
         {
             return;
         }
 
         const uint32_t base = ReadU32Le(bytes, exportDirFileOffset + 16, &ok);
-        if (!ok)
-        {
-            return;
-        }
-
         const uint32_t numberOfFunctions = ReadU32Le(bytes, exportDirFileOffset + 20, &ok);
         const uint32_t numberOfNames = ReadU32Le(bytes, exportDirFileOffset + 24, &ok);
         const uint32_t addressOfFunctionsRva = ReadU32Le(bytes, exportDirFileOffset + 28, &ok);
         const uint32_t addressOfNamesRva = ReadU32Le(bytes, exportDirFileOffset + 32, &ok);
         const uint32_t addressOfNameOrdinalsRva = ReadU32Le(bytes, exportDirFileOffset + 36, &ok);
 
-        if (!ok || numberOfFunctions == 0 || numberOfNames == 0)
+        if (!ok || numberOfFunctions == 0 || addressOfFunctionsRva == 0)
         {
             return;
         }
 
         uint32_t functionsOffset = 0;
-        uint32_t namesOffset = 0;
-        uint32_t ordinalsOffset = 0;
-
-        if (!RvaToFileOffsetPe(sections, addressOfFunctionsRva, &functionsOffset) ||
-            !RvaToFileOffsetPe(sections, addressOfNamesRva, &namesOffset) ||
-            !RvaToFileOffsetPe(sections, addressOfNameOrdinalsRva, &ordinalsOffset))
+        if (!RvaToFileOffsetPe(sections, addressOfFunctionsRva, &functionsOffset))
         {
             return;
         }
 
-        const size_t functionsBytes = static_cast<size_t>(numberOfFunctions) * 4;
-        const size_t namesBytes = static_cast<size_t>(numberOfNames) * 4;
-        const size_t ordinalsBytes = static_cast<size_t>(numberOfNames) * 2;
-
-        if (static_cast<size_t>(functionsOffset) + functionsBytes > bytes.size() ||
-            static_cast<size_t>(namesOffset) + namesBytes > bytes.size() ||
-            static_cast<size_t>(ordinalsOffset) + ordinalsBytes > bytes.size())
+        const size_t functionsBytes = static_cast<size_t>(numberOfFunctions) * 4u;
+        if (numberOfFunctions != 0 && functionsBytes / 4u != static_cast<size_t>(numberOfFunctions))
         {
             return;
+        }
+
+        if (static_cast<size_t>(functionsOffset) + functionsBytes > bytes.size())
+        {
+            return;
+        }
+
+        // ordinalIndex -> name（可能为空，表示该导出仅按 ordinal 导出）。
+        std::vector<std::string> nameByOrdinalIndex;
+        nameByOrdinalIndex.resize(static_cast<size_t>(numberOfFunctions));
+
+        if (numberOfNames > 0 && addressOfNamesRva != 0 && addressOfNameOrdinalsRva != 0)
+        {
+            uint32_t namesOffset = 0;
+            uint32_t ordinalsOffset = 0;
+            if (RvaToFileOffsetPe(sections, addressOfNamesRva, &namesOffset) &&
+                RvaToFileOffsetPe(sections, addressOfNameOrdinalsRva, &ordinalsOffset))
+            {
+                const size_t namesBytes = static_cast<size_t>(numberOfNames) * 4u;
+                const size_t ordinalsBytes = static_cast<size_t>(numberOfNames) * 2u;
+
+                const bool namesOk = (namesBytes / 4u == static_cast<size_t>(numberOfNames));
+                const bool ordOk = (ordinalsBytes / 2u == static_cast<size_t>(numberOfNames));
+
+                if (namesOk && ordOk &&
+                    static_cast<size_t>(namesOffset) + namesBytes <= bytes.size() &&
+                    static_cast<size_t>(ordinalsOffset) + ordinalsBytes <= bytes.size())
+                {
+                    for (uint32_t i = 0; i < numberOfNames; i++)
+                    {
+                        const uint32_t nameRva = ReadU32Le(bytes, static_cast<size_t>(namesOffset) + static_cast<size_t>(i) * 4u, &ok);
+                        if (!ok)
+                        {
+                            continue;
+                        }
+
+                        uint32_t nameFileOffset = 0;
+                        if (!RvaToFileOffsetPe(sections, nameRva, &nameFileOffset))
+                        {
+                            continue;
+                        }
+
+                        const std::string funcName = ReadCStringLimited(bytes, nameFileOffset, 4096);
+                        if (funcName.empty())
+                        {
+                            continue;
+                        }
+
+                        const uint16_t ordinalIndex = ReadU16Le(bytes, static_cast<size_t>(ordinalsOffset) + static_cast<size_t>(i) * 2u, &ok);
+                        if (!ok)
+                        {
+                            continue;
+                        }
+
+                        if (ordinalIndex >= numberOfFunctions)
+                        {
+                            continue;
+                        }
+
+                        nameByOrdinalIndex[static_cast<size_t>(ordinalIndex)] = funcName;
+                    }
+                }
+            }
         }
 
         std::unordered_set<std::string> uniqueSet;
-        uniqueSet.reserve(static_cast<size_t>(numberOfNames));
+        uniqueSet.reserve(static_cast<size_t>(numberOfFunctions));
 
-        for (uint32_t i = 0; i < numberOfNames; i++)
+        for (uint32_t ordinalIndex = 0; ordinalIndex < numberOfFunctions; ordinalIndex++)
         {
-            const uint32_t nameRva = ReadU32Le(bytes, static_cast<size_t>(namesOffset) + static_cast<size_t>(i) * 4, &ok);
-            if (!ok)
+            const uint32_t funcRva = ReadU32Le(bytes, static_cast<size_t>(functionsOffset) + static_cast<size_t>(ordinalIndex) * 4u, &ok);
+            if (!ok || funcRva == 0)
             {
                 continue;
             }
 
-            uint32_t nameFileOffset = 0;
-            if (!RvaToFileOffsetPe(sections, nameRva, &nameFileOffset))
+            const uint32_t ordinal = base + ordinalIndex;
+            std::string name = nameByOrdinalIndex[static_cast<size_t>(ordinalIndex)];
+            if (name.empty())
             {
+                name = "#" + std::to_string(ordinal);
+            }
+
+            if (onlyFunctionNames)
+            {
+                uniqueSet.insert(name);
                 continue;
             }
 
-            const std::string funcName = ReadCString(bytes, nameFileOffset);
-            if (funcName.empty())
-            {
-                continue;
-            }
-
-            const uint16_t ordinalIndex = ReadU16Le(bytes, static_cast<size_t>(ordinalsOffset) + static_cast<size_t>(i) * 2, &ok);
-            if (!ok)
-            {
-                continue;
-            }
-
-            if (ordinalIndex >= numberOfFunctions)
-            {
-                continue;
-            }
-
-            const uint32_t funcRva = ReadU32Le(bytes, static_cast<size_t>(functionsOffset) + static_cast<size_t>(ordinalIndex) * 4, &ok);
-            if (!ok)
-            {
-                continue;
-            }
-
-            // Build a dumpbin-ish line: Ordinal Hint RVA Name
             std::ostringstream oss;
-            oss << (base + static_cast<uint32_t>(ordinalIndex)) << " "
-                << i << " ";
+            oss << "ORD=" << ordinal;
+            oss << " RVA=0x" << std::uppercase << std::hex << funcRva << std::nouppercase << std::dec;
+            oss << " NAME=" << name;
 
-            oss.setf(std::ios::hex, std::ios::basefield);
-            oss << "0x" << funcRva;
-            oss.setf(std::ios::dec, std::ios::basefield);
-            oss << " " << funcName;
-
-            // Forwarder (func RVA points back into export directory range)
+            // Forwarder: func RVA points back into export directory range.
             if (funcRva >= exportDir.virtualAddress && funcRva < exportDir.virtualAddress + exportDir.size)
             {
                 uint32_t forwarderOffset = 0;
                 if (RvaToFileOffsetPe(sections, funcRva, &forwarderOffset))
                 {
-                    const std::string forwarder = ReadCString(bytes, forwarderOffset);
+                    const std::string forwarder = ReadCStringLimited(bytes, forwarderOffset, 4096);
                     if (!forwarder.empty())
                     {
                         oss << " -> " << forwarder;
@@ -2540,17 +2677,378 @@ namespace
                 }
             }
 
-            const std::string line = oss.str();
-            if (uniqueSet.insert(line).second)
-            {
-                outExports->push_back(line);
-            }
+            uniqueSet.insert(oss.str());
         }
 
-        std::sort(outExports->begin(), outExports->end());
+        outExports->assign(uniqueSet.begin(), uniqueSet.end());
+        std::sort(outExports->begin(), outExports->end(), [](const std::string& a, const std::string& b)
+            {
+                return ToLowerAscii(a) < ToLowerAscii(b);
+            });
     }
 
-    void ParsePeImports(const std::vector<unsigned char>& bytes, std::vector<std::string>* outImports)
+
+    bool ReadPeImageBase(const std::vector<unsigned char>& bytes,
+        size_t optionalOffset,
+        uint16_t sizeOfOptionalHeader,
+        bool isPe32Plus,
+        uint64_t* outImageBase)
+    {
+        if (outImageBase == nullptr)
+        {
+            return false;
+        }
+
+        *outImageBase = 0;
+
+        const size_t optionalEnd = optionalOffset + static_cast<size_t>(sizeOfOptionalHeader);
+        if (optionalEnd > bytes.size())
+        {
+            return false;
+        }
+
+        bool ok = false;
+        if (isPe32Plus)
+        {
+            // IMAGE_OPTIONAL_HEADER64::ImageBase offset = 24
+            if (optionalOffset + 24u + 8u > optionalEnd)
+            {
+                return false;
+            }
+
+            const uint64_t imageBase = ReadU64Le(bytes, optionalOffset + 24u, &ok);
+            if (!ok)
+            {
+                return false;
+            }
+
+            *outImageBase = imageBase;
+            return true;
+        }
+        else
+        {
+            // IMAGE_OPTIONAL_HEADER32::ImageBase offset = 28
+            if (optionalOffset + 28u + 4u > optionalEnd)
+            {
+                return false;
+            }
+
+            const uint32_t imageBase32 = ReadU32Le(bytes, optionalOffset + 28u, &ok);
+            if (!ok)
+            {
+                return false;
+            }
+
+            *outImageBase = static_cast<uint64_t>(imageBase32);
+            return true;
+        }
+    }
+
+    void ParsePeDelayImports(const std::vector<unsigned char>& bytes,
+        const std::vector<PeSectionHeader>& sections,
+        size_t optionalOffset,
+        uint16_t sizeOfOptionalHeader,
+        bool isPe32Plus,
+        bool onlyFunctionNames,
+        std::unordered_set<std::string>* uniqueSet)
+    {
+        if (uniqueSet == nullptr)
+        {
+            return;
+        }
+
+        // DataDirectory[13] = IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT
+        PeDataDirectory delayDir = {};
+        if (!ReadPeDataDirectory(bytes, optionalOffset, sizeOfOptionalHeader, isPe32Plus, 13u, delayDir))
+        {
+            return;
+        }
+
+        if (delayDir.virtualAddress == 0 || delayDir.size == 0)
+        {
+            return;
+        }
+
+        uint32_t delayDirFileOffset = 0;
+        if (!RvaToFileOffsetPe(sections, delayDir.virtualAddress, &delayDirFileOffset))
+        {
+            return;
+        }
+
+        uint64_t imageBase = 0;
+        const bool hasImageBase = ReadPeImageBase(bytes, optionalOffset, sizeOfOptionalHeader, isPe32Plus, &imageBase);
+
+        const size_t startOffset = static_cast<size_t>(delayDirFileOffset);
+        if (startOffset >= bytes.size())
+        {
+            return;
+        }
+
+        const size_t maxSize = bytes.size() - startOffset;
+        const size_t dirSize = std::min(maxSize, static_cast<size_t>(delayDir.size));
+        const size_t endOffset = startOffset + dirSize;
+
+        // ImgDelayDescr is 32 bytes (8 DWORDs)
+        size_t descOffset = startOffset;
+
+        bool ok = false;
+        while (descOffset + 32u <= endOffset)
+        {
+            const uint32_t grAttrs = ReadU32Le(bytes, descOffset + 0u, &ok);
+            const uint32_t rvaDllNameRaw = ReadU32Le(bytes, descOffset + 4u, &ok);
+            const uint32_t rvaHmodRaw = ReadU32Le(bytes, descOffset + 8u, &ok);
+            const uint32_t rvaIatRaw = ReadU32Le(bytes, descOffset + 12u, &ok);
+            const uint32_t rvaIntRaw = ReadU32Le(bytes, descOffset + 16u, &ok);
+            const uint32_t rvaBoundIatRaw = ReadU32Le(bytes, descOffset + 20u, &ok);
+            const uint32_t rvaUnloadIatRaw = ReadU32Le(bytes, descOffset + 24u, &ok);
+            const uint32_t timeStamp = ReadU32Le(bytes, descOffset + 28u, &ok);
+
+            (void)rvaHmodRaw;
+            (void)rvaBoundIatRaw;
+            (void)rvaUnloadIatRaw;
+            (void)timeStamp;
+
+            if (!ok)
+            {
+                break;
+            }
+
+            if (grAttrs == 0 && rvaDllNameRaw == 0 && rvaIatRaw == 0 && rvaIntRaw == 0)
+            {
+                break;
+            }
+
+            const bool ptrIsRva = ((grAttrs & 0x1u) != 0);
+
+            // delayimp.h 里 dlattrRva=0x1 表示“字段用 RVA 而不是指针(VA)”。
+            // x64/VS.NET+ 实际上应当始终使用 RVA 形式；若不是，则跳过避免误解析。
+            if (isPe32Plus && !ptrIsRva)
+            {
+                descOffset += 32u;
+                continue;
+            }
+
+            auto ToRva32FromRaw32 = [&](uint32_t raw) -> uint32_t
+                {
+                    if (ptrIsRva)
+                    {
+                        return raw;
+                    }
+
+                    if (!hasImageBase)
+                    {
+                        return 0;
+                    }
+
+                    const uint64_t va = static_cast<uint64_t>(raw);
+                    if (va < imageBase)
+                    {
+                        return 0;
+                    }
+
+                    const uint64_t rva64 = va - imageBase;
+                    if (rva64 > 0xFFFFFFFFULL)
+                    {
+                        return 0;
+                    }
+
+                    return static_cast<uint32_t>(rva64);
+                };
+
+            auto ToRva32FromRaw64 = [&](uint64_t raw) -> uint32_t
+                {
+                    if (ptrIsRva)
+                    {
+                        return static_cast<uint32_t>(raw & 0xFFFFFFFFULL);
+                    }
+
+                    if (!hasImageBase)
+                    {
+                        return 0;
+                    }
+
+                    if (raw < imageBase)
+                    {
+                        return 0;
+                    }
+
+                    const uint64_t rva64 = raw - imageBase;
+                    if (rva64 > 0xFFFFFFFFULL)
+                    {
+                        return 0;
+                    }
+
+                    return static_cast<uint32_t>(rva64);
+                };
+
+            const uint32_t rvaDllName = ToRva32FromRaw32(rvaDllNameRaw);
+            if (rvaDllName == 0)
+            {
+                descOffset += 32u;
+                continue;
+            }
+
+            uint32_t dllNameOffset = 0;
+            if (!RvaToFileOffsetPe(sections, rvaDllName, &dllNameOffset))
+            {
+                descOffset += 32u;
+                continue;
+            }
+
+            const std::string dllName = ReadCStringLimited(bytes, dllNameOffset, 4096);
+            if (dllName.empty())
+            {
+                descOffset += 32u;
+                continue;
+            }
+
+            uint32_t thunkRva = 0;
+            if (rvaIntRaw != 0)
+            {
+                thunkRva = ToRva32FromRaw32(rvaIntRaw);
+            }
+            else
+            {
+                thunkRva = ToRva32FromRaw32(rvaIatRaw);
+            }
+
+            if (thunkRva == 0)
+            {
+                descOffset += 32u;
+                continue;
+            }
+
+            uint32_t thunkOffset = 0;
+            if (!RvaToFileOffsetPe(sections, thunkRva, &thunkOffset))
+            {
+                descOffset += 32u;
+                continue;
+            }
+
+            const bool is64 = isPe32Plus;
+            size_t thunkEntryOffset = static_cast<size_t>(thunkOffset);
+
+            while (true)
+            {
+                if (is64)
+                {
+                    if (thunkEntryOffset + 8u > bytes.size())
+                    {
+                        break;
+                    }
+
+                    const uint64_t thunkValue = ReadU64Le(bytes, thunkEntryOffset, &ok);
+                    if (!ok || thunkValue == 0)
+                    {
+                        break;
+                    }
+
+                    const bool isOrdinal = ((thunkValue & 0x8000000000000000ULL) != 0);
+                    if (isOrdinal)
+                    {
+                        const uint16_t ordinal = static_cast<uint16_t>(thunkValue & 0xFFFFULL);
+                        const std::string funcId = "#" + std::to_string(static_cast<unsigned int>(ordinal));
+
+                        // onlyFunctionNames 也包含 DLL 名，保持“基础签名”可追溯到来源 DLL
+                        uniqueSet->insert(dllName + "!" + funcId);
+                    }
+                    else
+                    {
+                        const uint32_t importByNameRva = ToRva32FromRaw64(thunkValue);
+
+                        uint32_t importByNameOffset = 0;
+                        if (importByNameRva != 0 && RvaToFileOffsetPe(sections, importByNameRva, &importByNameOffset))
+                        {
+                            bool hintOk = false;
+                            const uint16_t hint = ReadU16Le(bytes, static_cast<size_t>(importByNameOffset), &hintOk);
+                            const std::string funcName = ReadCStringLimited(bytes, static_cast<size_t>(importByNameOffset) + 2u, 4096);
+                            if (!funcName.empty())
+                            {
+                                if (onlyFunctionNames)
+                                {
+                                    uniqueSet->insert(dllName + "!" + funcName);
+                                }
+                                else
+                                {
+                                    std::ostringstream oss;
+                                    oss << dllName << "!" << funcName;
+                                    if (hintOk)
+                                    {
+                                        oss << " HINT=0x" << std::uppercase << std::hex << hint << std::nouppercase << std::dec;
+                                    }
+                                    uniqueSet->insert(oss.str());
+                                }
+                            }
+                        }
+                    }
+
+                    thunkEntryOffset += 8u;
+                }
+                else
+                {
+                    if (thunkEntryOffset + 4u > bytes.size())
+                    {
+                        break;
+                    }
+
+                    uint32_t thunkValue = ReadU32Le(bytes, thunkEntryOffset, &ok);
+                    if (!ok || thunkValue == 0)
+                    {
+                        break;
+                    }
+
+                    const bool isOrdinal = ((thunkValue & 0x80000000UL) != 0);
+                    if (isOrdinal)
+                    {
+                        const uint16_t ordinal = static_cast<uint16_t>(thunkValue & 0xFFFFUL);
+                        const std::string funcId = "#" + std::to_string(static_cast<unsigned int>(ordinal));
+
+                        // onlyFunctionNames 也包含 DLL 名，保持“基础签名”可追溯到来源 DLL
+                        uniqueSet->insert(dllName + "!" + funcId);
+                    }
+                    else
+                    {
+                        const uint32_t importByNameRva = ptrIsRva ? thunkValue : ToRva32FromRaw32(thunkValue);
+                        if (importByNameRva == 0)
+                        {
+                            thunkEntryOffset += 4u;
+                            continue;
+                        }
+                        uint32_t importByNameOffset = 0;
+                        if (RvaToFileOffsetPe(sections, importByNameRva, &importByNameOffset))
+                        {
+                            bool hintOk = false;
+                            const uint16_t hint = ReadU16Le(bytes, static_cast<size_t>(importByNameOffset), &hintOk);
+                            const std::string funcName = ReadCStringLimited(bytes, static_cast<size_t>(importByNameOffset) + 2u, 4096);
+                            if (!funcName.empty())
+                            {
+                                if (onlyFunctionNames)
+                                {
+                                    uniqueSet->insert(dllName + "!" + funcName);
+                                }
+                                else
+                                {
+                                    std::ostringstream oss;
+                                    oss << dllName << "!" << funcName;
+                                    if (hintOk)
+                                    {
+                                        oss << " HINT=0x" << std::uppercase << std::hex << hint << std::nouppercase << std::dec;
+                                    }
+                                    uniqueSet->insert(oss.str());
+                                }
+                            }
+                        }
+                    }
+
+                    thunkEntryOffset += 4u;
+                }
+            }
+
+            descOffset += 32u;
+        }
+    }
+
+    void ParsePeImports(const std::vector<unsigned char>& bytes, bool onlyFunctionNames, std::vector<std::string>* outImports)
     {
         if (outImports == nullptr)
         {
@@ -2566,7 +3064,7 @@ namespace
 
         bool ok = false;
         const uint32_t e_lfanew = ReadU32Le(bytes, 0x3C, &ok);
-        if (!ok || e_lfanew + 4 + sizeof(PeCoffFileHeader) > bytes.size())
+        if (!ok || static_cast<size_t>(e_lfanew) + 4u + sizeof(PeCoffFileHeader) > bytes.size())
         {
             return;
         }
@@ -2576,12 +3074,13 @@ namespace
             return;
         }
 
-        const size_t coffOffset = static_cast<size_t>(e_lfanew + 4);
+        const size_t coffOffset = static_cast<size_t>(e_lfanew + 4u);
         PeCoffFileHeader coff = {};
         std::memcpy(&coff, &bytes[coffOffset], sizeof(PeCoffFileHeader));
 
         const size_t optionalOffset = coffOffset + sizeof(PeCoffFileHeader);
-        if (optionalOffset + coff.sizeOfOptionalHeader > bytes.size())
+        const size_t optionalEnd = optionalOffset + static_cast<size_t>(coff.sizeOfOptionalHeader);
+        if (optionalEnd > bytes.size())
         {
             return;
         }
@@ -2593,21 +3092,13 @@ namespace
         }
 
         const bool isPe32Plus = (optMagic == 0x20B);
-        const size_t dataDirOffset = isPe32Plus ? (optionalOffset + 112) : (optionalOffset + 96);
-        if (dataDirOffset + sizeof(PeDataDirectory) * 16 > bytes.size())
+        const bool isPe32 = (optMagic == 0x10B);
+        if (!isPe32Plus && !isPe32)
         {
             return;
         }
 
-        PeDataDirectory importDir = {};
-        std::memcpy(&importDir, &bytes[dataDirOffset + sizeof(PeDataDirectory) * 1], sizeof(PeDataDirectory));
-
-        if (importDir.virtualAddress == 0 || importDir.size == 0)
-        {
-            return;
-        }
-
-        const size_t sectionTableOffset = optionalOffset + coff.sizeOfOptionalHeader;
+        const size_t sectionTableOffset = optionalOffset + static_cast<size_t>(coff.sizeOfOptionalHeader);
         const size_t needSectionBytes = static_cast<size_t>(coff.numberOfSections) * sizeof(PeSectionHeader);
         if (sectionTableOffset + needSectionBytes > bytes.size())
         {
@@ -2618,148 +3109,197 @@ namespace
         sections.resize(coff.numberOfSections);
         std::memcpy(sections.data(), &bytes[sectionTableOffset], needSectionBytes);
 
-        uint32_t importDirFileOffset = 0;
-        if (!RvaToFileOffsetPe(sections, importDir.virtualAddress, &importDirFileOffset))
-        {
-            return;
-        }
-
-        // IMAGE_IMPORT_DESCRIPTOR is 20 bytes, array terminated by all-zeros entry.
         std::unordered_set<std::string> uniqueSet;
         uniqueSet.reserve(256);
 
-        size_t descOffset = static_cast<size_t>(importDirFileOffset);
-        while (descOffset + 20 <= bytes.size())
+        // -------------------------
+        // Normal Import Table (DataDirectory[1])
+        // -------------------------
+        PeDataDirectory importDir = {};
+        if (ReadPeDataDirectory(bytes, optionalOffset, coff.sizeOfOptionalHeader, isPe32Plus, 1u, importDir) &&
+            importDir.virtualAddress != 0 &&
+            importDir.size != 0)
         {
-            const uint32_t originalFirstThunk = ReadU32Le(bytes, descOffset + 0, &ok);
-            const uint32_t timeDateStamp = ReadU32Le(bytes, descOffset + 4, &ok);
-            const uint32_t forwarderChain = ReadU32Le(bytes, descOffset + 8, &ok);
-            const uint32_t nameRva = ReadU32Le(bytes, descOffset + 12, &ok);
-            const uint32_t firstThunk = ReadU32Le(bytes, descOffset + 16, &ok);
-
-            (void)timeDateStamp;
-            (void)forwarderChain;
-
-            if (!ok)
+            uint32_t importDirFileOffset = 0;
+            if (RvaToFileOffsetPe(sections, importDir.virtualAddress, &importDirFileOffset))
             {
-                break;
-            }
+                const size_t startOffset = static_cast<size_t>(importDirFileOffset);
+                const size_t endOffset = std::min(bytes.size(), startOffset + static_cast<size_t>(importDir.size));
 
-            if (originalFirstThunk == 0 && nameRva == 0 && firstThunk == 0)
-            {
-                break;
-            }
-
-            uint32_t dllNameOffset = 0;
-            if (!RvaToFileOffsetPe(sections, nameRva, &dllNameOffset))
-            {
-                descOffset += 20;
-                continue;
-            }
-
-            std::string dllName = ReadCString(bytes, dllNameOffset);
-            if (dllName.empty())
-            {
-                descOffset += 20;
-                continue;
-            }
-
-            const uint32_t thunkRva = (originalFirstThunk != 0) ? originalFirstThunk : firstThunk;
-            uint32_t thunkOffset = 0;
-            if (!RvaToFileOffsetPe(sections, thunkRva, &thunkOffset))
-            {
-                descOffset += 20;
-                continue;
-            }
-
-            const bool is64 = isPe32Plus;
-            size_t thunkEntryOffset = static_cast<size_t>(thunkOffset);
-
-            while (true)
-            {
-                if (is64)
+                // IMAGE_IMPORT_DESCRIPTOR is 20 bytes, array terminated by all-zeros entry.
+                size_t descOffset = startOffset;
+                while (descOffset + 20u <= endOffset)
                 {
-                    if (thunkEntryOffset + 8 > bytes.size())
+                    const uint32_t originalFirstThunk = ReadU32Le(bytes, descOffset + 0u, &ok);
+                    const uint32_t nameRva = ReadU32Le(bytes, descOffset + 12u, &ok);
+                    const uint32_t firstThunk = ReadU32Le(bytes, descOffset + 16u, &ok);
+
+                    if (!ok)
                     {
                         break;
                     }
 
-                    const uint64_t thunkValue = ReadU64Le(bytes, thunkEntryOffset, &ok);
-                    if (!ok || thunkValue == 0)
+                    if (originalFirstThunk == 0 && nameRva == 0 && firstThunk == 0)
                     {
                         break;
                     }
 
-                    const uint64_t isOrdinal = (thunkValue & 0x8000000000000000ULL);
-                    if (isOrdinal != 0)
+                    if (nameRva == 0)
                     {
-                        const uint16_t ordinal = static_cast<uint16_t>(thunkValue & 0xFFFFULL);
-                        std::ostringstream oss;
-                        oss << dllName << "!#" << ordinal;
-                        uniqueSet.insert(oss.str());
+                        descOffset += 20u;
+                        continue;
                     }
-                    else
+
+                    uint32_t dllNameOffset = 0;
+                    if (!RvaToFileOffsetPe(sections, nameRva, &dllNameOffset))
                     {
-                        const uint32_t importByNameRva = static_cast<uint32_t>(thunkValue & 0xFFFFFFFFULL);
-                        uint32_t importByNameOffset = 0;
-                        if (RvaToFileOffsetPe(sections, importByNameRva, &importByNameOffset))
+                        descOffset += 20u;
+                        continue;
+                    }
+
+                    const std::string dllName = ReadCStringLimited(bytes, dllNameOffset, 4096);
+                    if (dllName.empty())
+                    {
+                        descOffset += 20u;
+                        continue;
+                    }
+
+                    const uint32_t thunkRva = (originalFirstThunk != 0) ? originalFirstThunk : firstThunk;
+                    if (thunkRva == 0)
+                    {
+                        descOffset += 20u;
+                        continue;
+                    }
+
+                    uint32_t thunkOffset = 0;
+                    if (!RvaToFileOffsetPe(sections, thunkRva, &thunkOffset))
+                    {
+                        descOffset += 20u;
+                        continue;
+                    }
+
+                    const bool is64 = isPe32Plus;
+                    size_t thunkEntryOffset = static_cast<size_t>(thunkOffset);
+
+                    while (true)
+                    {
+                        if (is64)
                         {
-                            // IMAGE_IMPORT_BY_NAME: WORD hint + ASCII name
-                            const std::string funcName = ReadCString(bytes, static_cast<size_t>(importByNameOffset) + 2);
-                            if (!funcName.empty())
+                            if (thunkEntryOffset + 8u > bytes.size())
                             {
-                                std::ostringstream oss;
-                                oss << dllName << "!" << funcName;
-                                uniqueSet.insert(oss.str());
+                                break;
                             }
+
+                            const uint64_t thunkValue = ReadU64Le(bytes, thunkEntryOffset, &ok);
+                            if (!ok || thunkValue == 0)
+                            {
+                                break;
+                            }
+
+                            const bool isOrdinal = ((thunkValue & 0x8000000000000000ULL) != 0);
+                            if (isOrdinal)
+                            {
+                                const uint16_t ordinal = static_cast<uint16_t>(thunkValue & 0xFFFFULL);
+                                const std::string funcId = "#" + std::to_string(static_cast<unsigned int>(ordinal));
+
+                                // onlyFunctionNames 也包含 DLL 名，保持“基础签名”可追溯到来源 DLL
+                                uniqueSet.insert(dllName + "!" + funcId);
+                            }
+                            else
+                            {
+                                const uint32_t importByNameRva = static_cast<uint32_t>(thunkValue & 0xFFFFFFFFULL);
+                                uint32_t importByNameOffset = 0;
+                                if (importByNameRva != 0 && RvaToFileOffsetPe(sections, importByNameRva, &importByNameOffset))
+                                {
+                                    bool hintOk = false;
+                                    const uint16_t hint = ReadU16Le(bytes, static_cast<size_t>(importByNameOffset), &hintOk);
+                                    const std::string funcName = ReadCStringLimited(bytes, static_cast<size_t>(importByNameOffset) + 2u, 4096);
+                                    if (!funcName.empty())
+                                    {
+                                        if (onlyFunctionNames)
+                                        {
+                                            uniqueSet.insert(dllName + "!" + funcName);
+                                        }
+                                        else
+                                        {
+                                            std::ostringstream oss;
+                                            oss << dllName << "!" << funcName;
+                                            if (hintOk)
+                                            {
+                                                oss << " HINT=0x" << std::uppercase << std::hex << hint << std::nouppercase << std::dec;
+                                            }
+                                            uniqueSet.insert(oss.str());
+                                        }
+                                    }
+                                }
+                            }
+
+                            thunkEntryOffset += 8u;
+                        }
+                        else
+                        {
+                            if (thunkEntryOffset + 4u > bytes.size())
+                            {
+                                break;
+                            }
+
+                            const uint32_t thunkValue = ReadU32Le(bytes, thunkEntryOffset, &ok);
+                            if (!ok || thunkValue == 0)
+                            {
+                                break;
+                            }
+
+                            const bool isOrdinal = ((thunkValue & 0x80000000UL) != 0);
+                            if (isOrdinal)
+                            {
+                                const uint16_t ordinal = static_cast<uint16_t>(thunkValue & 0xFFFFUL);
+                                const std::string funcId = "#" + std::to_string(static_cast<unsigned int>(ordinal));
+
+                                // onlyFunctionNames 也包含 DLL 名，保持“基础签名”可追溯到来源 DLL
+                                uniqueSet.insert(dllName + "!" + funcId);
+                            }
+                            else
+                            {
+                                const uint32_t importByNameRva = thunkValue;
+                                uint32_t importByNameOffset = 0;
+                                if (importByNameRva != 0 && RvaToFileOffsetPe(sections, importByNameRva, &importByNameOffset))
+                                {
+                                    bool hintOk = false;
+                                    const uint16_t hint = ReadU16Le(bytes, static_cast<size_t>(importByNameOffset), &hintOk);
+                                    const std::string funcName = ReadCStringLimited(bytes, static_cast<size_t>(importByNameOffset) + 2u, 4096);
+                                    if (!funcName.empty())
+                                    {
+                                        if (onlyFunctionNames)
+                                        {
+                                            uniqueSet.insert(dllName + "!" + funcName);
+                                        }
+                                        else
+                                        {
+                                            std::ostringstream oss;
+                                            oss << dllName << "!" << funcName;
+                                            if (hintOk)
+                                            {
+                                                oss << " HINT=0x" << std::uppercase << std::hex << hint << std::nouppercase << std::dec;
+                                            }
+                                            uniqueSet.insert(oss.str());
+                                        }
+                                    }
+                                }
+                            }
+
+                            thunkEntryOffset += 4u;
                         }
                     }
 
-                    thunkEntryOffset += 8;
-                }
-                else
-                {
-                    if (thunkEntryOffset + 4 > bytes.size())
-                    {
-                        break;
-                    }
-
-                    const uint32_t thunkValue = ReadU32Le(bytes, thunkEntryOffset, &ok);
-                    if (!ok || thunkValue == 0)
-                    {
-                        break;
-                    }
-
-                    const uint32_t isOrdinal = (thunkValue & 0x80000000UL);
-                    if (isOrdinal != 0)
-                    {
-                        const uint16_t ordinal = static_cast<uint16_t>(thunkValue & 0xFFFFUL);
-                        std::ostringstream oss;
-                        oss << dllName << "!#" << ordinal;
-                        uniqueSet.insert(oss.str());
-                    }
-                    else
-                    {
-                        const uint32_t importByNameRva = thunkValue;
-                        uint32_t importByNameOffset = 0;
-                        if (RvaToFileOffsetPe(sections, importByNameRva, &importByNameOffset))
-                        {
-                            const std::string funcName = ReadCString(bytes, static_cast<size_t>(importByNameOffset) + 2);
-                            if (!funcName.empty())
-                            {
-                                std::ostringstream oss;
-                                oss << dllName << "!" << funcName;
-                                uniqueSet.insert(oss.str());
-                            }
-                        }
-                    }
-
-                    thunkEntryOffset += 4;
+                    descOffset += 20u;
                 }
             }
-
-            descOffset += 20;
         }
+
+        // -------------------------
+        // Delay-Load Import Table (DataDirectory[13])
+        // -------------------------
+        ParsePeDelayImports(bytes, sections, optionalOffset, coff.sizeOfOptionalHeader, isPe32Plus, onlyFunctionNames, &uniqueSet);
 
         outImports->assign(uniqueSet.begin(), uniqueSet.end());
         std::sort(outImports->begin(), outImports->end(), [](const std::string& a, const std::string& b)
@@ -2767,7 +3307,6 @@ namespace
                 return ToLowerAscii(a) < ToLowerAscii(b);
             });
     }
-
     // -------------------------
     // ELF parsing (little-endian)
     // -------------------------
@@ -2873,7 +3412,7 @@ namespace
         return static_cast<unsigned char>(stOther & 0x03);
     }
 
-    void ParseElfDynSymbols(const std::vector<unsigned char>& bytes, bool wantExports, std::vector<std::string>* outList)
+    void ParseElfDynSymbols(const std::vector<unsigned char>& bytes, bool wantExports, bool onlyFunctionNames, std::vector<std::string>* outList)
     {
         if (outList == nullptr)
         {
@@ -2934,7 +3473,10 @@ namespace
                     continue;
                 }
 
-                if (symSh.sh_entsize == 0 || symSh.sh_offset + symSh.sh_size > bytes.size())
+                const uint64_t symOffset = symSh.sh_offset;
+                const uint64_t symSize = symSh.sh_size;
+                if (symSh.sh_entsize == 0 || symOffset > static_cast<uint64_t>(bytes.size()) ||
+                    symSize > static_cast<uint64_t>(bytes.size()) - symOffset)
                 {
                     continue;
                 }
@@ -2946,7 +3488,10 @@ namespace
                 }
 
                 const Elf64_Shdr& strSh = shdrs[strIndex];
-                if (strSh.sh_offset + strSh.sh_size > bytes.size())
+                const uint64_t strOffset = strSh.sh_offset;
+                const uint64_t strSize64 = strSh.sh_size;
+                if (strOffset > static_cast<uint64_t>(bytes.size()) ||
+                    strSize64 > static_cast<uint64_t>(bytes.size()) - strOffset)
                 {
                     continue;
                 }
@@ -3006,7 +3551,18 @@ namespace
                         continue;
                     }
 
-                    uniqueSet.insert(std::string(namePtr));
+                    const std::string name(namePtr);
+
+                    if (onlyFunctionNames)
+                    {
+                        uniqueSet.insert(name);
+                    }
+                    else
+                    {
+                        std::ostringstream oss;
+                        oss << "0x" << std::uppercase << std::hex << sym.st_value << std::nouppercase << std::dec << " " << name;
+                        uniqueSet.insert(oss.str());
+                    }
                 }
             }
         }
@@ -3113,7 +3669,18 @@ namespace
                         continue;
                     }
 
-                    uniqueSet.insert(std::string(namePtr));
+                    const std::string name(namePtr);
+
+                    if (onlyFunctionNames)
+                    {
+                        uniqueSet.insert(name);
+                    }
+                    else
+                    {
+                        std::ostringstream oss;
+                        oss << "0x" << std::uppercase << std::hex << sym.st_value << std::nouppercase << std::dec << " " << name;
+                        uniqueSet.insert(oss.str());
+                    }
                 }
             }
         }
@@ -3127,52 +3694,58 @@ namespace
     }
 }
 
-std::vector<std::string> GB_GetExportedFunctionSignatures(const std::string& filePathUtf8)
+std::vector<std::string> GB_GetExportedFunctionSignatures(const std::string& filePathUtf8, bool onlyFunctionNames)
 {
+    std::vector<std::string> result;
+
     std::vector<unsigned char> bytes;
     if (!ReadAllBytesUtf8Path(filePathUtf8, &bytes))
     {
-        return std::vector<std::string>();
+        return result;
     }
-
-    std::vector<std::string> result;
 
     if (IsPeFile(bytes))
     {
-        ParsePeExports(bytes, &result);
-        return result;
+        ParsePeExports(bytes, onlyFunctionNames, &result);
     }
-
-    if (IsElfFile(bytes))
+    else if (IsElfFile(bytes))
     {
-        ParseElfDynSymbols(bytes, true, &result);
-        return result;
+        ParseElfDynSymbols(bytes, true, onlyFunctionNames, &result);
     }
 
-    return std::vector<std::string>();
+    std::sort(result.begin(), result.end(),
+        [](const std::string& left, const std::string& right)
+        {
+            return ToLowerAscii(left) < ToLowerAscii(right);
+        });
+
+    return result;
 }
 
-std::vector<std::string> GB_GetImportedFunctionSignatures(const std::string& filePathUtf8)
+std::vector<std::string> GB_GetImportedFunctionSignatures(const std::string& filePathUtf8, bool onlyFunctionNames)
 {
+    std::vector<std::string> result;
+
     std::vector<unsigned char> bytes;
     if (!ReadAllBytesUtf8Path(filePathUtf8, &bytes))
     {
-        return std::vector<std::string>();
+        return result;
     }
-
-    std::vector<std::string> result;
 
     if (IsPeFile(bytes))
     {
-        ParsePeImports(bytes, &result);
-        return result;
+        ParsePeImports(bytes, onlyFunctionNames, &result);
     }
-
-    if (IsElfFile(bytes))
+    else if (IsElfFile(bytes))
     {
-        ParseElfDynSymbols(bytes, false, &result);
-        return result;
+        ParseElfDynSymbols(bytes, false, onlyFunctionNames, &result);
     }
 
-    return std::vector<std::string>();
+    std::sort(result.begin(), result.end(),
+        [](const std::string& left, const std::string& right)
+        {
+            return ToLowerAscii(left) < ToLowerAscii(right);
+        });
+
+    return result;
 }
