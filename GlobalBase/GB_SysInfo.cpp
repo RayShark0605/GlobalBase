@@ -10,6 +10,7 @@
 #include <cerrno>
 #include <fstream>
 #include <sstream>
+#include <cctype>
 
 #if defined(_WIN32)
 #define NOMINMAX
@@ -18,18 +19,6 @@
 #include <powrprof.h>
 #pragma comment(lib, "PowrProf.lib")
 
-#ifndef PROCESSOR_POWER_INFORMATION_DEFINED
-#define PROCESSOR_POWER_INFORMATION_DEFINED
-typedef struct _PROCESSOR_POWER_INFORMATION
-{
-    ULONG Number;
-    ULONG MaxMhz;
-    ULONG CurrentMhz;
-    ULONG MhzLimit;
-    ULONG MaxIdleState;
-    ULONG CurrentIdleState;
-} PROCESSOR_POWER_INFORMATION, * PPROCESSOR_POWER_INFORMATION;
-#endif
 
 #include <intrin.h>        // __cpuid, __cpuidex
 #include <wbemidl.h>
@@ -75,60 +64,175 @@ namespace internal
 
 #if defined(_WIN32)
     // 简易 RAII
-    struct ComInit
+    //
+    // 注意：
+    // - CoInitializeSecurity 是进程级安全初始化，通常只能成功设置一次；若重复调用，常见返回 RPC_E_TOO_LATE。
+    // - CoInitializeEx 可能返回 RPC_E_CHANGED_MODE（线程已用其他并发模型初始化过），此时可继续使用 COM，但不要 CoUninitialize。
+    class ComScope
     {
-        HRESULT hr = E_FAIL;
-        
-        ComInit()
+    public:
+        ComScope()
         {
-            hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
-            if (SUCCEEDED(hr))
+            m_hrInitCom = ::CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+            if (m_hrInitCom == RPC_E_CHANGED_MODE)
             {
-                CoInitializeSecurity(nullptr, -1, nullptr, nullptr, RPC_C_AUTHN_LEVEL_DEFAULT, RPC_C_IMP_LEVEL_IMPERSONATE, nullptr, EOAC_NONE, nullptr);
+                m_needUninit = false;
+                m_hrInitCom = S_OK;
+            }
+            else if (SUCCEEDED(m_hrInitCom))
+            {
+                m_needUninit = true;
+            }
+            else
+            {
+                m_needUninit = false;
+                return;
+            }
+
+            m_hrInitSec = ::CoInitializeSecurity(nullptr, -1, nullptr, nullptr, RPC_C_AUTHN_LEVEL_DEFAULT, RPC_C_IMP_LEVEL_IMPERSONATE, nullptr, EOAC_NONE, nullptr);
+
+            if (m_hrInitSec == RPC_E_TOO_LATE)
+            {
+                m_hrInitSec = S_OK;
             }
         }
-        ~ComInit()
+
+        ~ComScope()
         {
-            if (SUCCEEDED(hr))
+            if (m_needUninit)
             {
-                CoUninitialize();
+                ::CoUninitialize();
             }
         }
+
+        bool IsOk() const
+        {
+            return SUCCEEDED(m_hrInitCom) && SUCCEEDED(m_hrInitSec);
+        }
+
+    private:
+        bool m_needUninit = false;
+        HRESULT m_hrInitCom = E_FAIL;
+        HRESULT m_hrInitSec = E_FAIL;
     };
+
+    // BSTR RAII：避免将 wchar_t* 字面量强转为 BSTR
+    class BstrScope
+    {
+    public:
+        BstrScope() = default;
+
+        explicit BstrScope(const wchar_t* s)
+        {
+            if (s)
+            {
+                m_bstr = ::SysAllocString(s);
+            }
+        }
+
+        explicit BstrScope(const std::wstring& s)
+        {
+            m_bstr = ::SysAllocStringLen(s.data(), static_cast<UINT>(s.size()));
+        }
+
+        BstrScope(const BstrScope&) = delete;
+        BstrScope& operator=(const BstrScope&) = delete;
+
+        BstrScope(BstrScope&& other) noexcept
+        {
+            m_bstr = other.m_bstr;
+            other.m_bstr = nullptr;
+        }
+
+        BstrScope& operator=(BstrScope&& other) noexcept
+        {
+            if (this != &other)
+            {
+                Reset();
+                m_bstr = other.m_bstr;
+                other.m_bstr = nullptr;
+            }
+            return *this;
+        }
+
+        ~BstrScope()
+        {
+            Reset();
+        }
+
+        BSTR Get() const
+        {
+            return m_bstr;
+        }
+
+        bool IsValid() const
+        {
+            return m_bstr != nullptr;
+        }
+
+    private:
+        void Reset()
+        {
+            if (m_bstr)
+            {
+                ::SysFreeString(m_bstr);
+                m_bstr = nullptr;
+            }
+        }
+
+        BSTR m_bstr = nullptr;
+    };
+
+    static string BstrToUtf8(BSTR b);
 
     // WMI 读取 Win32_Processor.ProcessorId（首个处理器）
     static string GetProcessorIdViaWmi()
     {
-        ComInit com;
-        if (FAILED(com.hr))
+        ComScope com;
+        if (!com.IsOk())
         {
-            return {};
+            return "";
         }
 
         IWbemLocator* pLoc = nullptr;
         if (FAILED(CoCreateInstance(CLSID_WbemLocator, 0, CLSCTX_INPROC_SERVER, IID_IWbemLocator, (LPVOID*)&pLoc)))
         {
-            return {};
+            return "";
         }
 
         IWbemServices* pSvc = nullptr;
-        HRESULT hr = pLoc->ConnectServer(BSTR(L"ROOT\\CIMV2"), nullptr, nullptr, 0, 0, 0, 0, &pSvc);
+        const BstrScope rootPath(L"ROOT\\CIMV2");
+        if (!rootPath.IsValid())
+        {
+            pLoc->Release();
+            return "";
+        }
+
+        HRESULT hr = pLoc->ConnectServer(rootPath.Get(), nullptr, nullptr, 0, 0, 0, 0, &pSvc);
 
         pLoc->Release();
         if (FAILED(hr))
         {
-            return {};
+            return "";
         }
 
         // 设置代理安全
-        CoSetProxyBlanket(pSvc, RPC_C_AUTHN_WINNT, RPC_C_AUTHZ_NONE, nullptr, RPC_C_AUTHN_LEVEL_CALL, RPC_C_IMP_LEVEL_IMPERSONATE, nullptr, EOAC_NONE);
+        (void)CoSetProxyBlanket(pSvc, RPC_C_AUTHN_WINNT, RPC_C_AUTHZ_NONE, nullptr, RPC_C_AUTHN_LEVEL_CALL, RPC_C_IMP_LEVEL_IMPERSONATE, nullptr, EOAC_NONE);
 
         IEnumWbemClassObject* pEnum = nullptr;
-        hr = pSvc->ExecQuery(BSTR(L"WQL"), BSTR(L"SELECT ProcessorId FROM Win32_Processor"), WBEM_FLAG_FORWARD_ONLY | WBEM_FLAG_RETURN_IMMEDIATELY, nullptr, &pEnum);
+        const BstrScope wqlLang(L"WQL");
+        const BstrScope wqlQuery(L"SELECT ProcessorId FROM Win32_Processor");
+        if (!wqlLang.IsValid() || !wqlQuery.IsValid())
+        {
+            pSvc->Release();
+            return "";
+        }
+
+        hr = pSvc->ExecQuery(wqlLang.Get(), wqlQuery.Get(), WBEM_FLAG_FORWARD_ONLY | WBEM_FLAG_RETURN_IMMEDIATELY, nullptr, &pEnum);
         if (FAILED(hr))
         {
             pSvc->Release();
-            return {};
+            return "";
         }
 
         string id;
@@ -140,14 +244,7 @@ namespace internal
             VariantInit(&vt);
             if (SUCCEEDED(pObj->Get(L"ProcessorId", 0, &vt, nullptr, nullptr)) && vt.vt == VT_BSTR)
             {
-                // 转成 UTF-8
-                int len = WideCharToMultiByte(CP_UTF8, 0, vt.bstrVal, -1, nullptr, 0, nullptr, nullptr);
-                string utf8(len ? (len - 1) : 0, '\0');
-                if (len > 1)
-                {
-                    WideCharToMultiByte(CP_UTF8, 0, vt.bstrVal, -1, &utf8[0], len, nullptr, nullptr);
-                }
-                id = utf8;
+                id = BstrToUtf8(vt.bstrVal);
             }
             VariantClear(&vt);
             pObj->Release();
@@ -160,17 +257,17 @@ namespace internal
     // 统计逻辑核/物理核/封装/NUMA
     static void QueryWindowsTopology(uint32_t& logical, uint32_t& cores, uint32_t& packages, uint32_t& numa)
     {
-        logical = GetActiveProcessorCount(ALL_PROCESSOR_GROUPS);
+        logical = ::GetActiveProcessorCount(ALL_PROCESSOR_GROUPS);
 
-        DWORD len = 0;
-        GetLogicalProcessorInformationEx(RelationAll, nullptr, &len);
-        vector<uint8_t> buf(len);
-        if (!GetLogicalProcessorInformationEx(RelationAll, reinterpret_cast<PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX>(buf.data()), &len))
+        // 先查询所需缓冲区大小（典型用法：第一次调用会失败，GetLastError=ERROR_INSUFFICIENT_BUFFER）
+        DWORD returnedLength = 0;
+        const BOOL firstCallOk = ::GetLogicalProcessorInformationEx(RelationAll, nullptr, &returnedLength);
+        if (firstCallOk || ::GetLastError() != ERROR_INSUFFICIENT_BUFFER || returnedLength == 0)
         {
             cores = packages = 0;
             // NUMA 回退
             ULONG highest = 0;
-            if (GetNumaHighestNodeNumber(&highest))
+            if (::GetNumaHighestNodeNumber(&highest))
             {
                 numa = highest + 1;
             }
@@ -181,14 +278,46 @@ namespace internal
             return;
         }
 
-        cores = packages = 0;
+        std::vector<uint8_t> buffer(returnedLength);
+        if (!::GetLogicalProcessorInformationEx(
+            RelationAll,
+            reinterpret_cast<PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX>(buffer.data()),
+            &returnedLength))
+        {
+            cores = packages = 0;
+            // NUMA 回退
+            ULONG highest = 0;
+            if (::GetNumaHighestNodeNumber(&highest))
+            {
+                numa = highest + 1;
+            }
+            else
+            {
+                numa = 1;
+            }
+            return;
+        }
+
+        cores = 0;
+        packages = 0;
         numa = 0;
 
-        uint8_t* ptr = buf.data();
-        uint8_t* end = buf.data() + len;
+        uint8_t* ptr = buffer.data();
+        uint8_t* end = buffer.data() + returnedLength;
+
         while (ptr < end)
         {
             auto info = reinterpret_cast<PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX>(ptr);
+            if (info->Size == 0)
+            {
+                break;
+            }
+
+            if (ptr + info->Size > end)
+            {
+                break;
+            }
+
             switch (info->Relationship)
             {
             case RelationProcessorCore:
@@ -206,15 +335,30 @@ namespace internal
             default:
                 break;
             }
+
             ptr += info->Size;
         }
 
         if (numa == 0)
         {
             ULONG highest = 0;
-            numa = GetNumaHighestNodeNumber(&highest) ? (highest + 1) : 1;
+            numa = ::GetNumaHighestNodeNumber(&highest) ? (highest + 1) : 1;
         }
     }
+
+    // CallNtPowerInformation(ProcessorInformation) 的输出布局与 PROCESSOR_POWER_INFORMATION 等价；
+    // 为避免与不同 SDK 版本的类型定义冲突，这里使用独立的本地结构体。
+    struct GbProcessorPowerInformation
+    {
+        ULONG number;
+        ULONG maxMhz;
+        ULONG currentMhz;
+        ULONG mhzLimit;
+        ULONG maxIdleState;
+        ULONG currentIdleState;
+    };
+
+    static_assert(sizeof(GbProcessorPowerInformation) == sizeof(ULONG) * 6, "GbProcessorPowerInformation size mismatch.");
 
     // 通过 CallNtPowerInformation 拿频率（MHz）
     static void QueryWindowsFrequencies(uint64_t& baseHz, uint64_t& maxHz)
@@ -223,10 +367,15 @@ namespace internal
 
         SYSTEM_INFO si{};
         GetNativeSystemInfo(&si);
-        const DWORD n = si.dwNumberOfProcessors ? si.dwNumberOfProcessors : 64;
 
-        vector<PROCESSOR_POWER_INFORMATION> ppi(n);
-        const ULONG outSize = static_cast<ULONG>(sizeof(PROCESSOR_POWER_INFORMATION) * ppi.size());
+        DWORD n = ::GetActiveProcessorCount(ALL_PROCESSOR_GROUPS);
+        if (n == 0)
+        {
+            n = si.dwNumberOfProcessors ? si.dwNumberOfProcessors : 64;
+        }
+
+        vector<GbProcessorPowerInformation> ppi(n);
+        const ULONG outSize = static_cast<ULONG>(sizeof(GbProcessorPowerInformation) * ppi.size());
         const NTSTATUS st = CallNtPowerInformation(ProcessorInformation, nullptr, 0, ppi.data(), outSize);
         if (st != 0)
         {
@@ -237,8 +386,8 @@ namespace internal
         uint32_t maxMhzObserved = 0;
         for (size_t i = 0; i < ppi.size(); ++i)
         {
-            baseMhzObserved = max((uint32_t)baseMhzObserved, (uint32_t)ppi[i].MaxMhz);
-            maxMhzObserved = max((uint32_t)maxMhzObserved, max((uint32_t)ppi[i].MaxMhz, (uint32_t)ppi[i].MhzLimit));
+            baseMhzObserved = max((uint32_t)baseMhzObserved, (uint32_t)ppi[i].maxMhz);
+            maxMhzObserved = max((uint32_t)maxMhzObserved, max((uint32_t)ppi[i].maxMhz, (uint32_t)ppi[i].mhzLimit));
         }
         baseHz = static_cast<uint64_t>(baseMhzObserved) * 1000000ULL;
         maxHz = static_cast<uint64_t>(maxMhzObserved) * 1000000ULL;
@@ -255,9 +404,9 @@ namespace internal
         int regs[4] = { 0 };
         __cpuid(regs, 0);
         char ven[13] = { 0 };
-        *reinterpret_cast<int*>(ven + 0) = regs[1]; // EBX
-        *reinterpret_cast<int*>(ven + 4) = regs[3]; // EDX
-        *reinterpret_cast<int*>(ven + 8) = regs[2]; // ECX
+        std::memcpy(ven + 0, &regs[1], sizeof(int)); // EBX
+        std::memcpy(ven + 4, &regs[3], sizeof(int)); // EDX
+        std::memcpy(ven + 8, &regs[2], sizeof(int)); // ECX
         vendor = ven;
 
         int maxExt[4] = { 0 };
@@ -265,10 +414,17 @@ namespace internal
         if (static_cast<unsigned>(maxExt[0]) >= 0x80000004)
         {
             char buf[49] = { 0 };
-            int* p = reinterpret_cast<int*>(buf);
-            __cpuid(p, 0x80000002);
-            __cpuid(p + 4, 0x80000003);
-            __cpuid(p + 8, 0x80000004);
+
+            int extRegs[4] = { 0 };
+            __cpuid(extRegs, 0x80000002);
+            std::memcpy(buf + 0, extRegs, sizeof(extRegs));
+
+            __cpuid(extRegs, 0x80000003);
+            std::memcpy(buf + 16, extRegs, sizeof(extRegs));
+
+            __cpuid(extRegs, 0x80000004);
+            std::memcpy(buf + 32, extRegs, sizeof(extRegs));
+
             brand = Trim(string(buf));
         }
 
@@ -279,9 +435,11 @@ namespace internal
         hypervisor = !!(leaf1[2] & (1 << 31));
 
         // 基本特性
-        auto add = [&](bool cond, const char* name)
+        auto add = [&](bool cond, const char* name) {
+            if (cond)
             {
-                if (cond) features.emplace_back(name);
+                features.emplace_back(name);
+            }
             };
         const unsigned ecx = static_cast<unsigned>(leaf1[2]);
         const unsigned edx = static_cast<unsigned>(leaf1[3]);
@@ -324,26 +482,14 @@ namespace internal
             return wstring();
         }
 
-        const int len = ::MultiByteToWideChar(
-            CP_UTF8,
-            MB_ERR_INVALID_CHARS,
-            s.data(),
-            static_cast<int>(s.size()),
-            nullptr,
-            0);
+        const int len = ::MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, s.data(), static_cast<int>(s.size()), nullptr, 0);
         if (len <= 0)
         {
             return wstring();
         }
 
         wstring ws(static_cast<size_t>(len), L'\0');
-        const int written = ::MultiByteToWideChar(
-            CP_UTF8,
-            MB_ERR_INVALID_CHARS,
-            s.data(),
-            static_cast<int>(s.size()),
-            &ws[0],
-            len);
+        const int written = ::MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, s.data(), static_cast<int>(s.size()), &ws[0], len);
         if (written <= 0)
         {
             return wstring();
@@ -359,30 +505,14 @@ namespace internal
             return string();
         }
 
-        const int len = ::WideCharToMultiByte(
-            CP_UTF8,
-            0,
-            ws.data(),
-            static_cast<int>(ws.size()),
-            nullptr,
-            0,
-            nullptr,
-            nullptr);
+        const int len = ::WideCharToMultiByte(CP_UTF8, 0, ws.data(), static_cast<int>(ws.size()), nullptr, 0, nullptr, nullptr);
         if (len <= 0)
         {
             return string();
         }
 
         string s(static_cast<size_t>(len), '\0');
-        const int written = ::WideCharToMultiByte(
-            CP_UTF8,
-            0,
-            ws.data(),
-            static_cast<int>(ws.size()),
-            &s[0],
-            len,
-            nullptr,
-            nullptr);
+        const int written = ::WideCharToMultiByte(CP_UTF8, 0, ws.data(), static_cast<int>(ws.size()), &s[0], len, nullptr, nullptr);
         if (written <= 0)
         {
             return string();
@@ -404,22 +534,35 @@ namespace internal
             return valueUtf8;
         }
 
-        const DWORD needed = ::ExpandEnvironmentStringsW(srcW.c_str(), nullptr, 0);
+        DWORD needed = ::ExpandEnvironmentStringsW(srcW.c_str(), nullptr, 0);
         if (needed == 0)
         {
             return valueUtf8;
         }
 
-        wstring dstW(static_cast<size_t>(needed), L'\0'); // 包含结尾 NUL
-        const DWORD written = ::ExpandEnvironmentStringsW(srcW.c_str(), &dstW[0], needed);
-        if (written == 0 || written > needed)
+        // ExpandEnvironmentStringsW 的返回值包含结尾 NUL。
+        // 环境变量可能在调用前后变化：若实际需要更大的缓冲区，则扩容后再重试一次。
+        for (int attempt = 0; attempt < 2; attempt++)
         {
-            return valueUtf8;
+            wstring dstW(static_cast<size_t>(needed), L'\0');
+            const DWORD written = ::ExpandEnvironmentStringsW(srcW.c_str(), &dstW[0], needed);
+            if (written == 0)
+            {
+                return valueUtf8;
+            }
+
+            if (written > needed)
+            {
+                needed = written;
+                continue;
+            }
+
+            // written 含结尾 NUL
+            dstW.resize(wcslen(dstW.c_str()));
+            return WideToUtf8(dstW);
         }
 
-        // written 含结尾 NUL
-        dstW.resize(wcslen(dstW.c_str()));
-        return WideToUtf8(dstW);
+        return valueUtf8;
     }
 
     static unordered_map<string, string> ReadEnvVarsFromRegistryPath(const string& configPathUtf8)
@@ -478,6 +621,184 @@ namespace internal
         return result;
     }
 
+    // 直接从注册表枚举环境变量（作为 GB_Config 读取失败时的兜底）。
+    // - 对 REG_EXPAND_SZ 做 ExpandEnvironmentStrings 展开（与 ReadEnvVarsFromRegistryPath 行为一致）。
+    // - REG_MULTI_SZ 用 ';' 拼接（PATH 语义更贴近）。
+    // - 其它常见整数类型（REG_DWORD/REG_QWORD）转为十进制字符串。
+    static unordered_map<string, string> ReadEnvVarsFromRegistryKey(HKEY rootKey, const wchar_t* subKey)
+    {
+        unordered_map<string, string> result;
+
+        if (subKey == nullptr)
+        {
+            return result;
+        }
+
+        HKEY keyHandle = nullptr;
+        const LONG openResult = ::RegOpenKeyExW(rootKey, subKey, 0, KEY_READ, &keyHandle);
+        if (openResult != ERROR_SUCCESS)
+        {
+            return result;
+        }
+
+        DWORD valueCount = 0;
+        DWORD maxValueNameLen = 0;
+        DWORD maxValueDataLen = 0;
+        const LONG infoResult = ::RegQueryInfoKeyW(
+            keyHandle,
+            nullptr,
+            nullptr,
+            nullptr,
+            nullptr,
+            nullptr,
+            nullptr,
+            &valueCount,
+            &maxValueNameLen,
+            &maxValueDataLen,
+            nullptr,
+            nullptr);
+
+        if (infoResult != ERROR_SUCCESS)
+        {
+            ::RegCloseKey(keyHandle);
+            return result;
+        }
+
+        std::vector<wchar_t> valueNameBuffer(static_cast<size_t>(maxValueNameLen) + 1u, L'\0');
+        std::vector<BYTE> dataBuffer(static_cast<size_t>(maxValueDataLen) + sizeof(wchar_t), 0);
+
+        for (DWORD valueIndex = 0; valueIndex < valueCount; valueIndex++)
+        {
+            DWORD valueNameLen = maxValueNameLen + 1;
+            DWORD type = 0;
+            DWORD dataSize = maxValueDataLen;
+
+            LONG enumResult = ::RegEnumValueW(
+                keyHandle,
+                valueIndex,
+                valueNameBuffer.data(),
+                &valueNameLen,
+                nullptr,
+                &type,
+                dataBuffer.data(),
+                &dataSize);
+
+            if (enumResult != ERROR_SUCCESS)
+            {
+                continue;
+            }
+
+            if (valueNameLen == 0)
+            {
+                // 默认值（无名）不视为环境变量
+                continue;
+            }
+
+            const std::wstring valueNameW(valueNameBuffer.data(), valueNameLen);
+            const std::string valueNameUtf8 = WideToUtf8(valueNameW);
+            if (valueNameUtf8.empty())
+            {
+                continue;
+            }
+
+            auto ReadStringValue = [&](std::wstring& outValueW) -> bool {
+                const size_t wcharCount = (dataSize / sizeof(wchar_t));
+                if (wcharCount == 0)
+                {
+                    outValueW.clear();
+                    return true;
+                }
+
+                const wchar_t* dataWchars = reinterpret_cast<const wchar_t*>(dataBuffer.data());
+                size_t len = 0;
+                while (len < wcharCount && dataWchars[len] != L'\0')
+                {
+                    len++;
+                }
+                outValueW.assign(dataWchars, dataWchars + len);
+                return true;
+                };
+
+            auto ReadMultiSzValue = [&](std::wstring& outValueW) -> bool {
+                const size_t wcharCount = (dataSize / sizeof(wchar_t));
+                if (wcharCount == 0)
+                {
+                    outValueW.clear();
+                    return true;
+                }
+
+                const wchar_t* dataWchars = reinterpret_cast<const wchar_t*>(dataBuffer.data());
+                std::wstring joined;
+
+                size_t wcharIndex = 0;
+                while (wcharIndex < wcharCount && dataWchars[wcharIndex] != L'\0')
+                {
+                    const size_t start = wcharIndex;
+                    while (wcharIndex < wcharCount && dataWchars[wcharIndex] != L'\0')
+                    {
+                        wcharIndex++;
+                    }
+
+                    const size_t itemLen = wcharIndex - start;
+                    if (itemLen > 0)
+                    {
+                        if (!joined.empty())
+                        {
+                            joined.push_back(L';');
+                        }
+                        joined.append(dataWchars + start, itemLen);
+                    }
+
+                    wcharIndex++; // skip NUL
+                }
+
+                outValueW = joined;
+                return true;
+                };
+
+            if (type == REG_SZ || type == REG_EXPAND_SZ)
+            {
+                std::wstring valueW;
+                if (!ReadStringValue(valueW))
+                {
+                    continue;
+                }
+
+                std::string valueUtf8 = WideToUtf8(valueW);
+                if (type == REG_EXPAND_SZ)
+                {
+                    valueUtf8 = ExpandEnvironmentStringsUtf8(valueUtf8);
+                }
+                result[valueNameUtf8] = valueUtf8;
+            }
+            else if (type == REG_MULTI_SZ)
+            {
+                std::wstring valueW;
+                if (!ReadMultiSzValue(valueW))
+                {
+                    continue;
+                }
+
+                result[valueNameUtf8] = WideToUtf8(valueW);
+            }
+            else if (type == REG_DWORD && dataSize >= sizeof(DWORD))
+            {
+                DWORD v = 0;
+                std::memcpy(&v, dataBuffer.data(), sizeof(DWORD));
+                result[valueNameUtf8] = std::to_string(static_cast<unsigned long long>(v));
+            }
+            else if (type == REG_QWORD && dataSize >= sizeof(unsigned long long))
+            {
+                unsigned long long v = 0;
+                std::memcpy(&v, dataBuffer.data(), sizeof(unsigned long long));
+                result[valueNameUtf8] = std::to_string(v);
+            }
+        }
+
+        ::RegCloseKey(keyHandle);
+        return result;
+    }
+
 #endif // _WIN32
 
 #if !defined(_WIN32)
@@ -526,6 +847,9 @@ namespace internal
         ProcCpuInfo info;
         ifstream ifs("/proc/cpuinfo");
         string line;
+
+        bool flagsParsed = false;
+
         while (getline(ifs, line))
         {
             const auto pos = line.find(':');
@@ -546,7 +870,7 @@ namespace internal
                     info.modelName = v;
                 }
             }
-            else if (k == "flags" || k == "Features")
+            else if ((k == "flags" || k == "Features") && !flagsParsed)
             {
                 istringstream iss(v);
                 string f;
@@ -554,6 +878,7 @@ namespace internal
                 {
                     info.flags.push_back(f);
                 }
+                flagsParsed = true;
             }
             info.kv[k] = v;
         }
@@ -591,18 +916,38 @@ namespace internal
                 const string base = string("/sys/devices/system/cpu/") + ent->d_name + "/topology/";
                 const string pathPkg = base + "physical_package_id";
                 const string pathCore = base + "core_id";
-                uint64_t pkg = 0, cid = 0;
+
+                int pkgId = -1;
+                int coreId = -1;
                 string s;
+
                 if (ReadFirstLine(pathPkg, s))
                 {
-                    pkg = strtol(s.c_str(), nullptr, 10);
+                    char* endp = nullptr;
+                    const long v = strtol(s.c_str(), &endp, 10);
+                    if (endp != s.c_str())
+                    {
+                        pkgId = static_cast<int>(v);
+                    }
                 }
                 if (ReadFirstLine(pathCore, s))
                 {
-                    cid = strtol(s.c_str(), nullptr, 10);
+                    char* endp = nullptr;
+                    const long v = strtol(s.c_str(), &endp, 10);
+                    if (endp != s.c_str())
+                    {
+                        coreId = static_cast<int>(v);
+                    }
                 }
-                packageSet.insert(static_cast<int>(pkg));
-                coreSet.insert({ static_cast<int>(pkg), static_cast<int>(cid) });
+
+                if (pkgId >= 0)
+                {
+                    packageSet.insert(pkgId);
+                }
+                if (pkgId >= 0 && coreId >= 0)
+                {
+                    coreSet.insert({ pkgId, coreId });
+                }
             }
             closedir(dir);
         }
@@ -731,15 +1076,28 @@ namespace internal
     {
         if (!b)
         {
-            return {};
+            return string();
         }
-        const int len = ::WideCharToMultiByte(CP_UTF8, 0, b, -1, nullptr, 0, nullptr, nullptr);
-        if (len <= 1)
+
+        const UINT wcharCount = ::SysStringLen(b); // 不含结尾 NUL
+        if (wcharCount == 0)
         {
-            return {};
+            return string();
         }
-        string out(static_cast<size_t>(len - 1), '\0');
-        ::WideCharToMultiByte(CP_UTF8, 0, b, -1, &out[0], len, nullptr, nullptr);
+
+        const int needed = ::WideCharToMultiByte(CP_UTF8, 0, b, static_cast<int>(wcharCount), nullptr, 0, nullptr, nullptr);
+        if (needed <= 0)
+        {
+            return string();
+        }
+
+        string out(static_cast<size_t>(needed), '\0');
+        const int written = ::WideCharToMultiByte(CP_UTF8, 0, b, static_cast<int>(wcharCount), &out[0], needed, nullptr, nullptr);
+        if (written <= 0)
+        {
+            return string();
+        }
+
         return out;
     }
 
@@ -748,8 +1106,8 @@ namespace internal
     {
         outStrings.clear();
 
-        ComInit com;
-        if (FAILED(com.hr))
+        ComScope com;
+        if (!com.IsOk())
         {
             return false;
         }
@@ -761,17 +1119,32 @@ namespace internal
         }
 
         IWbemServices* pSvc = nullptr;
-        HRESULT hr = pLoc->ConnectServer(BSTR(L"ROOT\\CIMV2"), nullptr, nullptr, 0, 0, 0, 0, &pSvc);
+        const BstrScope rootPath(L"ROOT\\CIMV2");
+        if (!rootPath.IsValid())
+        {
+            pLoc->Release();
+            return false;
+        }
+
+        HRESULT hr = pLoc->ConnectServer(rootPath.Get(), nullptr, nullptr, 0, 0, 0, 0, &pSvc);
         pLoc->Release();
         if (FAILED(hr))
         {
             return false;
         }
 
-        CoSetProxyBlanket(pSvc, RPC_C_AUTHN_WINNT, RPC_C_AUTHZ_NONE, nullptr, RPC_C_AUTHN_LEVEL_CALL, RPC_C_IMP_LEVEL_IMPERSONATE, nullptr, EOAC_NONE);
+        (void)CoSetProxyBlanket(pSvc, RPC_C_AUTHN_WINNT, RPC_C_AUTHZ_NONE, nullptr, RPC_C_AUTHN_LEVEL_CALL, RPC_C_IMP_LEVEL_IMPERSONATE, nullptr, EOAC_NONE);
 
         IEnumWbemClassObject* pEnum = nullptr;
-        hr = pSvc->ExecQuery(BSTR(L"WQL"), BSTR(wql), WBEM_FLAG_FORWARD_ONLY | WBEM_FLAG_RETURN_IMMEDIATELY, nullptr, &pEnum);
+        const BstrScope wqlLang(L"WQL");
+        const BstrScope wqlQuery(wql);
+        if (!wqlLang.IsValid() || !wqlQuery.IsValid())
+        {
+            pSvc->Release();
+            return false;
+        }
+
+        hr = pSvc->ExecQuery(wqlLang.Get(), wqlQuery.Get(), WBEM_FLAG_FORWARD_ONLY | WBEM_FLAG_RETURN_IMMEDIATELY, nullptr, &pEnum);
         if (FAILED(hr))
         {
             pSvc->Release();
@@ -804,10 +1177,10 @@ namespace internal
                         SafeArrayGetLBound(psa, 1, &l);
                         SafeArrayGetUBound(psa, 1, &u);
                         string cat;
-                        for (LONG i2 = l; i2 <= u; i2++)
+                        for (LONG arrayIndex = l; arrayIndex <= u; arrayIndex++)
                         {
                             BSTR bs = nullptr;
-                            if (SUCCEEDED(SafeArrayGetElement(psa, &i2, &bs)) && bs)
+                            if (SUCCEEDED(SafeArrayGetElement(psa, &arrayIndex, &bs)) && bs)
                             {
                                 if (!cat.empty()) cat += ",";
                                 cat += BstrToUtf8(bs);
@@ -894,43 +1267,42 @@ namespace internal
     // Key=Value（Value 可带双引号；可能含转义），本实现做常用健壮解析。
     static bool ParseOsRelease(map<string, string>& kv)
     {
-        auto parseFile = [&](const string& path) -> bool
+        auto parseFile = [&](const string& path) -> bool {
+            ifstream ifs(path.c_str());
+            if (!ifs)
             {
-                ifstream ifs(path.c_str());
-                if (!ifs)
+                return false;
+            }
+            string line;
+            while (getline(ifs, line))
+            {
+                // 去掉注释
+                const size_t hashPos = line.find('#');
+                if (hashPos != string::npos)
                 {
-                    return false;
+                    line = line.substr(0, hashPos);
                 }
-                string line;
-                while (getline(ifs, line))
+                line = Trim(line);
+                if (line.empty())
                 {
-                    // 去掉注释
-                    const size_t hashPos = line.find('#');
-                    if (hashPos != string::npos)
-                    {
-                        line = line.substr(0, hashPos);
-                    }
-                    line = Trim(line);
-                    if (line.empty())
-                    {
-                        continue;
-                    }
-                    const size_t eq = line.find('=');
-                    if (eq == string::npos)
-                    {
-                        continue;
-                    }
-                    string key = Trim(line.substr(0, eq));
-                    string val = Trim(line.substr(eq + 1));
+                    continue;
+                }
+                const size_t eq = line.find('=');
+                if (eq == string::npos)
+                {
+                    continue;
+                }
+                string key = Trim(line.substr(0, eq));
+                string val = Trim(line.substr(eq + 1));
 
-                    // 去除包裹引号；支持常见的 "..." 与 '...'
-                    if (!val.empty() && (val.front() == '"' || val.front() == '\'') && val.back() == val.front())
-                    {
-                        val = val.substr(1, val.size() - 2);
-                    }
-                    kv[key] = val;
+                // 去除包裹引号；支持常见的 "..." 与 '...'
+                if (val.size() >= 2 && (val.front() == '"' || val.front() == '\'') && val.back() == val.front())
+                {
+                    val = val.substr(1, val.size() - 2);
                 }
-                return !kv.empty();
+                kv[key] = val;
+            }
+            return !kv.empty();
             };
 
         // 规范推荐优先 /etc/os-release，失败再试 /usr/lib/os-release
@@ -962,10 +1334,6 @@ namespace internal
         }
 #endif
     }
-
-
-
-
 }
 
 string GB_CpuInfo::Serialize() const
@@ -988,7 +1356,7 @@ string GB_CpuInfo::Serialize() const
     }
     else
     {
-		s += "hypervisorPresent=0;";
+        s += "hypervisorPresent=0;";
     }
     s += "features=" + internal::JoinStrings(features, ',');
     return s;
@@ -1315,26 +1683,776 @@ GB_OsInfo GB_GetOsInfo()
     return info;
 }
 
-std::unordered_map<std::string, std::string> GB_GetWindowsUserEnvironmentVariables()
+// ============================================================================
+// Windows 环境变量操作（GB_WindowsEnvVarOperator）
+// ============================================================================
+
+namespace internal
 {
 #if defined(_WIN32)
-    // 用户变量：系统“环境变量”面板中的“用户变量”一般落在此处
-    const static string configPathUtf8 = GB_STR("计算机\\HKEY_CURRENT_USER\\Environment");
-    return internal::ReadEnvVarsFromRegistryPath(configPathUtf8);
+
+    static std::string ToLowerAscii(const std::string& s)
+    {
+        std::string result = s;
+        std::transform(result.begin(), result.end(), result.begin(),
+            [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        return result;
+    }
+
+    static std::wstring TrimQuotesAndSpaces(const std::wstring& s)
+    {
+        size_t beginIndex = 0;
+        size_t endIndex = s.size();
+
+        while (beginIndex < endIndex)
+        {
+            const wchar_t ch = s[beginIndex];
+            if (ch == L' ' || ch == L'\t' || ch == L'\r' || ch == L'\n')
+            {
+                beginIndex++;
+                continue;
+            }
+            break;
+        }
+
+        while (endIndex > beginIndex)
+        {
+            const wchar_t ch = s[endIndex - 1];
+            if (ch == L' ' || ch == L'\t' || ch == L'\r' || ch == L'\n')
+            {
+                endIndex--;
+                continue;
+            }
+            break;
+        }
+
+        std::wstring result = s.substr(beginIndex, endIndex - beginIndex);
+
+        // 去掉外层引号
+        if (result.size() >= 2)
+        {
+            if ((result.front() == L'"' && result.back() == L'"') ||
+                (result.front() == L'\'' && result.back() == L'\''))
+            {
+                result = result.substr(1, result.size() - 2);
+            }
+        }
+
+        return result;
+    }
+
+    static std::wstring NormalizePathEntryForCompare(const std::wstring& entryW)
+    {
+        std::wstring result = TrimQuotesAndSpaces(entryW);
+
+        // 统一分隔符到 '\'
+        std::replace(result.begin(), result.end(), L'/', L'\\');
+
+        // 去掉末尾 '\'（根路径除外）
+        while (result.size() > 1 && (result.back() == L'\\' || result.back() == L'/'))
+        {
+            if (result.size() == 3 && result[1] == L':' && (result[2] == L'\\' || result[2] == L'/'))
+            {
+                break; // "C:\"
+            }
+            result.pop_back();
+        }
+
+        // 小写化（Windows 路径比较通常大小写不敏感）
+        if (!result.empty())
+        {
+            ::CharLowerBuffW(&result[0], static_cast<DWORD>(result.size()));
+        }
+
+        return result;
+    }
+
+    static bool BroadcastEnvironmentChange()
+    {
+        DWORD_PTR result = 0;
+        const wchar_t* env = L"Environment";
+        const LRESULT r = ::SendMessageTimeoutW(HWND_BROADCAST, WM_SETTINGCHANGE, 0, reinterpret_cast<LPARAM>(env), SMTO_ABORTIFHUNG, 5000, &result);
+        return r != 0;
+    }
+
+    static bool ReadRegistryStringValue(HKEY rootKey, const wchar_t* subKey, const std::wstring& valueNameW, std::wstring* outValueW, DWORD* outType)
+    {
+        if (outValueW == nullptr || outType == nullptr)
+        {
+            return false;
+        }
+
+        outValueW->clear();
+        *outType = 0;
+
+        HKEY keyHandle = nullptr;
+        const LONG openResult = ::RegOpenKeyExW(rootKey, subKey, 0, KEY_READ, &keyHandle);
+        if (openResult != ERROR_SUCCESS)
+        {
+            return false;
+        }
+
+        DWORD type = 0;
+        DWORD bytes = 0;
+        LONG queryResult = ::RegQueryValueExW(keyHandle, valueNameW.c_str(), nullptr, &type, nullptr, &bytes);
+        if (queryResult != ERROR_SUCCESS)
+        {
+            ::RegCloseKey(keyHandle);
+            return false;
+        }
+
+        if (type != REG_SZ && type != REG_EXPAND_SZ && type != REG_MULTI_SZ)
+        {
+            ::RegCloseKey(keyHandle);
+            return false;
+        }
+
+        // 使用 wchar_t 缓冲区避免对 uint8_t 缓冲区做 reinterpret_cast 可能导致的非对齐访问问题
+        const size_t wcharCount = (bytes / sizeof(wchar_t)) + 1; // +1 保证可 NUL 结尾
+        std::vector<wchar_t> buffer(wcharCount, L'\0');
+
+        DWORD bytesToRead = static_cast<DWORD>(buffer.size() * sizeof(wchar_t));
+        queryResult = ::RegQueryValueExW(
+            keyHandle,
+            valueNameW.c_str(),
+            nullptr,
+            &type,
+            reinterpret_cast<LPBYTE>(buffer.data()),
+            &bytesToRead);
+
+        ::RegCloseKey(keyHandle);
+
+        if (queryResult != ERROR_SUCCESS)
+        {
+            return false;
+        }
+
+        *outType = type;
+        buffer.back() = L'\0';
+
+        if (type == REG_SZ || type == REG_EXPAND_SZ)
+        {
+            *outValueW = std::wstring(buffer.data());
+            return true;
+        }
+
+        // REG_MULTI_SZ：以 '\0' 分隔的字符串序列，末尾以双 '\0' 结束
+        std::wstring joined;
+        size_t i = 0;
+        while (i < buffer.size() && buffer[i] != L'\0')
+        {
+            const wchar_t* itemStart = &buffer[i];
+
+            size_t itemLen = 0;
+            while ((i + itemLen) < buffer.size() && itemStart[itemLen] != L'\0')
+            {
+                itemLen++;
+            }
+
+            if (itemLen > 0)
+            {
+                if (!joined.empty())
+                {
+                    joined.push_back(L';');
+                }
+                joined.append(itemStart, itemLen);
+            }
+
+            i += itemLen + 1;
+        }
+
+        *outValueW = joined;
+        return true;
+    }
+
+    static bool WriteRegistryStringValue(HKEY rootKey, const wchar_t* subKey, const std::wstring& valueNameW, const std::wstring& valueW, DWORD type)
+    {
+        HKEY keyHandle = nullptr;
+        DWORD disposition = 0;
+        const LONG createResult = ::RegCreateKeyExW(rootKey, subKey, 0, nullptr, 0, KEY_SET_VALUE, nullptr, &keyHandle, &disposition);
+        if (createResult != ERROR_SUCCESS)
+        {
+            return false;
+        }
+
+        const DWORD bytes = static_cast<DWORD>((valueW.size() + 1) * sizeof(wchar_t));
+        const LONG setResult = ::RegSetValueExW(keyHandle, valueNameW.c_str(), 0, type, reinterpret_cast<const BYTE*>(valueW.c_str()), bytes);
+
+        ::RegCloseKey(keyHandle);
+        return setResult == ERROR_SUCCESS;
+    }
+
+    static bool DeleteRegistryValue(HKEY rootKey, const wchar_t* subKey, const std::wstring& valueNameW)
+    {
+        HKEY keyHandle = nullptr;
+        const LONG openResult = ::RegOpenKeyExW(rootKey, subKey, 0, KEY_SET_VALUE, &keyHandle);
+        if (openResult != ERROR_SUCCESS)
+        {
+            return false;
+        }
+
+        const LONG delResult = ::RegDeleteValueW(keyHandle, valueNameW.c_str());
+        ::RegCloseKey(keyHandle);
+
+        return delResult == ERROR_SUCCESS || delResult == ERROR_FILE_NOT_FOUND;
+    }
+
+    static std::vector<std::string> SplitPathList(const std::string& pathValueUtf8)
+    {
+        std::vector<std::string> entries;
+        std::string current;
+
+        for (size_t i = 0; i < pathValueUtf8.size(); i++)
+        {
+            const char ch = pathValueUtf8[i];
+            if (ch == ';')
+            {
+                const std::string trimmed = Trim(current);
+                if (!trimmed.empty())
+                {
+                    entries.push_back(trimmed);
+                }
+                current.clear();
+                continue;
+            }
+            current.push_back(ch);
+        }
+
+        const std::string trimmed = Trim(current);
+        if (!trimmed.empty())
+        {
+            entries.push_back(trimmed);
+        }
+
+        return entries;
+    }
+
+    static std::string JoinPathList(const std::vector<std::string>& entries)
+    {
+        std::string joined;
+        for (size_t i = 0; i < entries.size(); i++)
+        {
+            if (entries[i].empty())
+            {
+                continue;
+            }
+
+            if (!joined.empty())
+            {
+                joined.push_back(';');
+            }
+            joined += entries[i];
+        }
+        return joined;
+    }
+
+    static bool ReadRawEnvVarFromRegistry(HKEY rootKey, const wchar_t* subKey, const std::string& varNameUtf8, std::string* outValueUtf8, DWORD* outType)
+    {
+        if (outValueUtf8 == nullptr || outType == nullptr)
+        {
+            return false;
+        }
+
+        const std::wstring varNameW = Utf8ToWide(varNameUtf8);
+        if (varNameW.empty())
+        {
+            return false;
+        }
+
+        std::wstring valueW;
+        DWORD type = 0;
+        if (!ReadRegistryStringValue(rootKey, subKey, varNameW, &valueW, &type))
+        {
+            // 再试一次常见大小写（PATH）
+            if (ToLowerAscii(varNameUtf8) == "path")
+            {
+                if (!ReadRegistryStringValue(rootKey, subKey, L"Path", &valueW, &type) &&
+                    !ReadRegistryStringValue(rootKey, subKey, L"PATH", &valueW, &type))
+                {
+                    return false;
+                }
+            }
+            else
+            {
+                return false;
+            }
+        }
+
+        *outType = type;
+        *outValueUtf8 = WideToUtf8(valueW);
+        return true;
+    }
+
+    static bool WriteEnvVarToRegistry(HKEY rootKey, const wchar_t* subKey, const std::string& varNameUtf8, const std::string& valueUtf8)
+    {
+        const std::wstring varNameW = Utf8ToWide(varNameUtf8);
+        const std::wstring valueW = Utf8ToWide(valueUtf8);
+        if (varNameW.empty())
+        {
+            return false;
+        }
+
+        // valueUtf8 非空但转换失败：避免把“非法 UTF-8”误写成空值
+        if (!valueUtf8.empty() && valueW.empty())
+        {
+            return false;
+        }
+
+        // 尽量保留既有类型
+        DWORD existingType = 0;
+        std::wstring existingValueW;
+        DWORD writeType = REG_SZ;
+        if (ReadRegistryStringValue(rootKey, subKey, varNameW, &existingValueW, &existingType))
+        {
+            if (existingType == REG_EXPAND_SZ || existingType == REG_SZ)
+            {
+                writeType = existingType;
+            }
+        }
+        else
+        {
+            // 新建：根据是否包含 %...% 推断
+            if (valueW.find(L'%') != std::wstring::npos)
+            {
+                writeType = REG_EXPAND_SZ;
+            }
+        }
+
+        if (!WriteRegistryStringValue(rootKey, subKey, varNameW, valueW, writeType))
+        {
+            return false;
+        }
+
+        // 更新当前进程的环境块（仅影响当前进程及其子进程）
+        ::SetEnvironmentVariableW(varNameW.c_str(), valueW.c_str());
+
+        // 通知系统刷新
+        BroadcastEnvironmentChange();
+        return true;
+    }
+
+#endif // _WIN32
+} // namespace internal
+
+
+// -------------------- UserEnvVarOperator --------------------
+
+std::unordered_map<std::string, std::string> GB_WindowsEnvVarOperator::UserEnvVarOperator::GetAllUserEnvironmentVariables()
+{
+#if defined(_WIN32)
+    static const std::string configPathUtf8 = GB_STR("计算机\\HKEY_CURRENT_USER\\Environment");
+    std::unordered_map<std::string, std::string> result = internal::ReadEnvVarsFromRegistryPath(configPathUtf8);
+    if (!result.empty())
+    {
+        return result;
+    }
+
+    // 兜底：直接枚举注册表。
+    return internal::ReadEnvVarsFromRegistryKey(HKEY_CURRENT_USER, L"Environment");
 #else
-    return unordered_map<string, string>();
+    return std::unordered_map<std::string, std::string>();
 #endif
 }
 
-std::unordered_map<std::string, std::string> GB_GetWindowsSystemEnvironmentVariables()
+bool GB_WindowsEnvVarOperator::UserEnvVarOperator::GetUserEnvironmentVariable(const std::string& varNameUtf8, std::string* outValueUtf8)
 {
+    if (outValueUtf8 == nullptr || varNameUtf8.empty())
+    {
+        return false;
+    }
+
 #if defined(_WIN32)
-    // 系统变量：系统“环境变量”面板中的“系统变量”一般落在此处
-    const static string configPathUtf8 = GB_STR("计算机\\HKEY_LOCAL_MACHINE\\SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Environment");
-    return internal::ReadEnvVarsFromRegistryPath(configPathUtf8);
+    std::string valueUtf8;
+    DWORD type = 0;
+    if (!internal::ReadRawEnvVarFromRegistry(HKEY_CURRENT_USER, L"Environment", varNameUtf8, &valueUtf8, &type))
+    {
+        outValueUtf8->clear();
+        return false;
+    }
+
+    // 与 GetAllUserEnvironmentVariables() 行为保持一致：REG_EXPAND_SZ 进行展开
+    if (type == REG_EXPAND_SZ)
+    {
+        valueUtf8 = internal::ExpandEnvironmentStringsUtf8(valueUtf8);
+    }
+
+    *outValueUtf8 = valueUtf8;
+    return true;
 #else
-    return unordered_map<string, string>();
+    (void)varNameUtf8;
+    outValueUtf8->clear();
+    return false;
 #endif
 }
 
+bool GB_WindowsEnvVarOperator::UserEnvVarOperator::SetUserEnvironmentVariable(const std::string& varNameUtf8, const std::string& valueUtf8)
+{
+#if defined(_WIN32)
+    if (varNameUtf8.empty())
+    {
+        return false;
+    }
+
+    const wchar_t* subKey = L"Environment";
+    return internal::WriteEnvVarToRegistry(HKEY_CURRENT_USER, subKey, varNameUtf8, valueUtf8);
+#else
+    (void)varNameUtf8;
+    (void)valueUtf8;
+    return false;
+#endif
+}
+
+
+// -------------------- UserPathOperator --------------------
+
+std::vector<std::string> GB_WindowsEnvVarOperator::UserEnvVarOperator::UserPathOperator::GetUserPathEntries()
+{
+#if defined(_WIN32)
+    std::string pathValueUtf8;
+    DWORD type = 0;
+    if (!internal::ReadRawEnvVarFromRegistry(HKEY_CURRENT_USER, L"Environment", "Path", &pathValueUtf8, &type))
+    {
+        return std::vector<std::string>();
+    }
+
+    return internal::SplitPathList(pathValueUtf8);
+#else
+    return std::vector<std::string>();
+#endif
+}
+
+bool GB_WindowsEnvVarOperator::UserEnvVarOperator::UserPathOperator::HasUserPathEntry(const std::string& entryUtf8)
+{
+#if defined(_WIN32)
+    if (entryUtf8.empty())
+    {
+        return false;
+    }
+
+    const std::wstring entryW = internal::Utf8ToWide(entryUtf8);
+    const std::wstring entryNormW = internal::NormalizePathEntryForCompare(entryW);
+
+    const std::vector<std::string> entries = GetUserPathEntries();
+    for (const std::string& e : entries)
+    {
+        const std::wstring eW = internal::Utf8ToWide(e);
+        const std::wstring eNormW = internal::NormalizePathEntryForCompare(eW);
+        if (!entryNormW.empty() && entryNormW == eNormW)
+        {
+            return true;
+        }
+
+        // 兼容：展开后比较（处理 %SystemRoot% 等）
+        const std::wstring entryExpandedW = internal::Utf8ToWide(internal::ExpandEnvironmentStringsUtf8(entryUtf8));
+        const std::wstring eExpandedW = internal::Utf8ToWide(internal::ExpandEnvironmentStringsUtf8(e));
+        if (!entryExpandedW.empty() && !eExpandedW.empty())
+        {
+            if (internal::NormalizePathEntryForCompare(entryExpandedW) == internal::NormalizePathEntryForCompare(eExpandedW))
+            {
+                return true;
+            }
+        }
+    }
+
+    return false;
+#else
+    (void)entryUtf8;
+    return false;
+#endif
+}
+
+bool GB_WindowsEnvVarOperator::UserEnvVarOperator::UserPathOperator::AddUserPathEntry(const std::string& entryUtf8, bool append)
+{
+#if defined(_WIN32)
+    const std::string entryTrimmed = internal::Trim(entryUtf8);
+    if (entryTrimmed.empty())
+    {
+        return false;
+    }
+
+    if (HasUserPathEntry(entryTrimmed))
+    {
+        return true;
+    }
+
+    std::vector<std::string> entries = GetUserPathEntries();
+    if (append)
+    {
+        entries.push_back(entryTrimmed);
+    }
+    else
+    {
+        entries.insert(entries.begin(), entryTrimmed);
+    }
+
+    const std::string joined = internal::JoinPathList(entries);
+    return GB_WindowsEnvVarOperator::UserEnvVarOperator::SetUserEnvironmentVariable("Path", joined);
+#else
+    (void)entryUtf8;
+    (void)append;
+    return false;
+#endif
+}
+
+bool GB_WindowsEnvVarOperator::UserEnvVarOperator::UserPathOperator::RemoveUserPathEntry(const std::string& entryUtf8)
+{
+#if defined(_WIN32)
+    const std::string entryTrimmed = internal::Trim(entryUtf8);
+    if (entryTrimmed.empty())
+    {
+        return false;
+    }
+
+    std::vector<std::string> entries = GetUserPathEntries();
+    if (entries.empty())
+    {
+        return true;
+    }
+
+    const std::wstring entryNormW = internal::NormalizePathEntryForCompare(internal::Utf8ToWide(entryTrimmed));
+    const std::wstring entryExpandedNormW = internal::NormalizePathEntryForCompare(internal::Utf8ToWide(internal::ExpandEnvironmentStringsUtf8(entryTrimmed)));
+
+    std::vector<std::string> filtered;
+    filtered.reserve(entries.size());
+
+    for (const std::string& e : entries)
+    {
+        const std::wstring eNormW = internal::NormalizePathEntryForCompare(internal::Utf8ToWide(e));
+        if (!entryNormW.empty() && entryNormW == eNormW)
+        {
+            continue;
+        }
+
+        const std::wstring eExpandedNormW = internal::NormalizePathEntryForCompare(internal::Utf8ToWide(internal::ExpandEnvironmentStringsUtf8(e)));
+        if (!entryExpandedNormW.empty() && entryExpandedNormW == eExpandedNormW)
+        {
+            continue;
+        }
+
+        filtered.push_back(e);
+    }
+
+    const std::string joined = internal::JoinPathList(filtered);
+    if (joined.empty())
+    {
+        // 没有条目时，删除用户 Path 变量更贴近“未设置用户 Path”
+        if (!internal::DeleteRegistryValue(HKEY_CURRENT_USER, L"Environment", L"Path"))
+        {
+            return false;
+        }
+
+        internal::BroadcastEnvironmentChange();
+        ::SetEnvironmentVariableW(L"Path", nullptr);
+        return true;
+    }
+
+    return GB_WindowsEnvVarOperator::UserEnvVarOperator::SetUserEnvironmentVariable("Path", joined);
+#else
+    (void)entryUtf8;
+    return false;
+#endif
+}
+
+std::unordered_map<std::string, std::string> GB_WindowsEnvVarOperator::SystemEnvVarOperator::GetAllSystemEnvironmentVariables()
+{
+#if defined(_WIN32)
+    static const std::string configPathUtf8 = GB_STR("计算机\\HKEY_LOCAL_MACHINE\\SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Environment");
+    std::unordered_map<std::string, std::string> result = internal::ReadEnvVarsFromRegistryPath(configPathUtf8);
+    if (!result.empty())
+    {
+        return result;
+    }
+
+    // 兜底：直接枚举注册表。
+    return internal::ReadEnvVarsFromRegistryKey(HKEY_LOCAL_MACHINE, L"SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Environment");
+#else
+    return std::unordered_map<std::string, std::string>();
+#endif
+}
+
+bool GB_WindowsEnvVarOperator::SystemEnvVarOperator::GetSystemEnvironmentVariable(const std::string& varNameUtf8, std::string* outValueUtf8)
+{
+    if (outValueUtf8 == nullptr || varNameUtf8.empty())
+    {
+        return false;
+    }
+
+#if defined(_WIN32)
+    std::string valueUtf8;
+    DWORD type = 0;
+    const wchar_t* subKey = L"SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Environment";
+    if (!internal::ReadRawEnvVarFromRegistry(HKEY_LOCAL_MACHINE, subKey, varNameUtf8, &valueUtf8, &type))
+    {
+        outValueUtf8->clear();
+        return false;
+    }
+
+    // 与 GetAllSystemEnvironmentVariables() 行为保持一致：REG_EXPAND_SZ 进行展开
+    if (type == REG_EXPAND_SZ)
+    {
+        valueUtf8 = internal::ExpandEnvironmentStringsUtf8(valueUtf8);
+    }
+
+    *outValueUtf8 = valueUtf8;
+    return true;
+#else
+    (void)varNameUtf8;
+    outValueUtf8->clear();
+    return false;
+#endif
+}
+
+bool GB_WindowsEnvVarOperator::SystemEnvVarOperator::SetSystemEnvironmentVariable(const std::string& varNameUtf8, const std::string& valueUtf8)
+{
+#if defined(_WIN32)
+    if (varNameUtf8.empty())
+    {
+        return false;
+    }
+
+    const wchar_t* subKey = L"SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Environment";
+    return internal::WriteEnvVarToRegistry(HKEY_LOCAL_MACHINE, subKey, varNameUtf8, valueUtf8);
+#else
+    (void)varNameUtf8;
+    (void)valueUtf8;
+    return false;
+#endif
+}
+
+std::vector<std::string> GB_WindowsEnvVarOperator::SystemEnvVarOperator::SystemPathOperator::GetSystemPathEntries()
+{
+#if defined(_WIN32)
+    std::string pathValueUtf8;
+    DWORD type = 0;
+    const wchar_t* subKey = L"SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Environment";
+    if (!internal::ReadRawEnvVarFromRegistry(HKEY_LOCAL_MACHINE, subKey, "Path", &pathValueUtf8, &type))
+    {
+        return std::vector<std::string>();
+    }
+
+    return internal::SplitPathList(pathValueUtf8);
+#else
+    return std::vector<std::string>();
+#endif
+}
+
+bool GB_WindowsEnvVarOperator::SystemEnvVarOperator::SystemPathOperator::HasSystemPathEntry(const std::string& entryUtf8)
+{
+#if defined(_WIN32)
+    if (entryUtf8.empty())
+    {
+        return false;
+    }
+
+    const std::wstring entryNormW = internal::NormalizePathEntryForCompare(internal::Utf8ToWide(entryUtf8));
+    const std::vector<std::string> entries = GetSystemPathEntries();
+    for (const std::string& e : entries)
+    {
+        const std::wstring eNormW = internal::NormalizePathEntryForCompare(internal::Utf8ToWide(e));
+        if (!entryNormW.empty() && entryNormW == eNormW)
+        {
+            return true;
+        }
+
+        const std::wstring entryExpandedW = internal::Utf8ToWide(internal::ExpandEnvironmentStringsUtf8(entryUtf8));
+        const std::wstring eExpandedW = internal::Utf8ToWide(internal::ExpandEnvironmentStringsUtf8(e));
+        if (!entryExpandedW.empty() && !eExpandedW.empty())
+        {
+            if (internal::NormalizePathEntryForCompare(entryExpandedW) == internal::NormalizePathEntryForCompare(eExpandedW))
+            {
+                return true;
+            }
+        }
+    }
+    return false;
+#else
+    (void)entryUtf8;
+    return false;
+#endif
+}
+
+bool GB_WindowsEnvVarOperator::SystemEnvVarOperator::SystemPathOperator::AddSystemPathEntry(const std::string& entryUtf8, bool append)
+{
+#if defined(_WIN32)
+    const std::string entryTrimmed = internal::Trim(entryUtf8);
+    if (entryTrimmed.empty())
+    {
+        return false;
+    }
+
+    if (HasSystemPathEntry(entryTrimmed))
+    {
+        return true;
+    }
+
+    std::vector<std::string> entries = GetSystemPathEntries();
+    if (append)
+    {
+        entries.push_back(entryTrimmed);
+    }
+    else
+    {
+        entries.insert(entries.begin(), entryTrimmed);
+    }
+
+    const std::string joined = internal::JoinPathList(entries);
+    return GB_WindowsEnvVarOperator::SystemEnvVarOperator::SetSystemEnvironmentVariable("Path", joined);
+#else
+    (void)entryUtf8;
+    (void)append;
+    return false;
+#endif
+}
+
+bool GB_WindowsEnvVarOperator::SystemEnvVarOperator::SystemPathOperator::RemoveSystemPathEntry(const std::string& entryUtf8)
+{
+#if defined(_WIN32)
+    const std::string entryTrimmed = internal::Trim(entryUtf8);
+    if (entryTrimmed.empty())
+    {
+        return false;
+    }
+
+    std::vector<std::string> entries = GetSystemPathEntries();
+    if (entries.empty())
+    {
+        return true;
+    }
+
+    const std::wstring entryNormW = internal::NormalizePathEntryForCompare(internal::Utf8ToWide(entryTrimmed));
+    const std::wstring entryExpandedNormW = internal::NormalizePathEntryForCompare(internal::Utf8ToWide(internal::ExpandEnvironmentStringsUtf8(entryTrimmed)));
+
+    std::vector<std::string> filtered;
+    filtered.reserve(entries.size());
+
+    for (const std::string& e : entries)
+    {
+        const std::wstring eNormW = internal::NormalizePathEntryForCompare(internal::Utf8ToWide(e));
+        if (!entryNormW.empty() && entryNormW == eNormW)
+        {
+            continue;
+        }
+
+        const std::wstring eExpandedNormW = internal::NormalizePathEntryForCompare(internal::Utf8ToWide(internal::ExpandEnvironmentStringsUtf8(e)));
+        if (!entryExpandedNormW.empty() && entryExpandedNormW == eExpandedNormW)
+        {
+            continue;
+        }
+
+        filtered.push_back(e);
+    }
+
+    const std::string joined = internal::JoinPathList(filtered);
+    if (joined.empty())
+    {
+        // 系统 Path 清空通常不合理，但这里仍提供能力：写空值。
+        return GB_WindowsEnvVarOperator::SystemEnvVarOperator::SetSystemEnvironmentVariable("Path", "");
+    }
+
+    return GB_WindowsEnvVarOperator::SystemEnvVarOperator::SetSystemEnvironmentVariable("Path", joined);
+#else
+    (void)entryUtf8;
+    return false;
+#endif
+}
 
