@@ -1,4 +1,7 @@
 ﻿#include "GB_Utf8String.h"
+#include <unordered_set>
+#include <stdexcept>
+
 #if defined(_WIN32)
 #include <windows.h>
 #else
@@ -23,6 +26,8 @@ namespace internal
         const size_t n = s.size();
         if (pos >= n)
         {
+            codePoint = 0;
+            nextPos = n;
             return false;
         }
 
@@ -227,7 +232,7 @@ string GB_MakeUtf8String(const char* s)
     {
         return {};
     }
-	return string(s);
+    return string(s);
 }
 
 string GB_MakeUtf8String(char32_t utf8Char)
@@ -366,6 +371,11 @@ string GB_Utf8ToAnsi(const string& utf8Str)
         throw runtime_error("Local multibyte encoding failed (wstring -> bytes).");
     }
 
+    if (need == 0)
+    {
+        return {};
+    }
+
     string out(need, '\0');
     src = ws.c_str();
     st = mbstate_t{};
@@ -464,6 +474,11 @@ string GB_AnsiToUtf8(const string& ansiStr)
     if (wlen == static_cast<size_t>(-1))
     {
         throw runtime_error("Local multibyte decoding failed (bytes -> wstring).");
+    }
+
+    if (wlen == 0)
+    {
+        return {};
     }
 
     wstring ws(wlen, L'\0');
@@ -620,7 +635,7 @@ wstring GB_Utf8ToWString(const string& utf8Str)
 }
 
 // 获取 UTF-8 字符串的长度（以 UTF-8 字符/码点 为单位）
-size_t GetUtf8Length(const string& utf8Str)
+size_t GB_GetUtf8Length(const string& utf8Str)
 {
     size_t len = 0;
     size_t pos = 0;
@@ -777,15 +792,15 @@ string GB_Utf8ToUpper(const string& utf8Str)
 
 vector<string> GB_Utf8Split(const string& textUtf8, char32_t delimiter)
 {
-	vector<string> parts;
+    vector<string> parts;
 
-	size_t tokenStart = 0;
-	size_t pos = 0;
-	while (pos < textUtf8.size())
-	{
-		char32_t cp = 0;
-		size_t nextPos = pos;
-		bool ok = internal::DecodeOne(textUtf8, pos, cp, nextPos);
+    size_t tokenStart = 0;
+    size_t pos = 0;
+    while (pos < textUtf8.size())
+    {
+        char32_t cp = 0;
+        size_t nextPos = pos;
+        bool ok = internal::DecodeOne(textUtf8, pos, cp, nextPos);
         if (!ok)
         {
             // 非法字节：按原样跳过一个字节（注意：不能把 delimiter 与字节直接比较）
@@ -799,7 +814,7 @@ vector<string> GB_Utf8Split(const string& textUtf8, char32_t delimiter)
             tokenStart = nextPos;
         }
         pos = nextPos;
-	}
+    }
 
     parts.emplace_back(textUtf8.substr(tokenStart));
     return parts;
@@ -1048,7 +1063,7 @@ int64_t GB_Utf8FindLast(const string& text, const string& needle, bool caseSensi
 {
     if (needle.empty())
     {
-        return static_cast<int64_t>(GetUtf8Length(text));
+        return static_cast<int64_t>(GB_GetUtf8Length(text));
     }
 
     // —— ASCII + 大小写敏感：字节级快速路径（ASCII 下“字节偏移 == 码点偏移”）—— //
@@ -1084,7 +1099,7 @@ int64_t GB_Utf8FindLast(const string& text, const string& needle, bool caseSensi
     if (m == 0)
     {
         // 理论上不会走到（非法字节也会转为 U+FFFD），兜底与上面保持一致
-        return static_cast<int64_t>(GetUtf8Length(text));
+        return static_cast<int64_t>(GB_GetUtf8Length(text));
     }
 
     // 2) 计算 KMP 的 LPS（最长真前后缀）表
@@ -1236,8 +1251,8 @@ string GB_Utf8Replace(const string& utf8Str, const string& oldValue, const strin
     }
 
     // —— 通用路径：按“码点”替换，复用 Utf8Find / Utf8Substr —— //
-    const int64_t totalChars = static_cast<int64_t>(GetUtf8Length(utf8Str));
-    const int64_t patLen = static_cast<int64_t>(GetUtf8Length(oldValue));
+    const int64_t totalChars = static_cast<int64_t>(GB_GetUtf8Length(utf8Str));
+    const int64_t patLen = static_cast<int64_t>(GB_GetUtf8Length(oldValue));
 
     string out;
     int64_t curChar = 0;

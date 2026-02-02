@@ -39,7 +39,7 @@ GLOBALBASE_PORT std::string GB_WStringToUtf8(const std::wstring& wstring);
 GLOBALBASE_PORT std::wstring GB_Utf8ToWString(const std::string& utf8Str);
 
 // 获取 UTF-8 字符串的长度（以 UTF-8 字符为单位）
-GLOBALBASE_PORT size_t GetUtf8Length(const std::string& utf8Str);
+GLOBALBASE_PORT size_t GB_GetUtf8Length(const std::string& utf8Str);
 
 // 获取 UTF-8 字符串中指定索引的字符（UTF-8 字符偏移）
 GLOBALBASE_PORT char32_t GB_GetUtf8Char(const std::string& utf8Str, int64_t index);
