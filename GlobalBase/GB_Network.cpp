@@ -1,14 +1,18 @@
 ﻿#include "GB_Network.h"
 #include "GB_Utf8String.h"
 
-#include <chrono>
 #include <algorithm>
 #include <cctype>
+#include <chrono>
 #include <cstring>
+#include <limits>
 #include <memory>
-#include <curl/curl.h>
+#include <mutex>
 
 #ifdef _WIN32
+#  ifndef WIN32_LEAN_AND_MEAN
+#    define WIN32_LEAN_AND_MEAN
+#  endif
 #  ifndef NOMINMAX
 #    define NOMINMAX
 #  endif
@@ -25,7 +29,12 @@
 #  include <unistd.h>
 #  include <fcntl.h>
 #  include <errno.h>
+#  include <arpa/inet.h>
 #endif
+
+#include <curl/curl.h>
+
+
 
 namespace
 {
@@ -116,27 +125,103 @@ namespace
     }
 #endif
 
-    static bool WaitForConnect(SocketHandle socketHandle, unsigned int timeoutMs)
+    static bool IsNumericHost(const std::string& hostUtf8)
     {
-        fd_set writeSet;
-        FD_ZERO(&writeSet);
-        FD_SET(socketHandle, &writeSet);
-
-        fd_set exceptSet;
-        FD_ZERO(&exceptSet);
-        FD_SET(socketHandle, &exceptSet);
-
-        timeval tv;
-        tv.tv_sec = static_cast<long>(timeoutMs / 1000);
-        tv.tv_usec = static_cast<long>((timeoutMs % 1000) * 1000);
+        if (hostUtf8.empty())
+        {
+            return false;
+        }
 
 #ifdef _WIN32
-        const int selectResult = ::select(0, nullptr, &writeSet, &exceptSet, &tv);
-#else
-        const int selectResult = ::select(socketHandle + 1, nullptr, &writeSet, &exceptSet, &tv);
-#endif
-        if (selectResult <= 0)
+        IN_ADDR addr4;
+        if (::InetPtonA(AF_INET, hostUtf8.c_str(), &addr4) == 1)
         {
+            return true;
+        }
+
+        IN6_ADDR addr6;
+        if (::InetPtonA(AF_INET6, hostUtf8.c_str(), &addr6) == 1)
+        {
+            return true;
+        }
+
+        return false;
+#else
+        in_addr addr4;
+        if (::inet_pton(AF_INET, hostUtf8.c_str(), &addr4) == 1)
+        {
+            return true;
+        }
+
+        in6_addr addr6;
+        if (::inet_pton(AF_INET6, hostUtf8.c_str(), &addr6) == 1)
+        {
+            return true;
+        }
+
+        return false;
+#endif
+    }
+
+    static bool WaitForConnect(SocketHandle socketHandle, unsigned int timeoutMs)
+    {
+        if (timeoutMs == 0)
+        {
+            return false;
+        }
+
+        const auto startTime = std::chrono::steady_clock::now();
+
+        while (true)
+        {
+            const auto nowTime = std::chrono::steady_clock::now();
+            const auto elapsedMs = static_cast<unsigned int>(std::chrono::duration_cast<std::chrono::milliseconds>(nowTime - startTime).count());
+            if (elapsedMs >= timeoutMs)
+            {
+                return false;
+            }
+
+            const unsigned int remainingMs = timeoutMs - elapsedMs;
+
+            fd_set writeSet;
+            FD_ZERO(&writeSet);
+            FD_SET(socketHandle, &writeSet);
+
+            fd_set exceptSet;
+            FD_ZERO(&exceptSet);
+            FD_SET(socketHandle, &exceptSet);
+
+            timeval tv;
+            tv.tv_sec = static_cast<long>(remainingMs / 1000);
+            tv.tv_usec = static_cast<long>((remainingMs % 1000) * 1000);
+
+#ifdef _WIN32
+            const int selectResult = ::select(0, nullptr, &writeSet, &exceptSet, &tv);
+#else
+            const int selectResult = ::select(socketHandle + 1, nullptr, &writeSet, &exceptSet, &tv);
+#endif
+            if (selectResult > 0)
+            {
+                break;
+            }
+
+            if (selectResult == 0)
+            {
+                return false;
+            }
+
+#ifdef _WIN32
+            const int lastError = ::WSAGetLastError();
+            if (lastError == WSAEINTR)
+            {
+                continue;
+            }
+#else
+            if (errno == EINTR)
+            {
+                continue;
+            }
+#endif
             return false;
         }
 
@@ -162,6 +247,11 @@ namespace
 
     static bool ConnectTcpWithTimeout(const std::string& hostUtf8, unsigned short port, unsigned int timeoutMs)
     {
+        if (timeoutMs == 0)
+        {
+            return false;
+        }
+
         const std::string portString = std::to_string(static_cast<unsigned int>(port));
 
         addrinfo hints;
@@ -169,8 +259,21 @@ namespace
         hints.ai_family = AF_UNSPEC;
         hints.ai_socktype = SOCK_STREAM;
         hints.ai_protocol = IPPROTO_TCP;
+
+        const bool isNumericHost = IsNumericHost(hostUtf8);
+
+#ifdef AI_NUMERICHOST
+        if (isNumericHost)
+        {
+            hints.ai_flags |= AI_NUMERICHOST;
+        }
+#endif
+
 #ifdef AI_ADDRCONFIG
-        hints.ai_flags = AI_ADDRCONFIG;
+        if (!isNumericHost)
+        {
+            hints.ai_flags |= AI_ADDRCONFIG;
+        }
 #endif
 
         addrinfo* results = nullptr;
@@ -196,8 +299,22 @@ namespace
         AddrInfoGuard resultsGuard;
         resultsGuard.ptr = results;
 
+        const auto startTime = std::chrono::steady_clock::now();
+
         for (addrinfo* ai = results; ai != nullptr; ai = ai->ai_next)
         {
+            const auto nowTime = std::chrono::steady_clock::now();
+            const auto elapsedMs = static_cast<unsigned int>(std::chrono::duration_cast<std::chrono::milliseconds>(nowTime - startTime).count());
+            if (elapsedMs >= timeoutMs)
+            {
+                break;
+            }
+            const unsigned int remainingMs = timeoutMs - elapsedMs;
+            if (remainingMs == 0)
+            {
+                break;
+            }
+
             SocketHandle socketHandle = ::socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
             if (socketHandle == kInvalidSocket)
             {
@@ -235,13 +352,14 @@ namespace
                 (lastError == EINPROGRESS) ||
                 (lastError == EALREADY);
 #endif
+
             if (!inProgress)
             {
                 CloseSocket(socketHandle);
                 continue;
             }
 
-            const bool ok = WaitForConnect(socketHandle, timeoutMs);
+            const bool ok = WaitForConnect(socketHandle, remainingMs);
             CloseSocket(socketHandle);
 
             if (ok)
@@ -253,35 +371,33 @@ namespace
         return false;
     }
 
-    class CurlGlobalGuard
-    {
-    public:
-        CurlGlobalGuard()
-        {
-            m_ok = (::curl_global_init(CURL_GLOBAL_DEFAULT) == CURLE_OK);
-        }
-
-        ~CurlGlobalGuard()
-        {
-            if (m_ok)
-            {
-                ::curl_global_cleanup();
-            }
-        }
-
-        bool IsOk() const
-        {
-            return m_ok;
-        }
-
-    private:
-        bool m_ok = false;
-    };
-
     static bool EnsureCurlGlobalInit()
     {
-        static const CurlGlobalGuard guard;
-        return guard.IsOk();
+        static std::once_flag initFlag;
+        static bool initOk = false;
+
+        std::call_once(initFlag, [](){
+            initOk = (::curl_global_init(CURL_GLOBAL_DEFAULT) == CURLE_OK);
+        });
+
+        return initOk;
+    }
+
+    static bool TryComputeTotalSize(size_t size, size_t nmemb, size_t& totalSize)
+    {
+        if (size == 0 || nmemb == 0)
+        {
+            totalSize = 0;
+            return true;
+        }
+
+        if (size > (std::numeric_limits<size_t>::max() / nmemb))
+        {
+            return false;
+        }
+
+        totalSize = size * nmemb;
+        return true;
     }
 
     static size_t CurlWriteCallback(char* ptr, size_t size, size_t nmemb, void* userData)
@@ -291,7 +407,12 @@ namespace
             return 0;
         }
 
-        const size_t totalSize = size * nmemb;
+        size_t totalSize = 0;
+        if (!TryComputeTotalSize(size, nmemb, totalSize))
+        {
+            return 0;
+        }
+
         std::string* buffer = static_cast<std::string*>(userData);
         buffer->append(ptr, totalSize);
         return totalSize;
@@ -304,7 +425,12 @@ namespace
             return 0;
         }
 
-        const size_t totalSize = size * nitems;
+        size_t totalSize = 0;
+        if (!TryComputeTotalSize(size, nitems, totalSize))
+        {
+            return 0;
+        }
+
         std::vector<std::string>* headers = static_cast<std::vector<std::string>*>(userData);
         headers->emplace_back(buffer, totalSize);
         return totalSize;
@@ -366,6 +492,7 @@ namespace
         }
         return TrimCopy(noProxyUtf8);
     }
+#ifdef _WIN32
 
     static std::string NormalizeProxyToken(std::string token)
     {
@@ -498,6 +625,8 @@ namespace
         return fallback;
     }
 
+#endif
+
 #ifdef _WIN32
     struct ScopedGlobalFreeW
     {
@@ -511,6 +640,7 @@ namespace
             }
         }
     };
+
 
     static bool GetWindowsSystemProxyForUrlUtf8(const std::string& urlUtf8, std::string& proxyUtf8, std::string& bypassUtf8)
     {
@@ -526,9 +656,37 @@ namespace
         WINHTTP_CURRENT_USER_IE_PROXY_CONFIG ieProxyConfig;
         std::memset(&ieProxyConfig, 0, sizeof(ieProxyConfig));
 
-        if (!::WinHttpGetIEProxyConfigForCurrentUser(&ieProxyConfig))
+        const bool ieConfigOk = (::WinHttpGetIEProxyConfigForCurrentUser(&ieProxyConfig) != FALSE);
+        if (!ieConfigOk)
         {
-            return false;
+            WINHTTP_PROXY_INFO defaultProxyInfo;
+            std::memset(&defaultProxyInfo, 0, sizeof(defaultProxyInfo));
+
+            if (!::WinHttpGetDefaultProxyConfiguration(&defaultProxyInfo))
+            {
+                return false;
+            }
+
+            ScopedGlobalFreeW defaultProxyFree;
+            ScopedGlobalFreeW defaultBypassFree;
+            defaultProxyFree.ptr = defaultProxyInfo.lpszProxy;
+            defaultBypassFree.ptr = defaultProxyInfo.lpszProxyBypass;
+
+            if (defaultProxyInfo.lpszProxy != nullptr && defaultProxyInfo.lpszProxy[0] != 0)
+            {
+                proxyUtf8 = GB_WStringToUtf8(defaultProxyInfo.lpszProxy);
+            }
+            else
+            {
+                proxyUtf8.clear();
+            }
+
+            if (defaultProxyInfo.lpszProxyBypass != nullptr && defaultProxyInfo.lpszProxyBypass[0] != 0)
+            {
+                bypassUtf8 = GB_WStringToUtf8(defaultProxyInfo.lpszProxyBypass);
+            }
+
+            return true;
         }
 
         ScopedGlobalFreeW proxyFree;
@@ -538,11 +696,11 @@ namespace
         bypassFree.ptr = ieProxyConfig.lpszProxyBypass;
         pacUrlFree.ptr = ieProxyConfig.lpszAutoConfigUrl;
 
-        bool gotProxy = false;
+        bool gotExplicitProxy = false;
         if (ieProxyConfig.lpszProxy != nullptr && ieProxyConfig.lpszProxy[0] != 0)
         {
             proxyUtf8 = GB_WStringToUtf8(ieProxyConfig.lpszProxy);
-            gotProxy = !proxyUtf8.empty();
+            gotExplicitProxy = !proxyUtf8.empty();
         }
 
         if (ieProxyConfig.lpszProxyBypass != nullptr && ieProxyConfig.lpszProxyBypass[0] != 0)
@@ -553,13 +711,21 @@ namespace
         const bool needsAuto = (ieProxyConfig.fAutoDetect != FALSE) || (ieProxyConfig.lpszAutoConfigUrl != nullptr);
         if (!needsAuto)
         {
-            return gotProxy;
+            // IE 配置读取成功。此时 proxyUtf8 可能为空（DIRECT），也应返回 true。
+            return true;
         }
 
         HINTERNET session = ::WinHttpOpen(L"GlobalBase/1.0", WINHTTP_ACCESS_TYPE_NO_PROXY, WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+        if (session != nullptr)
+        {
+            // 避免 WPAD/PAC 等场景下长时间阻塞
+            ::WinHttpSetTimeouts(session, 2000, 2000, 2000, 2000);
+        }
+
         if (session == nullptr)
         {
-            return gotProxy;
+            // 自动代理需要 WinHTTP session，但创建失败时回退到“显式代理”（若有）。
+            return gotExplicitProxy;
         }
 
         WINHTTP_AUTOPROXY_OPTIONS autoProxyOptions;
@@ -583,15 +749,21 @@ namespace
 
         ScopedGlobalFreeW proxyInfoFree;
         ScopedGlobalFreeW bypassInfoFree;
+
+        bool gotAutoResult = false;
         if (::WinHttpGetProxyForUrl(session, urlW.c_str(), &autoProxyOptions, &proxyInfo))
         {
+            gotAutoResult = true;
             proxyInfoFree.ptr = proxyInfo.lpszProxy;
             bypassInfoFree.ptr = proxyInfo.lpszProxyBypass;
 
             if (proxyInfo.lpszProxy != nullptr && proxyInfo.lpszProxy[0] != 0)
             {
                 proxyUtf8 = GB_WStringToUtf8(proxyInfo.lpszProxy);
-                gotProxy = !proxyUtf8.empty();
+            }
+            else
+            {
+                proxyUtf8.clear();
             }
 
             if (proxyInfo.lpszProxyBypass != nullptr && proxyInfo.lpszProxyBypass[0] != 0)
@@ -601,9 +773,17 @@ namespace
         }
 
         ::WinHttpCloseHandle(session);
-        return gotProxy;
+
+        if (gotAutoResult)
+        {
+            return true;
+        }
+
+        // 自动代理失败时：若存在显式代理，则仍认为获取成功；否则交由上层决定回退策略
+        return gotExplicitProxy;
     }
 #endif
+
 
     static void ApplyProxySettings(CURL* curlHandle, const std::string& urlUtf8, const GB_NetworkProxySettings& proxySettings)
     {
@@ -612,87 +792,116 @@ namespace
             return;
         }
 
+        const std::string schemeLower = GetUrlSchemeLower(urlUtf8);
+
         if (proxySettings.useSystemProxy)
         {
 #ifdef _WIN32
             std::string systemProxyUtf8;
             std::string systemBypassUtf8;
+
             if (GetWindowsSystemProxyForUrlUtf8(urlUtf8, systemProxyUtf8, systemBypassUtf8))
             {
-                const std::string schemeLower = GetUrlSchemeLower(urlUtf8);
                 const std::string selectedProxy = PickProxyFromProtocolList(systemProxyUtf8, schemeLower);
+
                 if (!selectedProxy.empty())
                 {
                     ::curl_easy_setopt(curlHandle, CURLOPT_PROXY, selectedProxy.c_str());
-                }
 
-                const std::string rawBypass = NormalizeNoProxyList(systemBypassUtf8);
-                const bool hadLocalBypass = (ToLowerCopy(rawBypass).find("<local>") != std::string::npos);
+                    const std::string rawBypass = NormalizeNoProxyList(systemBypassUtf8);
+                    const bool hadLocalBypass = (ToLowerCopy(rawBypass).find("<local>") != std::string::npos);
 
-                std::string bypass = RemoveLocalBypassToken(rawBypass);
-                if (hadLocalBypass)
-                {
+                    std::string bypass = RemoveLocalBypassToken(rawBypass);
+                    if (hadLocalBypass)
+                    {
+                        if (!bypass.empty())
+                        {
+                            bypass += ",";
+                        }
+                        bypass += "localhost,127.0.0.1";
+                    }
+
+                    bypass = NormalizeNoProxyList(bypass);
                     if (!bypass.empty())
                     {
-                        bypass += ",";
+                        ::curl_easy_setopt(curlHandle, CURLOPT_NOPROXY, bypass.c_str());
                     }
-                    bypass += "localhost,127.0.0.1";
+                    else
+                    {
+                        // 清空 NOPROXY，避免环境变量 no_proxy 干扰
+                        ::curl_easy_setopt(curlHandle, CURLOPT_NOPROXY, "");
+                    }
+                }
+                else
+                {
+                    // 系统配置为 DIRECT：显式禁用代理（包括环境变量代理）
+                    ::curl_easy_setopt(curlHandle, CURLOPT_PROXY, "");
+                    ::curl_easy_setopt(curlHandle, CURLOPT_NOPROXY, "*");
                 }
 
-                bypass = NormalizeNoProxyList(bypass);
-                if (!bypass.empty())
-                {
-                    ::curl_easy_setopt(curlHandle, CURLOPT_NOPROXY, bypass.c_str());
-                }
+                return;
             }
 #endif
+            // 非 Windows 或系统代理获取失败：不做任何设置，让 libcurl 按默认（环境变量等）处理
             return;
         }
 
         if (!proxySettings.enableProxy)
         {
+            // 显式禁用所有代理（包括环境变量代理）
             ::curl_easy_setopt(curlHandle, CURLOPT_PROXY, "");
             ::curl_easy_setopt(curlHandle, CURLOPT_NOPROXY, "*");
             return;
         }
 
-        if (!proxySettings.proxyHostUtf8.empty())
+        if (proxySettings.proxyHostUtf8.empty())
         {
-            ::curl_easy_setopt(curlHandle, CURLOPT_PROXY, proxySettings.proxyHostUtf8.c_str());
+            // enableProxy=true 但未给出代理主机：为避免“意外使用环境变量代理”，这里选择直连
+            ::curl_easy_setopt(curlHandle, CURLOPT_PROXY, "");
+            ::curl_easy_setopt(curlHandle, CURLOPT_NOPROXY, "*");
+            return;
         }
 
-        if (proxySettings.proxyPort != 0)
-        {
-            ::curl_easy_setopt(curlHandle, CURLOPT_PROXYPORT, static_cast<long>(proxySettings.proxyPort));
-        }
+        const bool proxyHasScheme = (proxySettings.proxyHostUtf8.find("://") != std::string::npos);
+        ::curl_easy_setopt(curlHandle, CURLOPT_PROXY, proxySettings.proxyHostUtf8.c_str());
 
-        switch (proxySettings.proxyType)
+        // 如果 proxy 字符串自带 scheme（如 http:// / https:// / socks5h://），则 libcurl 可以自行推导代理类型与端口。
+        // 为避免 scheme 与 CURLOPT_PROXYTYPE 冲突，这里仅在“不带 scheme”时设置 CURLOPT_PROXYTYPE / CURLOPT_PROXYPORT。
+        if (!proxyHasScheme)
         {
-        case GB_NetworkProxyType::Http:
-            ::curl_easy_setopt(curlHandle, CURLOPT_PROXYTYPE, CURLPROXY_HTTP);
-            break;
-        case GB_NetworkProxyType::Https:
+            if (proxySettings.proxyPort != 0)
+            {
+                ::curl_easy_setopt(curlHandle, CURLOPT_PROXYPORT, static_cast<long>(proxySettings.proxyPort));
+            }
+
+            switch (proxySettings.proxyType)
+            {
+            case GB_NetworkProxyType::Http:
+                ::curl_easy_setopt(curlHandle, CURLOPT_PROXYTYPE, CURLPROXY_HTTP);
+                break;
+            case GB_NetworkProxyType::Https:
 #ifdef CURLPROXY_HTTPS
-            ::curl_easy_setopt(curlHandle, CURLOPT_PROXYTYPE, CURLPROXY_HTTPS);
+                ::curl_easy_setopt(curlHandle, CURLOPT_PROXYTYPE, CURLPROXY_HTTPS);
 #else
-            ::curl_easy_setopt(curlHandle, CURLOPT_PROXYTYPE, CURLPROXY_HTTP);
+                ::curl_easy_setopt(curlHandle, CURLOPT_PROXYTYPE, CURLPROXY_HTTP);
 #endif
-            break;
-        case GB_NetworkProxyType::Socks4:
-            ::curl_easy_setopt(curlHandle, CURLOPT_PROXYTYPE, CURLPROXY_SOCKS4);
-            break;
-        case GB_NetworkProxyType::Socks4a:
-            ::curl_easy_setopt(curlHandle, CURLOPT_PROXYTYPE, CURLPROXY_SOCKS4A);
-            break;
-        case GB_NetworkProxyType::Socks5:
-            ::curl_easy_setopt(curlHandle, CURLOPT_PROXYTYPE, CURLPROXY_SOCKS5);
-            break;
-        case GB_NetworkProxyType::Socks5Hostname:
-            ::curl_easy_setopt(curlHandle, CURLOPT_PROXYTYPE, CURLPROXY_SOCKS5_HOSTNAME);
-            break;
-        default:
-            ::curl_easy_setopt(curlHandle, CURLOPT_PROXYTYPE, CURLPROXY_HTTP);
-            break;
+                break;
+            case GB_NetworkProxyType::Socks4:
+                ::curl_easy_setopt(curlHandle, CURLOPT_PROXYTYPE, CURLPROXY_SOCKS4);
+                break;
+            case GB_NetworkProxyType::Socks4a:
+                ::curl_easy_setopt(curlHandle, CURLOPT_PROXYTYPE, CURLPROXY_SOCKS4A);
+                break;
+            case GB_NetworkProxyType::Socks5:
+                ::curl_easy_setopt(curlHandle, CURLOPT_PROXYTYPE, CURLPROXY_SOCKS5);
+                break;
+            case GB_NetworkProxyType::Socks5Hostname:
+                ::curl_easy_setopt(curlHandle, CURLOPT_PROXYTYPE, CURLPROXY_SOCKS5_HOSTNAME);
+                break;
+            default:
+                ::curl_easy_setopt(curlHandle, CURLOPT_PROXYTYPE, CURLPROXY_HTTP);
+                break;
+            }
         }
 
         if (!proxySettings.proxyUserNameUtf8.empty())
@@ -705,15 +914,29 @@ namespace
             ::curl_easy_setopt(curlHandle, CURLOPT_PROXYPASSWORD, proxySettings.proxyPasswordUtf8.c_str());
         }
 
-        if (proxySettings.proxyTunnel)
+        bool isHttpOrHttpsProxy = false;
+        if (proxyHasScheme)
         {
-            ::curl_easy_setopt(curlHandle, CURLOPT_HTTPPROXYTUNNEL, 1L);
+            const std::string proxySchemeLower = GetUrlSchemeLower(proxySettings.proxyHostUtf8);
+            isHttpOrHttpsProxy = (proxySchemeLower == "http" || proxySchemeLower == "https");
         }
+        else
+        {
+            isHttpOrHttpsProxy = (proxySettings.proxyType == GB_NetworkProxyType::Http || proxySettings.proxyType == GB_NetworkProxyType::Https);
+        }
+
+        const bool useTunnel = proxySettings.proxyTunnel && (schemeLower == "https") && isHttpOrHttpsProxy;
+        ::curl_easy_setopt(curlHandle, CURLOPT_HTTPPROXYTUNNEL, useTunnel ? 1L : 0L);
 
         const std::string noProxy = NormalizeNoProxyList(proxySettings.noProxyUtf8);
         if (!noProxy.empty())
         {
             ::curl_easy_setopt(curlHandle, CURLOPT_NOPROXY, noProxy.c_str());
+        }
+        else
+        {
+            // 清空 NOPROXY，避免环境变量 no_proxy 干扰
+            ::curl_easy_setopt(curlHandle, CURLOPT_NOPROXY, "");
         }
     }
 }
@@ -740,11 +963,11 @@ bool GB_CanConnectToInternet(unsigned int timeoutMs)
     };
 
     // 端点顺序：先不依赖 DNS 的 IP，再尝试常见域名
-    const ProbeEndpoint endpoints[] =
+    constexpr static ProbeEndpoint endpoints[] =
     {
-        { "1.1.1.1", 443 },
         { "www.baidu.com", 443 },
-        { "www.qq.com", 443 }
+        { "www.qq.com", 443 },
+        { "1.1.1.1", 443 }
     };
 
     const auto startTime = std::chrono::steady_clock::now();
@@ -784,6 +1007,14 @@ GB_NetworkResponse GB_RequestUrlData(const std::string& urlUtf8, const GB_Networ
         return response;
     }
 
+    const std::string schemeLower = GetUrlSchemeLower(urlUtf8);
+    if (schemeLower != "http" && schemeLower != "https")
+    {
+        response.ok = false;
+        response.errorMessageUtf8 = "Unsupported URL scheme (only http/https)";
+        return response;
+    }
+
     if (!EnsureCurlGlobalInit())
     {
         response.ok = false;
@@ -815,10 +1046,28 @@ GB_NetworkResponse GB_RequestUrlData(const std::string& urlUtf8, const GB_Networ
     CurlEasyHandleGuard easyGuard;
     easyGuard.handle = curlHandle;
 
+    char curlErrorBuffer[CURL_ERROR_SIZE];
+    std::memset(curlErrorBuffer, 0, sizeof(curlErrorBuffer));
+    ::curl_easy_setopt(curlHandle, CURLOPT_ERRORBUFFER, curlErrorBuffer);
+
     ::curl_easy_setopt(curlHandle, CURLOPT_URL, urlUtf8.c_str());
+    ::curl_easy_setopt(curlHandle, CURLOPT_HTTPGET, 1L);
+
+#if defined(CURLOPT_PROTOCOLS_STR)
+    ::curl_easy_setopt(curlHandle, CURLOPT_PROTOCOLS_STR, "http,https");
+#elif defined(CURLOPT_PROTOCOLS)
+    ::curl_easy_setopt(curlHandle, CURLOPT_PROTOCOLS, static_cast<long>(CURLPROTO_HTTP | CURLPROTO_HTTPS));
+#endif
+
+#if defined(CURLOPT_REDIR_PROTOCOLS_STR)
+    ::curl_easy_setopt(curlHandle, CURLOPT_REDIR_PROTOCOLS_STR, "http,https");
+#elif defined(CURLOPT_REDIR_PROTOCOLS)
+    ::curl_easy_setopt(curlHandle, CURLOPT_REDIR_PROTOCOLS, static_cast<long>(CURLPROTO_HTTP | CURLPROTO_HTTPS));
+#endif
     ::curl_easy_setopt(curlHandle, CURLOPT_NOSIGNAL, 1L);
     ::curl_easy_setopt(curlHandle, CURLOPT_FOLLOWLOCATION, options.followRedirects ? 1L : 0L);
-    ::curl_easy_setopt(curlHandle, CURLOPT_MAXREDIRS, static_cast<long>(options.maxRedirects));
+    const long maxRedirects = (options.maxRedirects > 0) ? static_cast<long>(options.maxRedirects) : 0L;
+    ::curl_easy_setopt(curlHandle, CURLOPT_MAXREDIRS, maxRedirects);
     ::curl_easy_setopt(curlHandle, CURLOPT_CONNECTTIMEOUT_MS, static_cast<long>(options.connectTimeoutMs));
     ::curl_easy_setopt(curlHandle, CURLOPT_TIMEOUT_MS, static_cast<long>(options.totalTimeoutMs));
 
@@ -906,7 +1155,14 @@ GB_NetworkResponse GB_RequestUrlData(const std::string& urlUtf8, const GB_Networ
     if (curlCode != CURLE_OK)
     {
         response.ok = false;
-        response.errorMessageUtf8 = ::curl_easy_strerror(curlCode);
+        if (curlErrorBuffer[0] != 0)
+        {
+            response.errorMessageUtf8 = curlErrorBuffer;
+        }
+        else
+        {
+            response.errorMessageUtf8 = ::curl_easy_strerror(curlCode);
+        }
     }
 
     long httpCode = 0;
