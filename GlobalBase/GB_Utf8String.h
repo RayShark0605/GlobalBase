@@ -1,7 +1,11 @@
 ﻿#ifndef GLOBALBASE_UTF8_STRING_H_H
 #define GLOBALBASE_UTF8_STRING_H_H
 
-#include "GB_Utility.h"
+#include "GlobalBasePort.h"
+#include <cstdint>
+#include <limits>
+#include <string>
+#include <vector>
 
 // 构造 UTF-8 字符串
 GLOBALBASE_PORT std::string GB_MakeUtf8String(const char* s);
@@ -24,13 +28,34 @@ inline std::string GB_MakeUtf8String(const char8_t* s)
 #define GB_CHAR2STR(ch) GB_MakeUtf8String(ch)
 
 // UTF-8 转 ANSI 编码字符串
+// 注意（POSIX）：
+// - 本文件中的 GB_AnsiToUtf8 / GB_Utf8ToAnsi / GB_IsAnsi 等函数在 POSIX 下会依赖当前 LC_CTYPE locale 的多字节编码。
+// - 为了在默认 "C/POSIX" locale 下尽量可用，库内部可能会在第一次调用这些函数时尝试执行 setlocale(LC_CTYPE, "")，
+//   以从环境变量（LANG/LC_ALL/LC_CTYPE 等）继承本地化设置。
+// - setlocale 会修改整个进程的全局 locale，且不是线程安全的；若希望完全避免该副作用，可在编译时定义 GB_DISABLE_POSIX_SETLOCALE_AUTO_INIT。
 GLOBALBASE_PORT std::string GB_Utf8ToAnsi(const std::string& utf8Str);
 
 // ANSI 编码字符串转 UTF-8
 GLOBALBASE_PORT std::string GB_AnsiToUtf8(const std::string& ansiStr);
 
-// 是否是 UTF-8 编码字符串
+// 是否是“合法的 UTF-8 字节序列”
+// 注意：返回 true 仅表示按 UTF-8 解码不会出错（字节序列是 well-formed）。
+// 它并不能证明这段数据的“真实编码”一定是 UTF-8（例如：纯 ASCII 同时也是合法 UTF-8 / 多种 ANSI 代码页内容）。
 GLOBALBASE_PORT bool GB_IsUtf8(const std::string& text);
+
+// 是否是 ANSI 编码字符串
+// 说明：这里的“ANSI”并不是一种固定编码。
+// - Windows：指系统默认 ANSI 代码页（CP_ACP / GetACP）
+// - Linux/macOS：指当前 LC_CTYPE locale 的多字节编码
+GLOBALBASE_PORT bool GB_IsAnsi(const std::string& text);
+
+// 尽可能判断字符串是否“看起来像 UTF-8”文本（启发式，不保证一定正确）
+// - 纯 ASCII 无法区分 UTF-8 与 ANSI，因此会返回 false
+GLOBALBASE_PORT bool GB_LooksLikeUtf8(const std::string& text);
+
+// 尽可能判断字符串是否“看起来像 ANSI”文本（启发式，不保证一定正确）
+// - 纯 ASCII 无法区分 UTF-8 与 ANSI，因此会返回 false
+GLOBALBASE_PORT bool GB_LooksLikeAnsi(const std::string& text);
 
 // std::wstring 转 UTF-8
 GLOBALBASE_PORT std::string GB_WStringToUtf8(const std::wstring& wstring);

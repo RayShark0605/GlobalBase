@@ -1,6 +1,8 @@
 ﻿#include "GB_Utf8String.h"
 #include <unordered_set>
 #include <stdexcept>
+#include <climits>
+#include <mutex>
 
 #if defined(_WIN32)
 #include <windows.h>
@@ -8,16 +10,36 @@
 #include <clocale>
 #include <cwchar>
 #include <cerrno>
-#include <stdexcept>
 #include <locale>
 #include <codecvt>
-#include <climits>
+#include <langinfo.h>
+#endif
+#ifndef GB_DISABLE_POSIX_SETLOCALE_AUTO_INIT
+#define GB_DISABLE_POSIX_SETLOCALE_AUTO_INIT 0
 #endif
 
-using namespace std;
+
+using std::string;
+using std::wstring;
+using std::vector;
+using std::unordered_set;
+using std::runtime_error;
+using std::range_error;
+
 
 namespace internal
 {
+#if defined(_WIN32)
+    static int ToWinApiLengthChecked(size_t length)
+    {
+        if (length > static_cast<size_t>(INT_MAX))
+        {
+            throw runtime_error("Input string too large for Win32 API.");
+        }
+        return static_cast<int>(length);
+    }
+#endif
+
     // 从 s[pos] 解码一个 UTF-8 码点：
     // 成功：返回 true，写出 codePoint 与 nextPos（下一个字节位置）
     // 失败：返回 false，仅前进一个字节（nextPos = pos + 1），调用方可按“原始字节”处理
@@ -57,7 +79,7 @@ namespace internal
             return false;
         }
 
-        for (int i = 1; i < len; ++i)
+        for (int i = 1; i < len; i++)
         {
             unsigned char bx = static_cast<unsigned char>(s[pos + i]);
             if ((bx & 0xC0) != 0x80)
@@ -123,6 +145,117 @@ namespace internal
         return (ch >= 'a' && ch <= 'z') ? static_cast<char>(ch - 'a' + 'A') : ch;
     }
 
+
+    static unsigned char NormalizeAsciiCaseByte(unsigned char byteValue, bool caseSensitive)
+    {
+        if (!caseSensitive && byteValue >= static_cast<unsigned char>('A') && byteValue <= static_cast<unsigned char>('Z'))
+        {
+            return static_cast<unsigned char>(byteValue - static_cast<unsigned char>('A') + static_cast<unsigned char>('a'));
+        }
+        return byteValue;
+    }
+
+    static vector<size_t> BuildKmpLpsBytes(const string& pattern, bool caseSensitive)
+    {
+        const size_t m = pattern.size();
+        vector<size_t> lps(m, 0);
+
+        size_t len = 0;
+        size_t i = 1;
+        while (i < m)
+        {
+            const unsigned char a = NormalizeAsciiCaseByte(static_cast<unsigned char>(pattern[i]), caseSensitive);
+            const unsigned char b = NormalizeAsciiCaseByte(static_cast<unsigned char>(pattern[len]), caseSensitive);
+
+            if (a == b)
+            {
+                len++;
+                lps[i] = len;
+                i++;
+            }
+            else if (len != 0)
+            {
+                len = lps[len - 1];
+            }
+            else
+            {
+                lps[i] = 0;
+                i++;
+            }
+        }
+        return lps;
+    }
+
+    static string ReplaceAllBytesKmp(const string& text, const string& oldValue, const string& newValue, bool caseSensitive)
+    {
+        if (text.empty() || oldValue.empty())
+        {
+            return text;
+        }
+        if (oldValue.size() > text.size())
+        {
+            return text;
+        }
+
+        const size_t m = oldValue.size();
+        const vector<size_t> lps = BuildKmpLpsBytes(oldValue, caseSensitive);
+
+        string out;
+        out.reserve(text.size());
+
+        size_t i = 0;                 // text 字节索引
+        size_t j = 0;                 // oldValue 已匹配长度
+        size_t lastCopyPos = 0;       // 上一次复制到 out 的 text 字节位置
+
+        while (i < text.size())
+        {
+            const unsigned char t = NormalizeAsciiCaseByte(static_cast<unsigned char>(text[i]), caseSensitive);
+            const unsigned char p = NormalizeAsciiCaseByte(static_cast<unsigned char>(oldValue[j]), caseSensitive);
+
+            if (t == p)
+            {
+                i++;
+                j++;
+                if (j == m)
+                {
+                    const size_t matchEnd = i;
+                    const size_t matchStart = matchEnd - m;
+
+                    // 追加匹配之前的内容
+                    if (matchStart > lastCopyPos)
+                    {
+                        out.append(text, lastCopyPos, matchStart - lastCopyPos);
+                    }
+                    // 追加替换内容
+                    out += newValue;
+
+                    // 非重叠替换：从 matchEnd 继续搜索
+                    lastCopyPos = matchEnd;
+                    j = 0;
+                }
+            }
+            else
+            {
+                if (j != 0)
+                {
+                    j = lps[j - 1];
+                }
+                else
+                {
+                    i++;
+                }
+            }
+        }
+
+        // 追加尾部剩余
+        if (lastCopyPos < text.size())
+        {
+            out.append(text, lastCopyPos, text.size() - lastCopyPos);
+        }
+
+        return out;
+    }
+
     static bool IsValidUnicode(uint32_t cp)
     {
         // Unicode 标准平面范围：U+0000 ~ U+10FFFF，排除代理区
@@ -134,22 +267,36 @@ namespace internal
     // 若当前是 "C"/"POSIX"（7-bit ASCII），请先 setlocale 到合适的本地编码。
     static void EnsureLocaleInitialized()
     {
-        const char* cur = setlocale(LC_CTYPE, nullptr);
-        if (!cur || string(cur) == "C" || string(cur) == "POSIX")
-        {
-            setlocale(LC_CTYPE, ""); // 从环境继承
-        }
+#if GB_DISABLE_POSIX_SETLOCALE_AUTO_INIT
+        // 由调用方自行负责设置合适的进程 locale（例如 setlocale(LC_CTYPE, "")）。
+        return;
+#else
+        // 注意：setlocale 会影响进程全局 locale（并非线程安全）。
+        // 这里用 call_once 保证：
+        // 1) 只在第一次需要时做一次初始化；
+        // 2) 降低多线程竞争导致的风险（但无法阻止外部线程同时调用 setlocale）。
+        static std::once_flag onceFlag;
+        std::call_once(onceFlag, []()
+            {
+                const char* cur = setlocale(LC_CTYPE, nullptr);
+                if (!cur || string(cur) == "C" || string(cur) == "POSIX")
+                {
+                    // 从环境继承（如 LANG/LC_ALL/LC_CTYPE），让 mbsrtowcs/wcsrtombs 有机会按本地多字节编码工作。
+                    setlocale(LC_CTYPE, "");
+                }
+            });
+#endif
     }
 
     static wstring Utf8ToWString_Posix(const string& utf8Str)
     {
-        wstring_convert<codecvt_utf8<wchar_t>> c8; // C++11 可用
+        std::wstring_convert<std::codecvt_utf8<wchar_t>> c8; // C++11 可用
         return c8.from_bytes(utf8Str);
     }
 
     static string WStringToUtf8_Posix(const wstring& ws)
     {
-        wstring_convert<codecvt_utf8<wchar_t>> c8;
+        std::wstring_convert<std::codecvt_utf8<wchar_t>> c8;
         return c8.to_bytes(ws);
     }
 #endif // !_WIN32
@@ -166,6 +313,368 @@ namespace internal
         return true;
     }
 
+    static bool HasUtf8Bom(const string& text)
+    {
+        if (text.size() < 3)
+        {
+            return false;
+        }
+
+        const unsigned char b0 = static_cast<unsigned char>(text[0]);
+        const unsigned char b1 = static_cast<unsigned char>(text[1]);
+        const unsigned char b2 = static_cast<unsigned char>(text[2]);
+        return b0 == 0xEF && b1 == 0xBB && b2 == 0xBF;
+    }
+
+    static string ToLowerAsciiString(const string& text)
+    {
+        string result = text;
+        for (size_t i = 0; i < result.size(); i++)
+        {
+            result[i] = internal::ToLowerAsciiChar(result[i]);
+        }
+        return result;
+    }
+
+    static bool IsCurrentAnsiUtf8()
+    {
+#if defined(_WIN32)
+        return ::GetACP() == CP_UTF8;
+#else
+        internal::EnsureLocaleInitialized();
+        const char* codeset = nl_langinfo(CODESET);
+        if (!codeset)
+        {
+            return false;
+        }
+
+        const string codesetLower = internal::ToLowerAsciiString(string(codeset));
+        if (codesetLower.find("utf-8") != string::npos)
+        {
+            return true;
+        }
+        if (codesetLower.find("utf8") != string::npos)
+        {
+            return true;
+        }
+        return false;
+#endif
+    }
+
+    static bool IsNonCharacter(char32_t codePoint)
+    {
+        if (codePoint >= 0xFDD0u && codePoint <= 0xFDEFu)
+        {
+            return true;
+        }
+        if ((codePoint & 0xFFFEu) == 0xFFFEu && codePoint <= 0x10FFFFu)
+        {
+            return true;
+        }
+        return false;
+    }
+
+    static bool IsCjk(char32_t codePoint)
+    {
+        // CJK Unified Ideographs + Extensions (常用范围)
+        if (codePoint >= 0x4E00u && codePoint <= 0x9FFFu)
+        {
+            return true;
+        }
+        if (codePoint >= 0x3400u && codePoint <= 0x4DBFu)
+        {
+            return true;
+        }
+        if (codePoint >= 0x20000u && codePoint <= 0x2A6DFu)
+        {
+            return true;
+        }
+        if (codePoint >= 0x2A700u && codePoint <= 0x2B73Fu)
+        {
+            return true;
+        }
+        if (codePoint >= 0x2B740u && codePoint <= 0x2B81Fu)
+        {
+            return true;
+        }
+        if (codePoint >= 0x2B820u && codePoint <= 0x2CEAFu)
+        {
+            return true;
+        }
+        if (codePoint >= 0xF900u && codePoint <= 0xFAFFu)
+        {
+            return true;
+        }
+        return false;
+    }
+
+    static bool IsHiragana(char32_t codePoint)
+    {
+        return codePoint >= 0x3040u && codePoint <= 0x309Fu;
+    }
+
+    static bool IsKatakana(char32_t codePoint)
+    {
+        return (codePoint >= 0x30A0u && codePoint <= 0x30FFu) ||
+            (codePoint >= 0x31F0u && codePoint <= 0x31FFu);
+    }
+
+    static bool IsHangul(char32_t codePoint)
+    {
+        return (codePoint >= 0xAC00u && codePoint <= 0xD7AFu) ||
+            (codePoint >= 0x1100u && codePoint <= 0x11FFu);
+    }
+
+    static bool IsCommonWhitespace(char32_t codePoint)
+    {
+        return codePoint == 0x20u || codePoint == 0x09u || codePoint == 0x0Au ||
+            codePoint == 0x0Du || codePoint == 0x3000u;
+    }
+
+    static int ScoreCodePoint(char32_t codePoint, bool isFirstCodePoint)
+    {
+        // UTF-8 BOM 常作为首字符出现：忽略它
+        if (isFirstCodePoint && codePoint == 0xFEFFu)
+        {
+            return 0;
+        }
+
+        if (codePoint == 0u)
+        {
+            return -50;
+        }
+
+        if (codePoint == 0xFFFDu)
+        {
+            return -30;
+        }
+
+        if (IsNonCharacter(codePoint))
+        {
+            return -10;
+        }
+
+        if (IsCommonWhitespace(codePoint))
+        {
+            return 1;
+        }
+
+        // 控制字符（排除 \t \n \r）
+        if (codePoint < 0x20u || codePoint == 0x7Fu)
+        {
+            return -20;
+        }
+        if (codePoint >= 0x80u && codePoint < 0xA0u)
+        {
+            return -20;
+        }
+
+        // ASCII 可见字符
+        if (codePoint >= 0x21u && codePoint <= 0x7Eu)
+        {
+            if ((codePoint >= U'a' && codePoint <= U'z') || (codePoint >= U'A' && codePoint <= U'Z'))
+            {
+                return 3;
+            }
+            if (codePoint >= U'0' && codePoint <= U'9')
+            {
+                return 2;
+            }
+            return 1;
+        }
+
+        // 拉丁扩展（带重音等）
+        if (codePoint >= 0x00A0u && codePoint <= 0x024Fu)
+        {
+            return 3;
+        }
+
+        // 西里尔/希腊等常见文字
+        if (codePoint >= 0x0370u && codePoint <= 0x052Fu)
+        {
+            return 3;
+        }
+
+        if (IsCjk(codePoint))
+        {
+            return 6;
+        }
+        if (IsHiragana(codePoint) || IsKatakana(codePoint))
+        {
+            return 5;
+        }
+        if (IsHangul(codePoint))
+        {
+            return 5;
+        }
+
+        // Emoji/符号等：允许，但不给太多分
+        if (codePoint >= 0x1F300u && codePoint <= 0x1FAFFu)
+        {
+            return 1;
+        }
+
+        // 其它可打印字符：给一点点分
+        return 1;
+    }
+
+    static int ComputeQualityScoreFromUtf8AssumingValid(const string& utf8Text)
+    {
+        size_t pos = 0;
+        bool isFirstCodePoint = true;
+        int score = 0;
+
+        while (pos < utf8Text.size())
+        {
+            char32_t codePoint = 0;
+            size_t nextPos = pos;
+            if (!internal::DecodeOne(utf8Text, pos, codePoint, nextPos))
+            {
+                // 理论上不应发生（调用方应确保 utf8Text 为合法 UTF-8）
+                return INT_MIN;
+            }
+
+            score += internal::ScoreCodePoint(codePoint, isFirstCodePoint);
+            isFirstCodePoint = false;
+            pos = nextPos;
+        }
+
+        return score;
+    }
+
+    static int ComputeQualityScoreFromWideString(const wstring& wideString)
+    {
+        bool isFirstCodePoint = true;
+        int score = 0;
+
+#if defined(_WIN32)
+        for (size_t i = 0; i < wideString.size(); i++)
+        {
+            const wchar_t w = wideString[i];
+            char32_t codePoint = static_cast<char32_t>(w);
+
+            // 处理 UTF-16 代理项对
+            if (w >= 0xD800 && w <= 0xDBFF)
+            {
+                if (i + 1 < wideString.size())
+                {
+                    const wchar_t w2 = wideString[i + 1];
+                    if (w2 >= 0xDC00 && w2 <= 0xDFFF)
+                    {
+                        const uint32_t high = static_cast<uint32_t>(w - 0xD800);
+                        const uint32_t low = static_cast<uint32_t>(w2 - 0xDC00);
+                        codePoint = static_cast<char32_t>(0x10000u + ((high << 10) | low));
+                        i++;
+                    }
+                    else
+                    {
+                        // 孤立高代理项
+                        codePoint = 0xFFFDu;
+                    }
+                }
+                else
+                {
+                    codePoint = 0xFFFDu;
+                }
+            }
+            else if (w >= 0xDC00 && w <= 0xDFFF)
+            {
+                // 孤立低代理项
+                codePoint = 0xFFFDu;
+            }
+
+            score += internal::ScoreCodePoint(codePoint, isFirstCodePoint);
+            isFirstCodePoint = false;
+        }
+#else
+        for (size_t i = 0; i < wideString.size(); i++)
+        {
+            const char32_t codePoint = static_cast<char32_t>(wideString[i]);
+            score += internal::ScoreCodePoint(codePoint, isFirstCodePoint);
+            isFirstCodePoint = false;
+        }
+#endif
+        return score;
+    }
+
+    static int ComputeQualityScoreFromAnsiBytes(const string& ansiBytes, bool& decodedOk)
+    {
+        decodedOk = false;
+
+        if (ansiBytes.empty())
+        {
+            decodedOk = true;
+            return 0;
+        }
+
+#if defined(_WIN32)
+        const UINT codePage = CP_ACP;
+
+        int wideLength = ::MultiByteToWideChar(
+            codePage,
+            MB_ERR_INVALID_CHARS,
+            ansiBytes.data(),
+            internal::ToWinApiLengthChecked(ansiBytes.size()),
+            nullptr,
+            0
+        );
+        if (wideLength <= 0)
+        {
+            decodedOk = false;
+            return INT_MIN;
+        }
+
+        wstring wideString(static_cast<size_t>(wideLength), L'\0');
+        const int written = ::MultiByteToWideChar(
+            codePage,
+            MB_ERR_INVALID_CHARS,
+            ansiBytes.data(),
+            internal::ToWinApiLengthChecked(ansiBytes.size()),
+            &wideString[0],
+            wideLength
+        );
+        if (written <= 0)
+        {
+            decodedOk = false;
+            return INT_MIN;
+        }
+
+        decodedOk = true;
+        return internal::ComputeQualityScoreFromWideString(wideString);
+
+#else
+        internal::EnsureLocaleInitialized();
+
+        const char* src = ansiBytes.c_str();
+        mbstate_t state = mbstate_t{};
+        errno = 0;
+        const size_t wideLength = mbsrtowcs(nullptr, &src, 0, &state);
+        if (wideLength == static_cast<size_t>(-1))
+        {
+            decodedOk = false;
+            return INT_MIN;
+        }
+
+        wstring wideString(wideLength, L'\0');
+        src = ansiBytes.c_str();
+        state = mbstate_t{};
+        errno = 0;
+        const size_t written = mbsrtowcs(&wideString[0], &src, wideLength, &state);
+        if (written == static_cast<size_t>(-1))
+        {
+            decodedOk = false;
+            return INT_MIN;
+        }
+
+        if (written < wideString.size())
+        {
+            wideString.resize(written);
+        }
+
+        decodedOk = true;
+        return internal::ComputeQualityScoreFromWideString(wideString);
+#endif
+    }
     static unordered_set<char32_t> BuildTrimSet(const string& trimCharsUtf8)
     {
         unordered_set<char32_t> st;
@@ -224,6 +733,375 @@ namespace internal
         }
         return s.substr(0, lastNonTrimEnd);
     }
+
+    enum class AnsiEncodingFamily
+    {
+        utf8,
+        gbkLike,
+        big5Like,
+        shiftJisLike,
+        eucKrLike,
+        singleByte,
+        unknown
+    };
+
+    static AnsiEncodingFamily GetAnsiEncodingFamily()
+    {
+#if defined(_WIN32)
+        const UINT ansiCodePage = ::GetACP();
+        if (ansiCodePage == CP_UTF8)
+        {
+            return AnsiEncodingFamily::utf8;
+        }
+
+        // 常见 East Asian 多字节 ANSI 代码页
+        if (ansiCodePage == 936u || ansiCodePage == 54936u)
+        {
+            return AnsiEncodingFamily::gbkLike;     // GBK / GB18030
+        }
+        if (ansiCodePage == 950u)
+        {
+            return AnsiEncodingFamily::big5Like;    // Big5
+        }
+        if (ansiCodePage == 932u)
+        {
+            return AnsiEncodingFamily::shiftJisLike; // Shift-JIS
+        }
+        if (ansiCodePage == 949u)
+        {
+            return AnsiEncodingFamily::eucKrLike;   // EUC-KR / CP949 系
+        }
+
+        // 其余多数为单字节（125x、874 等）
+        return AnsiEncodingFamily::singleByte;
+#else
+        EnsureLocaleInitialized();
+        const char* codeset = nl_langinfo(CODESET);
+        if (codeset == nullptr)
+        {
+            return AnsiEncodingFamily::unknown;
+        }
+
+        const string codesetLower = ToLowerAsciiString(string(codeset));
+        if (codesetLower.find("utf-8") != string::npos || codesetLower.find("utf8") != string::npos)
+        {
+            return AnsiEncodingFamily::utf8;
+        }
+        if (codesetLower.find("gb18030") != string::npos || codesetLower.find("gbk") != string::npos || codesetLower.find("cp936") != string::npos)
+        {
+            return AnsiEncodingFamily::gbkLike;
+        }
+        if (codesetLower.find("big5") != string::npos || codesetLower.find("cp950") != string::npos)
+        {
+            return AnsiEncodingFamily::big5Like;
+        }
+        if (codesetLower.find("shift_jis") != string::npos || codesetLower.find("sjis") != string::npos || codesetLower.find("cp932") != string::npos)
+        {
+            return AnsiEncodingFamily::shiftJisLike;
+        }
+        if (codesetLower.find("euc-kr") != string::npos || codesetLower.find("cp949") != string::npos)
+        {
+            return AnsiEncodingFamily::eucKrLike;
+        }
+
+        return AnsiEncodingFamily::unknown;
+#endif
+    }
+
+    struct ByteStats
+    {
+        size_t totalBytes = 0;
+        size_t nullBytes = 0;
+        size_t suspiciousControlBytes = 0;
+        size_t nonAsciiBytes = 0;
+        size_t continuationBytes = 0;
+    };
+
+    static ByteStats GetByteStats(const string& bytes)
+    {
+        ByteStats stats;
+        stats.totalBytes = bytes.size();
+
+        for (size_t i = 0; i < bytes.size(); i++)
+        {
+            const unsigned char ch = static_cast<unsigned char>(bytes[i]);
+
+            if (ch == 0u)
+            {
+                stats.nullBytes++;
+                continue;
+            }
+
+            if (ch >= 0x80u)
+            {
+                stats.nonAsciiBytes++;
+                if (ch <= 0xBFu)
+                {
+                    stats.continuationBytes++;
+                }
+            }
+
+            // 控制字符（排除 \t \n \r）
+            if ((ch < 0x20u && ch != '\t' && ch != '\n' && ch != '\r') || ch == 0x7Fu)
+            {
+                stats.suspiciousControlBytes++;
+            }
+        }
+
+        return stats;
+    }
+
+    static bool LooksLikeTextBytes(const ByteStats& stats)
+    {
+        if (stats.totalBytes == 0)
+        {
+            return false;
+        }
+
+        // 小样本：容忍少量控制字符，但不接受 NUL
+        if (stats.totalBytes <= 16)
+        {
+            if (stats.nullBytes > 0)
+            {
+                return false;
+            }
+            return stats.suspiciousControlBytes <= 2;
+        }
+
+        // NUL 占比 >= 12.5%：高度可疑（UTF-16 / 二进制）
+        if (stats.nullBytes > 0 && stats.nullBytes * 8 >= stats.totalBytes)
+        {
+            return false;
+        }
+
+        // 可疑控制字节占比 > 2%：更像二进制
+        if (stats.suspiciousControlBytes * 50 >= stats.totalBytes)
+        {
+            return false;
+        }
+
+        return true;
+    }
+
+    struct Utf8Strength
+    {
+        size_t length2Count = 0;
+        size_t length3Count = 0;
+        size_t length4Count = 0;
+        int qualityScore = 0;
+    };
+
+    static bool ComputeUtf8Strength(const string& text, Utf8Strength& strength)
+    {
+        size_t pos = 0;
+        bool isFirst = true;
+
+        while (pos < text.size())
+        {
+            char32_t cp = 0;
+            size_t nextPos = pos;
+            if (!DecodeOne(text, pos, cp, nextPos))
+            {
+                return false;
+            }
+
+            const size_t byteCount = nextPos - pos;
+            if (byteCount == 2)
+            {
+                strength.length2Count++;
+            }
+            else if (byteCount == 3)
+            {
+                strength.length3Count++;
+            }
+            else if (byteCount == 4)
+            {
+                strength.length4Count++;
+            }
+
+            strength.qualityScore += ScoreCodePoint(cp, isFirst);
+            isFirst = false;
+            pos = nextPos;
+        }
+
+        return true;
+    }
+
+    static int ClampInt(int value, int minValue, int maxValue)
+    {
+        if (value < minValue)
+        {
+            return minValue;
+        }
+        if (value > maxValue)
+        {
+            return maxValue;
+        }
+        return value;
+    }
+
+    // ---- ANSI 字节形态评分（只在常见 East Asian 多字节编码下启用）----
+
+    static int ComputeGbkLikePairScore(const string& bytes)
+    {
+        const size_t n = bytes.size();
+        size_t i = 0;
+        int validPairs = 0;
+        int invalidBytes = 0;
+
+        while (i < n)
+        {
+            const unsigned char b0 = static_cast<unsigned char>(bytes[i]);
+            if (b0 < 0x80u)
+            {
+                i++;
+                continue;
+            }
+
+            if (b0 >= 0x81u && b0 <= 0xFEu && i + 1 < n)
+            {
+                const unsigned char b1 = static_cast<unsigned char>(bytes[i + 1]);
+                if (b1 >= 0x40u && b1 <= 0xFEu && b1 != 0x7Fu)
+                {
+                    validPairs++;
+                    i += 2;
+                    continue;
+                }
+            }
+
+            invalidBytes++;
+            i++;
+        }
+
+        return validPairs * 3 - invalidBytes * 6;
+    }
+
+    static int ComputeBig5LikePairScore(const string& bytes)
+    {
+        const size_t n = bytes.size();
+        size_t i = 0;
+        int validPairs = 0;
+        int invalidBytes = 0;
+
+        while (i < n)
+        {
+            const unsigned char b0 = static_cast<unsigned char>(bytes[i]);
+            if (b0 < 0x80u)
+            {
+                i++;
+                continue;
+            }
+
+            if (b0 >= 0x81u && b0 <= 0xFEu && i + 1 < n)
+            {
+                const unsigned char b1 = static_cast<unsigned char>(bytes[i + 1]);
+                const bool isTrail = (b1 >= 0x40u && b1 <= 0x7Eu) || (b1 >= 0xA1u && b1 <= 0xFEu);
+                if (isTrail)
+                {
+                    validPairs++;
+                    i += 2;
+                    continue;
+                }
+            }
+
+            invalidBytes++;
+            i++;
+        }
+
+        return validPairs * 3 - invalidBytes * 6;
+    }
+
+    static int ComputeShiftJisLikePairScore(const string& bytes)
+    {
+        const size_t n = bytes.size();
+        size_t i = 0;
+        int validPairs = 0;
+        int invalidBytes = 0;
+
+        while (i < n)
+        {
+            const unsigned char b0 = static_cast<unsigned char>(bytes[i]);
+            if (b0 < 0x80u)
+            {
+                i++;
+                continue;
+            }
+
+            const bool isLead = (b0 >= 0x81u && b0 <= 0x9Fu) || (b0 >= 0xE0u && b0 <= 0xFCu);
+            if (isLead && i + 1 < n)
+            {
+                const unsigned char b1 = static_cast<unsigned char>(bytes[i + 1]);
+                const bool isTrail = (b1 >= 0x40u && b1 <= 0x7Eu) || (b1 >= 0x80u && b1 <= 0xFCu);
+                if (isTrail)
+                {
+                    validPairs++;
+                    i += 2;
+                    continue;
+                }
+            }
+
+            invalidBytes++;
+            i++;
+        }
+
+        return validPairs * 3 - invalidBytes * 6;
+    }
+
+    static int ComputeEucKrLikePairScore(const string& bytes)
+    {
+        const size_t n = bytes.size();
+        size_t i = 0;
+        int validPairs = 0;
+        int invalidBytes = 0;
+
+        while (i < n)
+        {
+            const unsigned char b0 = static_cast<unsigned char>(bytes[i]);
+            if (b0 < 0x80u)
+            {
+                i++;
+                continue;
+            }
+
+            if (b0 >= 0xA1u && b0 <= 0xFEu && i + 1 < n)
+            {
+                const unsigned char b1 = static_cast<unsigned char>(bytes[i + 1]);
+                if (b1 >= 0xA1u && b1 <= 0xFEu)
+                {
+                    validPairs++;
+                    i += 2;
+                    continue;
+                }
+            }
+
+            invalidBytes++;
+            i++;
+        }
+
+        return validPairs * 3 - invalidBytes * 6;
+    }
+
+    static int ComputeAnsiPairScore(const string& bytes)
+    {
+        const AnsiEncodingFamily family = GetAnsiEncodingFamily();
+        if (family == AnsiEncodingFamily::gbkLike)
+        {
+            return ComputeGbkLikePairScore(bytes);
+        }
+        if (family == AnsiEncodingFamily::big5Like)
+        {
+            return ComputeBig5LikePairScore(bytes);
+        }
+        if (family == AnsiEncodingFamily::shiftJisLike)
+        {
+            return ComputeShiftJisLikePairScore(bytes);
+        }
+        if (family == AnsiEncodingFamily::eucKrLike)
+        {
+            return ComputeEucKrLikePairScore(bytes);
+        }
+        return 0;
+    }
 }
 
 string GB_MakeUtf8String(const char* s)
@@ -280,27 +1158,13 @@ string GB_Utf8ToAnsi(const string& utf8Str)
     }
 #if defined(_WIN32)
     // UTF-8 -> UTF-16
-    const int wlen = ::MultiByteToWideChar(
-        CP_UTF8,
-        MB_ERR_INVALID_CHARS,            // 无效序列直接失败
-        utf8Str.data(),
-        static_cast<int>(utf8Str.size()),
-        nullptr,
-        0
-    );
+    const int wlen = ::MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, utf8Str.data(), internal::ToWinApiLengthChecked(utf8Str.size()), nullptr, 0);
     if (wlen <= 0)
     {
         throw runtime_error("MultiByteToWideChar(CP_UTF8) failed (size).");
     }
     wstring ws(static_cast<size_t>(wlen), L'\0');
-    const int wwritten = ::MultiByteToWideChar(
-        CP_UTF8,
-        MB_ERR_INVALID_CHARS,
-        utf8Str.data(),
-        static_cast<int>(utf8Str.size()),
-        &ws[0],
-        wlen
-    );
+    const int wwritten = ::MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, utf8Str.data(), internal::ToWinApiLengthChecked(utf8Str.size()), &ws[0], wlen);
     if (wwritten <= 0)
     {
         throw runtime_error("MultiByteToWideChar(CP_UTF8) failed (convert).");
@@ -308,32 +1172,14 @@ string GB_Utf8ToAnsi(const string& utf8Str)
 
     // UTF-16 -> ANSI(ACP)
     // 说明：CP_ACP 为系统 ANSI 代码页；不同机器可能不同，且会被用户修改。
-    const int alen = ::WideCharToMultiByte(
-        CP_ACP,
-        WC_NO_BEST_FIT_CHARS,            // 避免近似匹配（可选）
-        ws.data(),
-        static_cast<int>(ws.size()),
-        nullptr,
-        0,
-        nullptr,
-        nullptr
-    );
+    const int alen = ::WideCharToMultiByte(CP_ACP, WC_NO_BEST_FIT_CHARS, ws.data(), static_cast<int>(ws.size()), nullptr, 0, nullptr, nullptr);
     if (alen <= 0)
     {
         throw runtime_error("WideCharToMultiByte(CP_ACP) failed (size).");
     }
     string ansi(static_cast<size_t>(alen), '\0');
     BOOL usedDefaultChar = FALSE;
-    const int awritten = ::WideCharToMultiByte(
-        CP_ACP,
-        WC_NO_BEST_FIT_CHARS,
-        ws.data(),
-        static_cast<int>(ws.size()),
-        &ansi[0],
-        alen,
-        nullptr,                          // 默认 '?'
-        &usedDefaultChar                  // 如有无法表示的字符会置 TRUE
-    );
+    const int awritten = ::WideCharToMultiByte(CP_ACP, WC_NO_BEST_FIT_CHARS, ws.data(), static_cast<int>(ws.size()), &ansi[0], alen, nullptr, &usedDefaultChar);
     if (awritten <= 0)
     {
         throw runtime_error("WideCharToMultiByte(CP_ACP) failed (convert).");
@@ -385,8 +1231,10 @@ string GB_Utf8ToAnsi(const string& utf8Str)
     {
         throw runtime_error("Local multibyte encoding failed (wstring -> bytes).");
     }
-    // wcsrtombs 返回的字节数不含 '\0'，长度正好是 written/need
-    // out 已经是正确大小
+    if (written < out.size())
+    {
+        out.resize(written);
+    }
     return out;
 #endif
 }
@@ -399,58 +1247,26 @@ string GB_AnsiToUtf8(const string& ansiStr)
     }
 #if defined(_WIN32)
     // ANSI(ACP) -> UTF-16
-    const int wlen = ::MultiByteToWideChar(
-        CP_ACP,
-        0,                                 // 不加 MB_ERR_INVALID_CHARS，防止某些旧代码页数据直接失败
-        ansiStr.data(),
-        static_cast<int>(ansiStr.size()),
-        nullptr,
-        0
-    );
+    const int wlen = ::MultiByteToWideChar(CP_ACP, 0, ansiStr.data(), internal::ToWinApiLengthChecked(ansiStr.size()), nullptr, 0);
     if (wlen <= 0)
     {
         throw runtime_error("MultiByteToWideChar(CP_ACP) failed (size).");
     }
     wstring ws(static_cast<size_t>(wlen), L'\0');
-    const int wwritten = ::MultiByteToWideChar(
-        CP_ACP,
-        0,
-        ansiStr.data(),
-        static_cast<int>(ansiStr.size()),
-        &ws[0],
-        wlen
-    );
+    const int wwritten = ::MultiByteToWideChar(CP_ACP, 0, ansiStr.data(), internal::ToWinApiLengthChecked(ansiStr.size()), &ws[0], wlen);
     if (wwritten <= 0)
     {
         throw runtime_error("MultiByteToWideChar(CP_ACP) failed (convert).");
     }
 
     // UTF-16 -> UTF-8
-    const int u8len = ::WideCharToMultiByte(
-        CP_UTF8,
-        0,
-        ws.data(),
-        static_cast<int>(ws.size()),
-        nullptr,
-        0,
-        nullptr,
-        nullptr
-    );
+    const int u8len = ::WideCharToMultiByte(CP_UTF8, 0, ws.data(), static_cast<int>(ws.size()), nullptr, 0, nullptr, nullptr);
     if (u8len <= 0)
     {
         throw runtime_error("WideCharToMultiByte(CP_UTF8) failed (size).");
     }
     string utf8(static_cast<size_t>(u8len), '\0');
-    const int u8written = ::WideCharToMultiByte(
-        CP_UTF8,
-        0,
-        ws.data(),
-        static_cast<int>(ws.size()),
-        &utf8[0],
-        u8len,
-        nullptr,
-        nullptr
-    );
+    const int u8written = ::WideCharToMultiByte(CP_UTF8, 0, ws.data(), static_cast<int>(ws.size()), &utf8[0], u8len, nullptr, nullptr);
     if (u8written <= 0)
     {
         throw runtime_error("WideCharToMultiByte(CP_UTF8) failed (convert).");
@@ -490,6 +1306,10 @@ string GB_AnsiToUtf8(const string& ansiStr)
     {
         throw runtime_error("Local multibyte decoding failed (bytes -> wstring).");
     }
+    if (wwritten < ws.size())
+    {
+        ws.resize(wwritten);
+    }
 
     // wstring -> UTF-8
     try
@@ -520,6 +1340,233 @@ bool GB_IsUtf8(const string& text)
     return true;
 }
 
+bool GB_IsAnsi(const string& text)
+{
+    if (text.empty())
+    {
+        return true;
+    }
+
+    // 若系统“ANSI 代码页/locale”本身就是 UTF-8，那么 ANSI 与 UTF-8 在这里等价
+    if (internal::IsCurrentAnsiUtf8())
+    {
+        return GB_IsUtf8(text);
+    }
+
+#if defined(_WIN32)
+    const UINT codePage = CP_ACP;
+
+    int wideLength = ::MultiByteToWideChar(codePage, MB_ERR_INVALID_CHARS, text.data(), static_cast<int>(text.size()), nullptr, 0);
+
+    if (wideLength > 0)
+    {
+        return true;
+    }
+
+    const DWORD lastError = ::GetLastError();
+    if (lastError == ERROR_INVALID_FLAGS)
+    {
+        // 个别环境下可能不支持 MB_ERR_INVALID_CHARS，退化为“能否转换”
+        wideLength = ::MultiByteToWideChar(codePage, 0, text.data(), static_cast<int>(text.size()), nullptr, 0);
+        return wideLength > 0;
+    }
+
+    return false;
+
+#else
+    internal::EnsureLocaleInitialized();
+
+    const char* src = text.c_str();
+    mbstate_t state = mbstate_t{};
+    errno = 0;
+
+    const size_t wideLength = mbsrtowcs(nullptr, &src, 0, &state);
+    return wideLength != static_cast<size_t>(-1);
+#endif
+}
+
+bool GB_LooksLikeUtf8(const string& text)
+{
+    if (text.empty())
+    {
+        return false;
+    }
+
+    // BOM 是强线索
+    if (internal::HasUtf8Bom(text))
+    {
+        return true;
+    }
+
+    // 纯 ASCII 无法区分 UTF-8 与 ANSI
+    if (internal::IsAllAscii(text))
+    {
+        return false;
+    }
+
+    const internal::ByteStats byteStats = internal::GetByteStats(text);
+    if (!internal::LooksLikeTextBytes(byteStats))
+    {
+        return false;
+    }
+
+    // 严格 UTF-8 合法性校验
+    if (!GB_IsUtf8(text))
+    {
+        return false;
+    }
+
+    // 若当前“ANSI”本身就是 UTF-8，那么这里直接认为更像 UTF-8
+    if (internal::IsCurrentAnsiUtf8())
+    {
+        return true;
+    }
+
+    internal::Utf8Strength utf8Strength;
+    if (!internal::ComputeUtf8Strength(text, utf8Strength))
+    {
+        return false;
+    }
+
+    // 防止“二进制碰巧合法 UTF-8”
+    if (utf8Strength.qualityScore < -20)
+    {
+        return false;
+    }
+
+    const double continuationRatio = (byteStats.nonAsciiBytes > 0) ? static_cast<double>(byteStats.continuationBytes) / static_cast<double>(byteStats.nonAsciiBytes) : 0;
+
+    int utf8Confidence = 0;
+    utf8Confidence += static_cast<int>(utf8Strength.length4Count) * 12;
+    utf8Confidence += static_cast<int>(utf8Strength.length3Count) * 6;
+    utf8Confidence += static_cast<int>(utf8Strength.length2Count) * 2;
+
+    if (continuationRatio >= 0.62)
+    {
+        utf8Confidence += 10;
+    }
+    else if (continuationRatio >= 0.55)
+    {
+        utf8Confidence += 6;
+    }
+    else if (continuationRatio >= 0.48)
+    {
+        utf8Confidence += 2;
+    }
+    else
+    {
+        utf8Confidence -= 6;
+    }
+
+    utf8Confidence += internal::ClampInt(utf8Strength.qualityScore / 10, -10, 10);
+
+    const internal::AnsiEncodingFamily family = internal::GetAnsiEncodingFamily();
+    if (family == internal::AnsiEncodingFamily::singleByte || family == internal::AnsiEncodingFamily::unknown)
+    {
+        // 单字节 ANSI 下：严格 UTF-8 且非 ASCII，通常就应该判 UTF-8
+        return utf8Confidence >= 0;
+    }
+
+    // 多字节 East Asian ANSI：对比一下“字节形态”得分
+    const int ansiPairScore = internal::ComputeAnsiPairScore(text);
+
+    if (continuationRatio >= 0.58)
+    {
+        // continuationRatio 偏高是 UTF-8 的强特征（CJK UTF-8 常见 ~2/3）
+        utf8Confidence += 6;
+    }
+
+    const int scoreMargin = 6; // 越大越保守
+    return utf8Confidence >= ansiPairScore + scoreMargin;
+}
+
+bool GB_LooksLikeAnsi(const string& text)
+{
+    if (text.empty())
+    {
+        return false;
+    }
+
+    // 纯 ASCII 无法区分 UTF-8 与 ANSI
+    if (internal::IsAllAscii(text))
+    {
+        return false;
+    }
+
+    // 若当前“ANSI”本身就是 UTF-8，那么 LooksLikeAnsi 退化为 LooksLikeUtf8
+    if (internal::IsCurrentAnsiUtf8())
+    {
+        return GB_LooksLikeUtf8(text);
+    }
+
+    const internal::ByteStats byteStats = internal::GetByteStats(text);
+    if (!internal::LooksLikeTextBytes(byteStats))
+    {
+        return false;
+    }
+
+    // 先确保按 ANSI 规则可解码
+    if (!GB_IsAnsi(text))
+    {
+        return false;
+    }
+
+    // 如果严格 UTF-8 不通过，那就更可能是 ANSI（或其它非 UTF-8 编码）
+    if (!GB_IsUtf8(text))
+    {
+        return true;
+    }
+
+    // 同时是合法 UTF-8 与合法 ANSI：只有在“ANSI 字节形态”明显更强时才判 ANSI
+    internal::Utf8Strength utf8Strength;
+    if (!internal::ComputeUtf8Strength(text, utf8Strength))
+    {
+        return false;
+    }
+
+    if (utf8Strength.qualityScore < -20)
+    {
+        return false;
+    }
+
+    const double continuationRatio = (byteStats.nonAsciiBytes > 0) ? static_cast<double>(byteStats.continuationBytes) / static_cast<double>(byteStats.nonAsciiBytes) : 0;
+
+    // continuationRatio 很高且存在 3/4 字节码点时，通常非常像 UTF-8
+    if (continuationRatio >= 0.60 && (utf8Strength.length3Count + utf8Strength.length4Count) > 0)
+    {
+        return false;
+    }
+
+    int utf8Confidence = 0;
+    utf8Confidence += static_cast<int>(utf8Strength.length4Count) * 12;
+    utf8Confidence += static_cast<int>(utf8Strength.length3Count) * 6;
+    utf8Confidence += static_cast<int>(utf8Strength.length2Count) * 2;
+
+    if (continuationRatio >= 0.62)
+    {
+        utf8Confidence += 10;
+    }
+    else if (continuationRatio >= 0.55)
+    {
+        utf8Confidence += 6;
+    }
+    else if (continuationRatio >= 0.48)
+    {
+        utf8Confidence += 2;
+    }
+    else
+    {
+        utf8Confidence -= 6;
+    }
+
+    utf8Confidence += internal::ClampInt(utf8Strength.qualityScore / 10, -10, 10);
+
+    const int ansiPairScore = internal::ComputeAnsiPairScore(text);
+
+    const int scoreMargin = 6;
+    return ansiPairScore >= utf8Confidence + scoreMargin;
+}
+
 string GB_WStringToUtf8(const wstring& ws)
 {
 #if defined(_WIN32)
@@ -529,16 +1576,7 @@ string GB_WStringToUtf8(const wstring& ws)
     }
 
     // 1) 计算所需字节数（不含 '\0'）
-    const int sizeRequired = ::WideCharToMultiByte(
-        CP_UTF8,
-        WC_ERR_INVALID_CHARS, // 非法代理项直接报错
-        ws.data(),
-        static_cast<int>(ws.size()),
-        nullptr,
-        0,
-        nullptr,
-        nullptr
-    );
+    const int sizeRequired = ::WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, ws.data(), static_cast<int>(ws.size()), nullptr, 0, nullptr, nullptr);
     if (sizeRequired <= 0)
     {
         throw runtime_error("WideCharToMultiByte failed (size).");
@@ -546,16 +1584,7 @@ string GB_WStringToUtf8(const wstring& ws)
 
     // 2) 实际转换
     string result(static_cast<size_t>(sizeRequired), '\0');
-    int written = ::WideCharToMultiByte(
-        CP_UTF8,
-        WC_ERR_INVALID_CHARS,
-        ws.data(),
-        static_cast<int>(ws.size()),
-        &result[0],
-        sizeRequired,
-        nullptr,
-        nullptr
-    );
+    int written = ::WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, ws.data(), static_cast<int>(ws.size()), &result[0], sizeRequired, nullptr, nullptr);
     if (written <= 0)
     {
         throw runtime_error("WideCharToMultiByte failed (convert).");
@@ -567,7 +1596,7 @@ string GB_WStringToUtf8(const wstring& ws)
         return {};
     }
 
-    wstring_convert<codecvt_utf8<wchar_t>> cvt;
+    std::wstring_convert<std::codecvt_utf8<wchar_t>> cvt;
     try
     {
         return cvt.to_bytes(ws);
@@ -588,14 +1617,7 @@ wstring GB_Utf8ToWString(const string& utf8Str)
     }
 
     // 1) 计算需要的 wchar_t 数量（不含 '\0'）
-    const int sizeRequired = ::MultiByteToWideChar(
-        CP_UTF8,
-        MB_ERR_INVALID_CHARS,          // 非法 UTF-8 序列直接报错
-        utf8Str.data(),
-        static_cast<int>(utf8Str.size()),
-        nullptr,
-        0
-    );
+    const int sizeRequired = ::MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, utf8Str.data(), internal::ToWinApiLengthChecked(utf8Str.size()), nullptr, 0);
     if (sizeRequired <= 0)
     {
         throw runtime_error("MultiByteToWideChar failed (size).");
@@ -603,14 +1625,7 @@ wstring GB_Utf8ToWString(const string& utf8Str)
 
     // 2) 实际转换
     wstring result(static_cast<size_t>(sizeRequired), L'\0');
-    int written = ::MultiByteToWideChar(
-        CP_UTF8,
-        MB_ERR_INVALID_CHARS,
-        utf8Str.data(),
-        static_cast<int>(utf8Str.size()),
-        &result[0],
-        sizeRequired
-    );
+    int written = ::MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, utf8Str.data(), internal::ToWinApiLengthChecked(utf8Str.size()), &result[0], sizeRequired);
     if (written <= 0)
     {
         throw runtime_error("MultiByteToWideChar failed (convert).");
@@ -622,7 +1637,7 @@ wstring GB_Utf8ToWString(const string& utf8Str)
         return {};
     }
 
-    wstring_convert<codecvt_utf8<wchar_t>> conv;
+    std::wstring_convert<std::codecvt_utf8<wchar_t>> conv;
     try
     {
         return conv.from_bytes(utf8Str);
@@ -829,16 +1844,15 @@ bool GB_Utf8StartsWith(const string& textUtf8, const string& targetUtf8, bool ca
     }
 
     // ASCII 快速路径：大小写敏感，且两端均为纯 ASCII，直接做字节前缀比较
-    auto isAllAscii = [](const string& s) -> bool
+    auto isAllAscii = [](const string& s) -> bool {
+        for (unsigned char ch : s)
         {
-            for (unsigned char ch : s)
+            if (ch >= 0x80)
             {
-                if (ch >= 0x80)
-                {
-                    return false;
-                }
+                return false;
             }
-            return true;
+        }
+        return true;
         };
     if (caseSensitive && isAllAscii(textUtf8) && isAllAscii(targetUtf8))
     {
@@ -846,7 +1860,7 @@ bool GB_Utf8StartsWith(const string& textUtf8, const string& targetUtf8, bool ca
         {
             return false;
         }
-        return char_traits<char>::compare(textUtf8.data(), targetUtf8.data(), targetUtf8.size()) == 0;
+        return std::char_traits<char>::compare(textUtf8.data(), targetUtf8.data(), targetUtf8.size()) == 0;
     }
 
     // 通用路径：逐码点对齐比较（不解整串，流式解码）
@@ -903,7 +1917,7 @@ bool GB_Utf8EndsWith(const string& textUtf8, const string& targetUtf8, bool case
         }
         const size_t off = textUtf8.size() - targetUtf8.size();
         // 手写比较，避免额外依赖
-        for (size_t i = 0; i < targetUtf8.size(); ++i)
+        for (size_t i = 0; i < targetUtf8.size(); i++)
         {
             if (textUtf8[off + i] != targetUtf8[i]) return false;
         }
@@ -966,7 +1980,7 @@ bool GB_Utf8EndsWith(const string& textUtf8, const string& targetUtf8, bool case
 
     // 3.3 比较最后 m 个码点是否与 pat 一致
     const size_t start = (written - m) % m;
-    for (size_t i = 0; i < m; ++i)
+    for (size_t i = 0; i < m; i++)
     {
         if (ring[(start + i) % m] != pat[i])
         {
@@ -1001,16 +2015,18 @@ int64_t GB_Utf8Find(const string& text, const string& needle, bool caseSensitive
     {
         return 0; // 与 string::find("") 一致
     }
-
     // 2) 计算 KMP 的前缀函数（LPS）
     vector<size_t> lps(m, 0);
     {
         size_t len = 0;
-        for (size_t i = 1; i < m; )
+        size_t i = 1;
+        while (i < m)
         {
             if (pat[i] == pat[len])
             {
-                lps[i++] = ++len;
+                len++;
+                lps[i] = len;
+                i++;
             }
             else if (len != 0)
             {
@@ -1018,7 +2034,8 @@ int64_t GB_Utf8Find(const string& text, const string& needle, bool caseSensitive
             }
             else
             {
-                lps[i++] = 0;
+                lps[i] = 0;
+                i++;
             }
         }
     }
@@ -1101,16 +2118,18 @@ int64_t GB_Utf8FindLast(const string& text, const string& needle, bool caseSensi
         // 理论上不会走到（非法字节也会转为 U+FFFD），兜底与上面保持一致
         return static_cast<int64_t>(GB_GetUtf8Length(text));
     }
-
     // 2) 计算 KMP 的 LPS（最长真前后缀）表
     vector<size_t> lps(m, 0);
     {
         size_t len = 0;
-        for (size_t i = 1; i < m; )
+        size_t i = 1;
+        while (i < m)
         {
             if (pat[i] == pat[len])
             {
-                lps[i++] = ++len;
+                len++;
+                lps[i] = len;
+                i++;
             }
             else if (len != 0)
             {
@@ -1118,7 +2137,8 @@ int64_t GB_Utf8FindLast(const string& text, const string& needle, bool caseSensi
             }
             else
             {
-                lps[i++] = 0;
+                lps[i] = 0;
+                i++;
             }
         }
     }
@@ -1229,58 +2249,12 @@ string GB_Utf8Replace(const string& utf8Str, const string& oldValue, const strin
         return utf8Str;
     }
 
-    // —— 快速路径：ASCII + 大小写敏感 → 按字节替换 —— //
-    if (caseSensitive && internal::IsAllAscii(utf8Str) && internal::IsAllAscii(oldValue) && internal::IsAllAscii(newValue))
-    {
-        string out;
-        out.reserve(utf8Str.size());
-        size_t prev = 0;
-        while (true)
-        {
-            size_t pos = utf8Str.find(oldValue, prev);
-            if (pos == string::npos)
-            {
-                out.append(utf8Str, prev, utf8Str.size() - prev);
-                break;
-            }
-            out.append(utf8Str, prev, pos - prev);
-            out += newValue;
-            prev = pos + oldValue.size();
-        }
-        return out;
-    }
+    // 说明：
+    // 1) 本库的“大小写不敏感”仅对 ASCII 字母生效；非 ASCII 内容按字节精确匹配。
+    // 2) UTF-8 是自同步编码：合法 UTF-8 子串的首字节不可能落在另一个码点的续字节(10xxxxxx)上，
+    //    因此对合法 UTF-8 文本，按字节序列查找/替换不会产生“从码点内部开始匹配”的伪命中。
+    // 3) 这里使用字节级 KMP 做一次线性扫描与拼接，避免 GB_Utf8Substr + GB_Utf8Find 循环导致的 O(N^2) 退化。
 
-    // —— 通用路径：按“码点”替换，复用 Utf8Find / Utf8Substr —— //
-    const int64_t totalChars = static_cast<int64_t>(GB_GetUtf8Length(utf8Str));
-    const int64_t patLen = static_cast<int64_t>(GB_GetUtf8Length(oldValue));
-
-    string out;
-    int64_t curChar = 0;
-    while (curChar < totalChars)
-    {
-        const int64_t remain = totalChars - curChar;
-        const string suffix = GB_Utf8Substr(utf8Str, curChar, remain);
-        const int64_t rel = GB_Utf8Find(suffix, oldValue, caseSensitive);
-        if (rel < 0)
-        {
-            // 无更多匹配：把余下部分整体追加
-            out += suffix;
-            break;
-        }
-
-        // 追加“匹配之前”的部分（按码点切分，不会截断 UTF-8）
-        if (rel > 0)
-        {
-            out += GB_Utf8Substr(utf8Str, curChar, rel);
-        }
-
-        // 追加替换内容
-        out += newValue;
-
-        // 跳过被替换的那一段，继续向后搜索
-        curChar += rel + patLen;
-    }
-
-    return out;
+    return internal::ReplaceAllBytesKmp(utf8Str, oldValue, newValue, caseSensitive);
 }
 
