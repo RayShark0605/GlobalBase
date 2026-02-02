@@ -26,6 +26,7 @@
     <ClInclude Include="GB_IO.h" />
     <ClInclude Include="GB_Logger.h" />
     <ClInclude Include="GB_Math.h" />
+    <ClInclude Include="GB_Network.h" />
     <ClInclude Include="GB_Process.h" />
     <ClInclude Include="GB_ReadWriteLock.h" />
     <ClInclude Include="GB_SmbAccessor.h" />
@@ -49,6 +50,7 @@
     <ClCompile Include="GB_FileSystem.cpp" />
     <ClCompile Include="GB_IO.cpp" />
     <ClCompile Include="GB_Logger.cpp" />
+    <ClCompile Include="GB_Network.cpp" />
     <ClCompile Include="GB_Process.cpp" />
     <ClCompile Include="GB_ReadWriteLock.cpp" />
     <ClCompile Include="GB_SmbAccessor.cpp" />
@@ -115,6 +117,14 @@
     <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
   </ImportGroup>
   <PropertyGroup Label="UserMacros" />
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
+    <IncludePath>../3rdParty/libcurl_8.18.0/include;$(IncludePath)</IncludePath>
+    <LibraryPath>../3rdParty/libcurl_8.18.0/lib/Debug;$(LibraryPath)</LibraryPath>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
+    <IncludePath>../3rdParty/libcurl_8.18.0/include;$(IncludePath)</IncludePath>
+    <LibraryPath>../3rdParty/libcurl_8.18.0/lib/Release;$(LibraryPath)</LibraryPath>
+  </PropertyGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">
     <ClCompile>
       <WarningLevel>Level3</WarningLevel>
@@ -159,11 +169,14 @@
       <LanguageStandard>
       </LanguageStandard>
       <OpenMPSupport>true</OpenMPSupport>
+      <MultiProcessorCompilation>true</MultiProcessorCompilation>
     </ClCompile>
     <Link>
       <SubSystem>Windows</SubSystem>
       <GenerateDebugInformation>true</GenerateDebugInformation>
       <EnableUAC>false</EnableUAC>
+      <AdditionalDependencies>libcurl-d.lib;delayimp.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalOptions>/DELAYLOAD:libcurl-d.dll %(AdditionalOptions)</AdditionalOptions>
     </Link>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
@@ -180,11 +193,14 @@
       <LanguageStandard>
       </LanguageStandard>
       <OpenMPSupport>true</OpenMPSupport>
+      <MultiProcessorCompilation>true</MultiProcessorCompilation>
     </ClCompile>
     <Link>
       <SubSystem>Windows</SubSystem>
       <GenerateDebugInformation>true</GenerateDebugInformation>
       <EnableUAC>false</EnableUAC>
+      <AdditionalDependencies>libcurl.lib;delayimp.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalOptions>/DELAYLOAD:libcurl.dll %(AdditionalOptions)</AdditionalOptions>
     </Link>
   </ItemDefinitionGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />

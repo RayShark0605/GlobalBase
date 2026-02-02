@@ -10,6 +10,7 @@ GLOBALBASE_PORT bool GB_WriteUtf8ToFile(const std::string& filePathUtf8, const s
 GLOBALBASE_PORT GB_ByteBuffer GB_ReadFileToBinary(const std::string& filePathUtf8);
 
 GLOBALBASE_PORT bool GB_WriteBinaryToFile(const GB_ByteBuffer& data, const std::string& filePathUtf8);
+GLOBALBASE_PORT bool GB_WriteBinaryToFile(const std::string& data, const std::string& filePathUtf8);
 
 class GLOBALBASE_PORT GB_ByteBufferIO
 {

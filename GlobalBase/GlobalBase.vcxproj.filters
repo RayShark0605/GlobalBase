@@ -87,6 +87,9 @@
     <ClInclude Include="GB_Process.h">
       <Filter>头文件</Filter>
     </ClInclude>
+    <ClInclude Include="GB_Network.h">
+      <Filter>头文件</Filter>
+    </ClInclude>
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="GB_Utf8String.cpp">
@@ -144,6 +147,9 @@
       <Filter>源文件\Geometry</Filter>
     </ClCompile>
     <ClCompile Include="GB_Process.cpp">
+      <Filter>源文件</Filter>
+    </ClCompile>
+    <ClCompile Include="GB_Network.cpp">
       <Filter>源文件</Filter>
     </ClCompile>
   </ItemGroup>

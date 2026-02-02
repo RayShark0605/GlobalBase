@@ -530,6 +530,12 @@ bool GB_WriteBinaryToFile(const GB_ByteBuffer& data, const std::string& filePath
 #endif
 }
 
+bool GB_WriteBinaryToFile(const std::string& data, const std::string& filePathUtf8)
+{
+    const GB_ByteBuffer buffer(data.begin(), data.end());
+	return GB_WriteBinaryToFile(buffer, filePathUtf8);
+}
+
 void GB_ByteBufferIO::AppendUInt16LE(GB_ByteBuffer& buffer, uint16_t value)
 {
     buffer.push_back(static_cast<unsigned char>((value >> 0) & 0xFF));
