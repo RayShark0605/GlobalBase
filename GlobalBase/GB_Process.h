@@ -185,4 +185,10 @@ GLOBALBASE_PORT std::vector<std::string> GB_GetExportedFunctionSignatures(const 
 GLOBALBASE_PORT std::vector<std::string> GB_GetImportedFunctionSignatures(const std::string& filePathUtf8, bool onlyFunctionNames = true);
 
 
+
+
+
+
+
+
 #endif

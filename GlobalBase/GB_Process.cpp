@@ -2359,6 +2359,95 @@ namespace
         return s;
     }
 
+    static unsigned char AsciiToLower(unsigned char c)
+    {
+        if (c >= 'A' && c <= 'Z')
+        {
+            return static_cast<unsigned char>(c - 'A' + 'a');
+        }
+        return c;
+    }
+
+    static bool LessIgnoreCaseAscii(const std::string& left, const std::string& right)
+    {
+        const size_t minLen = std::min(left.size(), right.size());
+        for (size_t i = 0; i < minLen; i++)
+        {
+            const unsigned char lc = AsciiToLower(static_cast<unsigned char>(left[i]));
+            const unsigned char rc = AsciiToLower(static_cast<unsigned char>(right[i]));
+            if (lc < rc)
+            {
+                return true;
+            }
+            if (lc > rc)
+            {
+                return false;
+            }
+        }
+
+        if (left.size() != right.size())
+        {
+            return left.size() < right.size();
+        }
+
+        // 忽略大小写相等时，用原始字符串打破平局，保证排序稳定可复现。
+        return left < right;
+    }
+
+    static bool ReadU16LeChecked(const std::vector<unsigned char>& bytes, size_t offset, uint16_t* outValue)
+    {
+        if (outValue == nullptr)
+        {
+            return false;
+        }
+
+        bool ok = false;
+        const uint16_t v = ReadU16Le(bytes, offset, &ok);
+        if (!ok)
+        {
+            return false;
+        }
+
+        *outValue = v;
+        return true;
+    }
+
+    static bool ReadU32LeChecked(const std::vector<unsigned char>& bytes, size_t offset, uint32_t* outValue)
+    {
+        if (outValue == nullptr)
+        {
+            return false;
+        }
+
+        bool ok = false;
+        const uint32_t v = ReadU32Le(bytes, offset, &ok);
+        if (!ok)
+        {
+            return false;
+        }
+
+        *outValue = v;
+        return true;
+    }
+
+    static bool ReadU64LeChecked(const std::vector<unsigned char>& bytes, size_t offset, uint64_t* outValue)
+    {
+        if (outValue == nullptr)
+        {
+            return false;
+        }
+
+        bool ok = false;
+        const uint64_t v = ReadU64Le(bytes, offset, &ok);
+        if (!ok)
+        {
+            return false;
+        }
+
+        *outValue = v;
+        return true;
+    }
+
     // -------------------------
     // PE parsing (portable)
     // -------------------------
@@ -2446,21 +2535,51 @@ namespace
 
         for (size_t i = 0; i < sections.size(); i++)
         {
-            const PeSectionHeader& sec = sections[i];
-            const uint32_t secVa = sec.virtualAddress;
-            const uint32_t secSize = std::max(sec.virtualSize, sec.sizeOfRawData);
+            const PeSectionHeader& section = sections[i];
+            const uint32_t sectionVa = section.virtualAddress;
+            const uint32_t rawSize = section.sizeOfRawData;
 
-            if (rva >= secVa && rva < secVa + secSize)
+            // 仅允许映射到文件中“确实存在”的初始化数据区间：
+            // - 数据在文件中的长度由 SizeOfRawData 指定。
+            // - 若 SizeOfRawData < VirtualSize，则剩余部分在内存中会被 0 填充，但文件里不存在。
+            if (rawSize == 0)
             {
-                const uint32_t delta = rva - secVa;
-                *outOffset = sec.pointerToRawData + delta;
+                continue;
+            }
+
+            if (sectionVa > (0xFFFFFFFFu - rawSize))
+            {
+                continue;
+            }
+
+            if (rva >= sectionVa && rva < sectionVa + rawSize)
+            {
+                const uint32_t delta = rva - sectionVa;
+                if (section.pointerToRawData > (0xFFFFFFFFu - delta))
+                {
+                    continue;
+                }
+
+                *outOffset = section.pointerToRawData + delta;
                 return true;
             }
         }
 
-        // Some RVAs can be within headers; treat RVA as file offset in that case.
-        *outOffset = rva;
-        return true;
+        // 只有当 RVA 落在“头部”范围内时，才允许直接当作文件偏移。
+        // 避免损坏/恶意文件把一个离谱的 RVA 误当作 file offset 解析出伪数据。
+        uint32_t minPointerToRawData = 0xFFFFFFFFu;
+        for (size_t i = 0; i < sections.size(); i++)
+        {
+            minPointerToRawData = std::min(minPointerToRawData, sections[i].pointerToRawData);
+        }
+
+        if (rva < minPointerToRawData)
+        {
+            *outOffset = rva;
+            return true;
+        }
+
+        return false;
     }
 
     void ParsePeExports(const std::vector<unsigned char>& bytes, bool onlyFunctionNames, std::vector<std::string>* outExports)
@@ -2477,9 +2596,8 @@ namespace
             return;
         }
 
-        bool ok = false;
-        const uint32_t e_lfanew = ReadU32Le(bytes, 0x3C, &ok);
-        if (!ok || static_cast<size_t>(e_lfanew) + 4 + sizeof(PeCoffFileHeader) > bytes.size())
+        uint32_t e_lfanew = 0;
+        if (!ReadU32LeChecked(bytes, 0x3C, &e_lfanew) || static_cast<size_t>(e_lfanew) + 4u + sizeof(PeCoffFileHeader) > bytes.size())
         {
             return;
         }
@@ -2500,8 +2618,8 @@ namespace
             return;
         }
 
-        const uint16_t optMagic = ReadU16Le(bytes, optionalOffset, &ok);
-        if (!ok)
+        uint16_t optMagic = 0;
+        if (!ReadU16LeChecked(bytes, optionalOffset, &optMagic))
         {
             return;
         }
@@ -2547,14 +2665,28 @@ namespace
             return;
         }
 
-        const uint32_t base = ReadU32Le(bytes, exportDirFileOffset + 16, &ok);
-        const uint32_t numberOfFunctions = ReadU32Le(bytes, exportDirFileOffset + 20, &ok);
-        const uint32_t numberOfNames = ReadU32Le(bytes, exportDirFileOffset + 24, &ok);
-        const uint32_t addressOfFunctionsRva = ReadU32Le(bytes, exportDirFileOffset + 28, &ok);
-        const uint32_t addressOfNamesRva = ReadU32Le(bytes, exportDirFileOffset + 32, &ok);
-        const uint32_t addressOfNameOrdinalsRva = ReadU32Le(bytes, exportDirFileOffset + 36, &ok);
+        uint32_t base = 0;
+        uint32_t numberOfFunctions = 0;
+        uint32_t numberOfNames = 0;
+        uint32_t addressOfFunctionsRva = 0;
+        uint32_t addressOfNamesRva = 0;
+        uint32_t addressOfNameOrdinalsRva = 0;
 
-        if (!ok || numberOfFunctions == 0 || addressOfFunctionsRva == 0)
+        if (!ReadU32LeChecked(bytes, exportDirFileOffset + 16u, &base) ||
+            !ReadU32LeChecked(bytes, exportDirFileOffset + 20u, &numberOfFunctions) ||
+            !ReadU32LeChecked(bytes, exportDirFileOffset + 24u, &numberOfNames) ||
+            !ReadU32LeChecked(bytes, exportDirFileOffset + 28u, &addressOfFunctionsRva) ||
+            !ReadU32LeChecked(bytes, exportDirFileOffset + 32u, &addressOfNamesRva) ||
+            !ReadU32LeChecked(bytes, exportDirFileOffset + 36u, &addressOfNameOrdinalsRva) ||
+            numberOfFunctions == 0 ||
+            addressOfFunctionsRva == 0)
+        {
+            return;
+        }
+
+        // 防御性限制：避免恶意/损坏文件触发过大分配与超长循环。
+        const uint32_t maxEntries = (1u << 20); // 1,048,576
+        if (numberOfFunctions > maxEntries || numberOfNames > maxEntries)
         {
             return;
         }
@@ -2565,11 +2697,12 @@ namespace
             return;
         }
 
-        const size_t functionsBytes = static_cast<size_t>(numberOfFunctions) * 4u;
-        if (numberOfFunctions != 0 && functionsBytes / 4u != static_cast<size_t>(numberOfFunctions))
+        if (static_cast<size_t>(numberOfFunctions) > (std::numeric_limits<size_t>::max() / 4u))
         {
             return;
         }
+
+        const size_t functionsBytes = static_cast<size_t>(numberOfFunctions) * 4u;
 
         if (static_cast<size_t>(functionsOffset) + functionsBytes > bytes.size())
         {
@@ -2580,6 +2713,8 @@ namespace
         std::vector<std::string> nameByOrdinalIndex;
         nameByOrdinalIndex.resize(static_cast<size_t>(numberOfFunctions));
 
+        bool ok = false;
+
         if (numberOfNames > 0 && addressOfNamesRva != 0 && addressOfNameOrdinalsRva != 0)
         {
             uint32_t namesOffset = 0;
@@ -2587,6 +2722,12 @@ namespace
             if (RvaToFileOffsetPe(sections, addressOfNamesRva, &namesOffset) &&
                 RvaToFileOffsetPe(sections, addressOfNameOrdinalsRva, &ordinalsOffset))
             {
+                if (static_cast<size_t>(numberOfNames) > (std::numeric_limits<size_t>::max() / 4u))
+                {
+                    // 保险起见：避免 size_t 乘法溢出
+                    return;
+                }
+
                 const size_t namesBytes = static_cast<size_t>(numberOfNames) * 4u;
                 const size_t ordinalsBytes = static_cast<size_t>(numberOfNames) * 2u;
 
@@ -2635,12 +2776,12 @@ namespace
         }
 
         std::unordered_set<std::string> uniqueSet;
-        uniqueSet.reserve(static_cast<size_t>(numberOfFunctions));
+        uniqueSet.reserve(std::min(static_cast<size_t>(numberOfFunctions), static_cast<size_t>(65536u)));
 
         for (uint32_t ordinalIndex = 0; ordinalIndex < numberOfFunctions; ordinalIndex++)
         {
-            const uint32_t funcRva = ReadU32Le(bytes, static_cast<size_t>(functionsOffset) + static_cast<size_t>(ordinalIndex) * 4u, &ok);
-            if (!ok || funcRva == 0)
+            uint32_t funcRva = 0;
+            if (!ReadU32LeChecked(bytes, static_cast<size_t>(functionsOffset) + static_cast<size_t>(ordinalIndex) * 4u, &funcRva) || funcRva == 0)
             {
                 continue;
             }
@@ -2681,10 +2822,6 @@ namespace
         }
 
         outExports->assign(uniqueSet.begin(), uniqueSet.end());
-        std::sort(outExports->begin(), outExports->end(), [](const std::string& a, const std::string& b)
-            {
-                return ToLowerAscii(a) < ToLowerAscii(b);
-            });
     }
 
 
@@ -3181,8 +3318,18 @@ namespace
                     const bool is64 = isPe32Plus;
                     size_t thunkEntryOffset = static_cast<size_t>(thunkOffset);
 
+                    // 防御性限制：避免损坏/恶意文件缺少 0 终止导致线性扫描整个文件。
+                    size_t thunkCount = 0;
+                    const size_t maxThunkCount = (1u << 20); // 1,048,576
+
                     while (true)
                     {
+                        if (thunkCount >= maxThunkCount)
+                        {
+                            break;
+                        }
+                        thunkCount++;
+
                         if (is64)
                         {
                             if (thunkEntryOffset + 8u > bytes.size())
@@ -3302,10 +3449,6 @@ namespace
         ParsePeDelayImports(bytes, sections, optionalOffset, coff.sizeOfOptionalHeader, isPe32Plus, onlyFunctionNames, &uniqueSet);
 
         outImports->assign(uniqueSet.begin(), uniqueSet.end());
-        std::sort(outImports->begin(), outImports->end(), [](const std::string& a, const std::string& b)
-            {
-                return ToLowerAscii(a) < ToLowerAscii(b);
-            });
     }
     // -------------------------
     // ELF parsing (little-endian)
@@ -3436,6 +3579,7 @@ namespace
         const uint32_t SHT_DYNSYM = 11;
         const uint16_t SHN_UNDEF = 0;
         const unsigned char STT_FUNC = 2;
+        const unsigned char STT_GNU_IFUNC = 10;
         const unsigned char STB_GLOBAL = 1;
         const unsigned char STB_WEAK = 2;
         const unsigned char STV_DEFAULT = 0;
@@ -3507,7 +3651,7 @@ namespace
                     const Elf64_Sym& sym = syms[s];
 
                     const unsigned char type = ElfStType(sym.st_info);
-                    if (type != STT_FUNC)
+                    if (type != STT_FUNC && type != STT_GNU_IFUNC)
                     {
                         continue;
                     }
@@ -3625,7 +3769,7 @@ namespace
                     const Elf32_Sym& sym = syms[s];
 
                     const unsigned char type = ElfStType(sym.st_info);
-                    if (type != STT_FUNC)
+                    if (type != STT_FUNC && type != STT_GNU_IFUNC)
                     {
                         continue;
                     }
@@ -3690,7 +3834,6 @@ namespace
         }
 
         outList->assign(uniqueSet.begin(), uniqueSet.end());
-        std::sort(outList->begin(), outList->end());
     }
 }
 
@@ -3713,11 +3856,7 @@ std::vector<std::string> GB_GetExportedFunctionSignatures(const std::string& fil
         ParseElfDynSymbols(bytes, true, onlyFunctionNames, &result);
     }
 
-    std::sort(result.begin(), result.end(),
-        [](const std::string& left, const std::string& right)
-        {
-            return ToLowerAscii(left) < ToLowerAscii(right);
-        });
+    std::sort(result.begin(), result.end(), LessIgnoreCaseAscii);
 
     return result;
 }
@@ -3741,11 +3880,7 @@ std::vector<std::string> GB_GetImportedFunctionSignatures(const std::string& fil
         ParseElfDynSymbols(bytes, false, onlyFunctionNames, &result);
     }
 
-    std::sort(result.begin(), result.end(),
-        [](const std::string& left, const std::string& right)
-        {
-            return ToLowerAscii(left) < ToLowerAscii(right);
-        });
+    std::sort(result.begin(), result.end(), LessIgnoreCaseAscii);
 
     return result;
 }
