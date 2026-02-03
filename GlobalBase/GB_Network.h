@@ -1,5 +1,5 @@
-﻿#ifndef GLOBALBASE_NETWORK_H_H
-#define GLOBALBASE_NETWORK_H_H
+﻿#ifndef GLOBALBASE_NETWORK_H
+#define GLOBALBASE_NETWORK_H
 
 #include "GlobalBasePort.h"
 #include <string>
@@ -7,11 +7,6 @@
 
 /**
  * @brief 判断当前机器是否能连接到 Internet。
- *
- * 默认探测端点（可在 cpp 内按实际环境调整）：
- * - 1.1.1.1:443（不依赖 DNS，通常较快）
- * - www.baidu.com:443
- * - www.qq.com:443
  *
  * @remarks
  * - 返回 true 仅表示“至少能连通某个外部端点”，不保证所有网站均可访问（例如被代理/防火墙限制）。

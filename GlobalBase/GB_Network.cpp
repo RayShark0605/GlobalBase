@@ -34,8 +34,6 @@
 
 #include <curl/curl.h>
 
-
-
 namespace
 {
 #ifdef _WIN32
@@ -376,7 +374,7 @@ namespace
         static std::once_flag initFlag;
         static bool initOk = false;
 
-        std::call_once(initFlag, [](){
+        std::call_once(initFlag, []() {
             initOk = (::curl_global_init(CURL_GLOBAL_DEFAULT) == CURLE_OK);
         });
 
@@ -490,7 +488,33 @@ namespace
                 noProxyUtf8[i] = ',';
             }
         }
-        return TrimCopy(noProxyUtf8);
+
+        // libcurl 的 CURLOPT_NOPROXY 使用逗号分隔列表。
+        // 这里做一次“逐项 Trim + 去空项”，避免包含空白/空项导致匹配异常。
+        std::string result;
+        size_t begin = 0;
+        while (begin < noProxyUtf8.size())
+        {
+            size_t end = noProxyUtf8.find(',', begin);
+            if (end == std::string::npos)
+            {
+                end = noProxyUtf8.size();
+            }
+
+            const std::string token = TrimCopy(noProxyUtf8.substr(begin, end - begin));
+            if (!token.empty())
+            {
+                if (!result.empty())
+                {
+                    result += ",";
+                }
+                result += token;
+            }
+
+            begin = end + 1;
+        }
+
+        return result;
     }
 #ifdef _WIN32
 
@@ -818,7 +842,7 @@ namespace
                         {
                             bypass += ",";
                         }
-                        bypass += "localhost,127.0.0.1";
+                        bypass += "localhost,127.0.0.1,::1";
                     }
 
                     bypass = NormalizeNoProxyList(bypass);
@@ -828,7 +852,7 @@ namespace
                     }
                     else
                     {
-                        // 清空 NOPROXY，避免环境变量 no_proxy 干扰
+                        // 设为空串以覆盖环境变量 no_proxy（显式让所有主机都走代理）
                         ::curl_easy_setopt(curlHandle, CURLOPT_NOPROXY, "");
                     }
                 }
@@ -935,7 +959,7 @@ namespace
         }
         else
         {
-            // 清空 NOPROXY，避免环境变量 no_proxy 干扰
+            // 设为空串以覆盖环境变量 no_proxy（显式让所有主机都走代理）
             ::curl_easy_setopt(curlHandle, CURLOPT_NOPROXY, "");
         }
     }
@@ -1066,6 +1090,10 @@ GB_NetworkResponse GB_RequestUrlData(const std::string& urlUtf8, const GB_Networ
 #endif
     ::curl_easy_setopt(curlHandle, CURLOPT_NOSIGNAL, 1L);
     ::curl_easy_setopt(curlHandle, CURLOPT_FOLLOWLOCATION, options.followRedirects ? 1L : 0L);
+    if (options.followRedirects)
+    {
+        ::curl_easy_setopt(curlHandle, CURLOPT_AUTOREFERER, 1L);
+    }
     const long maxRedirects = (options.maxRedirects > 0) ? static_cast<long>(options.maxRedirects) : 0L;
     ::curl_easy_setopt(curlHandle, CURLOPT_MAXREDIRS, maxRedirects);
     ::curl_easy_setopt(curlHandle, CURLOPT_CONNECTTIMEOUT_MS, static_cast<long>(options.connectTimeoutMs));
