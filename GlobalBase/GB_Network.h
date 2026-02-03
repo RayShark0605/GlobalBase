@@ -2,6 +2,7 @@
 #define GLOBALBASE_NETWORK_H
 
 #include "GlobalBasePort.h"
+#include "GB_BaseTypes.h"
 #include <string>
 #include <vector>
 
@@ -74,7 +75,7 @@ struct GB_NetworkRequestOptions
     int maxRedirects = 10;                            // 最大重定向次数（followRedirects=true 时有效）
 
     unsigned int connectTimeoutMs = 10000;            // 连接超时（毫秒）
-    unsigned int totalTimeoutMs = 30000;              // 总超时（毫秒，包含连接 + 传输）
+	unsigned int totalTimeoutMs = 30000;              // 总超时（毫秒，包含连接 + 传输），如果是下载大文件建议设置成 0
 
     bool enableHttp2 = true;                          // 是否允许 libcurl 通过 ALPN 等方式协商 HTTP/2（若当前构建支持）
 
@@ -119,5 +120,60 @@ struct GB_NetworkResponse
  * @return GB_NetworkResponse 请求结果。
  */
 GLOBALBASE_PORT GB_NetworkResponse GB_RequestUrlData(const std::string& urlUtf8, const GB_NetworkRequestOptions& options = GB_NetworkRequestOptions());
+
+/**
+ * @brief URL 文件下载结果。
+ *
+ * @remarks
+ * - data 为文件的原始字节流。
+ * - fileNameUtf8 会尽量从响应头 Content-Disposition 中解析（filename / filename*），否则会从最终 URL 推断。
+ * - totalSizeKnown=false 表示服务端未提供可用的总大小信息（例如 Transfer-Encoding: chunked、缺少 Content-Length 等）。
+ */
+struct GB_NetworkDownloadedFile
+{
+    bool ok = false;
+    long httpStatusCode = 0;
+    std::string effectiveUrlUtf8 = "";
+    std::string contentTypeUtf8 = "";
+    std::string fileNameUtf8 = "";
+
+    bool totalSizeKnown = false;
+    size_t totalBytes = 0;
+
+    GB_ByteBuffer data;
+
+    std::vector<std::string> responseHeadersUtf8;
+
+    std::string errorMessageUtf8 = "";
+    int curlErrorCode = 0;
+};
+
+/**
+ * @brief 根据 URL 下载文件并返回文件字节流。
+ *
+ * @remarks
+ * - 为降低误用风险，内部会限制协议为 http/https，并限制重定向协议为 http/https。
+ * - 如果 totalSizeAtomicPtr 和 downloadedSizeAtomicPtr 同时非空，则会按“字节数”持续更新进度：
+ *   - *totalSizeAtomicPtr：总大小（未知时为 0）
+ *   - *downloadedSizeAtomicPtr：已下载大小
+ * - 当文件较大且服务端支持 Range（Accept-Ranges: bytes 或可用的 Content-Range/Content-Length）时，会尝试并行分段下载以提升速度；
+ *   否则自动回退到单线程下载。
+ *
+ * @param urlUtf8 目标 URL（UTF-8）。
+ * @param options 请求选项。
+ * @param totalSizeAtomicPtr 可选进度输出指针（实际类型为 std::atomic_size_t*）。
+ * @param downloadedSizeAtomicPtr 可选进度输出指针（实际类型为 std::atomic_size_t*）。
+ * @return 下载结果。
+ */
+GLOBALBASE_PORT GB_NetworkDownloadedFile GB_DownloadFile(const std::string& urlUtf8, const GB_NetworkRequestOptions& options = GB_NetworkRequestOptions(), void* totalSizeAtomicPtr = nullptr, void* downloadedSizeAtomicPtr = nullptr);
+
+
+
+
+
+
+
+
+
 
 #endif
