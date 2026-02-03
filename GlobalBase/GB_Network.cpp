@@ -414,7 +414,17 @@ namespace
         }
 
         std::string* buffer = static_cast<std::string*>(userData);
-        buffer->append(ptr, totalSize);
+
+        try
+        {
+            buffer->append(ptr, totalSize);
+        }
+        catch (...)
+        {
+            // 回调异常不能跨越 C 边界，返回 0 让 libcurl 以 CURLE_WRITE_ERROR 终止
+            return 0;
+        }
+
         return totalSize;
     }
 
@@ -432,7 +442,16 @@ namespace
         }
 
         std::vector<std::string>* headers = static_cast<std::vector<std::string>*>(userData);
-        headers->emplace_back(buffer, totalSize);
+
+        try
+        {
+            headers->emplace_back(buffer, totalSize);
+        }
+        catch (...)
+        {
+            return 0;
+        }
+
         return totalSize;
     }
 
@@ -1255,7 +1274,11 @@ namespace
 
     static size_t DownloadHeaderCallback(char* buffer, size_t size, size_t nitems, void* userData)
     {
-        const size_t totalSize = size * nitems;
+        size_t totalSize = 0;
+        if (!TryComputeTotalSize(size, nitems, totalSize))
+        {
+            return 0;
+        }
         if (userData == nullptr || buffer == nullptr || totalSize == 0)
         {
             return totalSize;
@@ -1267,81 +1290,88 @@ namespace
             return totalSize;
         }
 
-        std::string headerLine(buffer, totalSize);
-        headerLine = TrimCopy(headerLine);
-
-        // libcurl 在跟随重定向/多次响应时，会多次回调 header（每段响应都会以 HTTP/... 状态行开头）。
-        // 为避免把中间 3xx 的 body/headers 混入最终结果，这里在检测到新的状态行时重置相关缓存。
-        if (!headerLine.empty())
+        try
         {
-            const std::string headerLower = ToLowerCopy(headerLine);
-            if (headerLower.find("http/") == 0)
-            {
-                if (state->hasSeenStatusLine)
-                {
-                    // 进入新的响应段（例如重定向后的最终 200）。
-                    state->result->data.clear();
-                    state->result->contentTypeUtf8.clear();
-                    state->result->fileNameUtf8.clear();
-                    state->result->totalSizeKnown = false;
-                    state->result->totalBytes = 0;
-                    state->hasReserved = false;
+            std::string headerLine(buffer, totalSize);
+            headerLine = TrimCopy(headerLine);
 
-                    if (state->includeResponseHeaders)
+            // libcurl 在跟随重定向/多次响应时，会多次回调 header（每段响应都会以 HTTP/... 状态行开头）。
+            // 为避免把中间 3xx 的 body/headers 混入最终结果，这里在检测到新的状态行时重置相关缓存。
+            if (!headerLine.empty())
+            {
+                const std::string headerLower = ToLowerCopy(headerLine);
+                if (headerLower.find("http/") == 0)
+                {
+                    if (state->hasSeenStatusLine)
                     {
-                        state->result->responseHeadersUtf8.clear();
+                        // 进入新的响应段（例如重定向后的最终 200）。
+                        state->result->data.clear();
+                        state->result->contentTypeUtf8.clear();
+                        state->result->fileNameUtf8.clear();
+                        state->result->totalSizeKnown = false;
+                        state->result->totalBytes = 0;
+                        state->hasReserved = false;
+
+                        if (state->includeResponseHeaders)
+                        {
+                            state->result->responseHeadersUtf8.clear();
+                        }
+                    }
+
+                    state->hasSeenStatusLine = true;
+                }
+
+                if (state->includeResponseHeaders)
+                {
+                    state->result->responseHeadersUtf8.push_back(headerLine);
+                }
+            }
+
+            const std::string lower = ToLowerCopy(headerLine);
+            if (lower.find("content-type:") == 0)
+            {
+                state->result->contentTypeUtf8 = TrimCopy(headerLine.substr(std::string("content-type:").size()));
+            }
+            else if (lower.find("content-length:") == 0)
+            {
+                const std::string valueText = TrimCopy(headerLine.substr(std::string("content-length:").size()));
+                unsigned long long v = 0;
+                if (TryParseUnsignedLongLong(valueText, v))
+                {
+                    state->result->totalSizeKnown = true;
+                    state->result->totalBytes = static_cast<size_t>(v);
+
+                    if (state->progress.enabled)
+                    {
+                        state->progress.totalBytesPtr->store(state->result->totalBytes, std::memory_order_relaxed);
+                    }
+
+                    if (!state->hasReserved && state->result->totalBytes > 0)
+                    {
+                        // 只 reserve，不 resize，避免先填充 0
+                        state->result->data.reserve(state->result->totalBytes);
+                        state->hasReserved = true;
                     }
                 }
-
-                state->hasSeenStatusLine = true;
             }
-
-            if (state->includeResponseHeaders)
+            else if (lower.find("content-disposition:") == 0)
             {
-                state->result->responseHeadersUtf8.push_back(headerLine);
-            }
-        }
-
-        const std::string lower = ToLowerCopy(headerLine);
-        if (lower.find("content-type:") == 0)
-        {
-            state->result->contentTypeUtf8 = TrimCopy(headerLine.substr(std::string("content-type:").size()));
-        }
-        else if (lower.find("content-length:") == 0)
-        {
-            const std::string valueText = TrimCopy(headerLine.substr(std::string("content-length:").size()));
-            unsigned long long v = 0;
-            if (TryParseUnsignedLongLong(valueText, v))
-            {
-                state->result->totalSizeKnown = true;
-                state->result->totalBytes = static_cast<size_t>(v);
-
-                if (state->progress.enabled)
+                const std::string valueText = TrimCopy(headerLine.substr(std::string("content-disposition:").size()));
+                std::string fileNameUtf8;
+                if (ParseContentDispositionFileNameUtf8(valueText, fileNameUtf8))
                 {
-                    state->progress.totalBytesPtr->store(state->result->totalBytes, std::memory_order_relaxed);
-                }
-
-                if (!state->hasReserved && state->result->totalBytes > 0)
-                {
-                    // 只 reserve，不 resize，避免先填充 0
-                    state->result->data.reserve(state->result->totalBytes);
-                    state->hasReserved = true;
+                    state->result->fileNameUtf8 = fileNameUtf8;
                 }
             }
-        }
-        else if (lower.find("content-disposition:") == 0)
-        {
-            const std::string valueText = TrimCopy(headerLine.substr(std::string("content-disposition:").size()));
-            std::string fileNameUtf8;
-            if (ParseContentDispositionFileNameUtf8(valueText, fileNameUtf8))
-            {
-                state->result->fileNameUtf8 = fileNameUtf8;
-            }
-        }
 
-        return totalSize;
+            return totalSize;
+        }
+        catch (...)
+        {
+            // 回调异常不能跨越 C 边界
+            return 0;
+        }
     }
-
     struct GbWriteState
     {
         GB_ByteBuffer* data = nullptr;
@@ -1350,7 +1380,11 @@ namespace
 
     static size_t DownloadWriteCallback(void* ptr, size_t size, size_t nmemb, void* userData)
     {
-        const size_t totalSize = size * nmemb;
+        size_t totalSize = 0;
+        if (!TryComputeTotalSize(size, nmemb, totalSize))
+        {
+            return 0;
+        }
         if (userData == nullptr || ptr == nullptr || totalSize == 0)
         {
             return 0;
@@ -1362,19 +1396,19 @@ namespace
             return 0;
         }
 
-        const unsigned char* bytes = static_cast<const unsigned char*>(ptr);
-        const size_t oldSize = state->data->size();
-        state->data->resize(oldSize + totalSize);
-        std::memcpy(state->data->data() + oldSize, bytes, totalSize);
-
-        if (state->progress.enabled)
+        try
         {
-            state->progress.downloadedBytesPtr->fetch_add(totalSize, std::memory_order_relaxed);
+            const unsigned char* bytes = static_cast<const unsigned char*>(ptr);
+            const size_t oldSize = state->data->size();
+            state->data->resize(oldSize + totalSize);
+            std::memcpy(state->data->data() + oldSize, bytes, totalSize);
+            return totalSize;
         }
-
-        return totalSize;
+        catch (...)
+        {
+            return 0;
+        }
     }
-
     static int DownloadXferInfoCallback(void* clientp, curl_off_t dltotal, curl_off_t dlnow, curl_off_t ultotal, curl_off_t ulnow)
     {
         (void)ultotal;
@@ -1552,7 +1586,11 @@ namespace
 
     static size_t ProbeHeaderCallback(char* buffer, size_t size, size_t nitems, void* userData)
     {
-        const size_t totalSize = size * nitems;
+        size_t totalSize = 0;
+        if (!TryComputeTotalSize(size, nitems, totalSize))
+        {
+            return 0;
+        }
         if (userData == nullptr || buffer == nullptr || totalSize == 0)
         {
             return totalSize;
@@ -1564,62 +1602,74 @@ namespace
             return totalSize;
         }
 
-        std::string headerLine(buffer, totalSize);
-        headerLine = TrimCopy(headerLine);
-
-        const std::string lower = ToLowerCopy(headerLine);
-
-        if (lower.find("accept-ranges:") == 0)
+        try
         {
-            const std::string valueText = TrimCopy(headerLine.substr(std::string("accept-ranges:").size()));
-            if (ToLowerCopy(valueText).find("bytes") != std::string::npos)
+            std::string headerLine(buffer, totalSize);
+            headerLine = TrimCopy(headerLine);
+
+            const std::string lower = ToLowerCopy(headerLine);
+
+            if (lower.find("accept-ranges:") == 0)
             {
-                state->info->acceptRangesBytes = true;
+                const std::string valueText = TrimCopy(headerLine.substr(std::string("accept-ranges:").size()));
+                if (ToLowerCopy(valueText).find("bytes") != std::string::npos)
+                {
+                    state->info->acceptRangesBytes = true;
+                }
             }
-        }
-        else if (lower.find("content-range:") == 0)
-        {
-            // bytes start-end/total
-            const std::string valueText = TrimCopy(headerLine.substr(std::string("content-range:").size()));
-            const size_t slashPos = valueText.find('/');
-            if (slashPos != std::string::npos && slashPos + 1 < valueText.size())
+            else if (lower.find("content-range:") == 0)
             {
-                const std::string totalText = TrimCopy(valueText.substr(slashPos + 1));
+                // bytes start-end/total
+                const std::string valueText = TrimCopy(headerLine.substr(std::string("content-range:").size()));
+                const std::string valueLower = ToLowerCopy(valueText);
+                if (valueLower.find("bytes") == 0)
+                {
+                    state->info->acceptRangesBytes = true;
+                }
+
+                const size_t slashPos = valueText.find('/');
+                if (slashPos != std::string::npos && slashPos + 1 < valueText.size())
+                {
+                    const std::string totalText = TrimCopy(valueText.substr(slashPos + 1));
+                    unsigned long long v = 0;
+                    if (totalText != "*" && TryParseUnsignedLongLong(totalText, v))
+                    {
+                        state->info->totalSizeKnown = true;
+                        state->info->totalBytes = static_cast<size_t>(v);
+                    }
+                }
+            }
+            else if (lower.find("content-length:") == 0)
+            {
+                const std::string valueText = TrimCopy(headerLine.substr(std::string("content-length:").size()));
                 unsigned long long v = 0;
-                if (totalText != "*" && TryParseUnsignedLongLong(totalText, v))
+                if (TryParseUnsignedLongLong(valueText, v))
                 {
                     state->info->totalSizeKnown = true;
                     state->info->totalBytes = static_cast<size_t>(v);
                 }
             }
-        }
-        else if (lower.find("content-length:") == 0)
-        {
-            const std::string valueText = TrimCopy(headerLine.substr(std::string("content-length:").size()));
-            unsigned long long v = 0;
-            if (TryParseUnsignedLongLong(valueText, v))
+            else if (lower.find("content-type:") == 0)
             {
-                state->info->totalSizeKnown = true;
-                state->info->totalBytes = static_cast<size_t>(v);
+                state->info->contentTypeUtf8 = TrimCopy(headerLine.substr(std::string("content-type:").size()));
             }
-        }
-        else if (lower.find("content-type:") == 0)
-        {
-            state->info->contentTypeUtf8 = TrimCopy(headerLine.substr(std::string("content-type:").size()));
-        }
-        else if (lower.find("content-disposition:") == 0)
-        {
-            const std::string valueText = TrimCopy(headerLine.substr(std::string("content-disposition:").size()));
-            std::string fileNameUtf8;
-            if (ParseContentDispositionFileNameUtf8(valueText, fileNameUtf8))
+            else if (lower.find("content-disposition:") == 0)
             {
-                state->info->fileNameUtf8 = fileNameUtf8;
+                const std::string valueText = TrimCopy(headerLine.substr(std::string("content-disposition:").size()));
+                std::string fileNameUtf8;
+                if (ParseContentDispositionFileNameUtf8(valueText, fileNameUtf8))
+                {
+                    state->info->fileNameUtf8 = fileNameUtf8;
+                }
             }
-        }
 
-        return totalSize;
+            return totalSize;
+        }
+        catch (...)
+        {
+            return 0;
+        }
     }
-
     struct GbProbeWriteState
     {
         size_t receivedBytes = 0;
@@ -1630,7 +1680,11 @@ namespace
     {
         (void)ptr;
 
-        const size_t totalSize = size * nmemb;
+        size_t totalSize = 0;
+        if (!TryComputeTotalSize(size, nmemb, totalSize))
+        {
+            return 0;
+        }
         if (userData == nullptr)
         {
             return totalSize;
@@ -1652,7 +1706,6 @@ namespace
 
         return totalSize;
     }
-
     static GbProbeInfo ProbeUrlForRangeAndSize(const std::string& urlUtf8, const GB_NetworkRequestOptions& options)
     {
         EnsureCurlGlobalInit();
@@ -1682,7 +1735,8 @@ namespace
 
                 long httpCode = 0;
                 curl_easy_getinfo(curlHandle, CURLINFO_RESPONSE_CODE, &httpCode);
-                info.ok = (res == CURLE_OK);
+                const bool headOk = (res == CURLE_OK) && (httpCode == 0 || (httpCode >= 200 && httpCode < 400));
+                info.ok = headOk;
 
                 char* effectiveUrl = nullptr;
                 curl_easy_getinfo(curlHandle, CURLINFO_EFFECTIVE_URL, &effectiveUrl);
@@ -1697,8 +1751,9 @@ namespace
                 }
                 curl_easy_cleanup(curlHandle);
 
-                // HEAD 成功且已经有 size + ranges 信息就直接返回
-                if (info.ok && info.totalSizeKnown)
+                // 仅当 HEAD 已确认“可用的总大小 + Accept-Ranges: bytes”时，才提前返回。
+                // 否则继续做 Range=0-0 探测以确认 Range 支持。
+                if (info.ok && info.totalSizeKnown && info.acceptRangesBytes)
                 {
                     return info;
                 }
@@ -1740,9 +1795,9 @@ namespace
             long httpCode = 0;
             curl_easy_getinfo(curlHandle, CURLINFO_RESPONSE_CODE, &httpCode);
 
-            // res 可能因为我们主动中止而不是 OK；但 headers 可能已经足够了
-            (void)res;
-            info.ok = true;
+            // res 可能因为我们主动中止（返回 0）而变成 CURLE_WRITE_ERROR；但 headers 可能已足够。
+            const bool rangeOk = (res == CURLE_OK || res == CURLE_WRITE_ERROR) && (httpCode == 0 || (httpCode >= 200 && httpCode < 400));
+            info.ok = rangeOk;
 
             char* effectiveUrl = nullptr;
             curl_easy_getinfo(curlHandle, CURLINFO_EFFECTIVE_URL, &effectiveUrl);
@@ -1786,7 +1841,11 @@ namespace
 
     static size_t RangeWriteCallback(void* ptr, size_t size, size_t nmemb, void* userData)
     {
-        const size_t totalSize = size * nmemb;
+        size_t totalSize = 0;
+        if (!TryComputeTotalSize(size, nmemb, totalSize))
+        {
+            return 0;
+        }
         if (userData == nullptr || ptr == nullptr || totalSize == 0)
         {
             return 0;
@@ -1814,7 +1873,6 @@ namespace
 
         return totalSize;
     }
-
     struct GbRangeThreadResult
     {
         CURLcode curlCode = CURLE_OK;
@@ -2121,9 +2179,9 @@ bool GB_CanConnectToInternet(unsigned int timeoutMs)
     // 端点顺序：先不依赖 DNS 的 IP，再尝试常见域名
     constexpr static ProbeEndpoint endpoints[] =
     {
+        { "1.1.1.1", 443 },
         { "www.baidu.com", 443 },
-        { "www.qq.com", 443 },
-        { "1.1.1.1", 443 }
+        { "www.qq.com", 443 }
     };
 
     const auto startTime = std::chrono::steady_clock::now();

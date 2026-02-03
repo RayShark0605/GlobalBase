@@ -75,7 +75,7 @@ struct GB_NetworkRequestOptions
     int maxRedirects = 10;                            // 最大重定向次数（followRedirects=true 时有效）
 
     unsigned int connectTimeoutMs = 10000;            // 连接超时（毫秒）
-	unsigned int totalTimeoutMs = 30000;              // 总超时（毫秒，包含连接 + 传输），如果是下载大文件建议设置成 0
+    unsigned int totalTimeoutMs = 0;                  // 总超时（毫秒，包含连接 + 传输），如果是下载大文件建议设置成 0
 
     bool enableHttp2 = true;                          // 是否允许 libcurl 通过 ALPN 等方式协商 HTTP/2（若当前构建支持）
 
@@ -166,10 +166,6 @@ struct GB_NetworkDownloadedFile
  * @return 下载结果。
  */
 GLOBALBASE_PORT GB_NetworkDownloadedFile GB_DownloadFile(const std::string& urlUtf8, const GB_NetworkRequestOptions& options = GB_NetworkRequestOptions(), void* totalSizeAtomicPtr = nullptr, void* downloadedSizeAtomicPtr = nullptr);
-
-
-
-
 
 
 
