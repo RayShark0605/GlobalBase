@@ -149,6 +149,47 @@ struct GB_NetworkDownloadedFile
 };
 
 /**
+ * @brief 尝试从下载链接推断即将下载的文件名（包含扩展名）。
+ *
+ * @remarks
+ * - 优先从响应头 Content-Disposition 中解析（filename / filename*），否则从最终生效 URL 推断。
+ * - 如果无法获得“看起来像文件名”的结果（例如 URL 末尾无文件段且响应头也不提供），返回 false。
+ * - outFileNameUtf8 仅为文件名，不包含路径分隔符。
+ *
+ * @param urlUtf8 目标 URL（UTF-8）。
+ * @param outFileNameUtf8 输出文件名（UTF-8）。
+ * @param options 请求选项（影响代理、重定向、UA 等）。
+ * @return 成功返回 true，否则返回 false。
+ */
+GLOBALBASE_PORT bool GB_TryGetDownloadFileName(const std::string& urlUtf8, std::string& outFileNameUtf8, const GB_NetworkRequestOptions& options = GB_NetworkRequestOptions());
+
+/**
+ * @brief URL 文件下载到指定文件路径的结果。
+ *
+ * @remarks
+ * - 与 GB_NetworkDownloadedFile 不同，本结构体不包含内存中的 data，而是直接写入 filePathUtf8。
+ * - remoteFileNameUtf8 会尽量从响应头 Content-Disposition 中解析（filename / filename*），否则会从最终 URL 推断。
+ */
+struct GB_NetworkDownloadedFileToPath
+{
+    bool ok = false;
+    long httpStatusCode = 0;
+    std::string effectiveUrlUtf8 = "";
+    std::string contentTypeUtf8 = "";
+    std::string remoteFileNameUtf8 = "";
+
+    std::string filePathUtf8 = "";
+
+    bool totalSizeKnown = false;
+    size_t totalBytes = 0;
+
+    std::vector<std::string> responseHeadersUtf8;
+
+    std::string errorMessageUtf8 = "";
+    int curlErrorCode = 0;
+};
+
+/**
  * @brief 文件下载策略。
  *
  * @remarks
@@ -181,5 +222,24 @@ enum class GB_DownloadFileStrategy
  * @return 下载结果。
  */
 GLOBALBASE_PORT GB_NetworkDownloadedFile GB_DownloadFile(const std::string& urlUtf8, const GB_NetworkRequestOptions& options = GB_NetworkRequestOptions(), GB_DownloadFileStrategy strategy = GB_DownloadFileStrategy::MultiCurl, void* totalSizeAtomicPtr = nullptr, void* downloadedSizeAtomicPtr = nullptr);
+
+/**
+ * @brief 根据 URL 下载文件并直接写入到指定路径（避免大文件占用过多内存）。
+ *
+ * @remarks
+ * - filePathUtf8 若已存在文件则会覆盖。
+ * - 若 filePathUtf8 的父目录不存在，会递归创建。
+ * - 当文件较大且服务端支持 Range 时，会尝试并行分段下载（MultiCurl 或 MultiThread），否则回退到单线程下载。
+ * - 当 options.includeResponseHeaders=true 时，为避免并行分段下载造成的响应头聚合歧义，内部会强制使用单线程下载。
+ *
+ * @param urlUtf8 目标 URL（UTF-8）。
+ * @param filePathUtf8 目标文件路径（UTF-8）。
+ * @param options 请求选项。
+ * @param strategy 下载策略。
+ * @param totalSizeAtomicPtr 可选进度输出指针（实际类型为 std::atomic_size_t*）。
+ * @param downloadedSizeAtomicPtr 可选进度输出指针（实际类型为 std::atomic_size_t*）。
+ * @return 下载结果。
+ */
+GLOBALBASE_PORT GB_NetworkDownloadedFileToPath GB_DownloadFileToPath(const std::string& urlUtf8, const std::string& filePathUtf8, const GB_NetworkRequestOptions& options = GB_NetworkRequestOptions(), GB_DownloadFileStrategy strategy = GB_DownloadFileStrategy::MultiCurl, void* totalSizeAtomicPtr = nullptr, void* downloadedSizeAtomicPtr = nullptr);
 
 #endif
