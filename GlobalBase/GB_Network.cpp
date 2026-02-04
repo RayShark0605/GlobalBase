@@ -422,6 +422,46 @@ namespace
         return true;
     }
 
+
+    static bool TryAppendCurlSlist(struct curl_slist*& list, const char* headerValue)
+    {
+        if (headerValue == nullptr)
+        {
+            return true;
+        }
+
+        struct curl_slist* newList = ::curl_slist_append(list, headerValue);
+        if (newList == nullptr)
+        {
+            return false;
+        }
+
+        list = newList;
+        return true;
+    }
+
+    static void SafeCopyErrorMessage(char* errorBuffer, size_t errorBufferSize, const char* message)
+    {
+        if (errorBuffer != nullptr && errorBufferSize > 0)
+        {
+            if (message == nullptr)
+            {
+                errorBuffer[0] = '\0';
+                return;
+            }
+
+            const size_t messageLength = std::strlen(message);
+            const size_t maxCopyLength = errorBufferSize - 1;
+            const size_t copyLength = std::min(maxCopyLength, messageLength);
+
+            if (copyLength > 0)
+            {
+                std::memcpy(errorBuffer, message, copyLength);
+            }
+            errorBuffer[copyLength] = '\0';
+        }
+    }
+
     static size_t CurlWriteCallback(char* ptr, size_t size, size_t nmemb, void* userData)
     {
         if (ptr == nullptr || userData == nullptr)
@@ -1338,6 +1378,12 @@ namespace
                         {
                             state->result->responseHeadersUtf8.clear();
                         }
+
+                        if (state->progress.enabled)
+                        {
+                            state->progress.totalBytesPtr->store(0, std::memory_order_relaxed);
+                            state->progress.downloadedBytesPtr->store(0, std::memory_order_relaxed);
+                        }
                     }
 
                     state->hasSeenStatusLine = true;
@@ -1371,8 +1417,19 @@ namespace
 
                     if (!state->hasReserved && state->result->totalBytes > 0)
                     {
-                        // 只 reserve，不 resize，避免先填充 0
-                        state->result->data.reserve(state->result->totalBytes);
+                        // 只 reserve，不 resize，避免先填充 0。
+                        // 注意：Content-Length 可能不准确；并且一次性 reserve 超大容量可能因内存碎片/策略而失败。
+                        // 因此这里做一个上限，并且 reserve 失败不视为致命错误。
+                        constexpr size_t kReserveCapBytes = 256ULL * 1024ULL * 1024ULL;
+                        const size_t reserveBytes = (state->result->totalBytes < kReserveCapBytes) ? state->result->totalBytes : kReserveCapBytes;
+                        try
+                        {
+                            state->result->data.reserve(reserveBytes);
+                        }
+                        catch (...)
+                        {
+                            // ignore
+                        }
                         state->hasReserved = true;
                     }
                 }
@@ -1430,8 +1487,8 @@ namespace
                 return 0;
             }
 
-            state->data->resize(newSize);
-            std::memcpy(state->data->data() + oldSize, bytes, totalSize);
+            // 使用 insert 直接追加，避免 resize 导致的额外零填充成本。
+            state->data->insert(state->data->end(), bytes, bytes + totalSize);
             return totalSize;
         }
         catch (...)
@@ -1482,6 +1539,53 @@ namespace
         return 0;
     }
 
+#if defined(LIBCURL_VERSION_NUM) && (LIBCURL_VERSION_NUM < 0x072000)
+    // 兼容旧版 libcurl：使用 CURLOPT_PROGRESSFUNCTION（double）回调。
+    static int DownloadProgressCallback(void* clientp, double dltotal, double dlnow, double ultotal, double ulnow)
+    {
+        (void)ultotal;
+        (void)ulnow;
+
+        if (clientp == nullptr)
+        {
+            return 0;
+        }
+
+        GbDownloadProgressPointers* progress = static_cast<GbDownloadProgressPointers*>(clientp);
+        if (!progress->enabled)
+        {
+            return 0;
+        }
+
+        size_t total = 0;
+        size_t now = 0;
+
+        if (dltotal > 0.0)
+        {
+            const unsigned long long totalUll = static_cast<unsigned long long>(dltotal);
+            if (!TryCastUnsignedLongLongToSize(totalUll, total))
+            {
+                total = std::numeric_limits<size_t>::max();
+            }
+        }
+
+        if (dlnow > 0.0)
+        {
+            const unsigned long long nowUll = static_cast<unsigned long long>(dlnow);
+            if (!TryCastUnsignedLongLongToSize(nowUll, now))
+            {
+                now = std::numeric_limits<size_t>::max();
+            }
+        }
+
+        progress->totalBytesPtr->store(total, std::memory_order_relaxed);
+        progress->downloadedBytesPtr->store(now, std::memory_order_relaxed);
+
+        return 0;
+    }
+#endif
+
+
     static bool ConfigureDownloadCurlCommon(
         CURL* curlHandle,
         const std::string& urlUtf8,
@@ -1506,21 +1610,19 @@ namespace
         curl_easy_setopt(curlHandle, CURLOPT_TIMEOUT_MS, static_cast<long>(options.totalTimeoutMs));
         curl_easy_setopt(curlHandle, CURLOPT_CONNECTTIMEOUT_MS, static_cast<long>(options.connectTimeoutMs));
         // 只允许 http/https
-#if defined(CURLOPT_PROTOCOLS_STR)
+#if defined(LIBCURL_VERSION_NUM) && (LIBCURL_VERSION_NUM >= 0x075500)
         curl_easy_setopt(curlHandle, CURLOPT_PROTOCOLS_STR, "http,https");
-#elif defined(CURLOPT_PROTOCOLS)
-        curl_easy_setopt(curlHandle, CURLOPT_PROTOCOLS, static_cast<long>(CURLPROTO_HTTP | CURLPROTO_HTTPS));
-#endif
-#if defined(CURLOPT_REDIR_PROTOCOLS_STR)
         curl_easy_setopt(curlHandle, CURLOPT_REDIR_PROTOCOLS_STR, "http,https");
-#elif defined(CURLOPT_REDIR_PROTOCOLS)
+#else
+        curl_easy_setopt(curlHandle, CURLOPT_PROTOCOLS, static_cast<long>(CURLPROTO_HTTP | CURLPROTO_HTTPS));
         curl_easy_setopt(curlHandle, CURLOPT_REDIR_PROTOCOLS, static_cast<long>(CURLPROTO_HTTP | CURLPROTO_HTTPS));
 #endif
 
         if (options.followRedirects)
         {
             curl_easy_setopt(curlHandle, CURLOPT_FOLLOWLOCATION, 1L);
-            curl_easy_setopt(curlHandle, CURLOPT_MAXREDIRS, static_cast<long>(options.maxRedirects));
+            const long maxRedirects = (options.maxRedirects > 0) ? static_cast<long>(options.maxRedirects) : 0L;
+            curl_easy_setopt(curlHandle, CURLOPT_MAXREDIRS, maxRedirects);
         }
         else
         {
@@ -1528,6 +1630,12 @@ namespace
         }
         // 多线程/超时场景下避免信号（Unix 下尤其重要）
         curl_easy_setopt(curlHandle, CURLOPT_NOSIGNAL, 1L);
+
+#if defined(LIBCURL_VERSION_NUM) && (LIBCURL_VERSION_NUM >= 0x071900)
+        curl_easy_setopt(curlHandle, CURLOPT_TCP_KEEPALIVE, 1L);
+        curl_easy_setopt(curlHandle, CURLOPT_TCP_KEEPIDLE, 60L);
+        curl_easy_setopt(curlHandle, CURLOPT_TCP_KEEPINTVL, 30L);
+#endif
 
         std::string userAgentUtf8 = options.userAgentUtf8;
         if (userAgentUtf8.empty() && options.impersonateBrowser)
@@ -1544,7 +1652,7 @@ namespace
             curl_easy_setopt(curlHandle, CURLOPT_REFERER, options.refererUtf8.c_str());
         }
 
-#ifdef CURL_HTTP_VERSION_2TLS
+#if defined(LIBCURL_VERSION_NUM) && (LIBCURL_VERSION_NUM >= 0x072F00)
         if (options.enableHttp2)
         {
             curl_easy_setopt(curlHandle, CURLOPT_HTTP_VERSION, static_cast<long>(CURL_HTTP_VERSION_2TLS));
@@ -1584,14 +1692,31 @@ namespace
         struct curl_slist* headers = nullptr;
         if (options.impersonateBrowser)
         {
-            headers = curl_slist_append(headers, "Accept: */*");
-            headers = curl_slist_append(headers, "Connection: keep-alive");
+            if (!TryAppendCurlSlist(headers, "Accept: */*"))
+            {
+                SafeCopyErrorMessage(errorBuffer, errorBufferSize, "Out of memory (curl_slist_append failed)");
+                return false;
+            }
         }
 
         for (size_t i = 0; i < options.headersUtf8.size(); i++)
         {
-            headers = curl_slist_append(headers, options.headersUtf8[i].c_str());
+            if (!TryAppendCurlSlist(headers, options.headersUtf8[i].c_str()))
+            {
+                if (headers != nullptr)
+                {
+                    curl_slist_free_all(headers);
+                    headers = nullptr;
+                }
+                if (outHeaders != nullptr)
+                {
+                    *outHeaders = nullptr;
+                }
+                SafeCopyErrorMessage(errorBuffer, errorBufferSize, "Out of memory (curl_slist_append failed)");
+                return false;
+            }
         }
+
         if (outHeaders != nullptr)
         {
             *outHeaders = headers;
@@ -1604,8 +1729,13 @@ namespace
         if (progress.enabled)
         {
             curl_easy_setopt(curlHandle, CURLOPT_NOPROGRESS, 0L);
+#if defined(LIBCURL_VERSION_NUM) && (LIBCURL_VERSION_NUM >= 0x072000)
             curl_easy_setopt(curlHandle, CURLOPT_XFERINFOFUNCTION, DownloadXferInfoCallback);
             curl_easy_setopt(curlHandle, CURLOPT_XFERINFODATA, &progress);
+#else
+            curl_easy_setopt(curlHandle, CURLOPT_PROGRESSFUNCTION, DownloadProgressCallback);
+            curl_easy_setopt(curlHandle, CURLOPT_PROGRESSDATA, &progress);
+#endif
         }
         else
         {
@@ -1769,7 +1899,12 @@ namespace
             return totalSize;
         }
 
-        state->receivedBytes += totalSize;
+        size_t newReceivedBytes = 0;
+        if (!TryAddSize(state->receivedBytes, totalSize, newReceivedBytes))
+        {
+            return 0;
+        }
+        state->receivedBytes = newReceivedBytes;
 
         // 如果服务端忽略 Range 且开始狂发 body，这里尽快中止
         if (state->receivedBytes > state->maxBytes)
@@ -1800,8 +1935,8 @@ namespace
                 char errorBuffer[CURL_ERROR_SIZE] = { 0 };
                 struct curl_slist* headers = nullptr;
 
-                GbDownloadProgressPointers progress;
-                ConfigureDownloadCurlCommon(curlHandle, urlUtf8, probeOptions, progress, errorBuffer, sizeof(errorBuffer), &headers);
+                GbDownloadProgressPointers disabledProgress{};
+                ConfigureDownloadCurlCommon(curlHandle, urlUtf8, probeOptions, disabledProgress, errorBuffer, sizeof(errorBuffer), &headers);
 
                 GbProbeHeaderState headerState;
                 headerState.info = &info;
@@ -1851,8 +1986,8 @@ namespace
             char errorBuffer[CURL_ERROR_SIZE] = { 0 };
             struct curl_slist* headers = nullptr;
 
-            GbDownloadProgressPointers progress;
-            ConfigureDownloadCurlCommon(curlHandle, urlUtf8, probeOptions, progress, errorBuffer, sizeof(errorBuffer), &headers);
+            GbDownloadProgressPointers disabledProgress{};
+            ConfigureDownloadCurlCommon(curlHandle, urlUtf8, probeOptions, disabledProgress, errorBuffer, sizeof(errorBuffer), &headers);
 
             GbProbeHeaderState headerState;
             headerState.info = &info;
@@ -1937,14 +2072,19 @@ namespace
             return 0;
         }
 
-        if (state->writtenBytes + totalSize > state->expectedBytes)
+        size_t newWrittenBytes = 0;
+        if (!TryAddSize(state->writtenBytes, totalSize, newWrittenBytes))
+        {
+            return 0;
+        }
+        if (newWrittenBytes > state->expectedBytes)
         {
             // 服务端忽略 Range 时，可能会超出预期，直接失败让上层回退
             return 0;
         }
 
         std::memcpy(state->bufferBase + state->baseOffset + state->writtenBytes, ptr, totalSize);
-        state->writtenBytes += totalSize;
+        state->writtenBytes = newWrittenBytes;
 
         if (state->progress.enabled)
         {
@@ -1956,6 +2096,7 @@ namespace
     struct GbRangeThreadResult
     {
         CURLcode curlCode = CURLE_OK;
+        long httpStatusCode = 0;
         std::string errorMessageUtf8 = "";
     };
 
@@ -1979,8 +2120,8 @@ namespace
         char errorBuffer[CURL_ERROR_SIZE] = { 0 };
         struct curl_slist* headers = nullptr;
 
-        GbDownloadProgressPointers progress;
-        ConfigureDownloadCurlCommon(curlHandle, urlUtf8, options, progress, errorBuffer, sizeof(errorBuffer), &headers);
+        GbDownloadProgressPointers disabledProgress{};
+        ConfigureDownloadCurlCommon(curlHandle, urlUtf8, options, disabledProgress, errorBuffer, sizeof(errorBuffer), &headers);
 
         const std::string rangeText = std::to_string(static_cast<unsigned long long>(rangeBegin)) + "-" + std::to_string(static_cast<unsigned long long>(rangeEnd));
         curl_easy_setopt(curlHandle, CURLOPT_RANGE, rangeText.c_str());
@@ -1990,6 +2131,10 @@ namespace
         curl_easy_setopt(curlHandle, CURLOPT_HEADERFUNCTION, nullptr);
 
         const CURLcode res = curl_easy_perform(curlHandle);
+
+        long httpCode = 0;
+        curl_easy_getinfo(curlHandle, CURLINFO_RESPONSE_CODE, &httpCode);
+        result.httpStatusCode = httpCode;
 
         if (headers != nullptr)
         {
@@ -2007,6 +2152,11 @@ namespace
         {
             result.curlCode = CURLE_WRITE_ERROR;
             result.errorMessageUtf8 = "Range download size mismatch";
+        }
+        else if (result.httpStatusCode != 0 && result.httpStatusCode != 206)
+        {
+            result.curlCode = CURLE_HTTP_RETURNED_ERROR;
+            result.errorMessageUtf8 = "HTTP status " + std::to_string(static_cast<long long>(result.httpStatusCode));
         }
 
         return result;
@@ -2092,7 +2242,7 @@ namespace
             result.contentTypeUtf8 = contentType;
         }
 
-#if defined(CURLINFO_CONTENT_LENGTH_DOWNLOAD_T)
+#if defined(LIBCURL_VERSION_NUM) && (LIBCURL_VERSION_NUM >= 0x073700)
         if (!result.totalSizeKnown)
         {
             curl_off_t contentLength = -1;
@@ -2101,6 +2251,26 @@ namespace
             {
                 size_t totalBytes = 0;
                 if (TryCastUnsignedLongLongToSize(static_cast<unsigned long long>(contentLength), totalBytes))
+                {
+                    result.totalSizeKnown = true;
+                    result.totalBytes = totalBytes;
+                    if (progress.enabled)
+                    {
+                        progress.totalBytesPtr->store(totalBytes, std::memory_order_relaxed);
+                    }
+                }
+            }
+        }
+#else
+        if (!result.totalSizeKnown)
+        {
+            double contentLength = -1.0;
+            const CURLcode lenRes = curl_easy_getinfo(curlHandle, CURLINFO_CONTENT_LENGTH_DOWNLOAD, &contentLength);
+            if (lenRes == CURLE_OK && contentLength > 0.0)
+            {
+                const unsigned long long contentLengthUll = static_cast<unsigned long long>(contentLength + 0.5);
+                size_t totalBytes = 0;
+                if (TryCastUnsignedLongLongToSize(contentLengthUll, totalBytes))
                 {
                     result.totalSizeKnown = true;
                     result.totalBytes = totalBytes;
@@ -2147,6 +2317,470 @@ namespace
         return result;
     }
 
+    struct GbMultiCurlChunkContext
+    {
+        CURL* easyHandle = nullptr;
+        struct curl_slist* headers = nullptr;
+
+        std::string rangeText = "";
+
+        char errorBuffer[CURL_ERROR_SIZE] = { 0 };
+        GbRangeChunkState* chunkState = nullptr;
+
+        CURLcode curlCode = CURLE_OK;
+        long httpStatusCode = 0;
+        bool completed = false;
+
+        std::string errorMessageUtf8 = "";
+    };
+
+
+    struct GbChunkRange
+    {
+        size_t begin = 0;
+        size_t end = 0;
+    };
+
+    enum class GbParallelPrepareResult
+    {
+        Ok,
+        FallbackToSingleThread,
+        FatalError
+    };
+
+    static void ResetDownloadProgress(GbDownloadProgressPointers progress)
+    {
+        if (progress.enabled)
+        {
+            progress.totalBytesPtr->store(0, std::memory_order_relaxed);
+            progress.downloadedBytesPtr->store(0, std::memory_order_relaxed);
+        }
+    }
+
+    static size_t ComputeParallelPartCount(size_t totalBytes)
+    {
+        unsigned int hw = std::thread::hardware_concurrency();
+        if (hw == 0)
+        {
+            hw = 4;
+        }
+
+        size_t partCount = static_cast<size_t>(hw);
+        if (partCount > 8)
+        {
+            partCount = 8;
+        }
+        if (partCount < 2)
+        {
+            partCount = 2;
+        }
+
+        const size_t kMinChunkSize = 4ULL * 1024ULL * 1024ULL;
+        if (partCount > 0 && totalBytes / partCount < kMinChunkSize)
+        {
+            partCount = std::max<size_t>(2, totalBytes / kMinChunkSize);
+        }
+
+        return partCount;
+    }
+
+    static bool BuildChunkRanges(size_t totalBytes, size_t partCount, std::vector<GbChunkRange>& outRanges)
+    {
+        outRanges.clear();
+        if (totalBytes == 0 || partCount < 2)
+        {
+            return false;
+        }
+
+        const size_t chunkSize = totalBytes / partCount;
+        if (chunkSize == 0)
+        {
+            return false;
+        }
+
+        outRanges.reserve(partCount);
+
+        size_t begin = 0;
+        for (size_t i = 0; i < partCount; i++)
+        {
+            size_t end = 0;
+            if (i + 1 == partCount)
+            {
+                end = totalBytes - 1;
+            }
+            else
+            {
+                end = begin + chunkSize - 1;
+            }
+
+            GbChunkRange range;
+            range.begin = begin;
+            range.end = end;
+            outRanges.push_back(range);
+
+            begin = end + 1;
+        }
+
+        return true;
+    }
+
+    static GbParallelPrepareResult PrepareParallelDownloadPlan(
+        const std::string& urlUtf8,
+        const GbProbeInfo& probe,
+        GbDownloadProgressPointers progress,
+        GB_NetworkDownloadedFile& outResult,
+        std::string& outFinalUrl,
+        std::vector<GbChunkRange>& outRanges,
+        std::vector<GbRangeChunkState>& outChunkStates)
+    {
+        outResult = GB_NetworkDownloadedFile();
+        outFinalUrl.clear();
+        outRanges.clear();
+        outChunkStates.clear();
+
+        if (!probe.totalSizeKnown || probe.totalBytes == 0)
+        {
+            return GbParallelPrepareResult::FallbackToSingleThread;
+        }
+
+        const size_t totalBytes = probe.totalBytes;
+        const size_t partCount = ComputeParallelPartCount(totalBytes);
+        if (partCount < 2)
+        {
+            return GbParallelPrepareResult::FallbackToSingleThread;
+        }
+
+        if (!BuildChunkRanges(totalBytes, partCount, outRanges))
+        {
+            return GbParallelPrepareResult::FallbackToSingleThread;
+        }
+
+        if (progress.enabled)
+        {
+            progress.totalBytesPtr->store(totalBytes, std::memory_order_relaxed);
+            progress.downloadedBytesPtr->store(0, std::memory_order_relaxed);
+        }
+
+        outResult.totalSizeKnown = true;
+        outResult.totalBytes = totalBytes;
+        outResult.fileNameUtf8 = !probe.fileNameUtf8.empty() ? probe.fileNameUtf8 : ExtractFileNameFromUrlUtf8(!probe.effectiveUrlUtf8.empty() ? probe.effectiveUrlUtf8 : urlUtf8);
+        outResult.contentTypeUtf8 = probe.contentTypeUtf8;
+
+        try
+        {
+            outResult.data.resize(totalBytes);
+        }
+        catch (...)
+        {
+            outResult.ok = false;
+            outResult.curlErrorCode = static_cast<int>(CURLE_OUT_OF_MEMORY);
+            outResult.errorMessageUtf8 = "Not enough memory to allocate download buffer";
+            ResetDownloadProgress(progress);
+            return GbParallelPrepareResult::FatalError;
+        }
+
+        outChunkStates.resize(outRanges.size());
+        for (size_t i = 0; i < outRanges.size(); i++)
+        {
+            const GbChunkRange& range = outRanges[i];
+
+            GbRangeChunkState& state = outChunkStates[i];
+            state.bufferBase = outResult.data.data();
+            state.baseOffset = range.begin;
+            state.expectedBytes = range.end - range.begin + 1;
+            state.writtenBytes = 0;
+            state.progress = progress;
+        }
+
+        outFinalUrl = !probe.effectiveUrlUtf8.empty() ? probe.effectiveUrlUtf8 : urlUtf8;
+        return GbParallelPrepareResult::Ok;
+    }
+
+    static void MarkParallelDownloadSuccess(const std::string& finalUrl, GB_NetworkDownloadedFile& result)
+    {
+        result.ok = true;
+        result.curlErrorCode = static_cast<int>(CURLE_OK);
+        result.httpStatusCode = 206; // 多个 206 合成的“完成态”
+        result.effectiveUrlUtf8 = finalUrl;
+    }
+
+    static GB_NetworkDownloadedFile DownloadFileMultiCurl(
+        const std::string& urlUtf8,
+        const GB_NetworkRequestOptions& options,
+        const GbProbeInfo& probe,
+        GbDownloadProgressPointers progress)
+    {
+        if (!EnsureCurlGlobalInit())
+        {
+            GB_NetworkDownloadedFile result;
+            result.ok = false;
+            result.curlErrorCode = static_cast<int>(CURLE_FAILED_INIT);
+            result.errorMessageUtf8 = "curl_global_init failed";
+            return result;
+        }
+
+        GB_NetworkDownloadedFile result;
+        std::string finalUrl;
+        std::vector<GbChunkRange> chunkRanges;
+        std::vector<GbRangeChunkState> chunkStates;
+
+        const GbParallelPrepareResult prepareRes = PrepareParallelDownloadPlan(urlUtf8, probe, progress, result, finalUrl, chunkRanges, chunkStates);
+        if (prepareRes == GbParallelPrepareResult::FatalError)
+        {
+            return result;
+        }
+        if (prepareRes != GbParallelPrepareResult::Ok)
+        {
+            return DownloadFileSingleThread(urlUtf8, options, progress);
+        }
+
+        const size_t numTransfers = chunkRanges.size();
+
+        CURLM* multiHandle = curl_multi_init();
+        if (multiHandle == nullptr)
+        {
+            ResetDownloadProgress(progress);
+            return DownloadFileSingleThread(urlUtf8, options, progress);
+        }
+
+        struct CurlMultiGuard
+        {
+            CURLM* handle = nullptr;
+            ~CurlMultiGuard()
+            {
+                if (handle != nullptr)
+                {
+                    curl_multi_cleanup(handle);
+                    handle = nullptr;
+                }
+            }
+        };
+
+        CurlMultiGuard multiGuard;
+        multiGuard.handle = multiHandle;
+
+#if defined(LIBCURL_VERSION_NUM) && (LIBCURL_VERSION_NUM >= 0x071E00)
+        curl_multi_setopt(multiHandle, CURLMOPT_MAX_TOTAL_CONNECTIONS, static_cast<long>(numTransfers));
+        curl_multi_setopt(multiHandle, CURLMOPT_MAX_HOST_CONNECTIONS, static_cast<long>(numTransfers));
+#endif
+
+        std::vector<GbMultiCurlChunkContext> contexts(numTransfers);
+
+        auto CleanupMultiCurlContexts = [&](std::vector<GbMultiCurlChunkContext>& ctxs)
+            {
+                for (size_t i = 0; i < ctxs.size(); i++)
+                {
+                    GbMultiCurlChunkContext& ctx = ctxs[i];
+                    if (ctx.easyHandle != nullptr)
+                    {
+                        curl_multi_remove_handle(multiHandle, ctx.easyHandle);
+                        curl_easy_cleanup(ctx.easyHandle);
+                        ctx.easyHandle = nullptr;
+                    }
+                    if (ctx.headers != nullptr)
+                    {
+                        curl_slist_free_all(ctx.headers);
+                        ctx.headers = nullptr;
+                    }
+                }
+            };
+
+        auto DrainDoneMessages = [&](bool& hasError, std::string& firstError)
+            {
+                int msgsInQueue = 0;
+                while (true)
+                {
+                    CURLMsg* msg = curl_multi_info_read(multiHandle, &msgsInQueue);
+                    if (msg == nullptr)
+                    {
+                        break;
+                    }
+                    if (msg->msg != CURLMSG_DONE)
+                    {
+                        continue;
+                    }
+
+                    CURL* easyHandle = msg->easy_handle;
+                    GbMultiCurlChunkContext* ctxPtr = nullptr;
+                    curl_easy_getinfo(easyHandle, CURLINFO_PRIVATE, &ctxPtr);
+
+                    if (ctxPtr != nullptr)
+                    {
+                        ctxPtr->curlCode = msg->data.result;
+                        ctxPtr->completed = true;
+
+                        long httpCode = 0;
+                        curl_easy_getinfo(easyHandle, CURLINFO_RESPONSE_CODE, &httpCode);
+                        ctxPtr->httpStatusCode = httpCode;
+
+                        if (ctxPtr->curlCode != CURLE_OK)
+                        {
+                            ctxPtr->errorMessageUtf8 = (ctxPtr->errorBuffer[0] != '\0') ? ctxPtr->errorBuffer : curl_easy_strerror(ctxPtr->curlCode);
+                            if (!hasError)
+                            {
+                                hasError = true;
+                                firstError = ctxPtr->errorMessageUtf8;
+                            }
+                        }
+                        else if (ctxPtr->httpStatusCode != 0 && ctxPtr->httpStatusCode != 206)
+                        {
+                            ctxPtr->errorMessageUtf8 = "HTTP status " + std::to_string(static_cast<long long>(ctxPtr->httpStatusCode));
+                            if (!hasError)
+                            {
+                                hasError = true;
+                                firstError = ctxPtr->errorMessageUtf8;
+                            }
+                        }
+                    }
+                    else
+                    {
+                        if (!hasError)
+                        {
+                            hasError = true;
+                            firstError = "curl_easy_getinfo(CURLINFO_PRIVATE) failed";
+                        }
+                    }
+
+                    // 移除并销毁完成的 easy 句柄
+                    curl_multi_remove_handle(multiHandle, easyHandle);
+                    curl_easy_cleanup(easyHandle);
+
+                    if (ctxPtr != nullptr)
+                    {
+                        ctxPtr->easyHandle = nullptr;
+                        if (ctxPtr->headers != nullptr)
+                        {
+                            curl_slist_free_all(ctxPtr->headers);
+                            ctxPtr->headers = nullptr;
+                        }
+                    }
+                }
+            };
+
+        bool setupOk = true;
+        for (size_t i = 0; i < numTransfers; i++)
+        {
+            GbRangeChunkState& state = chunkStates[i];
+            const GbChunkRange& range = chunkRanges[i];
+
+            GbMultiCurlChunkContext& ctx = contexts[i];
+            std::memset(ctx.errorBuffer, 0, sizeof(ctx.errorBuffer));
+            ctx.chunkState = &state;
+
+            CURL* easyHandle = curl_easy_init();
+            if (easyHandle == nullptr)
+            {
+                setupOk = false;
+                break;
+            }
+
+            ctx.easyHandle = easyHandle;
+
+            // 分段下载不使用 XFERINFO（避免多个句柄互相覆盖），进度在 RangeWriteCallback 中累加。
+            GbDownloadProgressPointers disabledProgress{};
+            if (!ConfigureDownloadCurlCommon(easyHandle, finalUrl, options, disabledProgress, ctx.errorBuffer, sizeof(ctx.errorBuffer), &ctx.headers))
+            {
+                setupOk = false;
+                break;
+            }
+
+            ctx.rangeText = std::to_string(static_cast<unsigned long long>(range.begin)) + "-" + std::to_string(static_cast<unsigned long long>(range.end));
+            curl_easy_setopt(easyHandle, CURLOPT_RANGE, ctx.rangeText.c_str());
+            curl_easy_setopt(easyHandle, CURLOPT_HTTPGET, 1L);
+            curl_easy_setopt(easyHandle, CURLOPT_NOBODY, 0L);
+            curl_easy_setopt(easyHandle, CURLOPT_HEADERFUNCTION, nullptr);
+            curl_easy_setopt(easyHandle, CURLOPT_WRITEFUNCTION, RangeWriteCallback);
+            curl_easy_setopt(easyHandle, CURLOPT_WRITEDATA, &state);
+
+            // 便于在 CURLMSG_DONE 中定位到上下文
+            curl_easy_setopt(easyHandle, CURLOPT_PRIVATE, &ctx);
+
+            const CURLMcode addRes = curl_multi_add_handle(multiHandle, easyHandle);
+            if (addRes != CURLM_OK)
+            {
+                setupOk = false;
+                break;
+            }
+        }
+
+        if (!setupOk)
+        {
+            CleanupMultiCurlContexts(contexts);
+            ResetDownloadProgress(progress);
+            return DownloadFileSingleThread(urlUtf8, options, progress);
+        }
+
+        int stillRunning = 0;
+        CURLMcode mc = CURLM_OK;
+        do
+        {
+            mc = curl_multi_perform(multiHandle, &stillRunning);
+        } while (mc == CURLM_CALL_MULTI_PERFORM);
+
+        if (mc != CURLM_OK)
+        {
+            CleanupMultiCurlContexts(contexts);
+            ResetDownloadProgress(progress);
+            return DownloadFileSingleThread(urlUtf8, options, progress);
+        }
+
+        bool hasError = false;
+        std::string firstError;
+
+        while (stillRunning && !hasError)
+        {
+            int numFds = 0;
+            mc = curl_multi_wait(multiHandle, nullptr, 0, 1000, &numFds);
+            if (mc != CURLM_OK)
+            {
+                hasError = true;
+                firstError = "curl_multi_wait failed";
+                break;
+            }
+
+            do
+            {
+                mc = curl_multi_perform(multiHandle, &stillRunning);
+            } while (mc == CURLM_CALL_MULTI_PERFORM);
+
+            if (mc != CURLM_OK)
+            {
+                hasError = true;
+                firstError = "curl_multi_perform failed";
+                break;
+            }
+
+            DrainDoneMessages(hasError, firstError);
+        }
+
+        // stillRunning 归零后，可能仍有完成消息留在队列中
+        if (!hasError)
+        {
+            DrainDoneMessages(hasError, firstError);
+        }
+
+        CleanupMultiCurlContexts(contexts);
+
+        if (hasError)
+        {
+            ResetDownloadProgress(progress);
+            return DownloadFileSingleThread(urlUtf8, options, progress);
+        }
+
+        for (size_t i = 0; i < chunkStates.size(); i++)
+        {
+            const GbRangeChunkState& state = chunkStates[i];
+            if (state.writtenBytes != state.expectedBytes)
+            {
+                ResetDownloadProgress(progress);
+                return DownloadFileSingleThread(urlUtf8, options, progress);
+            }
+        }
+
+        MarkParallelDownloadSuccess(finalUrl, result);
+        return result;
+    }
+
     static GB_NetworkDownloadedFile DownloadFileMultiThread(
         const std::string& urlUtf8,
         const GB_NetworkRequestOptions& options,
@@ -2163,66 +2797,21 @@ namespace
         }
 
         GB_NetworkDownloadedFile result;
+        std::string finalUrl;
+        std::vector<GbChunkRange> chunkRanges;
+        std::vector<GbRangeChunkState> chunkStates;
 
-        if (!probe.totalSizeKnown || probe.totalBytes == 0)
+        const GbParallelPrepareResult prepareRes = PrepareParallelDownloadPlan(urlUtf8, probe, progress, result, finalUrl, chunkRanges, chunkStates);
+        if (prepareRes == GbParallelPrepareResult::FatalError)
         {
-            return DownloadFileSingleThread(urlUtf8, options, progress);
-        }
-
-        const size_t totalBytes = probe.totalBytes;
-
-        if (progress.enabled)
-        {
-            progress.totalBytesPtr->store(totalBytes, std::memory_order_relaxed);
-            progress.downloadedBytesPtr->store(0, std::memory_order_relaxed);
-        }
-
-        result.totalSizeKnown = true;
-        result.totalBytes = totalBytes;
-        result.fileNameUtf8 = !probe.fileNameUtf8.empty() ? probe.fileNameUtf8 : ExtractFileNameFromUrlUtf8(!probe.effectiveUrlUtf8.empty() ? probe.effectiveUrlUtf8 : urlUtf8);
-        result.contentTypeUtf8 = probe.contentTypeUtf8;
-
-        try
-        {
-            result.data.resize(totalBytes);
-        }
-        catch (...)
-        {
-            result.ok = false;
-            result.curlErrorCode = static_cast<int>(CURLE_OUT_OF_MEMORY);
-            result.errorMessageUtf8 = "Not enough memory to allocate download buffer";
-            if (progress.enabled)
-            {
-                progress.totalBytesPtr->store(0, std::memory_order_relaxed);
-                progress.downloadedBytesPtr->store(0, std::memory_order_relaxed);
-            }
             return result;
         }
-
-        unsigned int hw = std::thread::hardware_concurrency();
-        if (hw == 0)
-        {
-            hw = 4;
-        }
-        size_t numThreads = static_cast<size_t>(hw);
-        if (numThreads > 8)
-        {
-            numThreads = 8;
-        }
-        if (numThreads < 2)
-        {
-            numThreads = 2;
-        }
-
-        const size_t kMinChunkSize = 4ULL * 1024ULL * 1024ULL;
-        if (totalBytes / numThreads < kMinChunkSize)
-        {
-            numThreads = std::max<size_t>(2, totalBytes / kMinChunkSize);
-        }
-        if (numThreads < 2)
+        if (prepareRes != GbParallelPrepareResult::Ok)
         {
             return DownloadFileSingleThread(urlUtf8, options, progress);
         }
+
+        const size_t numThreads = chunkRanges.size();
 
         std::vector<std::thread> threads;
         threads.reserve(numThreads);
@@ -2230,40 +2819,17 @@ namespace
         std::vector<GbRangeThreadResult> threadResults;
         threadResults.resize(numThreads);
 
-        std::vector<GbRangeChunkState> chunkStates;
-        chunkStates.resize(numThreads);
-
-        const std::string finalUrl = !probe.effectiveUrlUtf8.empty() ? probe.effectiveUrlUtf8 : urlUtf8;
-
-        size_t begin = 0;
         for (size_t i = 0; i < numThreads; i++)
         {
-            size_t end = 0;
-            if (i + 1 == numThreads)
-            {
-                end = totalBytes - 1;
-            }
-            else
-            {
-                const size_t chunkSize = totalBytes / numThreads;
-                end = begin + chunkSize - 1;
-            }
-
-            GbRangeChunkState& state = chunkStates[i];
-            state.bufferBase = result.data.data();
-            state.baseOffset = begin;
-            state.expectedBytes = end - begin + 1;
-            state.writtenBytes = 0;
-            state.progress = progress;
-
             const size_t threadIndex = i;
-            const size_t rangeBegin = begin;
-            const size_t rangeEnd = end;
+            const size_t rangeBegin = chunkRanges[i].begin;
+            const size_t rangeEnd = chunkRanges[i].end;
 
             try
             {
-                threads.emplace_back([&, threadIndex, rangeBegin, rangeEnd]() {
-                    threadResults[threadIndex] = DownloadRangeChunk(finalUrl, options, rangeBegin, rangeEnd, chunkStates[threadIndex]);
+                threads.emplace_back([&, threadIndex, rangeBegin, rangeEnd]()
+                    {
+                        threadResults[threadIndex] = DownloadRangeChunk(finalUrl, options, rangeBegin, rangeEnd, chunkStates[threadIndex]);
                     });
             }
             catch (...)
@@ -2273,16 +2839,9 @@ namespace
                     threads[t].join();
                 }
 
-                if (progress.enabled)
-                {
-                    progress.totalBytesPtr->store(0, std::memory_order_relaxed);
-                    progress.downloadedBytesPtr->store(0, std::memory_order_relaxed);
-                }
-
+                ResetDownloadProgress(progress);
                 return DownloadFileSingleThread(urlUtf8, options, progress);
             }
-
-            begin = end + 1;
         }
 
         for (size_t i = 0; i < threads.size(); i++)
@@ -2293,24 +2852,28 @@ namespace
         for (size_t i = 0; i < threadResults.size(); i++)
         {
             const GbRangeThreadResult& tr = threadResults[i];
-            if (tr.curlCode != CURLE_OK)
+            if (tr.curlCode != CURLE_OK || (tr.httpStatusCode != 0 && tr.httpStatusCode != 206))
             {
-                if (progress.enabled)
-                {
-                    progress.downloadedBytesPtr->store(0, std::memory_order_relaxed);
-                    progress.totalBytesPtr->store(0, std::memory_order_relaxed);
-                }
+                ResetDownloadProgress(progress);
                 return DownloadFileSingleThread(urlUtf8, options, progress);
             }
         }
 
-        result.ok = true;
-        result.httpStatusCode = 206; // 多个 206 合成的“完成态”
-        result.effectiveUrlUtf8 = finalUrl;
+        for (size_t i = 0; i < chunkStates.size(); i++)
+        {
+            const GbRangeChunkState& state = chunkStates[i];
+            if (state.writtenBytes != state.expectedBytes)
+            {
+                ResetDownloadProgress(progress);
+                return DownloadFileSingleThread(urlUtf8, options, progress);
+            }
+        }
 
+        MarkParallelDownloadSuccess(finalUrl, result);
         return result;
     }
 }
+
 
 bool GB_CanConnectToInternet(unsigned int timeoutMs)
 {
@@ -2333,7 +2896,7 @@ bool GB_CanConnectToInternet(unsigned int timeoutMs)
         unsigned short port;
     };
 
-    // 端点顺序：先不依赖 DNS 的 IP，再尝试常见域名
+    // 端点顺序：先不依赖 DNS 的数值 IP，再尝试常见域名
     constexpr static ProbeEndpoint endpoints[] =
     {
         { "1.1.1.1", 443 },
@@ -2424,15 +2987,11 @@ GB_NetworkResponse GB_RequestUrlData(const std::string& urlUtf8, const GB_Networ
     ::curl_easy_setopt(curlHandle, CURLOPT_URL, urlUtf8.c_str());
     ::curl_easy_setopt(curlHandle, CURLOPT_HTTPGET, 1L);
 
-#if defined(CURLOPT_PROTOCOLS_STR)
+#if defined(LIBCURL_VERSION_NUM) && (LIBCURL_VERSION_NUM >= 0x075500)
     ::curl_easy_setopt(curlHandle, CURLOPT_PROTOCOLS_STR, "http,https");
-#elif defined(CURLOPT_PROTOCOLS)
-    ::curl_easy_setopt(curlHandle, CURLOPT_PROTOCOLS, static_cast<long>(CURLPROTO_HTTP | CURLPROTO_HTTPS));
-#endif
-
-#if defined(CURLOPT_REDIR_PROTOCOLS_STR)
     ::curl_easy_setopt(curlHandle, CURLOPT_REDIR_PROTOCOLS_STR, "http,https");
-#elif defined(CURLOPT_REDIR_PROTOCOLS)
+#else
+    ::curl_easy_setopt(curlHandle, CURLOPT_PROTOCOLS, static_cast<long>(CURLPROTO_HTTP | CURLPROTO_HTTPS));
     ::curl_easy_setopt(curlHandle, CURLOPT_REDIR_PROTOCOLS, static_cast<long>(CURLPROTO_HTTP | CURLPROTO_HTTPS));
 #endif
 
@@ -2467,7 +3026,7 @@ GB_NetworkResponse GB_RequestUrlData(const std::string& urlUtf8, const GB_Networ
         ::curl_easy_setopt(curlHandle, CURLOPT_CAPATH, options.caPathUtf8.c_str());
     }
 
-#ifdef CURL_HTTP_VERSION_2TLS
+#if defined(LIBCURL_VERSION_NUM) && (LIBCURL_VERSION_NUM >= 0x072F00)
     if (options.enableHttp2)
     {
         ::curl_easy_setopt(curlHandle, CURLOPT_HTTP_VERSION, static_cast<long>(CURL_HTTP_VERSION_2TLS));
@@ -2503,10 +3062,35 @@ GB_NetworkResponse GB_RequestUrlData(const std::string& urlUtf8, const GB_Networ
     };
 
     CurlSlistGuard headerGuard;
+
+    const auto tryAppendHeader = [&](const char* headerValue) -> bool
+        {
+            if (headerValue == nullptr)
+            {
+                return true;
+            }
+
+            curl_slist* newList = ::curl_slist_append(headerGuard.list, headerValue);
+            if (newList == nullptr)
+            {
+                return false;
+            }
+
+            headerGuard.list = newList;
+            return true;
+        };
+
     if (options.impersonateBrowser)
     {
-        headerGuard.list = ::curl_slist_append(headerGuard.list, "Accept: */*");
-        headerGuard.list = ::curl_slist_append(headerGuard.list, "Accept-Language: zh-CN,zh;q=0.9,en;q=0.8");
+        if (!tryAppendHeader("Accept: */*") ||
+            !tryAppendHeader("Accept-Language: zh-CN,zh;q=0.9,en;q=0.8"))
+        {
+            response.ok = false;
+            response.curlErrorCode = static_cast<int>(CURLE_OUT_OF_MEMORY);
+            response.errorMessageUtf8 = "Out of memory (curl_slist_append failed)";
+            return response;
+        }
+
         ::curl_easy_setopt(curlHandle, CURLOPT_ACCEPT_ENCODING, "");
     }
 
@@ -2515,7 +3099,13 @@ GB_NetworkResponse GB_RequestUrlData(const std::string& urlUtf8, const GB_Networ
         const std::string& header = options.headersUtf8[i];
         if (!header.empty())
         {
-            headerGuard.list = ::curl_slist_append(headerGuard.list, header.c_str());
+            if (!tryAppendHeader(header.c_str()))
+            {
+                response.ok = false;
+                response.curlErrorCode = static_cast<int>(CURLE_OUT_OF_MEMORY);
+                response.errorMessageUtf8 = "Out of memory (curl_slist_append failed)";
+                return response;
+            }
         }
     }
 
@@ -2575,7 +3165,7 @@ GB_NetworkResponse GB_RequestUrlData(const std::string& urlUtf8, const GB_Networ
     return response;
 }
 
-GB_NetworkDownloadedFile GB_DownloadFile(const std::string& urlUtf8, const GB_NetworkRequestOptions& options, void* totalSizeAtomicPtr, void* downloadedSizeAtomicPtr)
+GB_NetworkDownloadedFile GB_DownloadFile(const std::string& urlUtf8, const GB_NetworkRequestOptions& options, GB_DownloadFileStrategy strategy, void* totalSizeAtomicPtr, void* downloadedSizeAtomicPtr)
 {
     const GbDownloadProgressPointers progress = GetDownloadProgressPointers(totalSizeAtomicPtr, downloadedSizeAtomicPtr);
 
@@ -2613,15 +3203,22 @@ GB_NetworkDownloadedFile GB_DownloadFile(const std::string& urlUtf8, const GB_Ne
         return result;
     }
 
+    // responseHeadersUtf8 为单请求模型设计；并行分段下载不提供 header 聚合，显式回退到单线程。
+    if (options.includeResponseHeaders)
+    {
+        return DownloadFileSingleThread(urlUtf8, options, progress);
+    }
+
     // 探测是否支持分段与总大小（用于并行下载 + 文件名推断）
     const GbProbeInfo probe = ProbeUrlForRangeAndSize(urlUtf8, options);
-
-    const bool allowMultiThread = !options.includeResponseHeaders;
-    if (allowMultiThread && probe.ok && ShouldUseMultiThreadDownload(probe.totalBytes, probe.acceptRangesBytes))
+    if (probe.ok && ShouldUseMultiThreadDownload(probe.totalBytes, probe.acceptRangesBytes))
     {
-        return DownloadFileMultiThread(urlUtf8, options, probe, progress);
+        if (strategy == GB_DownloadFileStrategy::MultiThread)
+        {
+            return DownloadFileMultiThread(urlUtf8, options, probe, progress);
+        }
+        return DownloadFileMultiCurl(urlUtf8, options, probe, progress);
     }
 
     return DownloadFileSingleThread(urlUtf8, options, progress);
 }
-

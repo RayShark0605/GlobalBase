@@ -149,6 +149,19 @@ struct GB_NetworkDownloadedFile
 };
 
 /**
+ * @brief 文件下载策略。
+ *
+ * @remarks
+ * - MultiCurl：使用 libcurl multi 接口在单线程中并行驱动多个 Range 请求（默认）。
+ * - MultiThread：使用多个线程 + 多个 easy handle 并行 Range 下载。
+ */
+enum class GB_DownloadFileStrategy
+{
+    MultiCurl,
+    MultiThread
+};
+
+/**
  * @brief 根据 URL 下载文件并返回文件字节流。
  *
  * @remarks
@@ -158,18 +171,15 @@ struct GB_NetworkDownloadedFile
  *   - *downloadedSizeAtomicPtr：已下载大小
  * - 当文件较大且服务端支持 Range（Accept-Ranges: bytes 或可用的 Content-Range/Content-Length）时，会尝试并行分段下载以提升速度；
  *   否则自动回退到单线程下载。
+ * - 当 options.includeResponseHeaders=true 时，为避免并行分段下载造成的响应头聚合歧义，内部会强制使用单线程下载。
  *
  * @param urlUtf8 目标 URL（UTF-8）。
  * @param options 请求选项。
+ * @param strategy 下载策略。
  * @param totalSizeAtomicPtr 可选进度输出指针（实际类型为 std::atomic_size_t*）。
  * @param downloadedSizeAtomicPtr 可选进度输出指针（实际类型为 std::atomic_size_t*）。
  * @return 下载结果。
  */
-GLOBALBASE_PORT GB_NetworkDownloadedFile GB_DownloadFile(const std::string& urlUtf8, const GB_NetworkRequestOptions& options = GB_NetworkRequestOptions(), void* totalSizeAtomicPtr = nullptr, void* downloadedSizeAtomicPtr = nullptr);
-
-
-
-
-
+GLOBALBASE_PORT GB_NetworkDownloadedFile GB_DownloadFile(const std::string& urlUtf8, const GB_NetworkRequestOptions& options = GB_NetworkRequestOptions(), GB_DownloadFileStrategy strategy = GB_DownloadFileStrategy::MultiCurl, void* totalSizeAtomicPtr = nullptr, void* downloadedSizeAtomicPtr = nullptr);
 
 #endif

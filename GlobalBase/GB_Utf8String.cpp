@@ -1853,7 +1853,7 @@ bool GB_Utf8StartsWith(const string& textUtf8, const string& targetUtf8, bool ca
             }
         }
         return true;
-        };
+    };
     if (caseSensitive && isAllAscii(textUtf8) && isAllAscii(targetUtf8))
     {
         if (textUtf8.size() < targetUtf8.size())
@@ -1919,7 +1919,10 @@ bool GB_Utf8EndsWith(const string& textUtf8, const string& targetUtf8, bool case
         // 手写比较，避免额外依赖
         for (size_t i = 0; i < targetUtf8.size(); i++)
         {
-            if (textUtf8[off + i] != targetUtf8[i]) return false;
+            if (textUtf8[off + i] != targetUtf8[i])
+            {
+                return false;
+            }
         }
         return true;
     }
@@ -2193,7 +2196,10 @@ string GB_Utf8Trim(const string& utf8Str, const string& trimChars)
     if (internal::IsAllAscii(utf8Str) && internal::IsAllAscii(trimChars))
     {
         const size_t first = utf8Str.find_first_not_of(trimChars);
-        if (first == string::npos) return string();
+        if (first == string::npos)
+        {
+            return string();
+        }
         const size_t last = utf8Str.find_last_not_of(trimChars);
         return utf8Str.substr(first, last - first + 1);
     }
@@ -2214,7 +2220,10 @@ string GB_Utf8TrimLeft(const string& utf8Str, const string& trimChars)
     if (internal::IsAllAscii(utf8Str) && internal::IsAllAscii(trimChars))
     {
         const size_t first = utf8Str.find_first_not_of(trimChars);
-        if (first == string::npos) return string();
+        if (first == string::npos)
+        {
+            return string();
+        }
         return utf8Str.substr(first);
     }
 
@@ -2233,7 +2242,10 @@ string GB_Utf8TrimRight(const string& utf8Str, const string& trimChars)
     if (internal::IsAllAscii(utf8Str) && internal::IsAllAscii(trimChars))
     {
         size_t last = utf8Str.find_last_not_of(trimChars);
-        if (last == string::npos) return string();
+        if (last == string::npos)
+        {
+            return string();
+        }
         return utf8Str.substr(0, last + 1);
     }
 
