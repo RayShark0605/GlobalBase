@@ -212,5 +212,63 @@ GLOBALBASE_PORT std::string GB_GetRelativePath(const std::string& pathAUtf8, con
  */
 GLOBALBASE_PORT std::string GB_JoinPath(const std::string& leftPathUtf8, const std::string& rightPathUtf8);
 
+/**
+ * @brief 获取临时文件目录。
+ *
+ * @remarks
+ * - 返回 UTF-8 编码的 std::string。
+ * - 路径分隔符统一使用 '/'。
+ * - 返回的目录路径保证以 '/' 结尾。
+ * - Windows：按 GetTempPathW 的规则（基于环境变量搜索顺序）获取。
+ * - Linux：优先使用 TMPDIR；否则使用 "/tmp/"。
+ *
+ * @return 临时目录路径；失败返回空字符串。
+ */
+GLOBALBASE_PORT std::string GB_GetTempDirectory();
+
+/**
+ * @brief 获取当前用户的桌面目录。
+ *
+ * @remarks
+ * - 返回 UTF-8 编码的 std::string。
+ * - 路径分隔符统一使用 '/'。
+ * - 返回的目录路径保证以 '/' 结尾。
+ * - Windows：使用 SHGetKnownFolderPath(FOLDERID_Desktop)。
+ * - Linux：优先读取 XDG user-dirs（user-dirs.dirs 里的 XDG_DESKTOP_DIR）；否则回退到 "$HOME/Desktop/"。
+ *
+ * @return 桌面目录路径；失败返回空字符串。
+ */
+GLOBALBASE_PORT std::string GB_GetDesktopDirectory();
+
+/**
+ * @brief 获取当前用户主目录（Home/Profile）。
+ *
+ * @remarks
+ * - 返回 UTF-8 编码的 std::string。
+ * - 路径分隔符统一使用 '/'。
+ * - 返回的目录路径保证以 '/' 结尾。
+ * - Windows：使用 SHGetKnownFolderPath(FOLDERID_Profile)。
+ * - Linux：优先使用 HOME；否则使用 getpwuid(getuid())。
+ *
+ * @return 用户主目录路径；失败返回空字符串。
+ */
+GLOBALBASE_PORT std::string GB_GetHomeDirectory();
+
+/**
+ * @brief 获取当前用户“下载(Downloads)”目录。
+ *
+ * @remarks
+ * - 返回 UTF-8 编码的 std::string。
+ * - 路径分隔符统一使用 '/'。
+ * - 返回的目录路径保证以 '/' 结尾。
+ * - Windows：使用 SHGetKnownFolderPath(FOLDERID_Downloads)。
+ * - Linux：优先读取 XDG user-dirs（user-dirs.dirs 里的 XDG_DOWNLOAD_DIR）；
+ *   若系统未配置/不存在该文件，则回退到 "$HOME/Downloads/"（注意：某些精简发行版或服务器环境可能并不存在该目录）。
+ *
+ * @return 下载目录路径；失败返回空字符串。
+ */
+GLOBALBASE_PORT std::string GB_GetDownloadsDirectory();
+
+
 
 #endif
