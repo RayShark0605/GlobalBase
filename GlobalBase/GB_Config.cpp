@@ -2308,7 +2308,7 @@ bool GB_GetConfigItem(const string& configPathUtf8, GB_ConfigItem& configItem, b
                     // 直接在本层的“值”
                     GB_ConfigValue one;
                     one.nameUtf8 = rel;                 // 例如 prefix="User"、key="User/Name" → name="Name"
-                    one.valueType = GbConfigValueType::GbConfigValueType_String;
+                    one.valueType = GB_ConfigValueType::GbConfigValueType_String;
                     one.valueUtf8 = it.second;
                     outItem.values.emplace_back(move(one));
                 }
