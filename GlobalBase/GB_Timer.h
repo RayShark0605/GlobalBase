@@ -309,7 +309,7 @@ std::chrono::nanoseconds GB_Timer::Measure(Func&& func, Args&&... args)
 }
 
 template <typename Func, typename... Args>
-static typename std::enable_if<
+typename std::enable_if<
     !std::is_void<decltype(std::declval<Func>()(std::declval<Args>()...))>::value,
     std::pair<
     typename std::decay<decltype(std::declval<Func>()(std::declval<Args>()...))>::type,

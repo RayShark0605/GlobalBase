@@ -5,8 +5,17 @@
 #include "GB_Utility.h"
 #include "GB_Timer.h"
 
+#include <cstring>
+
 #if defined(_WIN32)
 #  include <windows.h>
+#else
+#  include <unistd.h> 
+#  include <fcntl.h>
+#  include <sys/types.h>
+#  include <sys/stat.h>
+#  include <signal.h>
+#  include <execinfo.h>
 #endif
 
 using namespace std;
@@ -592,7 +601,7 @@ namespace crashlog
 		size_t n = 0;
 		while (s && s[n] && n < cap) n++;
 		size_t m = (n > cap ? cap : n);
-		memcpy(buf, s, m);
+		std::memcpy(buf, s, m);
 		return m;
 	}
 
@@ -649,7 +658,7 @@ namespace crashlog
 	static void EmergencyWriteLine(const char* s)
 	{
 		char nl = '\n';
-		EmergencyWrite(s, strlen(s));
+		EmergencyWrite(s, std::strlen(s));
 		EmergencyWrite(&nl, 1);
 	}
 
@@ -786,7 +795,7 @@ void GB_InstallCrashHandlers()
 	auto install = [](int sig)
 		{
 			struct sigaction sa;
-			memset(&sa, 0, sizeof(sa));
+			std::memset(&sa, 0, sizeof(sa));
 			sa.sa_sigaction = [](int s, siginfo_t* info, void* uctx)
 				{
 					(void)uctx;
