@@ -4131,9 +4131,9 @@ bool GB_CanConnectToInternet(unsigned int timeoutMs)
     // 端点顺序：先不依赖 DNS 的数值 IP，再尝试常见域名
     constexpr static ProbeEndpoint endpoints[] =
     {
-        { "1.1.1.1", 443 },
         { "www.baidu.com", 443 },
-        { "www.qq.com", 443 }
+        { "www.qq.com", 443 },
+        { "1.1.1.1", 443 }
     };
 
     const auto startTime = std::chrono::steady_clock::now();
