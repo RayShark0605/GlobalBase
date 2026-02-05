@@ -5,6 +5,7 @@
 #include <string>
 #include <unordered_map>
 #include <vector>
+#include <cstdint>
 
 // ----------------------------------------------- 默认配置项 ----------------------------------------------- //
 // 获取默认配置项路径，默认为"计算机\HKEY_CURRENT_USER\Software\GlobalBase"
@@ -66,11 +67,11 @@ struct GB_ConfigValue
 	std::string nameUtf8 = "";
 	GB_ConfigValueType valueType = GB_ConfigValueType::GbConfigValueType_Unknown;
 
-	std::string valueUtf8 = "";							// 用于 GbConfigValueType_String 和 GbConfigValueType_ExpandString
-	std::vector<std::string> multiStringValuesUtf8;		// 用于 GbConfigValueType_MultiString
-	std::vector<uint8_t> binaryValue;					// 用于 GbConfigValueType_Binary
-	uint32_t dwordValue = 0;							// 用于 GbConfigValueType_DWord
-	uint64_t qwordValue = 0;							// 用于 GbConfigValueType_QWord
+	std::string valueUtf8 = "";								// 用于 GbConfigValueType_String 和 GbConfigValueType_ExpandString
+	std::vector<std::string> multiStringValuesUtf8;			// 用于 GbConfigValueType_MultiString
+	std::vector<std::uint8_t> binaryValue;					// 用于 GbConfigValueType_Binary
+	std::uint32_t dwordValue = 0;							// 用于 GbConfigValueType_DWord
+	std::uint64_t qwordValue = 0;							// 用于 GbConfigValueType_QWord
 };
 
 // 在指定配置路径下，获取指定键值的数据

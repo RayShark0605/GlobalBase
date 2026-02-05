@@ -408,6 +408,48 @@ namespace internal
         return base + "/GlobalBase/config.kv";
     }
 
+    static std::string GetLeafNameFromPathUtf8(const std::string& pathUtf8, char separator, char altSeparator)
+    {
+        if (pathUtf8.empty())
+        {
+            return std::string();
+        }
+
+        size_t end = pathUtf8.size();
+        while (end > 0)
+        {
+            const char ch = pathUtf8[end - 1];
+            if (ch != separator && ch != altSeparator)
+            {
+                break;
+            }
+            end--;
+        }
+
+        // "/" 或 "////" 这种情况：叶子就返回 "/"
+        if (end == 0)
+        {
+            return std::string(1, separator);
+        }
+
+        size_t lastSep = pathUtf8.rfind(separator, end - 1);
+        if (altSeparator != separator)
+        {
+            const size_t lastAlt = pathUtf8.rfind(altSeparator, end - 1);
+            if (lastAlt != std::string::npos && (lastSep == std::string::npos || lastAlt > lastSep))
+            {
+                lastSep = lastAlt;
+            }
+        }
+
+        if (lastSep == std::string::npos)
+        {
+            return pathUtf8.substr(0, end);
+        }
+
+        return pathUtf8.substr(lastSep + 1, end - lastSep - 1);
+    }
+
     static bool MkdirsRecursively(const string& dir)
     {
         if (dir.empty())
@@ -655,7 +697,7 @@ string GB_GetGbConfigPath()
     // 提示性的“注册表路径”描述字符串
     return GB_STR("计算机\\HKEY_CURRENT_USER\\Software\\GlobalBase");
 #else
-    return GetLinuxConfigFile();
+    return internal::GetLinuxConfigFile();
 #endif
 }
 
@@ -1601,20 +1643,20 @@ bool GB_SetConfigValue(const string& configPathUtf8, const string& keyNameUtf8, 
     string toStore;
     switch (configValue.valueType)
     {
-    case GbConfigValueType::GbConfigValueType_String:
-    case GbConfigValueType::GbConfigValueType_ExpandString:
+    case GB_ConfigValueType::GbConfigValueType_String:
+    case GB_ConfigValueType::GbConfigValueType_ExpandString:
         toStore = configValue.valueUtf8;
         break;
 
-    case GbConfigValueType::GbConfigValueType_DWord:
+    case GB_ConfigValueType::GbConfigValueType_DWord:
         toStore = to_string(static_cast<unsigned long long>(configValue.dwordValue));
         break;
 
-    case GbConfigValueType::GbConfigValueType_QWord:
+    case GB_ConfigValueType::GbConfigValueType_QWord:
         toStore = to_string(static_cast<unsigned long long>(configValue.qwordValue));
         break;
 
-    case GbConfigValueType::GbConfigValueType_MultiString:
+    case GB_ConfigValueType::GbConfigValueType_MultiString:
     {
         // 简单可读的序列化：用换行连接
         for (size_t i = 0; i < configValue.multiStringValuesUtf8.size(); i++)
@@ -1625,7 +1667,7 @@ bool GB_SetConfigValue(const string& configPathUtf8, const string& keyNameUtf8, 
         break;
     }
 
-    case GbConfigValueType::GbConfigValueType_Binary:
+    case GB_ConfigValueType::GbConfigValueType_Binary:
     {
         static const char* hex = "0123456789ABCDEF";
         string hexStr;
@@ -2165,7 +2207,7 @@ bool GB_GetConfigItem(const string& configPathUtf8, GB_ConfigItem& configItem, b
                     break;
                 }
 
-                outItem.values.emplace_back(move(one));
+                outItem.values.emplace_back(std::move(one));
             }
 
             // —— 枚举子键并递归 ——
@@ -2241,8 +2283,8 @@ bool GB_GetConfigItem(const string& configPathUtf8, GB_ConfigItem& configItem, b
     configItem.nameUtf8 = internal::GetLeafNameFromPathUtf8(prefix.empty() ? string("/") : prefix, '/', '/');
 
     // 递归构造：从给定 prefix 出发，把 kv 中以 prefix 为前缀的键分成“直接值”和“子项首段”
-    function<void(const string&, GbConfigItem&)> BuildTree;
-    BuildTree = [&](const string& curPrefix, GbConfigItem& outItem)
+    function<void(const string&, GB_ConfigItem&)> BuildTree;
+    BuildTree = [&](const string& curPrefix, GB_ConfigItem& outItem)
         {
             const string head = curPrefix;
             const string need = head.empty() ? string() : (head + "/");
@@ -2264,7 +2306,7 @@ bool GB_GetConfigItem(const string& configPathUtf8, GB_ConfigItem& configItem, b
                 if (slashPos == string::npos)
                 {
                     // 直接在本层的“值”
-                    GbConfigValue one;
+                    GB_ConfigValue one;
                     one.nameUtf8 = rel;                 // 例如 prefix="User"、key="User/Name" → name="Name"
                     one.valueType = GbConfigValueType::GbConfigValueType_String;
                     one.valueUtf8 = it.second;
@@ -2284,14 +2326,14 @@ bool GB_GetConfigItem(const string& configPathUtf8, GB_ConfigItem& configItem, b
             // 递归孩子
             for (const auto& kvChild : childNames)
             {
-                GbConfigItem childItem;
+                GB_ConfigItem childItem;
                 childItem.nameUtf8 = kvChild.first;
                 if (recursive)
                 {
                     const string childPrefix = head.empty() ? kvChild.first : (head + "/" + kvChild.first);
                     BuildTree(childPrefix, childItem);
                 }
-                outItem.childenItems.emplace_back(move(childItem));
+                outItem.childenItems.emplace_back(std::move(childItem));
             }
         };
 
