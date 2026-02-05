@@ -51,7 +51,6 @@ find_package(OpenSSL REQUIRED)
 
 target_link_libraries(ThirdParty_libcurl INTERFACE
     Threads::Threads
-    dl
     OpenSSL::SSL
     OpenSSL::Crypto
 )
