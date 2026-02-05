@@ -2,6 +2,7 @@
 #define GLOBALBASE_FILESYSTEM_H_H
 
 #include "GlobalBasePort.h"
+
 #include <string>
 #include <vector>
 
@@ -58,7 +59,10 @@ GLOBALBASE_PORT bool GB_IsEmptyDirectory(const std::string& dirPathUtf8);
  * @return false 任一步骤失败（如只读文件、权限不足、正在占用等）。
  *
  * @details 实现先递归清空子项，再删除空目录。Linux 下对符号链接使用 lstat 区分：链接本身按“文件”删除；
- *          Windows 下按目录属性递归。该函数不尝试提升权限，不进入“挂载点/重解析点”的特殊处理。
+ *          Windows 下若遇到目录类型的重解析点（符号链接/联接点等），将仅删除该重解析点本身，
+ *          不递归进入其目标目录，以避免误删目标目录或形成循环遍历。
+ *
+ * @note   为安全起见，若 dirPathUtf8 指向文件系统根目录（如 "/"、"C:/"、"//server/share/"），将直接返回 false。
  */
 GLOBALBASE_PORT bool GB_DeleteDirectory(const std::string& dirPathUtf8);
 
@@ -94,6 +98,7 @@ GLOBALBASE_PORT bool GB_CopyFile(const std::string& srcFilePathUtf8, const std::
  * @return std::vector<std::string>  文件路径列表；若目录不存在或遍历失败返回空。
  *
  * @remarks 返回路径统一使用正斜杠“/”，且不以“/”结尾。遍历期间遇到不可读目录/条目会被跳过。
+ *          为避免循环与跨树遍历，递归模式下不会跟随目录符号链接继续深入（Windows：目录 reparse point；Linux：符号链接）。
  */
 GLOBALBASE_PORT std::vector<std::string> GB_GetFilesList(const std::string& dirPathUtf8, bool recursive = false);
 
@@ -104,8 +109,6 @@ GLOBALBASE_PORT std::vector<std::string> GB_GetFilesList(const std::string& dirP
  * @param withExt      true 返回包含扩展名的文件名；false 返回去掉“最后一个点”之后扩展的文件名。
  * @return std::string 文件名（不含路径）。特殊情况：以点开头的隐藏文件（如 ".bashrc"），
  *         当 withExt=false 时将返回空串（因为首个字符即为“最后一个点”）。
- *
- * @remarks 内部将反斜杠标准化为“/”后再截取。
  */
 GLOBALBASE_PORT std::string GB_GetFileName(const std::string& filePathUtf8, bool withExt = false);
 
@@ -149,9 +152,9 @@ GLOBALBASE_PORT double GB_GetFileSizeGB(const std::string& filePathUtf8);
  * @return std::string  返回目录（UTF-8）。失败返回空串。
  *
  * @remarks
- *  - Windows：通过 GetModuleFileNameW(nullptr, ...) 获取当前模块完整路径，再去掉文件名。该函数用于本进程更高效可靠。
+ *  - Windows：通过 GetModuleFileNameW(nullptr, ...) 获取当前模块完整路径，再去掉文件名。
  *  - Linux：通过 readlink("/proc/self/exe", ...) 读取指向当前进程可执行文件的内核符号链接；readlink 不会写入 NUL，需要手动补齐。
- *  - 两端统一将反斜杠替换为'/'，并规范化结尾只有一个'/'。
+ *  - 两端统一将反斜杠替换为'/'，并保证末尾只有一个'/'.
  */
 GLOBALBASE_PORT std::string GB_GetExeDirectory();
 
@@ -166,7 +169,6 @@ GLOBALBASE_PORT std::string GB_GetExeDirectory();
  *
  * @return true  成功（新建或满足条件时保持/截断为 0 字节）；
  * @return false 失败（父目录无法创建、路径指向目录、权限不足、底层系统调用失败等）。
- *
  */
 GLOBALBASE_PORT bool GB_CreateFileRecursive(const std::string& filePathUtf8, bool overwriteIfExists = true);
 
@@ -183,10 +185,6 @@ GLOBALBASE_PORT bool GB_CreateFileRecursive(const std::string& filePathUtf8, boo
  *  - 相对路径计算为 lexical（字符串）层面：会标准化分隔符、消解多余的 "." 与 ".." 片段，但不会解析符号链接。
  *  - 若 A 与 B 处于不同根（Windows 不同盘符 / 不同 UNC share），无法构造相对路径时，返回规范化后的 A（仍使用“/”）。
  *  - 若 A 被判定为目录（路径末尾带分隔符，或在文件系统中存在且为目录），返回结果末尾保证带“/”。
- *
- * @remarks
- *  - 为判定 A/B 是否目录，函数可能会访问文件系统（GB_IsDirectoryExists）。若希望完全避免访问文件系统，
- *    请在目录路径末尾显式追加分隔符（如 "a/b/" 或 "a\\b\\"）。
  */
 GLOBALBASE_PORT std::string GB_GetRelativePath(const std::string& pathAUtf8, const std::string& pathBUtf8);
 
@@ -205,10 +203,6 @@ GLOBALBASE_PORT std::string GB_GetRelativePath(const std::string& pathAUtf8, con
  *  - Windows 输入允许“/”与“\\”，输出统一使用“/”。
  *  - 若输出路径表示目录（例如 rightPathUtf8 以分隔符结尾、或最后一个片段为 "."/".."，
  *    或输出路径在文件系统中存在且为目录），则返回结果末尾保证带“/”。
- *
- * @remarks
- *  - 为了更准确地区分“文件/目录”，函数可能会访问文件系统做存在性与类型判断（stat / GetFileAttributesW）。
- *    若希望完全避免访问文件系统，请在“目录路径”末尾显式追加分隔符（如 "a/b/" 或 "a\\b\\"）。
  */
 GLOBALBASE_PORT std::string GB_JoinPath(const std::string& leftPathUtf8, const std::string& rightPathUtf8);
 
@@ -248,7 +242,7 @@ GLOBALBASE_PORT std::string GB_GetDesktopDirectory();
  * - 路径分隔符统一使用 '/'。
  * - 返回的目录路径保证以 '/' 结尾。
  * - Windows：使用 SHGetKnownFolderPath(FOLDERID_Profile)。
- * - Linux：优先使用 HOME；否则使用 getpwuid(getuid())。
+ * - Linux：优先使用 HOME；否则使用 getpwuid/getuid。
  *
  * @return 用户主目录路径；失败返回空字符串。
  */
@@ -263,7 +257,7 @@ GLOBALBASE_PORT std::string GB_GetHomeDirectory();
  * - 返回的目录路径保证以 '/' 结尾。
  * - Windows：使用 SHGetKnownFolderPath(FOLDERID_Downloads)。
  * - Linux：优先读取 XDG user-dirs（user-dirs.dirs 里的 XDG_DOWNLOAD_DIR）；
- *   若系统未配置/不存在该文件，则回退到 "$HOME/Downloads/"（注意：某些精简发行版或服务器环境可能并不存在该目录）。
+ *   若系统未配置/不存在该文件，则回退到 "$HOME/Downloads/"。
  *
  * @return 下载目录路径；失败返回空字符串。
  */

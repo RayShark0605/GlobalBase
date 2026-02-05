@@ -1,1342 +1,1350 @@
 ﻿#include "GB_FileSystem.h"
 #include "GB_Utf8String.h"
+
 #include <algorithm>
+#include <cerrno>
 #include <cstdio>
 #include <cstdlib>
-#include <cerrno>
+#include <cstring>
+#include <limits>
 #include <sys/stat.h>
 
 #if defined(_WIN32)
-#   define NOMINMAX
-#   include <windows.h>
-#   include <io.h>
-#   include <shlobj.h>
-#   include <KnownFolders.h>
+#    define NOMINMAX
+#    include <windows.h>
+#    include <shlobj.h>
+#    include <KnownFolders.h>
 #else
-#   include <dirent.h>
-#   include <unistd.h>
-#   include <fcntl.h>
-#   include <sys/types.h>
-#   include <utime.h>
-#   include <cstdlib>
-#   include <pwd.h>
-#   include <fstream>
+#    include <dirent.h>
+#    include <fcntl.h>
+#    include <pwd.h>
+#    include <sys/types.h>
+#    include <unistd.h>
+#    include <fstream>
 #endif
-
-using namespace std;
 
 namespace internal
 {
-    static inline bool IsSlash(char ch)
+    static bool IsSlash(char ch)
     {
         return ch == '/' || ch == '\\';
     }
 
-    // 将任意路径分隔符转为指定分隔符
-    static string ReplaceSlashes(const string& p, char toSlash)
+    static bool IsAsciiAlpha(char ch)
     {
-        string s = p;
-        for (size_t i = 0; i < s.size(); i++)
+        return (ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z');
+    }
+
+
+    static unsigned char ToLowerAscii(unsigned char ch)
+    {
+        if (ch >= static_cast<unsigned char>('A') && ch <= static_cast<unsigned char>('Z'))
         {
-            if (IsSlash(s[i]))
+            return static_cast<unsigned char>(ch - static_cast<unsigned char>('A') + static_cast<unsigned char>('a'));
+        }
+        return ch;
+    }
+
+    static void ReplaceBackslashWithSlash(std::string& text)
+    {
+        for (size_t i = 0; i < text.size(); i++)
+        {
+            if (text[i] == '\\')
             {
-                s[i] = toSlash;
+                text[i] = '/';
             }
         }
-        return s;
     }
 
-    // 统一内部输出：使用 forward slash '/'
-    static string ToOutputNorm(const string& p)
+    static std::string ToOutputNorm(const std::string& pathUtf8)
     {
-        return ReplaceSlashes(p, '/');
+        std::string out = pathUtf8;
+        ReplaceBackslashWithSlash(out);
+        return out;
     }
 
-    // 供 Windows WinAPI 调用：使用反斜杠
-    static string ToWindowsNative(const string& p)
+    static std::string ToWindowsNative(const std::string& pathUtf8)
     {
-        // 输入可能是混合分隔符，统一成反斜杠。
-        return ReplaceSlashes(p, '\\');
-    }
-
-    // 去掉末尾多余的分隔符（但保留根，如 "C:/", "/"）
-    static string StripTrailingSlashes(const string& in)
-    {
-        if (in.empty())
+        std::string out = pathUtf8;
+        for (size_t i = 0; i < out.size(); i++)
         {
-            return in;
-        }
-        string s = ToOutputNorm(in);
-        // 检测是否是根
-#if defined(_WIN32)
-        // 可能是 "C:/", "C:"（相对少见）, 或 UNC 根 "//server/share/"
-        if (s.size() <= 3 && ((s.size() >= 2 && s[1] == ':') || s == "/" || s.find("//") == 0))
-        {
-            // 最多保留到 "C:/"
-            if (s.size() == 2 && s[1] == ':')
+            if (out[i] == '/')
             {
-                return s + '/';
+                out[i] = '\\';
             }
+        }
+        return out;
+    }
+
+    static size_t FindUncShareEnd(const std::string& normalizedPath)
+    {
+        // normalizedPath uses '/'
+        // format: //server/share[/...]
+        if (normalizedPath.size() < 2 || normalizedPath[0] != '/' || normalizedPath[1] != '/')
+        {
+            return std::string::npos;
+        }
+
+        const size_t serverEnd = normalizedPath.find('/', 2);
+        if (serverEnd == std::string::npos)
+        {
+            return std::string::npos;
+        }
+
+        const size_t shareEnd = normalizedPath.find('/', serverEnd + 1);
+        if (shareEnd == std::string::npos)
+        {
+            return normalizedPath.size();
+        }
+
+        return shareEnd;
+    }
+
+    static std::string StripTrailingSlashesButKeepRoot(const std::string& pathUtf8)
+    {
+        std::string s = ToOutputNorm(pathUtf8);
+        if (s.empty())
+        {
             return s;
         }
-#else
+
+        // Unix root
         if (s == "/")
         {
             return s;
         }
-#endif
-        while (!s.empty() && s.back() == '/')
+
+        // Windows drive root: "C:/"
+        if (s.size() == 3 && IsAsciiAlpha(s[0]) && s[1] == ':' && s[2] == '/')
         {
+            return s;
+        }
+
+        // UNC share root: "//server/share" or "//server/share/"
+        const size_t uncRootEnd = FindUncShareEnd(s);
+        const size_t minLen = (uncRootEnd != std::string::npos) ? uncRootEnd : 0;
+
+        while (s.size() > 1 && s.back() == '/')
+        {
+            if (minLen > 0 && s.size() <= minLen)
+            {
+                break;
+            }
             s.pop_back();
         }
+
         return s;
     }
 
-    static string EnsureTrailingSlash(const string& in)
+    static std::string EnsureTrailingSlash(const std::string& pathUtf8)
     {
-        string s = ToOutputNorm(in);
-        if (s.empty())
+        if (pathUtf8.empty())
         {
-            return "/";
+            return "";
         }
-        if (s.back() != '/')
+
+        // 先做分隔符统一与末尾多余分隔符清理，再确保末尾只有一个 '/'。
+        std::string out = StripTrailingSlashesButKeepRoot(pathUtf8);
+        if (out.empty())
         {
-            s.push_back('/');
+            return "";
         }
-        return s;
+
+        // Special: "C:" -> "C:/"
+        if (out.size() == 2 && IsAsciiAlpha(out[0]) && out[1] == ':')
+        {
+            out.push_back('/');
+            return out;
+        }
+
+        if (out.back() != '/')
+        {
+            out.push_back('/');
+        }
+        return out;
     }
 
-    // 分离目录与文件名（输出用 forward slash）
-    static void SplitDirBase(const string& pathUtf8, string& dirOut, string& baseOut)
+    static bool EndsWithSlash(const std::string& pathUtf8)
     {
-        string norm = ToOutputNorm(pathUtf8);
-        // 特判纯目录形态（末尾带 /）
-        bool endsWithSlash = !norm.empty() && norm.back() == '/';
-        string s = endsWithSlash ? StripTrailingSlashes(norm) : norm;
-
-        const size_t pos = s.find_last_of('/');
-        if (pos == string::npos)
+        if (pathUtf8.empty())
         {
-            dirOut.clear();
-            baseOut = s;
-        }
-        else
-        {
-            dirOut = s.substr(0, pos);
-            baseOut = s.substr(pos + 1);
-        }
-    }
-
-#if defined(_WIN32)
-    // ---------- UTF-8 <-> UTF-16 helpers (Windows) ----------
-    // 参考：MultiByteToWideChar / WideCharToMultiByte 官方文档  :contentReference[oaicite:0]{index=0}
-    inline wstring Utf8ToWide(const string& s)
-    {
-        if (s.empty())
-        {
-            return wstring();
-        }
-        const string native = ToWindowsNative(s);
-        int wlen = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, native.c_str(),
-            static_cast<int>(native.size()), nullptr, 0);
-        if (wlen <= 0)
-        {
-            return wstring();
-        }
-        wstring ws(static_cast<size_t>(wlen), L'\0');
-        int written = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, native.c_str(),
-            static_cast<int>(native.size()), &ws[0], wlen);
-        if (written <= 0)
-        {
-            return wstring();
-        }
-        return ws;
-    }
-
-    inline string WideToUtf8(const wstring& ws)
-    {
-        if (ws.empty())
-        {
-            return string();
-        }
-        int len = WideCharToMultiByte(CP_UTF8, 0, ws.c_str(),
-            static_cast<int>(ws.size()), nullptr, 0, nullptr, nullptr);
-        if (len <= 0)
-        {
-            return string();
-        }
-        string out(static_cast<size_t>(len), '\0');
-        int written = WideCharToMultiByte(CP_UTF8, 0, ws.c_str(),
-            static_cast<int>(ws.size()), &out[0], len, nullptr, nullptr);
-        if (written <= 0)
-        {
-            return string();
-        }
-        // 统一输出正斜杠
-        return ToOutputNorm(out);
-    }
-#endif
-
-    inline bool IsDirByStat(const string& pathUtf8, bool& exists, bool& isDir)
-    {
-#if defined(_WIN32)
-        const wstring w = Utf8ToWide(pathUtf8);
-        if (w.empty())
-        {
-            exists = false;
-            isDir = false;
             return false;
         }
-        // GetFileAttributes(W)：文件或目录属性（INVALID_FILE_ATTRIBUTES 表示失败/不存在）
-        // 官方：GetFileAttributesA/W 文档。
-        DWORD attr = GetFileAttributesW(w.c_str());
-        if (attr == INVALID_FILE_ATTRIBUTES)
+        return IsSlash(pathUtf8.back());
+    }
+
+
+    static bool IsDirectoryHint(const std::string& pathUtf8)
+    {
+        if (pathUtf8.empty())
         {
-            exists = false;
-            isDir = false;
+            return false;
+        }
+
+        if (EndsWithSlash(pathUtf8))
+        {
             return true;
         }
-        exists = true;
-        isDir = (attr & FILE_ATTRIBUTE_DIRECTORY) != 0;
-        return true;
-#else
-        struct stat st;
-        string native = ReplaceSlashes(pathUtf8, '/');
-        if (stat(native.c_str(), &st) == 0)
+
+        const std::string normalized = ToOutputNorm(pathUtf8);
+        if (normalized == "." || normalized == "..")
         {
-            exists = true;
-            isDir = S_ISDIR(st.st_mode);
             return true;
         }
-        exists = false;
-        isDir = false;
-        return true;
-#endif
+
+        // Windows drive root: "C:"
+        if (normalized.size() == 2 && IsAsciiAlpha(normalized[0]) && normalized[1] == ':')
+        {
+            return true;
+        }
+
+        const size_t pos = normalized.find_last_of('/');
+        const std::string lastSegment = (pos == std::string::npos) ? normalized : normalized.substr(pos + 1);
+        return (lastSegment == "." || lastSegment == "..");
     }
 
-    // 递归创建目录（逐级）
-    inline bool MakeDirsRecursive(const string& dirUtf8)
+    struct PathParts
     {
-        if (dirUtf8.empty())
+        std::string root; // "", "/", "c:", "//server/share"
+        bool isAbsolute = false;
+        bool isDrive = false;
+        bool isUnc = false;
+        std::vector<std::string> segments;
+    };
+
+    static bool StartsWith(const std::string& text, const std::string& prefix)
+    {
+        return text.size() >= prefix.size() && text.compare(0, prefix.size(), prefix) == 0;
+    }
+
+    static PathParts ParseAndNormalizePathLexical(const std::string& rawPathUtf8)
+    {
+        PathParts path;
+        std::string s = ToOutputNorm(rawPathUtf8);
+
+        // Handle Windows "extended" prefixes in a tolerant way (keep lexical behavior).
+        // - "\\?\C:\..."  -> "C:/..."
+        // - "\\?\UNC\server\share\..." -> "//server/share/..."
+        // After ToOutputNorm: "//?/C:/..." and "//?/UNC/server/share/..."
+        if (StartsWith(s, "//?/UNC/"))
         {
-            return false;
+            s = "//" + s.substr(std::strlen("//?/UNC/"));
         }
-        // 统一正斜杠，逐级创建
-        string norm = EnsureTrailingSlash(dirUtf8);
-        // 从根开始切分
-        size_t start = 0;
-#if defined(_WIN32)
-        // 处理 "C:/..." 或 "//server/share/..."
-        if (norm.size() >= 3 && norm[1] == ':' && norm[2] == '/')
+        else if (StartsWith(s, "//?/"))
         {
-            start = 3; // 保留 "C:/"
+            s = s.substr(std::strlen("//?/"));
         }
-        else if (norm.size() >= 2 && norm[0] == '/' && norm[1] == '/')
+        else if (StartsWith(s, "//./"))
         {
-            // UNC 前缀，先定位到第三个 '/'
-            size_t p = norm.find('/', 2);
-            if (p != string::npos)
+            s = s.substr(std::strlen("//./"));
+        }
+
+        size_t index = 0;
+
+        // Drive root
+        if (s.size() >= 2 && IsAsciiAlpha(s[0]) && s[1] == ':')
+        {
+            path.isAbsolute = true;
+            path.isDrive = true;
+            char driveLower = s[0];
+            if (driveLower >= 'A' && driveLower <= 'Z')
             {
-                p = norm.find('/', p + 1);
-                start = (p == string::npos) ? norm.size() : p + 1;
+                driveLower = static_cast<char>(driveLower - 'A' + 'a');
+            }
+            path.root = std::string(1, driveLower) + ":";
+            index = 2;
+            if (index < s.size() && s[index] == '/')
+            {
+                index++;
             }
         }
-        else if (norm.size() >= 1 && norm[0] == '/')
+        // UNC
+        else if (StartsWith(s, "//"))
         {
-            start = 1;
-        }
-#else
-        if (norm.size() >= 1 && norm[0] == '/')
-        {
-            start = 1;
-        }
-#endif
-        for (size_t i = start; i < norm.size(); i++)
-        {
-            if (norm[i] == '/')
+            const size_t uncRootEnd = FindUncShareEnd(s);
+            if (uncRootEnd != std::string::npos)
             {
-                const string sub = norm.substr(0, i);
-                if (sub.empty())
+                path.isAbsolute = true;
+                path.isUnc = true;
+                path.root = s.substr(0, uncRootEnd);
+                index = uncRootEnd;
+                if (index < s.size() && s[index] == '/')
                 {
-                    continue;
+                    index++;
                 }
-#if defined(_WIN32)
-                wstring wsub = Utf8ToWide(sub);
-                if (wsub.empty())
-                {
-                    return false;
-                }
-                DWORD attr = GetFileAttributesW(wsub.c_str());
-                if (attr == INVALID_FILE_ATTRIBUTES)
-                {
-                    // CreateDirectoryW 仅创建最后一级；要逐级建。 :contentReference[oaicite:2]{index=2}
-                    if (!CreateDirectoryW(wsub.c_str(), nullptr))
-                    {
-                        // 如果竞态导致已存在，继续；否则失败
-                        DWORD ec = GetLastError();
-                        if (ec != ERROR_ALREADY_EXISTS)
-                        {
-                            return false;
-                        }
-                    }
-                }
-                else if (!(attr & FILE_ATTRIBUTE_DIRECTORY))
-                {
-                    return false; // 同名文件阻塞
-                }
-#else
-                if (mkdir(sub.c_str(), 0755) != 0)
-                {
-                    if (errno == EEXIST)
-                    {
-                        // 存在则继续，但需确认是目录
-                        struct stat st;
-                        if (stat(sub.c_str(), &st) != 0 || !S_ISDIR(st.st_mode))
-                        {
-                            return false;
-                        }
-                    }
-                    else
-                    {
-                        // 非根时 ENOENT 说明上级没建；但我们是逐级建，一般不会触发
-                        return false;
-                    }
-                }
-#endif
             }
         }
-        return true;
-    }
+        // Unix absolute
+        else if (!s.empty() && s[0] == '/')
+        {
+            path.isAbsolute = true;
+            path.root = "/";
+            index = 1;
+        }
 
-    // 删除单个文件
-    inline bool DeleteOneFile(const string& fileUtf8)
-    {
-#if defined(_WIN32)
-        wstring w = Utf8ToWide(fileUtf8);
-        if (w.empty())
+        // Segments
+        std::vector<std::string> rawSegments;
+        std::string current;
+        for (size_t i = index; i <= s.size(); i++)
         {
-            return false;
-        }
-        if (!DeleteFileW(w.c_str()))
-        {
-            return false;
-        }
-        return true;
-#else
-        string native = ReplaceSlashes(fileUtf8, '/');
-        return ::unlink(native.c_str()) == 0;
-#endif
-    }
-
-    // 删除空目录
-    inline bool RemoveEmptyDir(const string& dirUtf8)
-    {
-#if defined(_WIN32)
-        wstring w = Utf8ToWide(dirUtf8);
-        if (w.empty())
-        {
-            return false;
-        }
-        return ::RemoveDirectoryW(w.c_str()) != 0;
-#else
-        string native = ReplaceSlashes(dirUtf8, '/');
-        return ::rmdir(native.c_str()) == 0;
-#endif
-    }
-
-    // 递归列举文件（仅文件），结果用 forward slash，文件不带末尾 '/'
-    inline void ListFilesRecursive(const string& dirUtf8, bool recursive, vector<string>& out)
-    {
-#if defined(_WIN32)
-        // Windows: FindFirstFileExW + FindNextFileW  :contentReference[oaicite:3]{index=3}
-        string pattern = EnsureTrailingSlash(dirUtf8) + "*";
-        wstring wpat = Utf8ToWide(pattern);
-        if (wpat.empty())
-        {
-            return;
-        }
-        WIN32_FIND_DATAW fd;
-        HANDLE h = FindFirstFileExW(wpat.c_str(), FindExInfoBasic, &fd, FindExSearchNameMatch, nullptr, 0);
-        if (h == INVALID_HANDLE_VALUE)
-        {
-            return;
-        }
-        do
-        {
-            const wchar_t* name = fd.cFileName;
-            if (name[0] == L'.' && (name[1] == L'\0' || (name[1] == L'.' && name[2] == L'\0')))
+            const char ch = (i < s.size()) ? s[i] : '/';
+            if (ch == '/')
             {
-                continue; // skip . and ..
-            }
-            const bool isDir = (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
-            string item = EnsureTrailingSlash(dirUtf8) + WideToUtf8(name);
-            item = ToOutputNorm(item);
-            if (isDir)
-            {
-                if (recursive)
+                if (!current.empty())
                 {
-                    ListFilesRecursive(EnsureTrailingSlash(item), true, out);
+                    rawSegments.push_back(current);
+                    current.clear();
                 }
             }
             else
             {
-                out.push_back(item);
+                current.push_back(ch);
             }
-        } while (FindNextFileW(h, &fd));
-        FindClose(h);
-#else
-        string nativeDir = EnsureTrailingSlash(dirUtf8);
-        DIR* d = ::opendir(nativeDir.c_str()); // opendir/readdir 约定  :contentReference[oaicite:4]{index=4}
-        if (!d)
-        {
-            return;
         }
-        while (dirent* ent = ::readdir(d))
+
+        // Normalize dot segments (lexical, no symlink resolution)
+        std::vector<std::string> outSegments;
+        outSegments.reserve(rawSegments.size());
+        for (size_t i = 0; i < rawSegments.size(); i++)
         {
-            const char* name = ent->d_name;
-            if (name[0] == '.' && (name[1] == '\0' || (name[1] == '.' && name[2] == '\0')))
+            const std::string& seg = rawSegments[i];
+            if (seg.empty() || seg == ".")
             {
                 continue;
             }
-            string item = nativeDir + name;
-            struct stat st;
-            if (stat(item.c_str(), &st) != 0)
+            if (seg == "..")
             {
-                continue;
-            }
-            if (S_ISDIR(st.st_mode))
-            {
-                if (recursive)
+                if (!outSegments.empty() && outSegments.back() != "..")
                 {
-                    ListFilesRecursive(EnsureTrailingSlash(item), true, out);
+                    outSegments.pop_back();
+                }
+                else
+                {
+                    if (!path.isAbsolute)
+                    {
+                        outSegments.push_back("..");
+                    }
+                }
+                continue;
+            }
+            outSegments.push_back(seg);
+        }
+
+        path.segments.swap(outSegments);
+        return path;
+    }
+
+    static bool IsAbsoluteRootPath(const std::string& pathUtf8)
+    {
+        const PathParts path = ParseAndNormalizePathLexical(pathUtf8);
+        return path.isAbsolute && path.segments.empty();
+    }
+
+    static std::string BuildPathString(const PathParts& path, bool forceDir)
+    {
+        std::string out;
+
+        if (path.isAbsolute)
+        {
+            if (path.isDrive)
+            {
+                out = path.root;
+                out.push_back('/');
+            }
+            else if (path.isUnc)
+            {
+                out = path.root;
+                out.push_back('/');
+            }
+            else
+            {
+                out = "/";
+            }
+        }
+
+        for (size_t i = 0; i < path.segments.size(); i++)
+        {
+            if (!out.empty() && out.back() != '/')
+            {
+                out.push_back('/');
+            }
+            out += path.segments[i];
+        }
+
+        if (out.empty())
+        {
+            out = ".";
+        }
+
+        if (forceDir)
+        {
+            if (out == ".")
+            {
+                out = "./";
+            }
+            else if (out == "..")
+            {
+                out = "../";
+            }
+            else if (out.back() != '/')
+            {
+                out.push_back('/');
+            }
+        }
+        else
+        {
+            // Keep trailing slash only for explicit roots.
+            if (out != "/")
+            {
+                const bool isRootDrive = (out.size() == 3 && IsAsciiAlpha(out[0]) && out[1] == ':' && out[2] == '/');
+                const bool isRootUnc = (path.isUnc && out == path.root + "/");
+                if (!isRootDrive && !isRootUnc)
+                {
+                    while (out.size() > 1 && out.back() == '/')
+                    {
+                        out.pop_back();
+                    }
                 }
             }
-            else if (S_ISREG(st.st_mode))
+        }
+
+        return out;
+    }
+
+    static bool EqualSegment(const std::string& a, const std::string& b)
+    {
+#if defined(_WIN32)
+        if (a.size() != b.size())
+        {
+            return false;
+        }
+        for (size_t i = 0; i < a.size(); i++)
+        {
+            const unsigned char ca = static_cast<unsigned char>(a[i]);
+            const unsigned char cb = static_cast<unsigned char>(b[i]);
+            const unsigned char la = ToLowerAscii(ca);
+            const unsigned char lb = ToLowerAscii(cb);
+            if (la != lb)
             {
-                out.push_back(ToOutputNorm(item));
+                return false;
             }
         }
-        ::closedir(d);
+        return true;
+#else
+        return a == b;
 #endif
     }
 
-    // 递归删除目录内容（目录本身不删），仅内部使用
-    inline bool DeleteDirContents(const string& dirUtf8)
+    static bool EqualRoot(const PathParts& a, const PathParts& b)
     {
+        if (a.isAbsolute != b.isAbsolute)
+        {
+            return false;
+        }
+        if (a.isDrive != b.isDrive)
+        {
+            return false;
+        }
+        if (a.isUnc != b.isUnc)
+        {
+            return false;
+        }
+        return EqualSegment(a.root, b.root);
+    }
+
+    static std::string JoinSegmentsWithSlash(const std::vector<std::string>& segments)
+    {
+        if (segments.empty())
+        {
+            return "";
+        }
+        std::string out = segments[0];
+        for (size_t i = 1; i < segments.size(); i++)
+        {
+            out.push_back('/');
+            out += segments[i];
+        }
+        return out;
+    }
+
+    static std::string NormalizeDirectoryPathUtf8(const std::string& pathUtf8)
+    {
+        if (pathUtf8.empty())
+        {
+            return "";
+        }
+
+        const PathParts path = ParseAndNormalizePathLexical(pathUtf8);
+        return BuildPathString(path, true);
+    }
+
 #if defined(_WIN32)
-        string pattern = EnsureTrailingSlash(dirUtf8) + "*";
-        wstring wpat = Utf8ToWide(pattern);
-        if (wpat.empty())
+    static std::wstring Utf8ToWide(const std::string& utf8)
+    {
+        if (utf8.empty())
+        {
+            return L"";
+        }
+
+        const std::string native = ToWindowsNative(utf8);
+        const int required = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, native.c_str(),
+            static_cast<int>(native.size()), nullptr, 0);
+        if (required <= 0)
+        {
+            return L"";
+        }
+
+        std::wstring out;
+        out.resize(static_cast<size_t>(required));
+        const int written = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, native.c_str(),
+            static_cast<int>(native.size()), &out[0], required);
+        if (written != required)
+        {
+            return L"";
+        }
+        return out;
+    }
+
+    static std::string WideToUtf8(const std::wstring& wide)
+    {
+        if (wide.empty())
+        {
+            return "";
+        }
+
+        const int required = WideCharToMultiByte(CP_UTF8, 0, wide.c_str(), static_cast<int>(wide.size()),
+            nullptr, 0, nullptr, nullptr);
+        if (required <= 0)
+        {
+            return "";
+        }
+
+        std::string out;
+        out.resize(static_cast<size_t>(required));
+        const int written = WideCharToMultiByte(CP_UTF8, 0, wide.c_str(), static_cast<int>(wide.size()),
+            &out[0], required, nullptr, nullptr);
+        if (written != required)
+        {
+            return "";
+        }
+
+        return ToOutputNorm(out);
+    }
+#endif
+
+    static bool IsDirByStat(const std::string& pathUtf8, bool& outExists, bool& outIsDir)
+    {
+        outExists = false;
+        outIsDir = false;
+
+        if (pathUtf8.empty())
+        {
+            return true;
+        }
+
+#if defined(_WIN32)
+        const std::wstring pathW = Utf8ToWide(pathUtf8);
+        if (pathW.empty())
         {
             return false;
         }
-        WIN32_FIND_DATAW fd;
-        HANDLE h = FindFirstFileExW(wpat.c_str(), FindExInfoBasic, &fd, FindExSearchNameMatch, nullptr, 0);
-        if (h == INVALID_HANDLE_VALUE)
+
+        const DWORD attrs = GetFileAttributesW(pathW.c_str());
+        if (attrs == INVALID_FILE_ATTRIBUTES)
+        {
+            outExists = false;
+            outIsDir = false;
+            return true;
+        }
+
+        outExists = true;
+        outIsDir = (attrs & FILE_ATTRIBUTE_DIRECTORY) != 0;
+        return true;
+#else
+        const std::string normalized = ToOutputNorm(pathUtf8);
+
+        struct stat st;
+        if (::stat(normalized.c_str(), &st) != 0)
+        {
+            outExists = false;
+            outIsDir = false;
+            return true;
+        }
+
+        outExists = true;
+        outIsDir = S_ISDIR(st.st_mode) != 0;
+        return true;
+#endif
+    }
+
+    static bool TryGetFileSize64(const std::string& filePathUtf8, unsigned long long& outSize)
+    {
+        outSize = 0;
+
+#if defined(_WIN32)
+        const std::wstring pathW = Utf8ToWide(filePathUtf8);
+        if (pathW.empty())
         {
             return false;
         }
-        bool ok = true;
+
+        const DWORD attrs = GetFileAttributesW(pathW.c_str());
+        if (attrs == INVALID_FILE_ATTRIBUTES)
+        {
+            return false;
+        }
+        if ((attrs & FILE_ATTRIBUTE_DIRECTORY) != 0)
+        {
+            return false;
+        }
+
+        const HANDLE handle = CreateFileW(pathW.c_str(), FILE_READ_ATTRIBUTES,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (handle == INVALID_HANDLE_VALUE)
+        {
+            return false;
+        }
+
+        LARGE_INTEGER size = {};
+        const BOOL ok = GetFileSizeEx(handle, &size);
+        CloseHandle(handle);
+        if (!ok)
+        {
+            return false;
+        }
+
+        if (size.QuadPart < 0)
+        {
+            return false;
+        }
+
+        outSize = static_cast<unsigned long long>(size.QuadPart);
+        return true;
+#else
+        const std::string normalized = ToOutputNorm(filePathUtf8);
+
+        struct stat st;
+        if (::stat(normalized.c_str(), &st) != 0)
+        {
+            return false;
+        }
+        if (!S_ISREG(st.st_mode))
+        {
+            return false;
+        }
+
+        outSize = static_cast<unsigned long long>(st.st_size);
+        return true;
+#endif
+    }
+
+    static bool MakeDirsRecursive(const std::string& dirPathUtf8)
+    {
+        const std::string trimmed = StripTrailingSlashesButKeepRoot(dirPathUtf8);
+        if (trimmed.empty())
+        {
+            return false;
+        }
+
+        // quick return if already exists
+        bool exists = false;
+        bool isDir = false;
+        if (!IsDirByStat(trimmed, exists, isDir))
+        {
+            return false;
+        }
+        if (exists)
+        {
+            return isDir;
+        }
+
+        // Parse without forcing output dir
+        const PathParts path = ParseAndNormalizePathLexical(trimmed);
+
+#if defined(_WIN32)
+        // Drive root should always be treated as existing.
+        if (path.isDrive && path.segments.empty())
+        {
+            return true;
+        }
+        // UNC root should always be treated as existing.
+        if (path.isUnc && path.segments.empty())
+        {
+            return true;
+        }
+
+        std::string current;
+        if (path.isAbsolute)
+        {
+            if (path.isDrive)
+            {
+                current = path.root + "/";
+            }
+            else if (path.isUnc)
+            {
+                current = path.root + "/";
+            }
+            else
+            {
+                current = "/";
+            }
+        }
+
+        for (size_t i = 0; i < path.segments.size(); i++)
+        {
+            if (!current.empty() && current.back() != '/')
+            {
+                current.push_back('/');
+            }
+            current += path.segments[i];
+
+            bool stepExists = false;
+            bool stepIsDir = false;
+            if (!IsDirByStat(current, stepExists, stepIsDir))
+            {
+                return false;
+            }
+            if (stepExists)
+            {
+                if (!stepIsDir)
+                {
+                    return false;
+                }
+                continue;
+            }
+
+            const std::wstring w = Utf8ToWide(current);
+            if (w.empty())
+            {
+                return false;
+            }
+            if (!CreateDirectoryW(w.c_str(), nullptr))
+            {
+                const DWORD err = GetLastError();
+                if (err != ERROR_ALREADY_EXISTS)
+                {
+                    return false;
+                }
+
+                bool racedExists = false;
+                bool racedIsDir = false;
+                if (!IsDirByStat(current, racedExists, racedIsDir) || !racedExists || !racedIsDir)
+                {
+                    return false;
+                }
+            }
+        }
+        return true;
+#else
+        std::string current;
+        if (path.isAbsolute)
+        {
+            current = "/";
+        }
+
+        for (size_t i = 0; i < path.segments.size(); i++)
+        {
+            if (!current.empty() && current.back() != '/')
+            {
+                current.push_back('/');
+            }
+            current += path.segments[i];
+
+            struct stat st;
+            if (::stat(current.c_str(), &st) == 0)
+            {
+                if (!S_ISDIR(st.st_mode))
+                {
+                    return false;
+                }
+                continue;
+            }
+
+            if (::mkdir(current.c_str(), 0755) != 0)
+            {
+                if (errno == EEXIST)
+                {
+                    struct stat st2;
+                    if (::stat(current.c_str(), &st2) == 0 && S_ISDIR(st2.st_mode))
+                    {
+                        continue;
+                    }
+                    return false;
+                }
+                return false;
+            }
+        }
+        return true;
+#endif
+    }
+
+#if defined(_WIN32)
+    static std::wstring StripTrailingSlashForDirectoryApi(const std::wstring& path)
+    {
+        if (path.empty())
+        {
+            return path;
+        }
+        std::wstring out = path;
+        while (out.size() > 1)
+        {
+            const wchar_t last = out.back();
+            if (last != L'/' && last != L'\\')
+            {
+                break;
+            }
+            // Keep drive root (e.g. "C:\\")
+            if (out.size() == 3 && IsAsciiAlpha(static_cast<char>(out[0])) && out[1] == L':' && (out[2] == L'\\' || out[2] == L'/'))
+            {
+                break;
+            }
+            out.pop_back();
+        }
+        return out;
+    }
+
+    static void ClearReadOnlyAttributeIfNeeded(const std::wstring& pathW)
+    {
+        if (pathW.empty())
+        {
+            return;
+        }
+
+        const DWORD attrs = GetFileAttributesW(pathW.c_str());
+        if (attrs == INVALID_FILE_ATTRIBUTES)
+        {
+            return;
+        }
+        if ((attrs & FILE_ATTRIBUTE_READONLY) == 0)
+        {
+            return;
+        }
+
+        SetFileAttributesW(pathW.c_str(), attrs & ~FILE_ATTRIBUTE_READONLY);
+    }
+
+    static bool DeleteOneFile(const std::string& filePathUtf8)
+    {
+        const std::wstring w = Utf8ToWide(filePathUtf8);
+        if (w.empty())
+        {
+            return false;
+        }
+
+        ClearReadOnlyAttributeIfNeeded(w);
+        return DeleteFileW(w.c_str()) != 0;
+    }
+
+    static bool RemoveEmptyDir(const std::string& dirPathUtf8)
+    {
+        const std::wstring w = StripTrailingSlashForDirectoryApi(Utf8ToWide(dirPathUtf8));
+        if (w.empty())
+        {
+            return false;
+        }
+
+        ClearReadOnlyAttributeIfNeeded(w);
+        return RemoveDirectoryW(w.c_str()) != 0;
+    }
+
+    static bool DeleteDirContents(const std::string& dirPathUtf8)
+    {
+        const std::string dirWithSlash = EnsureTrailingSlash(dirPathUtf8);
+        if (dirWithSlash.empty())
+        {
+            return false;
+        }
+
+        const std::wstring patternW = Utf8ToWide(dirWithSlash + "*");
+        if (patternW.empty())
+        {
+            return false;
+        }
+
+        WIN32_FIND_DATAW data;
+        HANDLE find = FindFirstFileW(patternW.c_str(), &data);
+        if (find == INVALID_HANDLE_VALUE)
+        {
+            const DWORD err = GetLastError();
+            if (err == ERROR_FILE_NOT_FOUND)
+            {
+                return true;
+            }
+            return false;
+        }
+
         do
         {
-            const wchar_t* name = fd.cFileName;
-            if (name[0] == L'.' && (name[1] == L'\0' || (name[1] == L'.' && name[2] == L'\0')))
+            const wchar_t* name = data.cFileName;
+            if (!name)
             {
                 continue;
             }
-            bool isDir = (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
-            string child = EnsureTrailingSlash(dirUtf8) + WideToUtf8(name);
-            child = ToOutputNorm(child);
+            if (wcscmp(name, L".") == 0 || wcscmp(name, L"..") == 0)
+            {
+                continue;
+            }
+
+            const std::string child = dirWithSlash + WideToUtf8(std::wstring(name));
+            const DWORD attrs = data.dwFileAttributes;
+            const bool isDir = (attrs & FILE_ATTRIBUTE_DIRECTORY) != 0;
+            const bool isReparsePoint = (attrs & FILE_ATTRIBUTE_REPARSE_POINT) != 0;
             if (isDir)
             {
-                if (!DeleteDirContents(EnsureTrailingSlash(child)))
+                // 目录符号链接/联接点（reparse point）不应递归进入，避免误删目标目录。
+                if (isReparsePoint)
                 {
-                    ok = false;
-                    break;
+                    if (!RemoveEmptyDir(child))
+                    {
+                        FindClose(find);
+                        return false;
+                    }
                 }
-                if (!RemoveEmptyDir(child))
+                else
                 {
-                    ok = false;
-                    break;
+                    if (!DeleteDirContents(child))
+                    {
+                        FindClose(find);
+                        return false;
+                    }
+                    if (!RemoveEmptyDir(child))
+                    {
+                        FindClose(find);
+                        return false;
+                    }
                 }
             }
             else
             {
                 if (!DeleteOneFile(child))
                 {
-                    ok = false;
-                    break;
+                    FindClose(find);
+                    return false;
                 }
             }
-        } while (FindNextFileW(h, &fd));
-        FindClose(h);
-        return ok;
+        } while (FindNextFileW(find, &data));
+
+        FindClose(find);
+        return true;
+    }
 #else
-        string nativeDir = EnsureTrailingSlash(dirUtf8);
-        DIR* d = ::opendir(nativeDir.c_str());
-        if (!d)
+    static bool DeleteDirContents(const std::string& dirPathUtf8)
+    {
+        const std::string dirWithSlash = EnsureTrailingSlash(dirPathUtf8);
+        if (dirWithSlash.empty())
         {
             return false;
         }
-        bool ok = true;
-        while (dirent* ent = ::readdir(d))
+
+        DIR* dir = opendir(dirWithSlash.c_str());
+        if (!dir)
         {
-            const char* name = ent->d_name;
-            if (name[0] == '.' && (name[1] == '\0' || (name[1] == '.' && name[2] == '\0')))
+            return false;
+        }
+
+        struct dirent* entry = nullptr;
+        while ((entry = readdir(dir)) != nullptr)
+        {
+            const char* name = entry->d_name;
+            if (!name)
             {
                 continue;
             }
-            string child = nativeDir + name;
-            struct stat st;
-            if (lstat(child.c_str(), &st) != 0)
+            if (std::strcmp(name, ".") == 0 || std::strcmp(name, "..") == 0)
             {
-                ok = false;
-                break;
+                continue;
             }
+
+            const std::string fullPath = dirWithSlash + name;
+            struct stat st;
+            if (lstat(fullPath.c_str(), &st) != 0)
+            {
+                continue;
+            }
+
             if (S_ISDIR(st.st_mode))
             {
-                if (!DeleteDirContents(EnsureTrailingSlash(child)))
+                if (!DeleteDirContents(fullPath))
                 {
-                    ok = false;
-                    break;
+                    closedir(dir);
+                    return false;
                 }
-                if (::rmdir(child.c_str()) != 0)
+                if (rmdir(fullPath.c_str()) != 0)
                 {
-                    ok = false;
-                    break;
+                    closedir(dir);
+                    return false;
                 }
             }
             else
             {
-                if (::unlink(child.c_str()) != 0)
+                if (unlink(fullPath.c_str()) != 0)
                 {
-                    ok = false;
-                    break;
+                    closedir(dir);
+                    return false;
                 }
             }
         }
-        ::closedir(d);
-        return ok;
-#endif
-    }
 
-    // 平台无关：获取文件大小（字节），仅常规文件。成功返回 true 并写入 sizeOut。
-    static bool TryGetFileSize64(const string& filePathUtf8, uint64_t& sizeOut)
-    {
-#if defined(_WIN32)
-        // 先排除不存在或目录
-        const wstring w = Utf8ToWide(filePathUtf8);
-        if (w.empty())
-        {
-            return false;
-        }
-
-        const DWORD attr = GetFileAttributesW(w.c_str());
-        if (attr == INVALID_FILE_ATTRIBUTES)
-        {
-            return false;
-        }
-        if (attr & FILE_ATTRIBUTE_DIRECTORY)
-        {
-            return false; // 目录不在本 API 的定义范围内
-        }
-
-        // 以最小权限打开，不阻塞他人（共享读/写/删）
-        const HANDLE h = CreateFileW(
-            w.c_str(),
-            FILE_READ_ATTRIBUTES,
-            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-            nullptr,
-            OPEN_EXISTING,
-            FILE_ATTRIBUTE_NORMAL,
-            nullptr
-        );
-        if (h == INVALID_HANDLE_VALUE)
-        {
-            return false;
-        }
-
-        LARGE_INTEGER li = {};
-        const BOOL ok = GetFileSizeEx(h, &li); // 64 位大小
-        ::CloseHandle(h);
-
-        if (!ok || li.QuadPart < 0)
-        {
-            return false;
-        }
-        sizeOut = static_cast<uint64_t>(li.QuadPart);
-        return true;
-#else
-        string native = ReplaceSlashes(filePathUtf8, '/');
-        struct stat st;
-        if (stat(native.c_str(), &st) != 0)
-        {
-            return false;
-        }
-        if (!S_ISREG(st.st_mode))
-        {
-            return false; // 仅常规文件
-        }
-        // st_size 为 off_t，POSIX 规定表示文件字节数；符号链接时为其路径长度。我们已限制为常规文件。 :contentReference[oaicite:3]{index=3}
-        if (st.st_size < 0)
-        {
-            return false;
-        }
-        sizeOut = static_cast<uint64_t>(st.st_size);
+        closedir(dir);
         return true;
     }
 #endif
-}
 
-static void NormalizeToUnixDir(string& path)
-{
-    for (size_t i = 0; i < path.size(); i++)
+    static void ListFilesRecursive(const std::string& dirPathUtf8, bool recursive, std::vector<std::string>& outFiles)
     {
-        if (path[i] == '\\')
+        if (dirPathUtf8.empty())
         {
-            path[i] = '/';
+            return;
         }
-    }
-    // 去掉所有尾部斜杠，最后补一个，保证“有且仅有一个”
-    while (!path.empty() && path.back() == '/')
-    {
-        path.pop_back();
-    }
-    path.push_back('/');
-}
 
-static void ReplaceBackslashWithSlash(string& s)
-{
-    for (size_t i = 0; i < s.size(); i++)
-    {
-        if (s[i] == '\\')
+        bool exists = false;
+        bool isDir = false;
+        if (!IsDirByStat(dirPathUtf8, exists, isDir) || !exists || !isDir)
         {
-            s[i] = '/';
+            return;
         }
-    }
-}
 
-struct ParsedPath
-{
-    string root;                  // Windows: "c:", "//server/share"; Linux: "/"; relative: ""
-    vector<string> segments; // 不包含 root 的各段
-    bool isAbsolute = false;
-};
-
-static inline bool IsAsciiAlpha(char ch)
-{
-    return (ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z');
-}
-
-static inline char AsciiToLower(char ch)
-{
-    if (ch >= 'A' && ch <= 'Z')
-    {
-        return static_cast<char>(ch - 'A' + 'a');
-    }
-    return ch;
-}
-
-static string AsciiToLowerString(const string& s)
-{
-    string out = s;
-    for (size_t i = 0; i < out.size(); i++)
-    {
-        out[i] = AsciiToLower(out[i]);
-    }
-    return out;
-}
-
-static bool EqualRoot(const string& a, const string& b)
-{
-#if defined(_WIN32)
-    return AsciiToLowerString(a) == AsciiToLowerString(b);
-#else
-    return a == b;
-#endif
-}
-
-static bool EqualSegment(const string& a, const string& b)
-{
-#if defined(_WIN32)
-    // Windows 通常大小写不敏感；这里做 ASCII 级别的宽松比较（非 ASCII 字符保持原样）。
-    if (a.size() != b.size())
-    {
-        return false;
-    }
-    for (size_t i = 0; i < a.size(); i++)
-    {
-        if (AsciiToLower(a[i]) != AsciiToLower(b[i]))
+        const std::string dirWithSlash = EnsureTrailingSlash(dirPathUtf8);
+        if (dirWithSlash.empty())
         {
-            return false;
+            return;
         }
-    }
-    return true;
-#else
-    return a == b;
-#endif
-}
-
-static void SplitPathSegments(const string& path, size_t startIndex, vector<string>& segmentsOut)
-{
-    segmentsOut.clear();
-    size_t i = startIndex;
-    while (i < path.size())
-    {
-        // 跳过连续 '/'
-        while (i < path.size() && path[i] == '/')
-        {
-            i++;
-        }
-        if (i >= path.size())
-        {
-            break;
-        }
-        const size_t j = path.find('/', i);
-        if (j == string::npos)
-        {
-            segmentsOut.push_back(path.substr(i));
-            break;
-        }
-        segmentsOut.push_back(path.substr(i, j - i));
-        i = j + 1;
-    }
-}
-
-static void NormalizeSegmentsLexical(vector<string>& segments, bool isAbsolute)
-{
-    vector<string> out;
-    out.reserve(segments.size());
-    for (size_t i = 0; i < segments.size(); i++)
-    {
-        const string& seg = segments[i];
-        if (seg.empty() || seg == ".")
-        {
-            continue;
-        }
-        if (seg == "..")
-        {
-            if (!out.empty() && out.back() != "..")
-            {
-                out.pop_back();
-            }
-            else
-            {
-                // 绝对路径不能越过根；相对路径则保留 ".."
-                if (!isAbsolute)
-                {
-                    out.push_back("..");
-                }
-            }
-            continue;
-        }
-        out.push_back(seg);
-    }
-    segments.swap(out);
-}
-
-static ParsedPath ParseAndNormalizePathLexical(const string& rawPathUtf8)
-{
-    ParsedPath out;
-    string path = ToOutputNorm(rawPathUtf8);
 
 #if defined(_WIN32)
-    // 处理 Windows 扩展前缀："\\\\?\\" -> "//?/"、"\\\\.\\" -> "//./"（在 ToOutputNorm 后）
-    if (path.rfind("//?/", 0) == 0)
-    {
-        // "\\\\?\\UNC\\server\\share\\..." -> "//?/UNC/server/share/..."
-        if (path.rfind("//?/UNC/", 0) == 0)
+        const std::wstring patternW = Utf8ToWide(dirWithSlash + "*");
+        if (patternW.empty())
         {
-            path = "//" + path.substr(8); // len("//?/UNC/") == 8
+            return;
         }
-        else
+
+        WIN32_FIND_DATAW data;
+        HANDLE find = FindFirstFileExW(patternW.c_str(), FindExInfoBasic, &data, FindExSearchNameMatch, nullptr, 0);
+        if (find == INVALID_HANDLE_VALUE)
         {
-            path = path.substr(4); // len("//?/") == 4
+            return;
         }
-    }
-    else if (path.rfind("//./", 0) == 0)
-    {
-        path = path.substr(4);
-    }
 
-    size_t startIndex = 0;
-    if (path.size() >= 2 && IsAsciiAlpha(path[0]) && path[1] == ':')
-    {
-        // Drive root (e.g. C:/ or C:)
-        out.root = string(1, AsciiToLower(path[0])) + ":";
-        out.isAbsolute = true;
-        startIndex = 2;
-        if (startIndex < path.size() && path[startIndex] == '/')
+        do
         {
-            startIndex++;
-        }
-    }
-    else if (path.rfind("//", 0) == 0)
-    {
-        // UNC root: //server/share
-        size_t serverEnd = path.find('/', 2);
-        if (serverEnd == string::npos)
-        {
-            out.root = AsciiToLowerString(path);
-            out.isAbsolute = true;
-            return out;
-        }
-        size_t shareEnd = path.find('/', serverEnd + 1);
-        if (shareEnd == string::npos)
-        {
-            out.root = AsciiToLowerString(path);
-            out.isAbsolute = true;
-            return out;
-        }
-        out.root = AsciiToLowerString(path.substr(0, shareEnd));
-        out.isAbsolute = true;
-        startIndex = shareEnd + 1;
-    }
-    else if (!path.empty() && path[0] == '/')
-    {
-        out.root = "/";
-        out.isAbsolute = true;
-        startIndex = 1;
-    }
-    else
-    {
-        out.root.clear();
-        out.isAbsolute = false;
-        startIndex = 0;
-    }
-
-    SplitPathSegments(path, startIndex, out.segments);
-    NormalizeSegmentsLexical(out.segments, out.isAbsolute);
-    return out;
-#else
-    size_t startIndex = 0;
-    if (!path.empty() && path[0] == '/')
-    {
-        out.root = "/";
-        out.isAbsolute = true;
-        startIndex = 1;
-    }
-    SplitPathSegments(path, startIndex, out.segments);
-    NormalizeSegmentsLexical(out.segments, out.isAbsolute);
-    return out;
-#endif
-}
-
-static string JoinSegmentsWithSlash(const vector<string>& segments)
-{
-    if (segments.empty())
-    {
-        return string();
-    }
-    string out;
-    // 预估容量：每段 + 分隔符
-    size_t total = 0;
-    for (size_t i = 0; i < segments.size(); i++)
-    {
-        total += segments[i].size() + 1;
-    }
-    out.reserve(total);
-
-    for (size_t i = 0; i < segments.size(); i++)
-    {
-        if (i > 0)
-        {
-            out.push_back('/');
-        }
-        out.append(segments[i]);
-    }
-    return out;
-}
-
-static bool EndsWithDotOrDotDot(const string& pathUtf8)
-{
-    if (pathUtf8.empty())
-    {
-        return false;
-    }
-
-    string s = pathUtf8;
-    ReplaceBackslashWithSlash(s);
-
-    // 去尾斜杠后判断最后一个片段
-    while (!s.empty() && s.back() == '/')
-    {
-        s.pop_back();
-    }
-    if (s.empty())
-    {
-        return false;
-    }
-
-    const size_t pos = s.find_last_of('/');
-    const string last = (pos == string::npos) ? s : s.substr(pos + 1);
-    return last == "." || last == "..";
-}
-
-struct LexicalPath
-{
-    string root;
-    bool isAbsolute = false;
-    bool isDrive = false;
-    bool isUnc = false;
-    vector<string> segments;
-};
-
-static LexicalPath ParseLexicalPath(const string& rawPathUtf8)
-{
-    LexicalPath path;
-    string s = rawPathUtf8;
-    ReplaceBackslashWithSlash(s);
-
-    size_t index = 0;
-
-    // Drive: "C:" or "C:/..." or "C:..."  -> treat as rooted at drive.
-    if (s.size() >= 2 && IsAsciiAlpha(s[0]) && s[1] == ':')
-    {
-        path.isAbsolute = true;
-        path.isDrive = true;
-        path.root = s.substr(0, 2);
-        index = 2;
-        if (index < s.size() && s[index] == '/')
-        {
-            index++;
-        }
-    }
-    // UNC: //server/share/...
-    else if (s.size() >= 2 && s[0] == '/' && s[1] == '/')
-    {
-        path.isAbsolute = true;
-        path.isUnc = true;
-
-        // root = //server/share
-        const size_t serverEnd = s.find('/', 2);
-        if (serverEnd == string::npos)
-        {
-            path.root = s;
-            index = s.size();
-        }
-        else
-        {
-            const size_t shareEnd = s.find('/', serverEnd + 1);
-            if (shareEnd == string::npos)
+            const wchar_t* name = data.cFileName;
+            if (!name)
             {
-                path.root = s;
-                index = s.size();
-            }
-            else
-            {
-                path.root = s.substr(0, shareEnd);
-                index = shareEnd + 1;
-            }
-        }
-    }
-    // Unix absolute: /...
-    else if (!s.empty() && s[0] == '/')
-    {
-        path.isAbsolute = true;
-        path.root = "/";
-        index = 1;
-    }
-
-    // Parse segments (skip empty segments caused by duplicate slashes)
-    string current;
-    for (size_t i = index; i <= s.size(); i++)
-    {
-        const char ch = (i < s.size()) ? s[i] : '/';
-        if (ch == '/')
-        {
-            if (!current.empty())
-            {
-                path.segments.push_back(current);
-                current.clear();
-            }
-        }
-        else
-        {
-            current.push_back(ch);
-        }
-    }
-    return path;
-}
-
-static void NormalizeDotSegments(LexicalPath& path)
-{
-    vector<string> out;
-    out.reserve(path.segments.size());
-
-    for (size_t i = 0; i < path.segments.size(); i++)
-    {
-        const string& seg = path.segments[i];
-        if (seg.empty() || seg == ".")
-        {
-            continue;
-        }
-        if (seg == "..")
-        {
-            if (!out.empty() && out.back() != "..")
-            {
-                out.pop_back();
-            }
-            else
-            {
-                if (!path.isAbsolute)
-                {
-                    out.push_back("..");
-                }
-            }
-            continue;
-        }
-        out.push_back(seg);
-    }
-
-    path.segments.swap(out);
-}
-
-static string BuildPathString(const LexicalPath& path, bool forceDir)
-{
-    string out;
-
-    if (path.isAbsolute)
-    {
-        if (path.isDrive)
-        {
-            out = path.root;
-            out.push_back('/');
-        }
-        else if (path.isUnc)
-        {
-            out = path.root;
-            out.push_back('/');
-        }
-        else
-        {
-            out = "/";
-        }
-    }
-
-    for (size_t i = 0; i < path.segments.size(); i++)
-    {
-        if (!out.empty() && out.back() != '/')
-        {
-            out.push_back('/');
-        }
-        out += path.segments[i];
-    }
-
-    if (out.empty())
-    {
-        out = ".";
-    }
-
-    if (forceDir)
-    {
-        if (out == ".")
-        {
-            out = "./";
-        }
-        else if (out == "..")
-        {
-            out = "../";
-        }
-        else if (out.back() != '/')
-        {
-            out.push_back('/');
-        }
-    }
-    else
-    {
-        // 若是根目录（"/", "C:/", "//server/share/"），保留末尾 '/'
-        const bool isRootUnix = out == "/";
-        const bool isRootDrive = (out.size() == 3 && IsAsciiAlpha(out[0]) && out[1] == ':' && out[2] == '/');
-        const bool isRootUnc = (path.isUnc && out == path.root + "/");
-
-        if (!isRootUnix && !isRootDrive && !isRootUnc)
-        {
-            while (out.size() > 1 && out.back() == '/')
-            {
-                out.pop_back();
-            }
-        }
-    }
-
-    return out;
-}
-
-static void EnsureEndsWithSlash(std::string& pathUtf8)
-{
-    if (!pathUtf8.empty() && pathUtf8.back() != '/')
-    {
-        pathUtf8.push_back('/');
-    }
-}
-
-static std::string NormalizeDirectoryPathUtf8(const std::string& pathUtf8)
-{
-    std::string normalized = pathUtf8;
-    ReplaceBackslashWithSlash(normalized);
-    EnsureEndsWithSlash(normalized);
-    return normalized;
-}
-
-#if defined(_WIN32)
-static bool GetKnownFolderPathUtf8(const KNOWNFOLDERID& folderId, std::string& outPathUtf8)
-{
-    outPathUtf8.clear();
-
-    PWSTR rawPath = nullptr;
-    const HRESULT hr = SHGetKnownFolderPath(folderId, KF_FLAG_DEFAULT, nullptr, &rawPath);
-    if (FAILED(hr) || !rawPath)
-    {
-        return false;
-    }
-
-    const std::wstring pathW(rawPath);
-    CoTaskMemFree(rawPath);
-
-    outPathUtf8 = GB_WStringToUtf8(pathW);
-    outPathUtf8 = NormalizeDirectoryPathUtf8(outPathUtf8);
-    return !outPathUtf8.empty();
-}
-
-static std::wstring GetEnvVarW(const wchar_t* name)
-{
-    if (!name)
-    {
-        return L"";
-    }
-
-    const DWORD required = GetEnvironmentVariableW(name, nullptr, 0);
-    if (required == 0)
-    {
-        return L"";
-    }
-
-    std::wstring value;
-    value.resize(static_cast<size_t>(required), L'\0');
-
-    const DWORD written = GetEnvironmentVariableW(name, &value[0], required);
-    if (written == 0 || written >= required)
-    {
-        return L"";
-    }
-
-    value.resize(static_cast<size_t>(written));
-    return value;
-}
-
-static std::string GetEnvVarUtf8FromWide(const wchar_t* name)
-{
-    const std::wstring valueW = GetEnvVarW(name);
-    if (valueW.empty())
-    {
-        return "";
-    }
-    return GB_WStringToUtf8(valueW);
-}
-
-#else
-static std::string GetEnvVarUtf8(const char* name)
-{
-    if (!name)
-    {
-        return "";
-    }
-
-    const char* value = std::getenv(name);
-    if (!value)
-    {
-        return "";
-    }
-
-    return std::string(value);
-}
-
-static std::string GetHomeDirectoryUtf8_NoThrow()
-{
-    const std::string homeFromEnv = GetEnvVarUtf8("HOME");
-    if (!homeFromEnv.empty())
-    {
-        return NormalizeDirectoryPathUtf8(homeFromEnv);
-    }
-
-    const uid_t userId = getuid();
-    passwd* userInfo = getpwuid(userId);
-    if (userInfo && userInfo->pw_dir)
-    {
-        return NormalizeDirectoryPathUtf8(std::string(userInfo->pw_dir));
-    }
-
-    return "";
-}
-
-static std::string TrimAscii(const std::string& text)
-{
-    size_t beginIndex = 0;
-    while (beginIndex < text.size())
-    {
-        const char ch = text[beginIndex];
-        if (ch != ' ' && ch != '\t' && ch != '\r' && ch != '\n')
-        {
-            break;
-        }
-        beginIndex++;
-    }
-
-    size_t endIndex = text.size();
-    while (endIndex > beginIndex)
-    {
-        const char ch = text[endIndex - 1];
-        if (ch != ' ' && ch != '\t' && ch != '\r' && ch != '\n')
-        {
-            break;
-        }
-        endIndex--;
-    }
-
-    return text.substr(beginIndex, endIndex - beginIndex);
-}
-
-static bool StartsWith(const std::string& text, const std::string& prefix)
-{
-    if (text.size() < prefix.size())
-    {
-        return false;
-    }
-    return text.compare(0, prefix.size(), prefix) == 0;
-}
-
-static std::string UnescapeXdgValue(const std::string& value)
-{
-    std::string out;
-    out.reserve(value.size());
-
-    for (size_t i = 0; i < value.size(); i++)
-    {
-        const char ch = value[i];
-        if (ch == '\\' && i + 1 < value.size())
-        {
-            const char nextCh = value[i + 1];
-            if (nextCh == '\\' || nextCh == '"' || nextCh == '$')
-            {
-                out.push_back(nextCh);
-                i++;
                 continue;
             }
+            if (wcscmp(name, L".") == 0 || wcscmp(name, L"..") == 0)
+            {
+                continue;
+            }
+
+            const std::string item = dirWithSlash + WideToUtf8(std::wstring(name));
+            const DWORD attrs = data.dwFileAttributes;
+            const bool entryIsDir = (attrs & FILE_ATTRIBUTE_DIRECTORY) != 0;
+            const bool isReparsePoint = (attrs & FILE_ATTRIBUTE_REPARSE_POINT) != 0;
+            if (entryIsDir)
+            {
+                if (recursive && !isReparsePoint)
+                {
+                    ListFilesRecursive(item, true, outFiles);
+                }
+            }
+            else
+            {
+                outFiles.push_back(ToOutputNorm(item));
+            }
+        } while (FindNextFileW(find, &data));
+
+        FindClose(find);
+#else
+        DIR* dir = opendir(dirWithSlash.c_str());
+        if (!dir)
+        {
+            return;
         }
-        out.push_back(ch);
+
+        struct dirent* entry = nullptr;
+        while ((entry = readdir(dir)) != nullptr)
+        {
+            const char* name = entry->d_name;
+            if (!name)
+            {
+                continue;
+            }
+            if (std::strcmp(name, ".") == 0 || std::strcmp(name, "..") == 0)
+            {
+                continue;
+            }
+
+            const std::string item = dirWithSlash + name;
+            struct stat st;
+            if (lstat(item.c_str(), &st) != 0)
+            {
+                continue;
+            }
+
+            if (S_ISDIR(st.st_mode))
+            {
+                if (recursive)
+                {
+                    ListFilesRecursive(item, true, outFiles);
+                }
+            }
+            else if (S_ISREG(st.st_mode) || S_ISLNK(st.st_mode))
+            {
+                outFiles.push_back(ToOutputNorm(item));
+            }
+        }
+
+        closedir(dir);
+#endif
     }
 
-    return out;
-}
-
-static std::string ExpandHomeToken(const std::string& path, const std::string& homeDirWithSlash)
-{
-    if (homeDirWithSlash.empty())
+#if !defined(_WIN32)
+    static std::string GetEnvVarUtf8(const char* name)
     {
-        return path;
+        if (!name)
+        {
+            return "";
+        }
+        const char* value = std::getenv(name);
+        return value ? std::string(value) : std::string();
     }
 
-    std::string homeDirNoSlash = homeDirWithSlash;
-    if (!homeDirNoSlash.empty() && homeDirNoSlash.back() == '/')
+    static std::string GetHomeDirectoryUtf8_NoThrow()
     {
-        homeDirNoSlash.pop_back();
+        const std::string fromEnv = GetEnvVarUtf8("HOME");
+        if (!fromEnv.empty())
+        {
+            return NormalizeDirectoryPathUtf8(fromEnv);
+        }
+
+        const uid_t userId = getuid();
+        long bufferSize = sysconf(_SC_GETPW_R_SIZE_MAX);
+        if (bufferSize < 0)
+        {
+            bufferSize = 16384;
+        }
+
+        std::vector<char> buffer;
+        buffer.resize(static_cast<size_t>(bufferSize));
+
+        struct passwd pwd;
+        struct passwd* result = nullptr;
+        if (getpwuid_r(userId, &pwd, buffer.data(), buffer.size(), &result) != 0 || !result || !result->pw_dir)
+        {
+            return "";
+        }
+
+        return NormalizeDirectoryPathUtf8(std::string(result->pw_dir));
     }
 
-    std::string out = path;
-
-    // 支持 $HOME 与 ${HOME}
-    const std::string token1 = "$HOME";
-    const std::string token2 = "${HOME}";
-
-    size_t pos = 0;
-    while ((pos = out.find(token2, pos)) != std::string::npos)
+    static std::string TrimAscii(const std::string& text)
     {
-        out.replace(pos, token2.size(), homeDirNoSlash);
-        pos += homeDirNoSlash.size();
+        size_t beginIndex = 0;
+        while (beginIndex < text.size())
+        {
+            const char ch = text[beginIndex];
+            if (ch != ' ' && ch != '\t' && ch != '\r' && ch != '\n')
+            {
+                break;
+            }
+            beginIndex++;
+        }
+
+        size_t endIndex = text.size();
+        while (endIndex > beginIndex)
+        {
+            const char ch = text[endIndex - 1];
+            if (ch != ' ' && ch != '\t' && ch != '\r' && ch != '\n')
+            {
+                break;
+            }
+            endIndex--;
+        }
+
+        return text.substr(beginIndex, endIndex - beginIndex);
     }
 
-    pos = 0;
-    while ((pos = out.find(token1, pos)) != std::string::npos)
+    static std::string UnescapeXdgValue(const std::string& value)
     {
-        out.replace(pos, token1.size(), homeDirNoSlash);
-        pos += homeDirNoSlash.size();
+        std::string out;
+        out.reserve(value.size());
+
+        for (size_t i = 0; i < value.size(); i++)
+        {
+            const char ch = value[i];
+            if (ch == '\\' && i + 1 < value.size())
+            {
+                const char nextCh = value[i + 1];
+                if (nextCh == '\\' || nextCh == '"' || nextCh == '$')
+                {
+                    out.push_back(nextCh);
+                    i++;
+                    continue;
+                }
+            }
+            out.push_back(ch);
+        }
+
+        return out;
     }
 
-    // 支持 ~/xxx
-    if (StartsWith(out, "~/"))
+    static std::string ExpandHomeToken(const std::string& path, const std::string& homeDirWithSlash)
     {
-        out = homeDirNoSlash + out.substr(1);
-    }
+        if (homeDirWithSlash.empty())
+        {
+            return path;
+        }
 
-    return out;
-}
-
-static std::string GetXdgUserDirFromConfig(const std::string& xdgKeyName, const std::string& homeDirWithSlash)
-{
-    if (homeDirWithSlash.empty())
-    {
-        return "";
-    }
-
-    std::string configHome = GetEnvVarUtf8("XDG_CONFIG_HOME");
-    if (configHome.empty())
-    {
         std::string homeDirNoSlash = homeDirWithSlash;
         if (!homeDirNoSlash.empty() && homeDirNoSlash.back() == '/')
         {
             homeDirNoSlash.pop_back();
         }
-        configHome = homeDirNoSlash + "/.config";
+
+        std::string out = path;
+
+        // Support $HOME and ${HOME}
+        const std::string token1 = "$HOME";
+        const std::string token2 = "${HOME}";
+
+        size_t pos = 0;
+        while ((pos = out.find(token2, pos)) != std::string::npos)
+        {
+            out.replace(pos, token2.size(), homeDirNoSlash);
+            pos += homeDirNoSlash.size();
+        }
+
+        pos = 0;
+        while ((pos = out.find(token1, pos)) != std::string::npos)
+        {
+            out.replace(pos, token1.size(), homeDirNoSlash);
+            pos += homeDirNoSlash.size();
+        }
+
+        if (StartsWith(out, "~/"))
+        {
+            out = homeDirNoSlash + out.substr(1);
+        }
+
+        return out;
     }
 
-    internal::ReplaceBackslashWithSlash(configHome);
-    if (!configHome.empty() && configHome.back() == '/')
+    static std::string GetXdgUserDirFromConfig(const std::string& xdgKeyName, const std::string& homeDirWithSlash)
     {
-        configHome.pop_back();
-    }
+        if (homeDirWithSlash.empty())
+        {
+            return "";
+        }
 
-    const std::string configFilePath = configHome + "/user-dirs.dirs";
+        std::string configHome = GetEnvVarUtf8("XDG_CONFIG_HOME");
+        if (configHome.empty())
+        {
+            std::string homeDirNoSlash = homeDirWithSlash;
+            if (!homeDirNoSlash.empty() && homeDirNoSlash.back() == '/')
+            {
+                homeDirNoSlash.pop_back();
+            }
+            configHome = homeDirNoSlash + "/.config";
+        }
 
-    std::ifstream input(configFilePath.c_str(), std::ios::in);
-    if (!input.is_open())
-    {
+        ReplaceBackslashWithSlash(configHome);
+        configHome = StripTrailingSlashesButKeepRoot(configHome);
+        const std::string configFilePath = configHome + "/user-dirs.dirs";
+
+        std::ifstream input(configFilePath.c_str(), std::ios::in);
+        if (!input.is_open())
+        {
+            return "";
+        }
+
+        std::string line;
+        const std::string prefix = xdgKeyName + "=";
+        while (std::getline(input, line))
+        {
+            const std::string trimmed = TrimAscii(line);
+            if (trimmed.empty() || trimmed[0] == '#')
+            {
+                continue;
+            }
+            if (!StartsWith(trimmed, prefix))
+            {
+                continue;
+            }
+
+            std::string value = TrimAscii(trimmed.substr(prefix.size()));
+            if (value.size() >= 2 && value.front() == '"' && value.back() == '"')
+            {
+                value = value.substr(1, value.size() - 2);
+            }
+
+            value = UnescapeXdgValue(value);
+            value = ExpandHomeToken(value, homeDirWithSlash);
+            value = NormalizeDirectoryPathUtf8(value);
+            return value;
+        }
+
         return "";
     }
+#endif
 
-    std::string line;
-    const std::string prefix = xdgKeyName + "=";
-
-    while (std::getline(input, line))
+#if defined(_WIN32)
+    static bool GetKnownFolderPathUtf8(const KNOWNFOLDERID& folderId, std::string& outPathUtf8)
     {
-        const std::string trimmed = TrimAscii(line);
-        if (trimmed.empty() || trimmed[0] == '#')
-        {
-            continue;
-        }
-        if (!StartsWith(trimmed, prefix))
-        {
-            continue;
-        }
+        outPathUtf8.clear();
 
-        std::string value = TrimAscii(trimmed.substr(prefix.size()));
-        if (value.size() >= 2 && value.front() == '"' && value.back() == '"')
+        PWSTR rawPath = nullptr;
+        const HRESULT hr = SHGetKnownFolderPath(folderId, KF_FLAG_DEFAULT, nullptr, &rawPath);
+        if (FAILED(hr) || !rawPath)
         {
-            value = value.substr(1, value.size() - 2);
+            return false;
         }
 
-        value = UnescapeXdgValue(value);
-        value = ExpandHomeToken(value, homeDirWithSlash);
-        value = NormalizeDirectoryPathUtf8(value);
+        const std::wstring pathW(rawPath);
+        CoTaskMemFree(rawPath);
 
+        outPathUtf8 = GB_WStringToUtf8(pathW);
+        outPathUtf8 = NormalizeDirectoryPathUtf8(outPathUtf8);
+        return !outPathUtf8.empty();
+    }
+
+    static std::wstring GetEnvVarW(const wchar_t* name)
+    {
+        if (!name)
+        {
+            return L"";
+        }
+
+        const DWORD required = GetEnvironmentVariableW(name, nullptr, 0);
+        if (required == 0)
+        {
+            return L"";
+        }
+
+        std::wstring value;
+        value.resize(static_cast<size_t>(required), L'\0');
+        const DWORD written = GetEnvironmentVariableW(name, &value[0], required);
+        if (written == 0 || written >= required)
+        {
+            return L"";
+        }
+        value.resize(static_cast<size_t>(written));
         return value;
     }
 
-    return "";
-}
+    static std::string GetEnvVarUtf8FromWide(const wchar_t* name)
+    {
+        const std::wstring valueW = GetEnvVarW(name);
+        if (valueW.empty())
+        {
+            return "";
+        }
+        return GB_WStringToUtf8(valueW);
+    }
 #endif
 }
 
-bool GB_IsFileExists(const string& filePathUtf8)
+bool GB_IsFileExists(const std::string& filePathUtf8)
 {
     bool exists = false;
     bool isDir = false;
@@ -1347,7 +1355,7 @@ bool GB_IsFileExists(const string& filePathUtf8)
     return exists && !isDir;
 }
 
-bool GB_IsDirectoryExists(const string& dirPathUtf8)
+bool GB_IsDirectoryExists(const std::string& dirPathUtf8)
 {
     bool exists = false;
     bool isDir = false;
@@ -1358,356 +1366,449 @@ bool GB_IsDirectoryExists(const string& dirPathUtf8)
     return exists && isDir;
 }
 
-bool GB_CreateDirectory(const string& dirPathUtf8)
+bool GB_CreateDirectory(const std::string& dirPathUtf8)
 {
-    // 递归创建，逐级建；Windows 的 CreateDirectory* 仅建末级，这里做完整 walk
+    if (dirPathUtf8.empty())
+    {
+        return false;
+    }
     return internal::MakeDirsRecursive(internal::EnsureTrailingSlash(dirPathUtf8));
 }
 
-bool GB_IsEmptyDirectory(const string& dirPathUtf8)
+bool GB_IsEmptyDirectory(const std::string& dirPathUtf8)
 {
-    if (!GB_IsDirectoryExists(dirPathUtf8))
+    bool exists = false;
+    bool isDir = false;
+    if (!internal::IsDirByStat(dirPathUtf8, exists, isDir) || !exists || !isDir)
     {
         return false;
     }
+
 #if defined(_WIN32)
-    string pattern = internal::EnsureTrailingSlash(dirPathUtf8) + "*";
-    wstring wpat = internal::Utf8ToWide(pattern);
-    if (wpat.empty())
+    const std::string dirWithSlash = internal::EnsureTrailingSlash(dirPathUtf8);
+    if (dirWithSlash.empty())
     {
         return false;
     }
-    WIN32_FIND_DATAW fd;
-    HANDLE h = FindFirstFileExW(wpat.c_str(), FindExInfoBasic, &fd, FindExSearchNameMatch, nullptr, 0);
-    if (h == INVALID_HANDLE_VALUE)
+
+    WIN32_FIND_DATAW data;
+    const std::wstring patternW = internal::Utf8ToWide(dirWithSlash + "*");
+    if (patternW.empty())
     {
         return false;
     }
+
+    HANDLE find = FindFirstFileW(patternW.c_str(), &data);
+    if (find == INVALID_HANDLE_VALUE)
+    {
+        const DWORD err = GetLastError();
+        if (err == ERROR_FILE_NOT_FOUND)
+        {
+            return true;
+        }
+        return false;
+    }
+
     bool empty = true;
     do
     {
-        const wchar_t* name = fd.cFileName;
-        if (name[0] == L'.' && (name[1] == L'\0' || (name[1] == L'.' && name[2] == L'\0')))
+        const wchar_t* name = data.cFileName;
+        if (!name)
+        {
+            continue;
+        }
+        if (wcscmp(name, L".") == 0 || wcscmp(name, L"..") == 0)
         {
             continue;
         }
         empty = false;
         break;
-    } while (FindNextFileW(h, &fd));
-    FindClose(h);
+    } while (FindNextFileW(find, &data));
+
+    FindClose(find);
     return empty;
 #else
-    string native = internal::EnsureTrailingSlash(dirPathUtf8);
-    DIR* d = ::opendir(native.c_str());
-    if (!d)
+    const std::string dirWithSlash = internal::EnsureTrailingSlash(dirPathUtf8);
+    if (dirWithSlash.empty())
     {
         return false;
     }
-    bool empty = true;
-    while (dirent* ent = ::readdir(d))
+
+    DIR* dir = opendir(dirWithSlash.c_str());
+    if (!dir)
     {
-        const char* name = ent->d_name;
-        if (name[0] == '.' && (name[1] == '\0' || (name[1] == '.' && name[2] == '\0')))
+        return false;
+    }
+
+    bool empty = true;
+    struct dirent* entry = nullptr;
+    while ((entry = readdir(dir)) != nullptr)
+    {
+        const char* name = entry->d_name;
+        if (!name)
+        {
+            continue;
+        }
+        if (std::strcmp(name, ".") == 0 || std::strcmp(name, "..") == 0)
         {
             continue;
         }
         empty = false;
         break;
     }
-    ::closedir(d);
+
+    closedir(dir);
     return empty;
 #endif
 }
 
-bool GB_DeleteDirectory(const string& dirPathUtf8)
+bool GB_DeleteDirectory(const std::string& dirPathUtf8)
 {
-    if (!GB_IsDirectoryExists(dirPathUtf8))
+    if (dirPathUtf8.empty())
     {
         return false;
     }
-    const string dir = internal::EnsureTrailingSlash(dirPathUtf8);
-    if (!internal::DeleteDirContents(dir))
+
+    const std::string trimmedPath = internal::StripTrailingSlashesButKeepRoot(dirPathUtf8);
+    if (trimmedPath.empty())
     {
         return false;
     }
-    return internal::RemoveEmptyDir(dir);
+
+    // Refuse to delete absolute roots: "/", "C:/", "//server/share/".
+    if (internal::IsAbsoluteRootPath(trimmedPath))
+    {
+        return false;
+    }
+
+#if defined(_WIN32)
+    bool exists = false;
+    bool isDir = false;
+    if (!internal::IsDirByStat(trimmedPath, exists, isDir) || !exists || !isDir)
+    {
+        return false;
+    }
+
+    if (!internal::DeleteDirContents(trimmedPath))
+    {
+        return false;
+    }
+    return internal::RemoveEmptyDir(trimmedPath);
+#else
+    struct stat st;
+    if (lstat(trimmedPath.c_str(), &st) != 0)
+    {
+        return false;
+    }
+
+    if (S_ISLNK(st.st_mode))
+    {
+        // Do not follow symlinked directories; delete the link itself.
+        const std::string pathNormalized = internal::ToOutputNorm(trimmedPath);
+        return unlink(pathNormalized.c_str()) == 0;
+    }
+
+    if (!S_ISDIR(st.st_mode))
+    {
+        return false;
+    }
+
+    if (!internal::DeleteDirContents(trimmedPath))
+    {
+        return false;
+    }
+    return rmdir(trimmedPath.c_str()) == 0;
+#endif
 }
 
-bool GB_DeleteFile(const string& filePathUtf8)
+bool GB_DeleteFile(const std::string& filePathUtf8)
 {
     if (!GB_IsFileExists(filePathUtf8))
     {
         return false;
     }
+
+#if defined(_WIN32)
     return internal::DeleteOneFile(filePathUtf8);
+#else
+    const std::string pathNormalized = internal::ToOutputNorm(filePathUtf8);
+    return unlink(pathNormalized.c_str()) == 0;
+#endif
 }
 
-bool GB_CopyFile(const string& srcFilePathUtf8, const string& dstFilePathUtf8)
+bool GB_CopyFile(const std::string& srcFilePathUtf8, const std::string& dstFilePathUtf8)
 {
-#if defined(_WIN32)
-    // 使用 CopyFileW（会覆盖由第三参数决定；这里选择覆盖 false -> 允许覆盖）
-    wstring wsrc = internal::Utf8ToWide(srcFilePathUtf8);
-    wstring wdst = internal::Utf8ToWide(dstFilePathUtf8);
-    if (wsrc.empty() || wdst.empty())
+    if (!GB_IsFileExists(srcFilePathUtf8))
     {
         return false;
     }
-    // 官方：CopyFile/FindFirstFile 系列文档（与 GetFileAttributesW 同系列）
-    return ::CopyFileW(wsrc.c_str(), wdst.c_str(), FALSE) != 0;
-#else
-    // 纯 C++11 实现：ifstream/ofstream 流式复制（覆盖）。
-    string src = internal::ReplaceSlashes(srcFilePathUtf8, '/');
-    string dst = internal::ReplaceSlashes(dstFilePathUtf8, '/');
 
-    FILE* in = ::fopen(src.c_str(), "rb");
-    if (!in)
+    if (dstFilePathUtf8.empty())
     {
         return false;
     }
-    FILE* out = ::fopen(dst.c_str(), "wb");
-    if (!out)
+
+#if defined(_WIN32)
+    const std::wstring srcW = internal::Utf8ToWide(srcFilePathUtf8);
+    const std::wstring dstW = internal::Utf8ToWide(dstFilePathUtf8);
+    if (srcW.empty() || dstW.empty())
     {
-        ::fclose(in);
         return false;
     }
-    const size_t bufSize = 1 << 20; // 1 MB
-    vector<char> buf(bufSize);
+
+    return CopyFileW(srcW.c_str(), dstW.c_str(), FALSE) != 0;
+#else
+    const std::string srcNormalized = internal::ToOutputNorm(srcFilePathUtf8);
+
+    std::FILE* src = std::fopen(srcNormalized.c_str(), "rb");
+    if (!src)
+    {
+        return false;
+    }
+
+    const std::string dstNormalized = internal::ToOutputNorm(dstFilePathUtf8);
+
+    std::FILE* dst = std::fopen(dstNormalized.c_str(), "wb");
+    if (!dst)
+    {
+        std::fclose(src);
+        return false;
+    }
+
+    std::vector<char> buffer;
+    buffer.resize(1024 * 1024);
+
     bool ok = true;
-    while (ok)
+    for (;;)
     {
-        size_t n = ::fread(buf.data(), 1, buf.size(), in);
-        if (n > 0)
+        const size_t bytesRead = std::fread(buffer.data(), 1, buffer.size(), src);
+        if (bytesRead > 0)
         {
-            if (::fwrite(buf.data(), 1, n, out) != n)
+            const size_t bytesWritten = std::fwrite(buffer.data(), 1, bytesRead, dst);
+            if (bytesWritten != bytesRead)
             {
                 ok = false;
                 break;
             }
         }
-        if (n < buf.size())
+
+        if (bytesRead < buffer.size())
         {
-            if (::ferror(in))
+            if (std::ferror(src))
             {
                 ok = false;
             }
-            break; // EOF
+            break;
         }
     }
-    ::fclose(in);
-    if (::fclose(out) != 0)
-    {
-        ok = false;
-    }
+
+    std::fclose(src);
+    std::fclose(dst);
     return ok;
 #endif
 }
 
-vector<string> GB_GetFilesList(const string& dirPathUtf8, bool recursive)
+std::vector<std::string> GB_GetFilesList(const std::string& dirPathUtf8, bool recursive)
 {
-    vector<string> out;
-    if (!GB_IsDirectoryExists(dirPathUtf8))
-    {
-        return out;
-    }
-    internal::ListFilesRecursive(internal::EnsureTrailingSlash(dirPathUtf8), recursive, out);
+    std::vector<std::string> out;
+    internal::ListFilesRecursive(dirPathUtf8, recursive, out);
     return out;
 }
 
-string GB_GetFileName(const string& rawFilePathUtf8, bool withExt)
+std::string GB_GetFileName(const std::string& filePathUtf8, bool withExt)
 {
-    string filePathUtf8 = GB_Utf8Replace(rawFilePathUtf8, GB_STR("\\\\"), GB_STR("\\"));
-    filePathUtf8 = GB_Utf8Replace(filePathUtf8, GB_STR("\\"), GB_STR("/"));
-    const int64_t pos1 = GB_Utf8FindLast(filePathUtf8, GB_STR("/"));
-    if (pos1 < 0)
+    if (filePathUtf8.empty())
     {
-        return filePathUtf8;
+        return "";
     }
-    const string fileNameWithExt = GB_Utf8Substr(filePathUtf8, pos1 + 1);
+
+    const std::string trimmedPath = internal::StripTrailingSlashesButKeepRoot(filePathUtf8);
+    if (trimmedPath.empty())
+    {
+        return "";
+    }
+
+    const size_t sepPos = trimmedPath.find_last_of('/');
+    const std::string fileNameWithExt = (sepPos == std::string::npos) ? trimmedPath : trimmedPath.substr(sepPos + 1);
+
     if (withExt)
     {
         return fileNameWithExt;
     }
 
-    const int64_t pos2 = GB_Utf8FindLast(fileNameWithExt, GB_STR("."));
-    if (pos2 < 0)
+    const size_t dotPos = fileNameWithExt.find_last_of('.');
+    if (dotPos == std::string::npos)
     {
         return fileNameWithExt;
     }
-    return GB_Utf8Substr(fileNameWithExt, 0, pos2);
+
+    return fileNameWithExt.substr(0, dotPos);
 }
 
-string GB_GetFileExt(const string& filePathUtf8)
+std::string GB_GetFileExt(const std::string& filePathUtf8)
 {
-    const int64_t pos = GB_Utf8FindLast(filePathUtf8, GB_STR("."));
-    if (pos < 0)
+    if (filePathUtf8.empty())
     {
         return "";
     }
 
-    return GB_Utf8Substr(filePathUtf8, pos);
-}
-
-string GB_GetDirectoryPath(const string& rawFilePathUtf8)
-{
-    string filePathUtf8 = GB_Utf8Replace(rawFilePathUtf8, GB_STR("\\\\"), GB_STR("\\"));
-    filePathUtf8 = GB_Utf8Replace(filePathUtf8, GB_STR("\\"), GB_STR("/"));
-    const int64_t pos = GB_Utf8FindLast(filePathUtf8, GB_STR("/"));
-    if (pos < 0)
+    const std::string trimmedPath = internal::StripTrailingSlashesButKeepRoot(filePathUtf8);
+    if (trimmedPath.empty())
     {
         return "";
     }
 
-    return GB_Utf8Substr(filePathUtf8, 0, pos + 1);
+    const size_t sepPos = trimmedPath.find_last_of('/');
+    const size_t dotPos = trimmedPath.find_last_of('.');
+    if (dotPos == std::string::npos)
+    {
+        return "";
+    }
+    if (sepPos != std::string::npos && dotPos <= sepPos)
+    {
+        return "";
+    }
+
+    return trimmedPath.substr(dotPos);
 }
 
-size_t GB_GetFileSizeByte(const string& filePathUtf8)
+std::string GB_GetDirectoryPath(const std::string& filePathUtf8)
 {
-    uint64_t size64 = 0;
+    if (filePathUtf8.empty())
+    {
+        return "";
+    }
+
+    const size_t pos = filePathUtf8.find_last_of("/\\");
+    if (pos == std::string::npos)
+    {
+        return "";
+    }
+
+    std::string dir = filePathUtf8.substr(0, pos + 1);
+    internal::ReplaceBackslashWithSlash(dir);
+    return dir;
+}
+
+size_t GB_GetFileSizeByte(const std::string& filePathUtf8)
+{
+    unsigned long long size64 = 0;
     if (!internal::TryGetFileSize64(filePathUtf8, size64))
     {
         return 0;
     }
-    constexpr static uint64_t maxSizeT = static_cast<uint64_t>(numeric_limits<size_t>::max());
-    if (size64 > maxSizeT)
+
+    const unsigned long long maxSize = static_cast<unsigned long long>(std::numeric_limits<size_t>::max());
+    if (size64 > maxSize)
     {
-        return static_cast<size_t>(maxSizeT); // 截断以适配 32 位构建
+        return std::numeric_limits<size_t>::max();
     }
+
     return static_cast<size_t>(size64);
 }
 
-double GB_GetFileSizeKB(const string& filePathUtf8)
+double GB_GetFileSizeKB(const std::string& filePathUtf8)
 {
-    uint64_t size64 = 0;
-    if (!internal::TryGetFileSize64(filePathUtf8, size64))
-    {
-        return 0.0;
-    }
-    constexpr static double oneKB = 1024.0; // KiB
-    return static_cast<double>(size64) / oneKB;
+    return static_cast<double>(GB_GetFileSizeByte(filePathUtf8)) / 1024.0;
 }
 
-double GB_GetFileSizeMB(const string& filePathUtf8)
+double GB_GetFileSizeMB(const std::string& filePathUtf8)
 {
-    uint64_t size64 = 0;
-    if (!internal::TryGetFileSize64(filePathUtf8, size64))
-    {
-        return 0.0;
-    }
-    constexpr static double oneMB = 1024.0 * 1024.0; // MiB
-    return static_cast<double>(size64) / oneMB;
+    return GB_GetFileSizeKB(filePathUtf8) / 1024.0;
 }
 
-double GB_GetFileSizeGB(const string& filePathUtf8)
+double GB_GetFileSizeGB(const std::string& filePathUtf8)
 {
-    uint64_t size64 = 0;
-    if (!internal::TryGetFileSize64(filePathUtf8, size64))
-    {
-        return 0.0;
-    }
-    constexpr static double oneGB = 1024.0 * 1024.0 * 1024.0; // GiB
-    return static_cast<double>(size64) / oneGB;
+    return GB_GetFileSizeMB(filePathUtf8) / 1024.0;
 }
 
-string GB_GetExeDirectory()
+std::string GB_GetExeDirectory()
 {
 #if defined(_WIN32)
-    // 处理可能超出 MAX_PATH 的路径：循环扩容
-    vector<wchar_t> buf(512);
+    std::wstring buffer;
+    buffer.resize(260);
+
     for (;;)
     {
-        DWORD len = ::GetModuleFileNameW(nullptr, buf.data(), static_cast<DWORD>(buf.size()));
-        if (len == 0)
+        const DWORD written = GetModuleFileNameW(nullptr, &buffer[0], static_cast<DWORD>(buffer.size()));
+        if (written == 0)
         {
-            return string(); // 失败
+            return "";
         }
-        if (len < buf.size() - 1)
+
+        if (written < buffer.size())
         {
-            buf[len] = L'\0';
-            break; // 成功
+            buffer.resize(static_cast<size_t>(written));
+            break;
         }
-        // len == nSize（被截断），扩大缓冲区
-        buf.resize(buf.size() * 2);
+
+        buffer.resize(buffer.size() * 2);
+        if (buffer.size() > 32768)
+        {
+            return "";
+        }
     }
 
-    wstring fullWs(buf.data());
-    // 去掉文件名，得到目录
-    size_t pos = fullWs.find_last_of(L"\\/");
-    if (pos == wstring::npos)
+    size_t sepPos = buffer.find_last_of(L"\\/");
+    if (sepPos == std::wstring::npos)
     {
-        return string();
+        return "";
     }
-    wstring dirWs = fullWs.substr(0, pos);
-    string dirUtf8 = internal::WideToUtf8(dirWs);
-    internal::NormalizeToUnixDir(dirUtf8);
-    return dirUtf8;
-
+    const std::wstring dirW = buffer.substr(0, sepPos + 1);
+    const std::string dirUtf8 = internal::WideToUtf8(dirW);
+    return internal::NormalizeDirectoryPathUtf8(dirUtf8);
 #else
-    // Linux: readlink("/proc/self/exe")，注意：返回长度不含NUL，需要手动补
-    vector<char> buf(256);
+    std::vector<char> buffer;
+    buffer.resize(512);
+
+    ssize_t len = -1;
     for (;;)
     {
-        ssize_t n = ::readlink("/proc/self/exe", buf.data(), buf.size() - 1);
-        if (n < 0)
+        if (buffer.size() > 65536)
         {
-            return string(); // 失败
+            return "";
         }
-        if (static_cast<size_t>(n) < buf.size() - 1)
+
+        len = readlink("/proc/self/exe", buffer.data(), buffer.size() - 1);
+        if (len < 0)
         {
-            buf[static_cast<size_t>(n)] = '\0';
-            break; // 成功
+            return "";
         }
-        // 缓冲区被截断，扩容重试
-        buf.resize(buf.size() * 2);
+
+        if (static_cast<size_t>(len) < buffer.size() - 1)
+        {
+            buffer[static_cast<size_t>(len)] = '\0';
+            break;
+        }
+
+        buffer.resize(buffer.size() * 2);
     }
 
-    string full(buf.data());
-    // 某些发行版在可执行文件被删除时，路径末尾可能带" (deleted)"标记，这里去掉
-    const string deletedTag = " (deleted)";
-    if (full.size() > deletedTag.size() && full.compare(full.size() - deletedTag.size(), deletedTag.size(), deletedTag) == 0)
+    std::string path(buffer.data());
+    internal::ReplaceBackslashWithSlash(path);
+    const size_t sepPos = path.find_last_of('/');
+    if (sepPos == std::string::npos)
     {
-        full.erase(full.size() - deletedTag.size());
+        return "";
     }
-
-    // 去掉文件名，得到目录
-    size_t pos = full.find_last_of('/');
-    if (pos == string::npos)
-    {
-        return string();
-    }
-    string dir = full.substr(0, pos);
-    NormalizeToUnixDir(dir);
-    return dir;
+    const std::string dirUtf8 = path.substr(0, sepPos + 1);
+    return internal::NormalizeDirectoryPathUtf8(dirUtf8);
 #endif
 }
 
-bool GB_CreateFileRecursive(const string& filePathUtf8, bool overwriteIfExists)
+bool GB_CreateFileRecursive(const std::string& filePathUtf8, bool overwriteIfExists)
 {
     if (filePathUtf8.empty())
     {
         return false;
     }
 
-    // 统一分隔符
-    string normPath = filePathUtf8;
-    for (size_t i = 0; i < normPath.size(); i++)
+    if (internal::EndsWithSlash(filePathUtf8))
     {
-        if (normPath[i] == '\\')
-        {
-            normPath[i] = '/';
-        }
+        return false;
     }
 
-    // 末尾是分隔符 => 视为目录，拒绝
-    {
-        const char lastCh = normPath.back();
-        if (lastCh == '/' || lastCh == '\\')
-        {
-            return false;
-        }
-    }
-
-    // 先确保父目录存在
-    const string dirPathUtf8 = GB_GetDirectoryPath(normPath);
+    const std::string dirPathUtf8 = GB_GetDirectoryPath(filePathUtf8);
     if (!dirPathUtf8.empty())
     {
         if (!GB_CreateDirectory(dirPathUtf8))
@@ -1716,258 +1817,170 @@ bool GB_CreateFileRecursive(const string& filePathUtf8, bool overwriteIfExists)
         }
     }
 
-    // 存在性与非覆盖策略
     if (!overwriteIfExists)
     {
-        if (GB_IsFileExists(normPath))
+        if (GB_IsFileExists(filePathUtf8))
         {
-            const size_t sizeByte = GB_GetFileSizeByte(normPath);
-            return sizeByte == 0; // 已存在且已为空 ⇒ OK；否则拒绝
+            return GB_GetFileSizeByte(filePathUtf8) == 0;
         }
     }
 
 #if defined(_WIN32)
-    // UTF-8 -> UTF-16
-    auto Utf8ToWide = [](const string& utf8) -> wstring
-        {
-            if (utf8.empty())
-            {
-                return wstring();
-            }
-            const int need = ::MultiByteToWideChar(CP_UTF8, 0, utf8.c_str(),
-                static_cast<int>(utf8.size()),
-                nullptr, 0);
-            if (need <= 0)
-            {
-                return wstring();
-            }
-            wstring ws(static_cast<size_t>(need), L'\0');
-            const int wrote = ::MultiByteToWideChar(CP_UTF8, 0, utf8.c_str(),
-                static_cast<int>(utf8.size()),
-                &ws[0], need);
-            if (wrote != need)
-            {
-                return wstring();
-            }
-            return ws;
-        };
-
-    const wstring wPath = Utf8ToWide(normPath);
-    if (wPath.empty())
+    const std::wstring fileW = internal::Utf8ToWide(filePathUtf8);
+    if (fileW.empty())
     {
         return false;
     }
 
-    const DWORD creationDisposition = overwriteIfExists ? CREATE_ALWAYS : CREATE_NEW; // 见备注
-    HANDLE h = ::CreateFileW(
-        wPath.c_str(),
-        GENERIC_WRITE,
-        FILE_SHARE_READ,        // 允许其他进程读
-        nullptr,
-        creationDisposition,
-        FILE_ATTRIBUTE_NORMAL,
-        nullptr);
-
-    if (h == INVALID_HANDLE_VALUE)
+    const DWORD disposition = overwriteIfExists ? CREATE_ALWAYS : CREATE_NEW;
+    const HANDLE handle = CreateFileW(fileW.c_str(), GENERIC_WRITE,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, disposition,
+        FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (handle == INVALID_HANDLE_VALUE)
     {
         return false;
     }
-    ::CloseHandle(h);
+
+    CloseHandle(handle);
     return true;
-
 #else
-    // Linux/Unix：确保只在“不存在时创建”或“截断创建”
-    int flags = O_WRONLY | O_CREAT | (overwriteIfExists ? O_TRUNC : O_EXCL);
-    const int fd = ::open(normPath.c_str(), flags, 0644); // 最终权限受 umask 影响
+    int flags = O_WRONLY | O_CREAT;
+    if (overwriteIfExists)
+    {
+        flags |= O_TRUNC;
+    }
+    else
+    {
+        flags |= O_EXCL;
+    }
+
+    const std::string filePathNormalized = internal::ToOutputNorm(filePathUtf8);
+
+    const int fd = open(filePathNormalized.c_str(), flags, 0644);
     if (fd < 0)
     {
         return false;
     }
-    (void)::close(fd);
+
+    close(fd);
     return true;
 #endif
 }
 
-string GB_GetRelativePath(const string& pathAUtf8, const string& pathBUtf8)
+std::string GB_GetRelativePath(const std::string& pathAUtf8, const std::string& pathBUtf8)
 {
     if (pathAUtf8.empty())
     {
         return "";
     }
 
-    // 1) 判定 A 是否目录：优先相信用户输入形态（末尾分隔符），其次才查文件系统。
-    bool pathAIsDir = false;
-    if (!pathAUtf8.empty() && (pathAUtf8.back() == '/' || pathAUtf8.back() == '\\'))
-    {
-        pathAIsDir = true;
-    }
-    else
-    {
-        pathAIsDir = GB_IsDirectoryExists(pathAUtf8);
-    }
+    const bool aIsDir = internal::EndsWithSlash(pathAUtf8) || GB_IsDirectoryExists(pathAUtf8);
+    const std::string normalizedA = internal::BuildPathString(internal::ParseAndNormalizePathLexical(pathAUtf8), aIsDir);
 
-    // 2) 基准路径：若 B 是文件，则以其父目录作为 base；若 B 是目录，则以 B 本身作为 base。
-    bool pathBIsDir = false;
-    if (!pathBUtf8.empty() && (pathBUtf8.back() == '/' || pathBUtf8.back() == '\\'))
-    {
-        pathBIsDir = true;
-    }
-    else
-    {
-        pathBIsDir = GB_IsDirectoryExists(pathBUtf8);
-    }
-
-    string baseDirUtf8 = "";
+    std::string baseDirUtf8;
     if (pathBUtf8.empty())
     {
         baseDirUtf8 = ".";
     }
-    else if (pathBIsDir)
-    {
-        baseDirUtf8 = pathBUtf8;
-    }
     else
     {
-        baseDirUtf8 = GB_GetDirectoryPath(pathBUtf8);
-        if (baseDirUtf8.empty())
+        const bool bIsDir = internal::IsDirectoryHint(pathBUtf8) || GB_IsDirectoryExists(pathBUtf8);
+        if (bIsDir)
         {
-            baseDirUtf8 = ".";
+            baseDirUtf8 = pathBUtf8;
+        }
+        else
+        {
+            baseDirUtf8 = GB_GetDirectoryPath(pathBUtf8);
+            if (baseDirUtf8.empty())
+            {
+                baseDirUtf8 = ".";
+            }
         }
     }
 
-    // 3) 纯字符串（lexical）解析与标准化
-    const internal::ParsedPath target = internal::ParseAndNormalizePathLexical(pathAUtf8);
-    const internal::ParsedPath base = internal::ParseAndNormalizePathLexical(baseDirUtf8);
+    const internal::PathParts target = internal::ParseAndNormalizePathLexical(pathAUtf8);
+    const internal::PathParts base = internal::ParseAndNormalizePathLexical(baseDirUtf8);
 
-    // Windows：不同盘符/不同 UNC share 无法构造相对路径；此处回退为“规范化后的 A”。
-    // 参考：Win32 PathRelativePathToW 要求两者有共同前缀，否则失败。
-    if (!internal::EqualRoot(target.root, base.root) || target.isAbsolute != base.isAbsolute)
+    if (!internal::EqualRoot(target, base))
     {
-        string out = internal::ToOutputNorm(pathAUtf8);
-        if (pathAIsDir)
-        {
-            out = internal::EnsureTrailingSlash(out);
-        }
-        return out;
+        return normalizedA;
     }
 
-    // 4) 计算公共前缀
-    size_t common = 0;
-    const size_t minCount = min(target.segments.size(), base.segments.size());
-    for (; common < minCount; common++)
+    size_t commonCount = 0;
+    while (commonCount < target.segments.size() && commonCount < base.segments.size())
     {
-        if (!internal::EqualSegment(target.segments[common], base.segments[common]))
+        if (!internal::EqualSegment(target.segments[commonCount], base.segments[commonCount]))
         {
             break;
         }
+        commonCount++;
     }
 
-    // 5) base -> common：补 ".."；common -> target：补余下片段
-    vector<string> relSegments;
-    relSegments.reserve((base.segments.size() - common) + (target.segments.size() - common));
+    std::vector<std::string> relSegments;
+    relSegments.reserve((base.segments.size() - commonCount) + (target.segments.size() - commonCount));
 
-    for (size_t i = common; i < base.segments.size(); i++)
+    for (size_t i = commonCount; i < base.segments.size(); i++)
     {
         relSegments.push_back("..");
     }
-    for (size_t i = common; i < target.segments.size(); i++)
+    for (size_t i = commonCount; i < target.segments.size(); i++)
     {
         relSegments.push_back(target.segments[i]);
     }
 
-    string relPath = internal::JoinSegmentsWithSlash(relSegments);
-    if (relPath.empty())
+    std::string rel = internal::JoinSegmentsWithSlash(relSegments);
+    if (rel.empty())
     {
-        relPath = ".";
+        rel = ".";
     }
 
-    // 6) 若 A 为目录，保证结果末尾带 '/'
-    if (pathAIsDir)
+    if (aIsDir)
     {
-        relPath = internal::EnsureTrailingSlash(relPath);
+        rel = internal::EnsureTrailingSlash(rel);
     }
 
-    return relPath;
+    return rel;
 }
 
-string GB_JoinPath(const string& leftPathUtf8, const string& rightPathUtf8)
+std::string GB_JoinPath(const std::string& leftPathUtf8, const std::string& rightPathUtf8)
 {
-    bool outputIsDir = false;
-    if (!rightPathUtf8.empty())
+    if (rightPathUtf8.empty())
     {
-        outputIsDir = internal::IsSlash(rightPathUtf8.back()) || internal::EndsWithDotOrDotDot(rightPathUtf8);
-    }
-    else
-    {
-        if (!leftPathUtf8.empty() && internal::IsSlash(leftPathUtf8.back()))
-        {
-            outputIsDir = true;
-        }
-        else if (GB_IsDirectoryExists(leftPathUtf8))
-        {
-            outputIsDir = true;
-        }
+        const bool leftIsDir = internal::IsDirectoryHint(leftPathUtf8) || GB_IsDirectoryExists(leftPathUtf8);
+        return internal::BuildPathString(internal::ParseAndNormalizePathLexical(leftPathUtf8), leftIsDir);
     }
 
-    // 统一分隔符
-    string leftNorm = leftPathUtf8;
-    string rightNorm = rightPathUtf8;
-    internal::ReplaceBackslashWithSlash(leftNorm);
-    internal::ReplaceBackslashWithSlash(rightNorm);
+    const bool rightIsDirHint = internal::IsDirectoryHint(rightPathUtf8);
 
-    // right 为空：直接规范化 left
-    if (rightNorm.empty())
+    const internal::PathParts rightParsed = internal::ParseAndNormalizePathLexical(rightPathUtf8);
+    if (rightParsed.isAbsolute)
     {
-        internal::LexicalPath path = internal::ParseLexicalPath(leftNorm);
-        internal::NormalizeDotSegments(path);
-
-        // 若文件系统中存在且为目录，也认为是目录
-        if (!outputIsDir)
-        {
-            const string tmp = internal::BuildPathString(path, false);
-            bool exists = false;
-            bool isDir = false;
-            if (internal::IsDirByStat(tmp, exists, isDir) && exists && isDir)
-            {
-                outputIsDir = true;
-            }
-        }
-        return internal::BuildPathString(path, outputIsDir);
+        const bool outIsDir = rightIsDirHint || GB_IsDirectoryExists(rightPathUtf8);
+        return internal::BuildPathString(rightParsed, outIsDir);
     }
 
-    // left + right：尽量把 left 当作目录（除非明确是文件）
-    string base = leftNorm;
-    if (!base.empty())
+    std::string baseUtf8 = leftPathUtf8;
+    if (!baseUtf8.empty())
     {
         bool leftExists = false;
         bool leftIsDir = false;
-        if (internal::IsDirByStat(base, leftExists, leftIsDir) && leftExists && !leftIsDir)
+        if (internal::IsDirByStat(baseUtf8, leftExists, leftIsDir) && leftExists && !leftIsDir)
         {
-            base = GB_GetDirectoryPath(base);
-        }
-
-        // 作为目录拼接时，确保 base 末尾有 '/'
-        if (!base.empty() && base.back() != '/')
-        {
-            base.push_back('/');
+            baseUtf8 = GB_GetDirectoryPath(baseUtf8);
         }
     }
 
-    const string combined = base + rightNorm;
-    internal::LexicalPath combinedParsed = internal::ParseLexicalPath(combined);
-    internal::NormalizeDotSegments(combinedParsed);
+    const std::string baseWithSlash = internal::EnsureTrailingSlash(baseUtf8);
+    const std::string combined = baseWithSlash.empty() ? rightPathUtf8 : (baseWithSlash + rightPathUtf8);
 
-    if (!outputIsDir)
+    bool outIsDir = rightIsDirHint;
+    if (!outIsDir)
     {
-        const string tmp = internal::BuildPathString(combinedParsed, false);
-        bool exists = false;
-        bool isDir = false;
-        if (internal::IsDirByStat(tmp, exists, isDir) && exists && isDir)
-        {
-            outputIsDir = true;
-        }
+        outIsDir = GB_IsDirectoryExists(combined);
     }
-    return internal::BuildPathString(combinedParsed, outputIsDir);
+
+    return internal::BuildPathString(internal::ParseAndNormalizePathLexical(combined), outIsDir);
 }
 
 std::string GB_GetTempDirectory()
@@ -1981,38 +1994,35 @@ std::string GB_GetTempDirectory()
 
     std::vector<wchar_t> buffer;
     buffer.resize(static_cast<size_t>(required) + 1, L'\0');
-
-    const DWORD written = GetTempPathW(required, buffer.data());
-    if (written == 0 || written >= required)
+    const DWORD written = GetTempPathW(static_cast<DWORD>(buffer.size()), buffer.data());
+    if (written == 0 || written >= buffer.size())
     {
         return "";
     }
 
-    const std::wstring pathW(buffer.data(), static_cast<size_t>(written));
+    const std::wstring pathW(buffer.data(), written);
     std::string pathUtf8 = GB_WStringToUtf8(pathW);
-    pathUtf8 = internal::NormalizeDirectoryPathUtf8(pathUtf8);
-    return pathUtf8;
-
+    return internal::NormalizeDirectoryPathUtf8(pathUtf8);
 #else
-    const std::string tmpDir = internal::GetEnvVarUtf8("TMPDIR");
-    if (!tmpDir.empty())
+    std::string tmpDir = internal::GetEnvVarUtf8("TMPDIR");
+    if (tmpDir.empty())
     {
-        return internal::NormalizeDirectoryPathUtf8(tmpDir);
+        tmpDir = "/tmp";
     }
-    return std::string("/tmp/");
+    return internal::NormalizeDirectoryPathUtf8(tmpDir);
 #endif
 }
 
 std::string GB_GetHomeDirectory()
 {
 #if defined(_WIN32)
-    std::string homeUtf8 = "";
-    if (internal::GetKnownFolderPathUtf8(FOLDERID_Profile, homeUtf8))
+    std::string pathUtf8;
+    if (internal::GetKnownFolderPathUtf8(FOLDERID_Profile, pathUtf8))
     {
-        return homeUtf8;
+        return pathUtf8;
     }
 
-    // fallback: USERPROFILE 或 HOMEDRIVE+HOMEPATH
+    // Fallback: %USERPROFILE% or %HOMEDRIVE%%HOMEPATH%
     const std::string userProfile = internal::GetEnvVarUtf8FromWide(L"USERPROFILE");
     if (!userProfile.empty())
     {
@@ -2035,65 +2045,57 @@ std::string GB_GetHomeDirectory()
 std::string GB_GetDesktopDirectory()
 {
 #if defined(_WIN32)
-    std::string desktopUtf8;
-    if (internal::GetKnownFolderPathUtf8(FOLDERID_Desktop, desktopUtf8))
+    std::string pathUtf8;
+    if (internal::GetKnownFolderPathUtf8(FOLDERID_Desktop, pathUtf8))
     {
-        return desktopUtf8;
+        return pathUtf8;
     }
-
     const std::string homeUtf8 = GB_GetHomeDirectory();
-    if (!homeUtf8.empty())
+    if (homeUtf8.empty())
     {
-        return internal::NormalizeDirectoryPathUtf8(homeUtf8 + "Desktop");
+        return "";
     }
-
-    return "";
+    return internal::NormalizeDirectoryPathUtf8(homeUtf8 + "Desktop");
 #else
     const std::string homeUtf8 = GB_GetHomeDirectory();
+    if (homeUtf8.empty())
+    {
+        return "";
+    }
     const std::string fromXdg = internal::GetXdgUserDirFromConfig("XDG_DESKTOP_DIR", homeUtf8);
     if (!fromXdg.empty())
     {
         return fromXdg;
     }
-
-    if (!homeUtf8.empty())
-    {
-        return internal::NormalizeDirectoryPathUtf8(homeUtf8 + "Desktop");
-    }
-
-    return "";
+    return internal::NormalizeDirectoryPathUtf8(homeUtf8 + "Desktop");
 #endif
 }
 
 std::string GB_GetDownloadsDirectory()
 {
 #if defined(_WIN32)
-    std::string downloadsUtf8;
-    if (internal::GetKnownFolderPathUtf8(FOLDERID_Downloads, downloadsUtf8))
+    std::string pathUtf8;
+    if (internal::GetKnownFolderPathUtf8(FOLDERID_Downloads, pathUtf8))
     {
-        return downloadsUtf8;
+        return pathUtf8;
     }
-
     const std::string homeUtf8 = GB_GetHomeDirectory();
-    if (!homeUtf8.empty())
+    if (homeUtf8.empty())
     {
-        return internal::NormalizeDirectoryPathUtf8(homeUtf8 + "Downloads");
+        return "";
     }
-
-    return "";
+    return internal::NormalizeDirectoryPathUtf8(homeUtf8 + "Downloads");
 #else
     const std::string homeUtf8 = GB_GetHomeDirectory();
+    if (homeUtf8.empty())
+    {
+        return "";
+    }
     const std::string fromXdg = internal::GetXdgUserDirFromConfig("XDG_DOWNLOAD_DIR", homeUtf8);
     if (!fromXdg.empty())
     {
         return fromXdg;
     }
-
-    if (!homeUtf8.empty())
-    {
-        return internal::NormalizeDirectoryPathUtf8(homeUtf8 + "Downloads");
-    }
-
-    return "";
+    return internal::NormalizeDirectoryPathUtf8(homeUtf8 + "Downloads");
 #endif
 }
