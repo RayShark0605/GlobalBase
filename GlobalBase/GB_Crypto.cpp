@@ -8,6 +8,7 @@
 #include <random>
 #include <cassert>
 #include <sstream>
+#include <cstring>
 
 #if defined(_WIN32)
 #  include <windows.h>
@@ -2462,9 +2463,9 @@ string GB_RsaEncrypt(const string& plainText, const string& encryptionKey)
         const size_t psLen = k - 3 - mLen;
         string ps(psLen, '\0');
         internal::FillRandomNonZero(ps); // PS 必须全非零，且 len >= 8（当 mLen <= k-11 时天然满足）
-        memcpy(&em[2], ps.data(), psLen);
+        std::memcpy(&em[2], ps.data(), psLen);
         em[2 + psLen] = 0x00;
-        memcpy(&em[3 + psLen], &plainText[pos], mLen);
+        std::memcpy(&em[3 + psLen], &plainText[pos], mLen);
 
         // m^e mod n
         const BigInt m(internal::BytesToHex(em));

@@ -2077,173 +2077,172 @@ bool GB_GetConfigItem(const string& configPathUtf8, GB_ConfigItem& configItem, b
 
     // 递归函数：给定 root/subKeyW，填充 outItem
     function<bool(HKEY, const wstring&, GB_ConfigItem&)> Recurse;
-    Recurse = [&](HKEY rootKey, const wstring& keyPathW, GB_ConfigItem& outItem) -> bool
+    Recurse = [&](HKEY rootKey, const wstring& keyPathW, GB_ConfigItem& outItem) -> bool {
+        // 打开当前键（尽量 64 位视图，不行回退）
+        HKEY hKey = nullptr;
+        bool opened = false;
+        if (keyPathW.empty())
         {
-            // 打开当前键（尽量 64 位视图，不行回退）
-            HKEY hKey = nullptr;
-            bool opened = false;
-            if (keyPathW.empty())
-            {
-                // 根键本身：直接用 rootKey 句柄
-                hKey = rootKey;
-                opened = (hKey != nullptr);
-            }
-            else
-            {
-                opened = internal::OpenKeyAnyView(rootKey, keyPathW, KEY_READ | KEY_QUERY_VALUE | KEY_ENUMERATE_SUB_KEYS, hKey);
-            }
-            if (!opened || !hKey)
-            {
-                return false;
-            }
+            // 根键本身：直接用 rootKey 句柄
+            hKey = rootKey;
+            opened = (hKey != nullptr);
+        }
+        else
+        {
+            opened = internal::OpenKeyAnyView(rootKey, keyPathW, KEY_READ | KEY_QUERY_VALUE | KEY_ENUMERATE_SUB_KEYS, hKey);
+        }
+        if (!opened || !hKey)
+        {
+            return false;
+        }
 
-            // 询问信息：值数量/最大名/最大数据/子键数量/最大子键名
-            DWORD subKeyCount = 0, maxSubKeyLen = 0;
-            DWORD valueCount = 0, maxValueNameLen = 0, maxValueLen = 0;
-            LONG lrInfo = ::RegQueryInfoKeyW(
-                hKey,
-                nullptr, nullptr, nullptr,
-                &subKeyCount, &maxSubKeyLen, nullptr,
-                &valueCount, &maxValueNameLen, &maxValueLen,
-                nullptr, nullptr
+        // 询问信息：值数量/最大名/最大数据/子键数量/最大子键名
+        DWORD subKeyCount = 0, maxSubKeyLen = 0;
+        DWORD valueCount = 0, maxValueNameLen = 0, maxValueLen = 0;
+        LONG lrInfo = ::RegQueryInfoKeyW(
+            hKey,
+            nullptr, nullptr, nullptr,
+            &subKeyCount, &maxSubKeyLen, nullptr,
+            &valueCount, &maxValueNameLen, &maxValueLen,
+            nullptr, nullptr
+        );
+        if (lrInfo != ERROR_SUCCESS)
+        {
+            if (!keyPathW.empty() && hKey) ::RegCloseKey(hKey);
+            return false;
+        }
+
+        vector<wchar_t> valueNameBuf(static_cast<size_t>(maxValueNameLen) + 1, L'\0');
+        vector<BYTE>    valueDataBuf(static_cast<size_t>(maxValueLen) + 2 * sizeof(wchar_t), 0); // 给 REG_SZ/REG_MULTI_SZ 预留额外 NUL
+        vector<wchar_t> subKeyNameBuf(static_cast<size_t>(maxSubKeyLen) + 1, L'\0');
+
+        // —— 枚举当前键的所有值（含可能的“默认值”，其名称可为空字符串） ——
+        for (DWORD i = 0; i < valueCount; i++)
+        {
+            DWORD nameLen = static_cast<DWORD>(valueNameBuf.size());
+            DWORD dataLen = static_cast<DWORD>(valueDataBuf.size());
+            DWORD type = 0;
+            fill(valueNameBuf.begin(), valueNameBuf.end(), L'\0');
+            fill(valueDataBuf.begin(), valueDataBuf.end(), 0);
+
+            LONG lr = ::RegEnumValueW(
+                hKey, i,
+                valueNameBuf.data(), &nameLen,
+                nullptr,
+                &type,
+                reinterpret_cast<BYTE*>(valueDataBuf.data()), &dataLen
             );
-            if (lrInfo != ERROR_SUCCESS)
+            if (lr != ERROR_SUCCESS)
             {
-                if (!keyPathW.empty() && hKey) ::RegCloseKey(hKey);
-                return false;
-            }
-
-            vector<wchar_t> valueNameBuf(static_cast<size_t>(maxValueNameLen) + 1, L'\0');
-            vector<BYTE>    valueDataBuf(static_cast<size_t>(maxValueLen) + 2 * sizeof(wchar_t), 0); // 给 REG_SZ/REG_MULTI_SZ 预留额外 NUL
-            vector<wchar_t> subKeyNameBuf(static_cast<size_t>(maxSubKeyLen) + 1, L'\0');
-
-            // —— 枚举当前键的所有值（含可能的“默认值”，其名称可为空字符串） ——
-            for (DWORD i = 0; i < valueCount; i++)
-            {
-                DWORD nameLen = static_cast<DWORD>(valueNameBuf.size());
-                DWORD dataLen = static_cast<DWORD>(valueDataBuf.size());
-                DWORD type = 0;
-                fill(valueNameBuf.begin(), valueNameBuf.end(), L'\0');
-                fill(valueDataBuf.begin(), valueDataBuf.end(), 0);
-
-                LONG lr = ::RegEnumValueW(
-                    hKey, i,
-                    valueNameBuf.data(), &nameLen,
-                    nullptr,
-                    &type,
-                    reinterpret_cast<BYTE*>(valueDataBuf.data()), &dataLen
-                );
-                if (lr != ERROR_SUCCESS)
+                // 名/数据缓冲可能不够，保守地扩容重试一次
+                if (lr == ERROR_MORE_DATA)
                 {
-                    // 名/数据缓冲可能不够，保守地扩容重试一次
-                    if (lr == ERROR_MORE_DATA)
+                    // 再问一次最新的最大值
+                    DWORD _sk = 0, _msl = 0, _vc = 0, _mvnl = 0, _mvl = 0;
+                    if (::RegQueryInfoKeyW(hKey, nullptr, nullptr, nullptr, &_sk, &_msl, nullptr, &_vc, &_mvnl, &_mvl, nullptr, nullptr) == ERROR_SUCCESS)
                     {
-                        // 再问一次最新的最大值
-                        DWORD _sk = 0, _msl = 0, _vc = 0, _mvnl = 0, _mvl = 0;
-                        if (::RegQueryInfoKeyW(hKey, nullptr, nullptr, nullptr, &_sk, &_msl, nullptr, &_vc, &_mvnl, &_mvl, nullptr, nullptr) == ERROR_SUCCESS)
-                        {
-                            valueNameBuf.assign(static_cast<size_t>(_mvnl) + 1, L'\0');
-                            valueDataBuf.assign(static_cast<size_t>(_mvl) + 2 * sizeof(wchar_t), 0);
-                            nameLen = static_cast<DWORD>(valueNameBuf.size());
-                            dataLen = static_cast<DWORD>(valueDataBuf.size());
-                            lr = ::RegEnumValueW(hKey, i, valueNameBuf.data(), &nameLen, nullptr, &type,
-                                reinterpret_cast<BYTE*>(valueDataBuf.data()), &dataLen);
-                        }
+                        valueNameBuf.assign(static_cast<size_t>(_mvnl) + 1, L'\0');
+                        valueDataBuf.assign(static_cast<size_t>(_mvl) + 2 * sizeof(wchar_t), 0);
+                        nameLen = static_cast<DWORD>(valueNameBuf.size());
+                        dataLen = static_cast<DWORD>(valueDataBuf.size());
+                        lr = ::RegEnumValueW(hKey, i, valueNameBuf.data(), &nameLen, nullptr, &type,
+                            reinterpret_cast<BYTE*>(valueDataBuf.data()), &dataLen);
                     }
                 }
-                if (lr != ERROR_SUCCESS)
-                {
-                    continue;
-                }
-
-                GB_ConfigValue one;
-                one.nameUtf8 = internal::WideToUtf8(wstring(valueNameBuf.data()));
-                one.valueType = MapRegType(type);
-
-                switch (type)
-                {
-                case REG_SZ:
-                case REG_EXPAND_SZ:
-                {
-                    const wstring ws(reinterpret_cast<wchar_t*>(valueDataBuf.data()), dataLen / sizeof(wchar_t));
-                    one.valueUtf8 = internal::WideToUtf8(wstring(ws.c_str()));
-                    
-                    break;
-                }
-                case REG_MULTI_SZ:
-                {
-                    // 以双 NUL 结尾，逐段切分
-                    const wchar_t* p = reinterpret_cast<const wchar_t*>(valueDataBuf.data());
-                    const size_t n = dataLen / sizeof(wchar_t);
-                    size_t pos = 0;
-                    while (pos < n && p[pos] != L'\0')
-                    {
-                        const wchar_t* s = &p[pos];
-                        const size_t len = wcslen(s);
-                        one.multiStringValuesUtf8.emplace_back(internal::WideToUtf8(wstring(s)));
-                        pos += len + 1;
-                    }
-                    break;
-                }
-                case REG_DWORD:
-                    if (dataLen >= sizeof(DWORD))
-                    {
-                        DWORD v = 0;
-                        memcpy(&v, valueDataBuf.data(), sizeof(DWORD));
-                        one.dwordValue = static_cast<uint32_t>(v);
-                    }
-                    break;
-                case REG_QWORD:
-                    if (dataLen >= sizeof(ULONGLONG))
-                    {
-                        ULONGLONG v = 0;
-                        memcpy(&v, valueDataBuf.data(), sizeof(ULONGLONG));
-                        one.qwordValue = static_cast<uint64_t>(v);
-                    }
-                    break;
-                case REG_BINARY:
-                default:
-                    one.binaryValue.assign(valueDataBuf.begin(), valueDataBuf.begin() + dataLen);
-                    break;
-                }
-
-                outItem.values.emplace_back(std::move(one));
             }
-
-            // —— 枚举子键并递归 ——
-            for (DWORD i = 0; i < subKeyCount; i++)
+            if (lr != ERROR_SUCCESS)
             {
-                DWORD subLen = static_cast<DWORD>(subKeyNameBuf.size());
-                fill(subKeyNameBuf.begin(), subKeyNameBuf.end(), L'\0');
-
-                if (::RegEnumKeyExW(hKey, i, subKeyNameBuf.data(), &subLen, nullptr, nullptr, nullptr, nullptr) != ERROR_SUCCESS)
-                {
-                    continue;
-                }
-
-                GB_ConfigItem child;
-                child.nameUtf8 = internal::WideToUtf8(wstring(subKeyNameBuf.data()));
-                if (!recursive)
-                {
-                    // 非递归：仅列出直接子键名，不下钻，不读取其键值
-                    outItem.childenItems.emplace_back(move(child));
-                    continue;
-                }
-
-                const wstring childPathW = keyPathW.empty() ? wstring(subKeyNameBuf.data()) : (keyPathW + L'\\' + wstring(subKeyNameBuf.data()));
-
-                if (Recurse(rootKey, childPathW, child))
-                {
-                    outItem.childenItems.emplace_back(move(child));
-                }
+                continue;
             }
 
-            if (!keyPathW.empty() && hKey)
+            GB_ConfigValue one;
+            one.nameUtf8 = internal::WideToUtf8(wstring(valueNameBuf.data()));
+            one.valueType = MapRegType(type);
+
+            switch (type)
             {
-                ::RegCloseKey(hKey);
+            case REG_SZ:
+            case REG_EXPAND_SZ:
+            {
+                const wstring ws(reinterpret_cast<wchar_t*>(valueDataBuf.data()), dataLen / sizeof(wchar_t));
+                one.valueUtf8 = internal::WideToUtf8(wstring(ws.c_str()));
+                
+                break;
             }
-            return true;
-        };
+            case REG_MULTI_SZ:
+            {
+                // 以双 NUL 结尾，逐段切分
+                const wchar_t* p = reinterpret_cast<const wchar_t*>(valueDataBuf.data());
+                const size_t n = dataLen / sizeof(wchar_t);
+                size_t pos = 0;
+                while (pos < n && p[pos] != L'\0')
+                {
+                    const wchar_t* s = &p[pos];
+                    const size_t len = wcslen(s);
+                    one.multiStringValuesUtf8.emplace_back(internal::WideToUtf8(wstring(s)));
+                    pos += len + 1;
+                }
+                break;
+            }
+            case REG_DWORD:
+                if (dataLen >= sizeof(DWORD))
+                {
+                    DWORD v = 0;
+                    memcpy(&v, valueDataBuf.data(), sizeof(DWORD));
+                    one.dwordValue = static_cast<uint32_t>(v);
+                }
+                break;
+            case REG_QWORD:
+                if (dataLen >= sizeof(ULONGLONG))
+                {
+                    ULONGLONG v = 0;
+                    memcpy(&v, valueDataBuf.data(), sizeof(ULONGLONG));
+                    one.qwordValue = static_cast<uint64_t>(v);
+                }
+                break;
+            case REG_BINARY:
+            default:
+                one.binaryValue.assign(valueDataBuf.begin(), valueDataBuf.begin() + dataLen);
+                break;
+            }
+
+            outItem.values.emplace_back(std::move(one));
+        }
+
+        // —— 枚举子键并递归 ——
+        for (DWORD i = 0; i < subKeyCount; i++)
+        {
+            DWORD subLen = static_cast<DWORD>(subKeyNameBuf.size());
+            fill(subKeyNameBuf.begin(), subKeyNameBuf.end(), L'\0');
+
+            if (::RegEnumKeyExW(hKey, i, subKeyNameBuf.data(), &subLen, nullptr, nullptr, nullptr, nullptr) != ERROR_SUCCESS)
+            {
+                continue;
+            }
+
+            GB_ConfigItem child;
+            child.nameUtf8 = internal::WideToUtf8(wstring(subKeyNameBuf.data()));
+            if (!recursive)
+            {
+                // 非递归：仅列出直接子键名，不下钻，不读取其键值
+                outItem.childenItems.emplace_back(std::move(child));
+                continue;
+            }
+
+            const wstring childPathW = keyPathW.empty() ? wstring(subKeyNameBuf.data()) : (keyPathW + L'\\' + wstring(subKeyNameBuf.data()));
+
+            if (Recurse(rootKey, childPathW, child))
+            {
+                outItem.childenItems.emplace_back(std::move(child));
+            }
+        }
+
+        if (!keyPathW.empty() && hKey)
+        {
+            ::RegCloseKey(hKey);
+        }
+        return true;
+    };
 
     return Recurse(root, subKeyW, configItem);
 
@@ -2310,7 +2309,7 @@ bool GB_GetConfigItem(const string& configPathUtf8, GB_ConfigItem& configItem, b
                     one.nameUtf8 = rel;                 // 例如 prefix="User"、key="User/Name" → name="Name"
                     one.valueType = GB_ConfigValueType::GbConfigValueType_String;
                     one.valueUtf8 = it.second;
-                    outItem.values.emplace_back(move(one));
+                    outItem.values.emplace_back(std::move(one));
                 }
                 else
                 {
