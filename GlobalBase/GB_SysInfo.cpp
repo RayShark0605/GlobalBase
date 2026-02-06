@@ -1565,7 +1565,7 @@ string GB_GenerateHardwareId()
     const string cpuId = cpuInfo.cpuSerial.empty() ? cpuInfo.processorId : cpuInfo.cpuSerial;
     const string motherboardId = motherboardInfo.serialNumber.empty() ? motherboardInfo.uuid : motherboardInfo.serialNumber;
     const string hardwareId = cpuId + "--" + motherboardId;
-    return GB_GetSha256(hardwareId);
+    return GB_ShaHash(hardwareId);
 }
 
 // ===== 3) GB_GetOsInfo() 主体 =====
