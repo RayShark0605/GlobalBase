@@ -333,7 +333,173 @@ namespace GB_AES
     GLOBALBASE_PORT bool GB_DeriveAesKeyAndIv_Pbkdf2HmacSha256(const std::string& passwordUtf8, const std::string& saltBytes, uint32_t iterations, const GB_AesOptions& options, std::string& outKeyBytes, std::string& outIvBytes);
 }
 
+namespace GB_RSA
+{
+    enum class GB_RsaPublicKeyFormat
+    {
+        Auto = 0,
 
+        // PEM: "-----BEGIN PUBLIC KEY-----"（X.509 SubjectPublicKeyInfo）
+        PemSubjectPublicKeyInfo,
+
+        // PEM: "-----BEGIN RSA PUBLIC KEY-----"（PKCS#1 RSAPublicKey）
+        PemPkcs1,
+
+        // DER: X.509 SubjectPublicKeyInfo（二进制）
+        DerSubjectPublicKeyInfo,
+
+        // DER: PKCS#1 RSAPublicKey（二进制）
+        DerPkcs1
+    };
+
+    enum class GB_RsaPrivateKeyFormat
+    {
+        Auto = 0,
+
+        // PEM: "-----BEGIN PRIVATE KEY-----"（PKCS#8 PrivateKeyInfo，默认写出格式）
+        PemPkcs8,
+
+        // PEM: "-----BEGIN RSA PRIVATE KEY-----"（PKCS#1 RSAPrivateKey）
+        PemPkcs1,
+
+        // DER: PKCS#8 PrivateKeyInfo（二进制）
+        DerPkcs8,
+
+        // DER: PKCS#1 RSAPrivateKey（二进制）
+        DerPkcs1
+    };
+
+    enum class GB_RsaPaddingMode
+    {
+        Pkcs1V15 = 0, // RSA_PKCS1_PADDING
+        Oaep,         // RSA_PKCS1_OAEP_PADDING
+        NoPadding     // RSA_NO_PADDING（不安全，仅兼容用途）
+    };
+
+    enum class GB_RsaHashMethod
+    {
+        Sha1 = 0,
+        Sha256,
+        Sha384,
+        Sha512
+    };
+
+    /**
+     * @brief RSA 密钥生成参数。
+     *
+     * @remarks
+     * - keyBits 常用 2048/3072/4096；不建议使用 <=1024。
+     * - publicExponent 通常使用 65537（0x10001）。
+     * - 输出 key 的 std::string 为“字节序列”：
+     *   - PEM 输出为可打印文本；
+     *   - DER 输出为二进制（可能包含 '\0'）。
+     */
+    struct GB_RsaKeyGenOptions
+    {
+        size_t keyBits = 2048;
+        uint32_t publicExponent = 65537;
+        GB_RsaPublicKeyFormat publicKeyFormat = GB_RsaPublicKeyFormat::PemSubjectPublicKeyInfo;
+        GB_RsaPrivateKeyFormat privateKeyFormat = GB_RsaPrivateKeyFormat::PemPkcs8;
+    };
+
+    /**
+     * @brief RSA 加解密参数。
+     *
+     * @remarks
+     * - RSA 对单块明文有长度上限：与 keyBits 与 padding 有关；
+     *   本库会自动进行“分块 RSA”（将数据切片为多块分别加密，并把每块密文直接拼接输出）。
+     * - 若数据较大，建议使用“混合加密”（RSA 只加密对称密钥，数据使用 AES-GCM），否则密文会急剧膨胀且性能较差。
+     * - 当 padding=Oaep 时，可设置 oaepHash/mgf1Hash/oaepLabelBytes；其他 padding 会忽略这些字段。
+     * - 可选启用 zlib 压缩：会在加密前对明文进行压缩（若压缩后更大，则自动回退为不压缩）。
+     */
+    struct GB_RsaCryptOptions
+    {
+        GB_RsaPaddingMode padding = GB_RsaPaddingMode::Oaep;
+
+        // OAEP digest 与 MGF1 digest（仅 padding=Oaep 有效）。
+        GB_RsaHashMethod oaepHash = GB_RsaHashMethod::Sha256;
+        GB_RsaHashMethod mgf1Hash = GB_RsaHashMethod::Sha256;
+
+        // OAEP label（octet string，可为空；仅 padding=Oaep 有效）。
+        std::string oaepLabelBytes = "";
+
+        // 是否在 RSA 之前做 zlib 压缩。
+        bool zlibCompress = false;
+
+        // zlib 压缩等级：0-9，-1 表示使用 zlib 默认（通常等价于 6）。
+        int zlibCompressionLevel = -1;
+    };
+
+    /**
+     * @brief 生成一对 RSA 公钥与私钥。
+     *
+     * @param options 密钥生成参数（密钥长度/指数/输出格式）。
+     * @param outPublicKeyBytes 输出公钥（PEM 或 DER，取决于 options.publicKeyFormat）。
+     * @param outPrivateKeyBytes 输出私钥（PEM 或 DER，取决于 options.privateKeyFormat）。
+     * @return true 成功；false 失败。
+     */
+    GLOBALBASE_PORT bool GB_GenerateRsaKeyPair(const GB_RsaKeyGenOptions& options, std::string& outPublicKeyBytes, std::string& outPrivateKeyBytes);
+
+    /**
+     * @brief 使用 RSA 公钥加密 UTF-8 字符串，输出二进制密文（可能为多块拼接）。
+     *
+     * @param utf8PlainText 输入明文（UTF-8，按字节序列处理）。
+     * @param publicKeyBytes 公钥（PEM 或 DER，取决于 publicKeyFormat）。
+     * @param publicKeyFormat 公钥格式。
+     * @param options RSA 参数（padding/OAEP digest/zlib 等）。
+     * @param outCipherBytes 输出密文（二进制，按块拼接）。
+     * @return true 成功；false 失败（含 key 解析失败、参数非法、OpenSSL 错误等）。
+     */
+    GLOBALBASE_PORT bool GB_RsaEncrypt(const std::string& utf8PlainText, const std::string& publicKeyBytes, GB_RsaPublicKeyFormat publicKeyFormat, const GB_RsaCryptOptions& options, std::string& outCipherBytes);
+
+    /**
+     * @brief 使用 RSA 私钥解密二进制密文为 UTF-8 字符串（按字节序列输出）。
+     *
+     * @param cipherBytes 输入密文（二进制，按 GB_RsaEncrypt 的块拼接格式）。
+     * @param privateKeyBytes 私钥（PEM 或 DER，取决于 privateKeyFormat）。
+     * @param privateKeyFormat 私钥格式。
+     * @param options RSA 参数（需与加密保持一致：padding/OAEP digest/label/zlib）。
+     * @param outUtf8PlainText 输出明文（UTF-8，按字节序列处理）。
+     * @return true 成功；false 失败（含解密失败、padding 错误、zlib 解压失败等）。
+     */
+    GLOBALBASE_PORT bool GB_RsaDecrypt(const std::string& cipherBytes, const std::string& privateKeyBytes, GB_RsaPrivateKeyFormat privateKeyFormat, const GB_RsaCryptOptions& options, std::string& outUtf8PlainText);
+
+    /**
+     * @brief RSA 加密并输出 Base64 文本。
+     *
+     * @remarks
+     * - 返回值为 Base64(cipherBytes)；cipherBytes 为 GB_RsaEncrypt 的二进制输出。
+     * - 若 urlEscape=true，则会对 Base64 文本执行 URL-encoding（使用 libcurl 的 curl_easy_escape），便于直接拼入 URL/query。
+     *
+     * @param utf8PlainText 明文（UTF-8，按字节序列处理）。
+     * @param publicKeyBytes 公钥（PEM 或 DER）。
+     * @param publicKeyFormat 公钥格式。
+     * @param options RSA 参数。
+     * @param urlSafe 是否使用 base64url 字母表。
+     * @param noPadding 是否省略 '=' padding。
+     * @param urlEscape 是否进行 URL-encoding（仅对 Base64 文本）。
+     * @return Base64 文本；失败返回空串。
+     */
+    GLOBALBASE_PORT std::string GB_RsaEncryptToBase64(const std::string& utf8PlainText, const std::string& publicKeyBytes, GB_RsaPublicKeyFormat publicKeyFormat, const GB_RsaCryptOptions& options = GB_RsaCryptOptions(), bool urlSafe = true, bool noPadding = true, bool urlEscape = false);
+
+    /**
+     * @brief 从 Base64 文本解密为 UTF-8 字符串。
+     *
+     * @remarks
+     * - 若 urlEscaped=true，会先对输入进行 URL-decoding（使用 libcurl 的 curl_easy_unescape）。
+     *
+     * @param base64CipherText Base64 密文文本。
+     * @param privateKeyBytes 私钥（PEM 或 DER）。
+     * @param privateKeyFormat 私钥格式。
+     * @param options RSA 参数（需与加密保持一致）。
+     * @param outUtf8PlainText 输出明文（UTF-8，按字节序列处理）。
+     * @param urlSafe 是否使用 base64url 字母表。
+     * @param noPadding 是否允许省略 '=' padding。
+     * @param urlEscaped 输入是否为 URL-encoding 过的 Base64 文本。
+     * @return true 成功；false 失败。
+     */
+    GLOBALBASE_PORT bool GB_RsaDecryptFromBase64(const std::string& base64CipherText, const std::string& privateKeyBytes, GB_RsaPrivateKeyFormat privateKeyFormat, const GB_RsaCryptOptions& options, std::string& outUtf8PlainText, bool urlSafe = true, bool noPadding = true, bool urlEscaped = false);
+}
 
 
 #endif

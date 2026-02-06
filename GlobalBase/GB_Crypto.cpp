@@ -13,6 +13,13 @@
 #include <openssl/crypto.h>
 #include <openssl/rand.h>
 
+#include <openssl/pem.h>
+#include <openssl/rsa.h>
+#include <openssl/bn.h>
+#include <openssl/x509.h>
+
+#include <curl/curl.h>
+
 #if OPENSSL_VERSION_NUMBER >= 0x30000000L
 #include <openssl/provider.h>
 #endif
@@ -24,6 +31,27 @@
 #include <openssl/thread.h>
 #endif
 #include <zlib.h>
+
+#if OPENSSL_VERSION_NUMBER >= 0x30000000L
+#if defined(_MSC_VER)
+#pragma warning(push)
+#pragma warning(disable: 4996)
+#elif defined(__clang__)
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+#elif defined(__GNUC__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+#endif
+#endif
+
+#ifdef min
+#undef min
+#endif
+
+#ifdef max
+#undef max
+#endif
 
 namespace
 {
@@ -1441,30 +1469,6 @@ namespace GB_AES
         }
     };
 
-    static bool GenerateRandomBytes(size_t bytesCount, std::string& outBytes)
-    {
-        outBytes.clear();
-
-        if (bytesCount == 0)
-        {
-            return true;
-        }
-
-        if (bytesCount > static_cast<size_t>(std::numeric_limits<int>::max()))
-        {
-            return false;
-        }
-
-        outBytes.resize(bytesCount);
-        if (RAND_bytes(reinterpret_cast<unsigned char*>(&outBytes[0]), static_cast<int>(bytesCount)) != 1)
-        {
-            outBytes.clear();
-            return false;
-        }
-
-        return true;
-    }
-
     static bool EvpEncryptUpdateInChunks(EVP_CIPHER_CTX* ctx, unsigned char* outBytes, size_t outCapacity, size_t& outWritten, const unsigned char* inBytes, size_t inSize)
     {
         outWritten = 0;
@@ -2021,7 +2025,7 @@ namespace GB_AES
         }
 
         std::string ivBytes;
-        if (!GenerateRandomBytes(ivLength, ivBytes))
+        if (!GB_Argon2::GenerateRandomBytes(ivLength, ivBytes))
         {
             return std::string();
         }
@@ -2158,4 +2162,1128 @@ namespace GB_AES
     }
 }
 
+namespace
+{
+    struct BioDeleter
+    {
+        void operator()(BIO* bio) const
+        {
+            if (bio != nullptr)
+            {
+                ::BIO_free(bio);
+            }
+        }
+    };
 
+    struct EvpPkeyDeleter
+    {
+        void operator()(EVP_PKEY* pkey) const
+        {
+            if (pkey != nullptr)
+            {
+                ::EVP_PKEY_free(pkey);
+            }
+        }
+    };
+
+    struct EvpPkeyCtxDeleter
+    {
+        void operator()(EVP_PKEY_CTX* ctx) const
+        {
+            if (ctx != nullptr)
+            {
+                ::EVP_PKEY_CTX_free(ctx);
+            }
+        }
+    };
+
+    struct RsaDeleter
+    {
+        void operator()(RSA* rsa) const
+        {
+            if (rsa != nullptr)
+            {
+                ::RSA_free(rsa);
+            }
+        }
+    };
+
+    struct BignumDeleter
+    {
+        void operator()(BIGNUM* bn) const
+        {
+            if (bn != nullptr)
+            {
+                ::BN_free(bn);
+            }
+        }
+    };
+
+    static void EnsureCurlInitialized()
+    {
+        static std::once_flag s_curlInitOnce;
+        std::call_once(s_curlInitOnce, [](){
+            ::curl_global_init(CURL_GLOBAL_DEFAULT);
+        });
+    }
+
+    static bool CurlUrlEscapeText(const std::string& text, std::string& outEscapedText)
+    {
+        outEscapedText.clear();
+
+        EnsureCurlInitialized();
+
+        CURL* curl = ::curl_easy_init();
+        if (curl == nullptr)
+        {
+            return false;
+        }
+
+        char* escaped = ::curl_easy_escape(curl, text.c_str(), static_cast<int>(text.size()));
+        if (escaped == nullptr)
+        {
+            ::curl_easy_cleanup(curl);
+            return false;
+        }
+
+        outEscapedText.assign(escaped);
+        ::curl_free(escaped);
+        ::curl_easy_cleanup(curl);
+        return true;
+    }
+
+    static bool CurlUrlUnescapeText(const std::string& escapedText, std::string& outText)
+    {
+        outText.clear();
+
+        EnsureCurlInitialized();
+
+        CURL* curl = ::curl_easy_init();
+        if (curl == nullptr)
+        {
+            return false;
+        }
+
+        int outputLength = 0;
+        char* unescaped = ::curl_easy_unescape(curl, escapedText.c_str(), static_cast<int>(escapedText.size()), &outputLength);
+        if (unescaped == nullptr || outputLength < 0)
+        {
+            if (unescaped != nullptr)
+            {
+                ::curl_free(unescaped);
+            }
+            ::curl_easy_cleanup(curl);
+            return false;
+        }
+
+        outText.assign(unescaped, static_cast<size_t>(outputLength));
+        ::curl_free(unescaped);
+        ::curl_easy_cleanup(curl);
+        return true;
+    }
+
+    static bool ReadMemoryBioToString(BIO* bio, std::string& outBytes)
+    {
+        outBytes.clear();
+        if (bio == nullptr)
+        {
+            return false;
+        }
+
+        char* dataPtr = nullptr;
+        const long dataLength = ::BIO_get_mem_data(bio, &dataPtr);
+        if (dataLength <= 0 || dataPtr == nullptr)
+        {
+            return false;
+        }
+
+        outBytes.assign(dataPtr, static_cast<size_t>(dataLength));
+        return true;
+    }
+
+    static const EVP_MD* GetEvpMdForRsaHashMethod(GB_RSA::GB_RsaHashMethod method)
+    {
+        switch (method)
+        {
+        case GB_RSA::GB_RsaHashMethod::Sha1:
+            return ::EVP_sha1();
+        case GB_RSA::GB_RsaHashMethod::Sha256:
+            return ::EVP_sha256();
+        case GB_RSA::GB_RsaHashMethod::Sha384:
+            return ::EVP_sha384();
+        case GB_RSA::GB_RsaHashMethod::Sha512:
+            return ::EVP_sha512();
+        default:
+            return ::EVP_sha256();
+        }
+    }
+
+    static bool ZlibCompressBytes(const std::string& inputBytes, int compressionLevel, std::string& outCompressedBytes)
+    {
+        outCompressedBytes.clear();
+
+        if (inputBytes.empty())
+        {
+            return false;
+        }
+
+        const uLongf sourceLength = static_cast<uLongf>(inputBytes.size());
+        const uLongf bound = ::compressBound(sourceLength);
+        if (bound == 0)
+        {
+            return false;
+        }
+
+        outCompressedBytes.resize(static_cast<size_t>(bound));
+
+        uLongf destLength = bound;
+        const int level = (compressionLevel < -1 || compressionLevel > 9) ? Z_DEFAULT_COMPRESSION : compressionLevel;
+        const int rc = ::compress2(
+            reinterpret_cast<Bytef*>(&outCompressedBytes[0]),
+            &destLength,
+            reinterpret_cast<const Bytef*>(inputBytes.data()),
+            sourceLength,
+            level
+        );
+
+        if (rc != Z_OK)
+        {
+            outCompressedBytes.clear();
+            return false;
+        }
+
+        outCompressedBytes.resize(static_cast<size_t>(destLength));
+        return true;
+    }
+
+    static bool ZlibDecompressBytes(const std::string& compressedBytes, size_t uncompressedSize, std::string& outBytes)
+    {
+        outBytes.clear();
+
+        if (compressedBytes.empty())
+        {
+            return false;
+        }
+
+        if (uncompressedSize == 0)
+        {
+            return false;
+        }
+
+        if (uncompressedSize > static_cast<size_t>(std::numeric_limits<uLongf>::max()))
+        {
+            return false;
+        }
+
+        outBytes.resize(uncompressedSize);
+
+        uLongf destLength = static_cast<uLongf>(uncompressedSize);
+        const int rc = ::uncompress(
+            reinterpret_cast<Bytef*>(&outBytes[0]),
+            &destLength,
+            reinterpret_cast<const Bytef*>(compressedBytes.data()),
+            static_cast<uLongf>(compressedBytes.size())
+        );
+
+        if (rc != Z_OK || static_cast<size_t>(destLength) != uncompressedSize)
+        {
+            outBytes.clear();
+            return false;
+        }
+
+        return true;
+    }
+
+    static void WriteUint32Be(uint32_t value, unsigned char outBytes[4])
+    {
+        outBytes[0] = static_cast<unsigned char>((value >> 24) & 0xFF);
+        outBytes[1] = static_cast<unsigned char>((value >> 16) & 0xFF);
+        outBytes[2] = static_cast<unsigned char>((value >> 8) & 0xFF);
+        outBytes[3] = static_cast<unsigned char>(value & 0xFF);
+    }
+
+    static bool ReadUint32Be(const unsigned char bytes[4], uint32_t& outValue)
+    {
+        outValue = (static_cast<uint32_t>(bytes[0]) << 24)
+            | (static_cast<uint32_t>(bytes[1]) << 16)
+            | (static_cast<uint32_t>(bytes[2]) << 8)
+            | static_cast<uint32_t>(bytes[3]);
+        return true;
+    }
+
+    static bool BuildRsaPayload(const std::string& utf8PlainText, const GB_RSA::GB_RsaCryptOptions& options, std::string& outPayloadBytes)
+    {
+        outPayloadBytes.clear();
+
+        // Payload 格式：
+        //   4 bytes  magic "GBR1"
+        //   1 byte   flags（bit0=zlibCompressed）
+        //   1 byte   reserved
+        //   2 bytes  reserved
+        //   4 bytes  originalSize (BE, uint32)
+        //   4 bytes  storedSize   (BE, uint32)
+        //   N bytes  storedData   (raw or zlib)
+        const unsigned char magic[4] = { 'G', 'B', 'R', '1' };
+
+        const size_t originalSize = utf8PlainText.size();
+        if (originalSize > static_cast<size_t>(std::numeric_limits<uint32_t>::max()))
+        {
+            return false;
+        }
+
+        bool useCompressed = false;
+        std::string storedBytes = utf8PlainText;
+
+        if (options.zlibCompress && !utf8PlainText.empty())
+        {
+            std::string compressedBytes;
+            if (ZlibCompressBytes(utf8PlainText, options.zlibCompressionLevel, compressedBytes))
+            {
+                if (!compressedBytes.empty() && compressedBytes.size() < utf8PlainText.size())
+                {
+                    storedBytes.swap(compressedBytes);
+                    useCompressed = true;
+                }
+            }
+        }
+
+        if (storedBytes.size() > static_cast<size_t>(std::numeric_limits<uint32_t>::max()))
+        {
+            return false;
+        }
+
+        outPayloadBytes.reserve(4 + 1 + 1 + 2 + 4 + 4 + storedBytes.size());
+        outPayloadBytes.append(reinterpret_cast<const char*>(magic), 4);
+
+        const unsigned char flags = useCompressed ? 0x01 : 0x00;
+        outPayloadBytes.push_back(static_cast<char>(flags));
+        outPayloadBytes.push_back(static_cast<char>(0)); // reserved
+        outPayloadBytes.push_back(static_cast<char>(0)); // reserved
+        outPayloadBytes.push_back(static_cast<char>(0)); // reserved
+
+        unsigned char sizeBytes[4];
+        WriteUint32Be(static_cast<uint32_t>(originalSize), sizeBytes);
+        outPayloadBytes.append(reinterpret_cast<const char*>(sizeBytes), 4);
+
+        WriteUint32Be(static_cast<uint32_t>(storedBytes.size()), sizeBytes);
+        outPayloadBytes.append(reinterpret_cast<const char*>(sizeBytes), 4);
+
+        outPayloadBytes.append(storedBytes);
+        return true;
+    }
+
+    static bool ParseRsaPayload(const std::string& payloadBytes, std::string& outUtf8PlainText)
+    {
+        outUtf8PlainText.clear();
+
+        const size_t headerSize = 4 + 1 + 1 + 2 + 4 + 4;
+        if (payloadBytes.size() < headerSize)
+        {
+            // 兼容：若没有 header，则直接当作明文。
+            outUtf8PlainText = payloadBytes;
+            return true;
+        }
+
+        const unsigned char* data = reinterpret_cast<const unsigned char*>(payloadBytes.data());
+        if (!(data[0] == 'G' && data[1] == 'B' && data[2] == 'R' && data[3] == '1'))
+        {
+            outUtf8PlainText = payloadBytes;
+            return true;
+        }
+
+        const unsigned char flags = data[4];
+        const bool isCompressed = (flags & 0x01) != 0;
+
+        uint32_t originalSize = 0;
+        uint32_t storedSize = 0;
+        ReadUint32Be(data + 8, originalSize);
+        ReadUint32Be(data + 12, storedSize);
+
+        const size_t storedOffset = headerSize;
+        if (payloadBytes.size() < storedOffset + storedSize)
+        {
+            return false;
+        }
+
+        const std::string storedBytes = payloadBytes.substr(storedOffset, storedSize);
+
+        if (!isCompressed)
+        {
+            outUtf8PlainText = storedBytes;
+            return true;
+        }
+
+        return ZlibDecompressBytes(storedBytes, static_cast<size_t>(originalSize), outUtf8PlainText);
+    }
+
+    static bool ConfigureRsaCtx(EVP_PKEY_CTX* ctx, const GB_RSA::GB_RsaCryptOptions& options)
+    {
+        if (ctx == nullptr)
+        {
+            return false;
+        }
+
+        int padding = RSA_PKCS1_OAEP_PADDING;
+        switch (options.padding)
+        {
+        case GB_RSA::GB_RsaPaddingMode::Pkcs1V15:
+            padding = RSA_PKCS1_PADDING;
+            break;
+        case GB_RSA::GB_RsaPaddingMode::Oaep:
+            padding = RSA_PKCS1_OAEP_PADDING;
+            break;
+        case GB_RSA::GB_RsaPaddingMode::NoPadding:
+            padding = RSA_NO_PADDING;
+            break;
+        default:
+            padding = RSA_PKCS1_OAEP_PADDING;
+            break;
+        }
+
+        if (::EVP_PKEY_CTX_set_rsa_padding(ctx, padding) <= 0)
+        {
+            return false;
+        }
+
+        if (options.padding == GB_RSA::GB_RsaPaddingMode::Oaep)
+        {
+            const EVP_MD* oaepMd = GetEvpMdForRsaHashMethod(options.oaepHash);
+            const EVP_MD* mgf1Md = GetEvpMdForRsaHashMethod(options.mgf1Hash);
+
+#ifdef EVP_PKEY_CTX_set_rsa_oaep_md
+            if (oaepMd != nullptr)
+            {
+                if (::EVP_PKEY_CTX_set_rsa_oaep_md(ctx, oaepMd) <= 0)
+                {
+                    return false;
+                }
+            }
+#endif
+
+#ifdef EVP_PKEY_CTX_set_rsa_mgf1_md
+            if (mgf1Md != nullptr)
+            {
+                if (::EVP_PKEY_CTX_set_rsa_mgf1_md(ctx, mgf1Md) <= 0)
+                {
+                    return false;
+                }
+            }
+#endif
+
+#ifdef EVP_PKEY_CTX_set0_rsa_oaep_label
+            if (!options.oaepLabelBytes.empty())
+            {
+                unsigned char* labelCopy = reinterpret_cast<unsigned char*>(::OPENSSL_malloc(options.oaepLabelBytes.size()));
+                if (labelCopy == nullptr)
+                {
+                    return false;
+                }
+
+                ::memcpy(labelCopy, options.oaepLabelBytes.data(), options.oaepLabelBytes.size());
+
+                if (::EVP_PKEY_CTX_set0_rsa_oaep_label(ctx, labelCopy, options.oaepLabelBytes.size()) <= 0)
+                {
+                    ::OPENSSL_free(labelCopy);
+                    return false;
+                }
+            }
+#endif
+        }
+
+        return true;
+    }
+
+    static bool GetRsaBlockSizes(EVP_PKEY* pkey, const GB_RSA::GB_RsaCryptOptions& options, size_t& outKeySizeBytes, size_t& outMaxPlainTextBytes)
+    {
+        outKeySizeBytes = 0;
+        outMaxPlainTextBytes = 0;
+
+        if (pkey == nullptr)
+        {
+            return false;
+        }
+
+        const int keySizeBytesInt = ::EVP_PKEY_size(pkey);
+        if (keySizeBytesInt <= 0)
+        {
+            return false;
+        }
+
+        const size_t keySizeBytes = static_cast<size_t>(keySizeBytesInt);
+        outKeySizeBytes = keySizeBytes;
+
+        switch (options.padding)
+        {
+        case GB_RSA::GB_RsaPaddingMode::NoPadding:
+            outMaxPlainTextBytes = keySizeBytes;
+            return true;
+
+        case GB_RSA::GB_RsaPaddingMode::Pkcs1V15:
+            if (keySizeBytes <= 11)
+            {
+                return false;
+            }
+            outMaxPlainTextBytes = keySizeBytes - 11;
+            return true;
+
+        case GB_RSA::GB_RsaPaddingMode::Oaep:
+        default:
+        {
+            const EVP_MD* md = GetEvpMdForRsaHashMethod(options.oaepHash);
+            if (md == nullptr)
+            {
+                return false;
+            }
+
+            const int digestSizeInt = ::EVP_MD_size(md);
+            if (digestSizeInt <= 0)
+            {
+                return false;
+            }
+
+            const size_t digestSize = static_cast<size_t>(digestSizeInt);
+            const size_t overhead = 2 * digestSize + 2;
+            if (keySizeBytes <= overhead)
+            {
+                return false;
+            }
+
+            outMaxPlainTextBytes = keySizeBytes - overhead;
+            return true;
+        }
+        }
+    }
+
+    static std::unique_ptr<EVP_PKEY, EvpPkeyDeleter> LoadRsaPublicKey(const std::string& publicKeyBytes, GB_RSA::GB_RsaPublicKeyFormat format)
+    {
+        if (publicKeyBytes.empty())
+        {
+            return std::unique_ptr<EVP_PKEY, EvpPkeyDeleter>();
+        }
+
+#if OPENSSL_VERSION_NUMBER >= 0x30000000L
+        EnsureOpenSslProvidersLoaded();
+#endif
+
+        auto TryLoadPemSpki = [&]() -> std::unique_ptr<EVP_PKEY, EvpPkeyDeleter> {
+            std::unique_ptr<BIO, BioDeleter> bio(::BIO_new_mem_buf(publicKeyBytes.data(), static_cast<int>(publicKeyBytes.size())));
+            if (!bio)
+            {
+                return {};
+            }
+
+            EVP_PKEY* pkey = ::PEM_read_bio_PUBKEY(bio.get(), nullptr, nullptr, nullptr);
+            return std::unique_ptr<EVP_PKEY, EvpPkeyDeleter>(pkey);
+        };
+
+        auto TryLoadPemPkcs1 = [&]() -> std::unique_ptr<EVP_PKEY, EvpPkeyDeleter> {
+            std::unique_ptr<BIO, BioDeleter> bio(::BIO_new_mem_buf(publicKeyBytes.data(), static_cast<int>(publicKeyBytes.size())));
+            if (!bio)
+            {
+                return {};
+            }
+
+            std::unique_ptr<RSA, RsaDeleter> rsa(::PEM_read_bio_RSAPublicKey(bio.get(), nullptr, nullptr, nullptr));
+            if (!rsa)
+            {
+                return {};
+            }
+
+            std::unique_ptr<EVP_PKEY, EvpPkeyDeleter> pkey(::EVP_PKEY_new());
+            if (!pkey)
+            {
+                return {};
+            }
+
+            if (::EVP_PKEY_assign_RSA(pkey.get(), rsa.release()) != 1)
+            {
+                return {};
+            }
+
+            return pkey;
+        };
+
+        auto TryLoadDerSpki = [&]() -> std::unique_ptr<EVP_PKEY, EvpPkeyDeleter> {
+            const unsigned char* p = reinterpret_cast<const unsigned char*>(publicKeyBytes.data());
+            EVP_PKEY* pkey = ::d2i_PUBKEY(nullptr, &p, static_cast<long>(publicKeyBytes.size()));
+            return std::unique_ptr<EVP_PKEY, EvpPkeyDeleter>(pkey);
+        };
+
+        auto TryLoadDerPkcs1 = [&]() -> std::unique_ptr<EVP_PKEY, EvpPkeyDeleter> {
+            const unsigned char* p = reinterpret_cast<const unsigned char*>(publicKeyBytes.data());
+            std::unique_ptr<RSA, RsaDeleter> rsa(::d2i_RSAPublicKey(nullptr, &p, static_cast<long>(publicKeyBytes.size())));
+            if (!rsa)
+            {
+                return {};
+            }
+
+            std::unique_ptr<EVP_PKEY, EvpPkeyDeleter> pkey(::EVP_PKEY_new());
+            if (!pkey)
+            {
+                return {};
+            }
+
+            if (::EVP_PKEY_assign_RSA(pkey.get(), rsa.release()) != 1)
+            {
+                return {};
+            }
+
+            return pkey;
+        };
+
+        if (format == GB_RSA::GB_RsaPublicKeyFormat::PemSubjectPublicKeyInfo)
+        {
+            return TryLoadPemSpki();
+        }
+        if (format == GB_RSA::GB_RsaPublicKeyFormat::PemPkcs1)
+        {
+            return TryLoadPemPkcs1();
+        }
+        if (format == GB_RSA::GB_RsaPublicKeyFormat::DerSubjectPublicKeyInfo)
+        {
+            return TryLoadDerSpki();
+        }
+        if (format == GB_RSA::GB_RsaPublicKeyFormat::DerPkcs1)
+        {
+            return TryLoadDerPkcs1();
+        }
+
+        // Auto: 依次尝试
+        std::unique_ptr<EVP_PKEY, EvpPkeyDeleter> pkey = TryLoadPemSpki();
+        if (pkey)
+        {
+            return pkey;
+        }
+        pkey = TryLoadPemPkcs1();
+        if (pkey)
+        {
+            return pkey;
+        }
+        pkey = TryLoadDerSpki();
+        if (pkey)
+        {
+            return pkey;
+        }
+        return TryLoadDerPkcs1();
+    }
+
+    static std::unique_ptr<EVP_PKEY, EvpPkeyDeleter> LoadRsaPrivateKey(const std::string& privateKeyBytes, GB_RSA::GB_RsaPrivateKeyFormat format)
+    {
+        if (privateKeyBytes.empty())
+        {
+            return std::unique_ptr<EVP_PKEY, EvpPkeyDeleter>();
+        }
+
+#if OPENSSL_VERSION_NUMBER >= 0x30000000L
+        EnsureOpenSslProvidersLoaded();
+#endif
+
+        auto TryLoadPemPrivateKey = [&]() -> std::unique_ptr<EVP_PKEY, EvpPkeyDeleter> {
+            std::unique_ptr<BIO, BioDeleter> bio(::BIO_new_mem_buf(privateKeyBytes.data(), static_cast<int>(privateKeyBytes.size())));
+            if (!bio)
+            {
+                return {};
+            }
+
+            EVP_PKEY* pkey = ::PEM_read_bio_PrivateKey(bio.get(), nullptr, nullptr, nullptr);
+            return std::unique_ptr<EVP_PKEY, EvpPkeyDeleter>(pkey);
+        };
+
+        auto TryLoadPemPkcs1 = [&]() -> std::unique_ptr<EVP_PKEY, EvpPkeyDeleter> {
+            std::unique_ptr<BIO, BioDeleter> bio(::BIO_new_mem_buf(privateKeyBytes.data(), static_cast<int>(privateKeyBytes.size())));
+            if (!bio)
+            {
+                return {};
+            }
+
+            std::unique_ptr<RSA, RsaDeleter> rsa(::PEM_read_bio_RSAPrivateKey(bio.get(), nullptr, nullptr, nullptr));
+            if (!rsa)
+            {
+                return {};
+            }
+
+            std::unique_ptr<EVP_PKEY, EvpPkeyDeleter> pkey(::EVP_PKEY_new());
+            if (!pkey)
+            {
+                return {};
+            }
+
+            if (::EVP_PKEY_assign_RSA(pkey.get(), rsa.release()) != 1)
+            {
+                return {};
+            }
+
+            return pkey;
+        };
+
+        auto TryLoadDerAutoPrivateKey = [&]() -> std::unique_ptr<EVP_PKEY, EvpPkeyDeleter> {
+            const unsigned char* p = reinterpret_cast<const unsigned char*>(privateKeyBytes.data());
+            EVP_PKEY* pkey = ::d2i_AutoPrivateKey(nullptr, &p, static_cast<long>(privateKeyBytes.size()));
+            return std::unique_ptr<EVP_PKEY, EvpPkeyDeleter>(pkey);
+        };
+
+        auto TryLoadDerPkcs1 = [&]() -> std::unique_ptr<EVP_PKEY, EvpPkeyDeleter> {
+            const unsigned char* p = reinterpret_cast<const unsigned char*>(privateKeyBytes.data());
+            std::unique_ptr<RSA, RsaDeleter> rsa(::d2i_RSAPrivateKey(nullptr, &p, static_cast<long>(privateKeyBytes.size())));
+            if (!rsa)
+            {
+                return {};
+            }
+
+            std::unique_ptr<EVP_PKEY, EvpPkeyDeleter> pkey(::EVP_PKEY_new());
+            if (!pkey)
+            {
+                return {};
+            }
+
+            if (::EVP_PKEY_assign_RSA(pkey.get(), rsa.release()) != 1)
+            {
+                return {};
+            }
+
+            return pkey;
+        };
+
+        if (format == GB_RSA::GB_RsaPrivateKeyFormat::PemPkcs8)
+        {
+            return TryLoadPemPrivateKey();
+        }
+        if (format == GB_RSA::GB_RsaPrivateKeyFormat::PemPkcs1)
+        {
+            // 兼容：既尝试 PEM_read_bio_PrivateKey，也尝试传统 RSA PRIVATE KEY
+            std::unique_ptr<EVP_PKEY, EvpPkeyDeleter> pkey = TryLoadPemPrivateKey();
+            if (pkey)
+            {
+                return pkey;
+            }
+            return TryLoadPemPkcs1();
+        }
+        if (format == GB_RSA::GB_RsaPrivateKeyFormat::DerPkcs8)
+        {
+            return TryLoadDerAutoPrivateKey();
+        }
+        if (format == GB_RSA::GB_RsaPrivateKeyFormat::DerPkcs1)
+        {
+            return TryLoadDerPkcs1();
+        }
+
+        // Auto
+        std::unique_ptr<EVP_PKEY, EvpPkeyDeleter> pkey = TryLoadPemPrivateKey();
+        if (pkey)
+        {
+            return pkey;
+        }
+        pkey = TryLoadDerAutoPrivateKey();
+        if (pkey)
+        {
+            return pkey;
+        }
+        pkey = TryLoadPemPkcs1();
+        if (pkey)
+        {
+            return pkey;
+        }
+        return TryLoadDerPkcs1();
+    }
+
+    static bool WritePublicKeyToBytes(EVP_PKEY* pkey, GB_RSA::GB_RsaPublicKeyFormat format, std::string& outPublicKeyBytes)
+    {
+        outPublicKeyBytes.clear();
+
+        std::unique_ptr<BIO, BioDeleter> bio(::BIO_new(BIO_s_mem()));
+        if (!bio)
+        {
+            return false;
+        }
+
+        int ok = 0;
+        if (format == GB_RSA::GB_RsaPublicKeyFormat::PemSubjectPublicKeyInfo)
+        {
+            ok = ::PEM_write_bio_PUBKEY(bio.get(), pkey);
+        }
+        else if (format == GB_RSA::GB_RsaPublicKeyFormat::PemPkcs1)
+        {
+            std::unique_ptr<RSA, RsaDeleter> rsa(::EVP_PKEY_get1_RSA(pkey));
+            if (!rsa)
+            {
+                return false;
+            }
+            ok = ::PEM_write_bio_RSAPublicKey(bio.get(), rsa.get());
+        }
+        else if (format == GB_RSA::GB_RsaPublicKeyFormat::DerSubjectPublicKeyInfo)
+        {
+            ok = ::i2d_PUBKEY_bio(bio.get(), pkey);
+        }
+        else if (format == GB_RSA::GB_RsaPublicKeyFormat::DerPkcs1)
+        {
+            std::unique_ptr<RSA, RsaDeleter> rsa(::EVP_PKEY_get1_RSA(pkey));
+            if (!rsa)
+            {
+                return false;
+            }
+            ok = ::i2d_RSAPublicKey_bio(bio.get(), rsa.get());
+        }
+        else
+        {
+            ok = ::PEM_write_bio_PUBKEY(bio.get(), pkey);
+        }
+
+        if (ok != 1)
+        {
+            return false;
+        }
+
+        return ReadMemoryBioToString(bio.get(), outPublicKeyBytes);
+    }
+
+    static bool WritePrivateKeyToBytes(EVP_PKEY* pkey, GB_RSA::GB_RsaPrivateKeyFormat format, std::string& outPrivateKeyBytes)
+    {
+        outPrivateKeyBytes.clear();
+
+        std::unique_ptr<BIO, BioDeleter> bio(::BIO_new(BIO_s_mem()));
+        if (!bio)
+        {
+            return false;
+        }
+
+        int ok = 0;
+        if (format == GB_RSA::GB_RsaPrivateKeyFormat::PemPkcs8)
+        {
+            // PEM_write_bio_PrivateKey 会写出 PKCS#8（未加密）。
+            ok = ::PEM_write_bio_PrivateKey(bio.get(), pkey, nullptr, nullptr, 0, nullptr, nullptr);
+        }
+        else if (format == GB_RSA::GB_RsaPrivateKeyFormat::PemPkcs1)
+        {
+            std::unique_ptr<RSA, RsaDeleter> rsa(::EVP_PKEY_get1_RSA(pkey));
+            if (!rsa)
+            {
+                return false;
+            }
+            ok = ::PEM_write_bio_RSAPrivateKey(bio.get(), rsa.get(), nullptr, nullptr, 0, nullptr, nullptr);
+        }
+        else if (format == GB_RSA::GB_RsaPrivateKeyFormat::DerPkcs8)
+        {
+            // i2d_PrivateKey_bio：通常会输出 PKCS#8 unencrypted PrivateKeyInfo。
+            ok = ::i2d_PrivateKey_bio(bio.get(), pkey);
+        }
+        else if (format == GB_RSA::GB_RsaPrivateKeyFormat::DerPkcs1)
+        {
+            std::unique_ptr<RSA, RsaDeleter> rsa(::EVP_PKEY_get1_RSA(pkey));
+            if (!rsa)
+            {
+                return false;
+            }
+            ok = ::i2d_RSAPrivateKey_bio(bio.get(), rsa.get());
+        }
+        else
+        {
+            ok = ::PEM_write_bio_PrivateKey(bio.get(), pkey, nullptr, nullptr, 0, nullptr, nullptr);
+        }
+
+        if (ok != 1)
+        {
+            return false;
+        }
+
+        return ReadMemoryBioToString(bio.get(), outPrivateKeyBytes);
+    }
+}
+
+namespace GB_RSA
+{
+    bool GB_GenerateRsaKeyPair(const GB_RsaKeyGenOptions& options, std::string& outPublicKeyBytes, std::string& outPrivateKeyBytes)
+    {
+        outPublicKeyBytes.clear();
+        outPrivateKeyBytes.clear();
+
+        if (options.keyBits < 512 || options.keyBits > 16384)
+        {
+            return false;
+        }
+
+#if OPENSSL_VERSION_NUMBER >= 0x30000000L
+        EnsureOpenSslProvidersLoaded();
+#endif
+
+        std::unique_ptr<EVP_PKEY_CTX, EvpPkeyCtxDeleter> ctx(::EVP_PKEY_CTX_new_id(EVP_PKEY_RSA, nullptr));
+        if (!ctx)
+        {
+            return false;
+        }
+
+        if (::EVP_PKEY_keygen_init(ctx.get()) <= 0)
+        {
+            return false;
+        }
+
+        if (::EVP_PKEY_CTX_set_rsa_keygen_bits(ctx.get(), static_cast<int>(options.keyBits)) <= 0)
+        {
+            return false;
+        }
+
+        std::unique_ptr<BIGNUM, BignumDeleter> pubExp(::BN_new());
+        if (!pubExp)
+        {
+            return false;
+        }
+
+        if (::BN_set_word(pubExp.get(), static_cast<unsigned long>(options.publicExponent)) != 1)
+        {
+            return false;
+        }
+
+#ifdef EVP_PKEY_CTX_set1_rsa_keygen_pubexp
+        if (::EVP_PKEY_CTX_set1_rsa_keygen_pubexp(ctx.get(), pubExp.get()) <= 0)
+        {
+            return false;
+        }
+#else
+        if (::EVP_PKEY_CTX_set_rsa_keygen_pubexp(ctx.get(), pubExp.get()) <= 0)
+        {
+            return false;
+        }
+        // 注意：EVP_PKEY_CTX_set_rsa_keygen_pubexp() 可能不拷贝 pubExp，因此不能 free。
+        pubExp.release();
+#endif
+
+        EVP_PKEY* generatedKey = nullptr;
+        if (::EVP_PKEY_keygen(ctx.get(), &generatedKey) <= 0)
+        {
+            return false;
+        }
+
+        std::unique_ptr<EVP_PKEY, EvpPkeyDeleter> pkey(generatedKey);
+
+        if (!WritePublicKeyToBytes(pkey.get(), options.publicKeyFormat, outPublicKeyBytes))
+        {
+            outPublicKeyBytes.clear();
+            outPrivateKeyBytes.clear();
+            return false;
+        }
+
+        if (!WritePrivateKeyToBytes(pkey.get(), options.privateKeyFormat, outPrivateKeyBytes))
+        {
+            outPublicKeyBytes.clear();
+            outPrivateKeyBytes.clear();
+            return false;
+        }
+
+        return true;
+    }
+
+    bool GB_RsaEncrypt(const std::string& utf8PlainText, const std::string& publicKeyBytes, GB_RsaPublicKeyFormat publicKeyFormat, const GB_RsaCryptOptions& options, std::string& outCipherBytes)
+    {
+        outCipherBytes.clear();
+
+        std::unique_ptr<EVP_PKEY, EvpPkeyDeleter> publicKey = LoadRsaPublicKey(publicKeyBytes, publicKeyFormat);
+        if (!publicKey)
+        {
+            return false;
+        }
+
+        std::string payloadBytes;
+        if (!BuildRsaPayload(utf8PlainText, options, payloadBytes))
+        {
+            return false;
+        }
+
+        size_t keySizeBytes = 0;
+        size_t maxPlainTextBytes = 0;
+        if (!GetRsaBlockSizes(publicKey.get(), options, keySizeBytes, maxPlainTextBytes))
+        {
+            return false;
+        }
+
+        if (maxPlainTextBytes == 0)
+        {
+            return false;
+        }
+
+        size_t offset = 0;
+        while (offset < payloadBytes.size())
+        {
+            const size_t remaining = payloadBytes.size() - offset;
+            const size_t chunkSize = std::min(remaining, maxPlainTextBytes);
+
+            const unsigned char* inPtr = reinterpret_cast<const unsigned char*>(payloadBytes.data() + offset);
+
+            std::unique_ptr<EVP_PKEY_CTX, EvpPkeyCtxDeleter> ctx(::EVP_PKEY_CTX_new(publicKey.get(), nullptr));
+            if (!ctx)
+            {
+                outCipherBytes.clear();
+                return false;
+            }
+
+            if (::EVP_PKEY_encrypt_init(ctx.get()) <= 0)
+            {
+                outCipherBytes.clear();
+                return false;
+            }
+
+            if (!ConfigureRsaCtx(ctx.get(), options))
+            {
+                outCipherBytes.clear();
+                return false;
+            }
+
+            size_t outLen = 0;
+            if (::EVP_PKEY_encrypt(ctx.get(), nullptr, &outLen, inPtr, chunkSize) <= 0)
+            {
+                outCipherBytes.clear();
+                return false;
+            }
+
+            std::string encryptedBlock;
+            encryptedBlock.resize(outLen);
+
+            if (::EVP_PKEY_encrypt(ctx.get(), reinterpret_cast<unsigned char*>(&encryptedBlock[0]), &outLen, inPtr, chunkSize) <= 0)
+            {
+                outCipherBytes.clear();
+                return false;
+            }
+
+            encryptedBlock.resize(outLen);
+            outCipherBytes.append(encryptedBlock);
+
+            offset += chunkSize;
+        }
+
+        return true;
+    }
+
+    bool GB_RsaDecrypt(const std::string& cipherBytes, const std::string& privateKeyBytes, GB_RsaPrivateKeyFormat privateKeyFormat, const GB_RsaCryptOptions& options, std::string& outUtf8PlainText)
+    {
+        outUtf8PlainText.clear();
+
+        std::unique_ptr<EVP_PKEY, EvpPkeyDeleter> privateKey = LoadRsaPrivateKey(privateKeyBytes, privateKeyFormat);
+        if (!privateKey)
+        {
+            return false;
+        }
+
+        size_t keySizeBytes = 0;
+        size_t maxPlainTextBytes = 0;
+        if (!GetRsaBlockSizes(privateKey.get(), options, keySizeBytes, maxPlainTextBytes))
+        {
+            return false;
+        }
+
+        if (keySizeBytes == 0)
+        {
+            return false;
+        }
+
+        if (cipherBytes.empty() || (cipherBytes.size() % keySizeBytes) != 0)
+        {
+            return false;
+        }
+
+        std::string payloadBytes;
+
+        for (size_t offset = 0; offset < cipherBytes.size(); offset += keySizeBytes)
+        {
+            const unsigned char* inPtr = reinterpret_cast<const unsigned char*>(cipherBytes.data() + offset);
+
+            std::unique_ptr<EVP_PKEY_CTX, EvpPkeyCtxDeleter> ctx(::EVP_PKEY_CTX_new(privateKey.get(), nullptr));
+            if (!ctx)
+            {
+                payloadBytes.clear();
+                return false;
+            }
+
+            if (::EVP_PKEY_decrypt_init(ctx.get()) <= 0)
+            {
+                payloadBytes.clear();
+                return false;
+            }
+
+            if (!ConfigureRsaCtx(ctx.get(), options))
+            {
+                payloadBytes.clear();
+                return false;
+            }
+
+            size_t outLen = 0;
+            if (::EVP_PKEY_decrypt(ctx.get(), nullptr, &outLen, inPtr, keySizeBytes) <= 0)
+            {
+                payloadBytes.clear();
+                return false;
+            }
+
+            std::string decryptedChunk;
+            decryptedChunk.resize(outLen);
+
+            if (::EVP_PKEY_decrypt(ctx.get(), reinterpret_cast<unsigned char*>(&decryptedChunk[0]), &outLen, inPtr, keySizeBytes) <= 0)
+            {
+                payloadBytes.clear();
+                return false;
+            }
+
+            decryptedChunk.resize(outLen);
+            payloadBytes.append(decryptedChunk);
+        }
+
+        return ParseRsaPayload(payloadBytes, outUtf8PlainText);
+    }
+
+    std::string GB_RsaEncryptToBase64(const std::string& utf8PlainText, const std::string& publicKeyBytes, GB_RsaPublicKeyFormat publicKeyFormat, const GB_RsaCryptOptions& options, bool urlSafe, bool noPadding, bool urlEscape)
+    {
+        std::string cipherBytes;
+        if (!GB_RsaEncrypt(utf8PlainText, publicKeyBytes, publicKeyFormat, options, cipherBytes))
+        {
+            return std::string();
+        }
+
+        std::string base64Text = GB_Base64Encode(cipherBytes, urlSafe, noPadding);
+        if (base64Text.empty())
+        {
+            return std::string();
+        }
+
+        if (!urlEscape)
+        {
+            return base64Text;
+        }
+
+        std::string escaped;
+        if (!CurlUrlEscapeText(base64Text, escaped))
+        {
+            return std::string();
+        }
+
+        return escaped;
+    }
+
+    bool GB_RsaDecryptFromBase64(const std::string& base64CipherText, const std::string& privateKeyBytes, GB_RsaPrivateKeyFormat privateKeyFormat, const GB_RsaCryptOptions& options, std::string& outUtf8PlainText, bool urlSafe, bool noPadding, bool urlEscaped)
+    {
+        outUtf8PlainText.clear();
+
+        std::string base64Text = base64CipherText;
+        if (urlEscaped)
+        {
+            if (!CurlUrlUnescapeText(base64CipherText, base64Text))
+            {
+                return false;
+            }
+        }
+
+        std::string cipherBytes;
+        if (!GB_Base64Decode(base64Text, cipherBytes, urlSafe, noPadding))
+        {
+            return false;
+        }
+
+        return GB_RsaDecrypt(cipherBytes, privateKeyBytes, privateKeyFormat, options, outUtf8PlainText);
+    }
+}
+
+
+#if OPENSSL_VERSION_NUMBER >= 0x30000000L
+#if defined(_MSC_VER)
+#pragma warning(pop)
+#elif defined(__clang__)
+#pragma clang diagnostic pop
+#elif defined(__GNUC__)
+#pragma GCC diagnostic pop
+#endif
+#endif
