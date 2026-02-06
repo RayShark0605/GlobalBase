@@ -175,8 +175,8 @@
       <SubSystem>Windows</SubSystem>
       <GenerateDebugInformation>true</GenerateDebugInformation>
       <EnableUAC>false</EnableUAC>
-      <AdditionalDependencies>libcurl-d.lib;libcrypto.lib;delayimp.lib;%(AdditionalDependencies)</AdditionalDependencies>
-      <AdditionalOptions>/DELAYLOAD:libcurl-d.dll /DELAYLOAD:libcrypto-3-x64.dll %(AdditionalOptions)</AdditionalOptions>
+      <AdditionalDependencies>libcurl-d.lib;libcrypto.lib;zlibd.lib;delayimp.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalOptions>/DELAYLOAD:libcurl-d.dll /DELAYLOAD:libcrypto-3-x64.dll /DELAYLOAD:zlibd1.dll %(AdditionalOptions)</AdditionalOptions>
     </Link>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
@@ -199,8 +199,8 @@
       <SubSystem>Windows</SubSystem>
       <GenerateDebugInformation>true</GenerateDebugInformation>
       <EnableUAC>false</EnableUAC>
-      <AdditionalDependencies>libcurl.lib;libcrypto.lib;delayimp.lib;%(AdditionalDependencies)</AdditionalDependencies>
-      <AdditionalOptions>/DELAYLOAD:libcurl-d.dll /DELAYLOAD:libcrypto-3-x64.dll %(AdditionalOptions)</AdditionalOptions>
+      <AdditionalDependencies>libcurl.lib;libcrypto.lib;zlib.lib;delayimp.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalOptions>/DELAYLOAD:libcurl.dll /DELAYLOAD:libcrypto-3-x64.dll /DELAYLOAD:zlib1.dll %(AdditionalOptions)</AdditionalOptions>
     </Link>
   </ItemDefinitionGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
