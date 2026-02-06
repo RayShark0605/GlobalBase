@@ -336,13 +336,4 @@ namespace GB_AES
 
 
 
-
-
-
-
-
-
-
-
-
 #endif

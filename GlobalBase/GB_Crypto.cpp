@@ -181,6 +181,34 @@ namespace
         return true;
     }
 
+    static bool SafeAddSizeT(size_t a, size_t b, size_t& out)
+    {
+        if (a > (std::numeric_limits<size_t>::max)() - b)
+        {
+            return false;
+        }
+
+        out = a + b;
+        return true;
+    }
+
+    static bool SafeMulSizeT(size_t a, size_t b, size_t& out)
+    {
+        if (a == 0 || b == 0)
+        {
+            out = 0;
+            return true;
+        }
+
+        if (a > (std::numeric_limits<size_t>::max)() / b)
+        {
+            return false;
+        }
+
+        out = a * b;
+        return true;
+    }
+
     static char ToHexCharLower(unsigned char value)
     {
         if (value < 10U)
@@ -253,10 +281,9 @@ namespace
 
 #if OPENSSL_VERSION_NUMBER < 0x10100000L
         static std::once_flag addAllDigestsOnceFlag;
-        std::call_once(addAllDigestsOnceFlag, []()
-            {
-                ::OpenSSL_add_all_digests();
-            });
+        std::call_once(addAllDigestsOnceFlag, []() {
+            ::OpenSSL_add_all_digests();
+        });
 #endif
         digestType = ::EVP_get_digestbyname(algorithmName);
 #  if OPENSSL_VERSION_NUMBER >= 0x10101000L
@@ -322,7 +349,6 @@ namespace
 
 }
 
-
 std::string GB_Base64Encode(const std::string& utf8Text, bool urlSafe, bool noPadding)
 {
     if (utf8Text.empty())
@@ -334,7 +360,19 @@ std::string GB_Base64Encode(const std::string& utf8Text, bool urlSafe, bool noPa
     const size_t dataSize = utf8Text.size();
     const char* alphabet = GetBase64Alphabet(urlSafe);
 
-    const size_t fullSize = ((dataSize + 2) / 3) * 4;
+    // 计算输出大小：fullSize = ceil(dataSize / 3) * 4
+    size_t dataSizePlus2 = 0;
+    if (!SafeAddSizeT(dataSize, 2, dataSizePlus2))
+    {
+        return std::string();
+    }
+
+    const size_t groups = dataSizePlus2 / 3;
+    size_t fullSize = 0;
+    if (!SafeMulSizeT(groups, 4, fullSize))
+    {
+        return std::string();
+    }
 
     size_t outputSize = fullSize;
     if (noPadding)
@@ -394,7 +432,6 @@ std::string GB_Base64Encode(const std::string& utf8Text, bool urlSafe, bool noPa
     return result;
 }
 
-
 bool GB_Base64Decode(const std::string& base64Text, std::string& outUtf8Text, bool urlSafe, bool noPadding)
 {
     outUtf8Text.clear();
@@ -422,7 +459,13 @@ bool GB_Base64Decode(const std::string& base64Text, std::string& outUtf8Text, bo
         return false;
     }
 
-    outUtf8Text.reserve((inputSize / 4) * 3);
+    // 预估最大输出长度：inputSize/4*3
+    const size_t groups = inputSize / 4;
+    size_t reserveSize = 0;
+    if (SafeMulSizeT(groups, 3, reserveSize))
+    {
+        outUtf8Text.reserve(reserveSize);
+    }
 
     for (size_t i = 0; i < inputSize; i += 4)
     {
@@ -533,11 +576,7 @@ std::string GB_Crc32Hash(const std::string& utf8Text)
     // crc32() 的长度参数是 uInt（通常是 32-bit），这里分块处理以避免极端情况下溢出。
     while (remaining > 0)
     {
-        const size_t chunkSize = std::min(
-            remaining,
-            static_cast<size_t>(std::numeric_limits<uInt>::max())
-        );
-
+        const size_t chunkSize = std::min(remaining, static_cast<size_t>(std::numeric_limits<uInt>::max()));
         crc = ::crc32(crc, data, static_cast<uInt>(chunkSize));
 
         data += chunkSize;
@@ -752,13 +791,7 @@ namespace GB_Argon2
         std::string& m_bytes;
     };
 
-    static bool DeriveArgon2BytesOnce(
-        const std::string& passwordBytes,
-        const std::string& saltBytes,
-        const GB_Argon2::GB_Argon2Options& options,
-        bool includeThreadsParam,
-        std::string& outDerivedBytes
-    )
+    static bool DeriveArgon2BytesOnce(const std::string& passwordBytes, const std::string& saltBytes, const GB_Argon2::GB_Argon2Options& options, bool includeThreadsParam, std::string& outDerivedBytes)
     {
         outDerivedBytes.clear();
 
@@ -915,12 +948,7 @@ namespace GB_Argon2
         return true;
     }
 
-    static bool DeriveArgon2Bytes(
-        const std::string& passwordBytes,
-        const std::string& saltBytes,
-        const GB_Argon2::GB_Argon2Options& options,
-        std::string& outDerivedBytes
-    )
+    static bool DeriveArgon2Bytes(const std::string& passwordBytes, const std::string& saltBytes, const GB_Argon2::GB_Argon2Options& options, std::string& outDerivedBytes)
     {
         outDerivedBytes.clear();
 
@@ -1215,7 +1243,6 @@ namespace GB_Argon2
         result += hashBase64;
         return result;
 #endif
-
     }
 
     bool GB_Argon2Verify(const std::string& utf8Text, const std::string& encodedHash)
@@ -1315,12 +1342,7 @@ namespace GB_AES
         return 0;
     }
 
-    static bool ValidateAesParams(
-        const std::string& keyBytes,
-        const std::string& ivBytes,
-        const GB_AesOptions& options,
-        size_t& outIvLength
-    )
+    static bool ValidateAesParams(const std::string& keyBytes, const std::string& ivBytes, const GB_AesOptions& options, size_t& outIvLength)
     {
         outIvLength = options.ivLength;
         if (outIvLength == 0)
@@ -1443,14 +1465,111 @@ namespace GB_AES
         return true;
     }
 
-    bool GB_AesEncrypt(
-        const std::string& utf8PlainText,
-        const std::string& keyBytes,
-        const std::string& ivBytes,
-        const GB_AesOptions& options,
-        std::string& outCipherBytes,
-        std::string& outGcmTagBytes
-    )
+    static bool EvpEncryptUpdateInChunks(EVP_CIPHER_CTX* ctx, unsigned char* outBytes, size_t outCapacity, size_t& outWritten, const unsigned char* inBytes, size_t inSize)
+    {
+        outWritten = 0;
+
+        if (ctx == nullptr)
+        {
+            return false;
+        }
+
+        if (inSize == 0)
+        {
+            return true;
+        }
+
+        constexpr static size_t maxChunkSize = static_cast<size_t>((std::numeric_limits<int>::max)());
+
+        while (inSize > 0)
+        {
+            const size_t chunkSize = (inSize > maxChunkSize) ? maxChunkSize : inSize;
+            int chunkOutLen = 0;
+
+            if (::EVP_EncryptUpdate(ctx, outBytes ? (outBytes + outWritten) : nullptr, &chunkOutLen, inBytes, static_cast<int>(chunkSize)) != 1)
+            {
+                return false;
+            }
+
+            if (outBytes != nullptr)
+            {
+                if (chunkOutLen < 0)
+                {
+                    return false;
+                }
+
+                size_t newWritten = 0;
+                if (!SafeAddSizeT(outWritten, static_cast<size_t>(chunkOutLen), newWritten))
+                {
+                    return false;
+                }
+                if (newWritten > outCapacity)
+                {
+                    return false;
+                }
+                outWritten = newWritten;
+            }
+
+            inBytes += chunkSize;
+            inSize -= chunkSize;
+        }
+
+        return true;
+    }
+
+    static bool EvpDecryptUpdateInChunks(EVP_CIPHER_CTX* ctx, unsigned char* outBytes, size_t outCapacity, size_t& outWritten, const unsigned char* inBytes, size_t inSize)
+    {
+        outWritten = 0;
+
+        if (ctx == nullptr)
+        {
+            return false;
+        }
+
+        if (inSize == 0)
+        {
+            return true;
+        }
+
+        const size_t maxChunkSize = static_cast<size_t>((std::numeric_limits<int>::max)());
+
+        while (inSize > 0)
+        {
+            const size_t chunkSize = (inSize > maxChunkSize) ? maxChunkSize : inSize;
+            int chunkOutLen = 0;
+
+            if (::EVP_DecryptUpdate(ctx, outBytes ? (outBytes + outWritten) : nullptr, &chunkOutLen, inBytes, static_cast<int>(chunkSize)) != 1)
+            {
+                return false;
+            }
+
+            if (outBytes != nullptr)
+            {
+                if (chunkOutLen < 0)
+                {
+                    return false;
+                }
+
+                size_t newWritten = 0;
+                if (!SafeAddSizeT(outWritten, static_cast<size_t>(chunkOutLen), newWritten))
+                {
+                    return false;
+                }
+                if (newWritten > outCapacity)
+                {
+                    return false;
+                }
+                outWritten = newWritten;
+            }
+
+            inBytes += chunkSize;
+            inSize -= chunkSize;
+        }
+
+        return true;
+    }
+
+    bool GB_AesEncrypt(const std::string& utf8PlainText, const std::string& keyBytes, const std::string& ivBytes, const GB_AesOptions& options, std::string& outCipherBytes, std::string& outGcmTagBytes)
     {
         outCipherBytes.clear();
         outGcmTagBytes.clear();
@@ -1509,13 +1628,14 @@ namespace GB_AES
             // 4) AAD（可选）
             if (!normalizedOptions.aadBytes.empty())
             {
-                int aadOutLen = 0;
-                if (::EVP_EncryptUpdate(
+                size_t ignoredAadWritten = 0;
+                if (!EvpEncryptUpdateInChunks(
                     ctx.get(),
                     nullptr,
-                    &aadOutLen,
+                    0,
+                    ignoredAadWritten,
                     reinterpret_cast<const unsigned char*>(normalizedOptions.aadBytes.data()),
-                    static_cast<int>(normalizedOptions.aadBytes.size())) != 1)
+                    normalizedOptions.aadBytes.size()))
                 {
                     return false;
                 }
@@ -1523,7 +1643,12 @@ namespace GB_AES
 
             // 5) Encrypt
             const int blockSize = ::EVP_CIPHER_block_size(cipher);
-            size_t maxOutSize = utf8PlainText.size() + static_cast<size_t>(std::max(blockSize, 0));
+            const size_t blockSizeBytes = static_cast<size_t>(std::max(blockSize, 0));
+            size_t maxOutSize = 0;
+            if (!SafeAddSizeT(utf8PlainText.size(), blockSizeBytes, maxOutSize))
+            {
+                return false;
+            }
             if (maxOutSize == 0)
             {
                 maxOutSize = 1;
@@ -1531,13 +1656,14 @@ namespace GB_AES
 
             outCipherBytes.resize(maxOutSize);
 
-            int outLen1 = 0;
-            if (::EVP_EncryptUpdate(
+            size_t outLen1 = 0;
+            if (!EvpEncryptUpdateInChunks(
                 ctx.get(),
                 reinterpret_cast<unsigned char*>(&outCipherBytes[0]),
-                &outLen1,
+                maxOutSize,
+                outLen1,
                 utf8PlainText.empty() ? nullptr : reinterpret_cast<const unsigned char*>(utf8PlainText.data()),
-                static_cast<int>(utf8PlainText.size())) != 1)
+                utf8PlainText.size()))
             {
                 outCipherBytes.clear();
                 return false;
@@ -1550,7 +1676,19 @@ namespace GB_AES
                 return false;
             }
 
-            outCipherBytes.resize(static_cast<size_t>(outLen1 + outLen2));
+            if (outLen2 < 0)
+            {
+                outCipherBytes.clear();
+                return false;
+            }
+
+            size_t finalSize = 0;
+            if (!SafeAddSizeT(outLen1, static_cast<size_t>(outLen2), finalSize))
+            {
+                outCipherBytes.clear();
+                return false;
+            }
+            outCipherBytes.resize(finalSize);
 
             // 6) Get TAG
             if (normalizedOptions.gcmTagLength == 0 || normalizedOptions.gcmTagLength > static_cast<size_t>(std::numeric_limits<int>::max()))
@@ -1561,11 +1699,7 @@ namespace GB_AES
 
             outGcmTagBytes.resize(normalizedOptions.gcmTagLength);
 
-            if (::EVP_CIPHER_CTX_ctrl(
-                ctx.get(),
-                EVP_CTRL_GCM_GET_TAG,
-                static_cast<int>(normalizedOptions.gcmTagLength),
-                &outGcmTagBytes[0]) != 1)
+            if (::EVP_CIPHER_CTX_ctrl(ctx.get(), EVP_CTRL_GCM_GET_TAG, static_cast<int>(normalizedOptions.gcmTagLength), &outGcmTagBytes[0]) != 1)
             {
                 outCipherBytes.clear();
                 outGcmTagBytes.clear();
@@ -1588,7 +1722,12 @@ namespace GB_AES
         }
 
         const int blockSize = ::EVP_CIPHER_block_size(cipher);
-        size_t maxOutSize = utf8PlainText.size() + static_cast<size_t>(std::max(blockSize, 0));
+        const size_t blockSizeBytes = static_cast<size_t>(std::max(blockSize, 0));
+        size_t maxOutSize = 0;
+        if (!SafeAddSizeT(utf8PlainText.size(), blockSizeBytes, maxOutSize))
+        {
+            return false;
+        }
         if (maxOutSize == 0)
         {
             maxOutSize = 1;
@@ -1596,13 +1735,14 @@ namespace GB_AES
 
         outCipherBytes.resize(maxOutSize);
 
-        int outLen1 = 0;
-        if (::EVP_EncryptUpdate(
+        size_t outLen1 = 0;
+        if (!EvpEncryptUpdateInChunks(
             ctx.get(),
             reinterpret_cast<unsigned char*>(&outCipherBytes[0]),
-            &outLen1,
+            maxOutSize,
+            outLen1,
             utf8PlainText.empty() ? nullptr : reinterpret_cast<const unsigned char*>(utf8PlainText.data()),
-            static_cast<int>(utf8PlainText.size())) != 1)
+            utf8PlainText.size()))
         {
             outCipherBytes.clear();
             return false;
@@ -1615,18 +1755,23 @@ namespace GB_AES
             return false;
         }
 
-        outCipherBytes.resize(static_cast<size_t>(outLen1 + outLen2));
+        if (outLen2 < 0)
+        {
+            outCipherBytes.clear();
+            return false;
+        }
+
+        size_t finalSize = 0;
+        if (!SafeAddSizeT(outLen1, static_cast<size_t>(outLen2), finalSize))
+        {
+            outCipherBytes.clear();
+            return false;
+        }
+        outCipherBytes.resize(finalSize);
         return true;
     }
 
-    bool GB_AesDecrypt(
-        const std::string& cipherBytes,
-        const std::string& keyBytes,
-        const std::string& ivBytes,
-        const GB_AesOptions& options,
-        const std::string& gcmTagBytes,
-        std::string& outUtf8PlainText
-    )
+    bool GB_AesDecrypt(const std::string& cipherBytes, const std::string& keyBytes, const std::string& ivBytes, const GB_AesOptions& options, const std::string& gcmTagBytes, std::string& outUtf8PlainText)
     {
         outUtf8PlainText.clear();
 
@@ -1694,13 +1839,14 @@ namespace GB_AES
             // 4) AAD
             if (!normalizedOptions.aadBytes.empty())
             {
-                int aadOutLen = 0;
-                if (::EVP_DecryptUpdate(
+                size_t ignoredAadWritten = 0;
+                if (!EvpDecryptUpdateInChunks(
                     ctx.get(),
                     nullptr,
-                    &aadOutLen,
+                    0,
+                    ignoredAadWritten,
                     reinterpret_cast<const unsigned char*>(normalizedOptions.aadBytes.data()),
-                    static_cast<int>(normalizedOptions.aadBytes.size())) != 1)
+                    normalizedOptions.aadBytes.size()))
                 {
                     return false;
                 }
@@ -1708,7 +1854,12 @@ namespace GB_AES
 
             // 5) Decrypt (Update)
             const int blockSize = ::EVP_CIPHER_block_size(cipher);
-            size_t maxOutSize = cipherBytes.size() + static_cast<size_t>(std::max(blockSize, 0));
+            const size_t blockSizeBytes = static_cast<size_t>(std::max(blockSize, 0));
+            size_t maxOutSize = 0;
+            if (!SafeAddSizeT(cipherBytes.size(), blockSizeBytes, maxOutSize))
+            {
+                return false;
+            }
             if (maxOutSize == 0)
             {
                 maxOutSize = 1;
@@ -1716,13 +1867,14 @@ namespace GB_AES
 
             outUtf8PlainText.resize(maxOutSize);
 
-            int outLen1 = 0;
-            if (::EVP_DecryptUpdate(
+            size_t outLen1 = 0;
+            if (!EvpDecryptUpdateInChunks(
                 ctx.get(),
                 reinterpret_cast<unsigned char*>(&outUtf8PlainText[0]),
-                &outLen1,
+                maxOutSize,
+                outLen1,
                 cipherBytes.empty() ? nullptr : reinterpret_cast<const unsigned char*>(cipherBytes.data()),
-                static_cast<int>(cipherBytes.size())) != 1)
+                cipherBytes.size()))
             {
                 outUtf8PlainText.clear();
                 return false;
@@ -1748,7 +1900,19 @@ namespace GB_AES
                 return false;
             }
 
-            outUtf8PlainText.resize(static_cast<size_t>(outLen1 + outLen2));
+            if (outLen2 < 0)
+            {
+                outUtf8PlainText.clear();
+                return false;
+            }
+
+            size_t finalSize = 0;
+            if (!SafeAddSizeT(outLen1, static_cast<size_t>(outLen2), finalSize))
+            {
+                outUtf8PlainText.clear();
+                return false;
+            }
+            outUtf8PlainText.resize(finalSize);
             return true;
         }
 
@@ -1764,7 +1928,12 @@ namespace GB_AES
         }
 
         const int blockSize = ::EVP_CIPHER_block_size(cipher);
-        size_t maxOutSize = cipherBytes.size() + static_cast<size_t>(std::max(blockSize, 0));
+        const size_t blockSizeBytes = static_cast<size_t>(std::max(blockSize, 0));
+        size_t maxOutSize = 0;
+        if (!SafeAddSizeT(cipherBytes.size(), blockSizeBytes, maxOutSize))
+        {
+            return false;
+        }
         if (maxOutSize == 0)
         {
             maxOutSize = 1;
@@ -1772,13 +1941,14 @@ namespace GB_AES
 
         outUtf8PlainText.resize(maxOutSize);
 
-        int outLen1 = 0;
-        if (::EVP_DecryptUpdate(
+        size_t outLen1 = 0;
+        if (!EvpDecryptUpdateInChunks(
             ctx.get(),
             reinterpret_cast<unsigned char*>(&outUtf8PlainText[0]),
-            &outLen1,
+            maxOutSize,
+            outLen1,
             cipherBytes.empty() ? nullptr : reinterpret_cast<const unsigned char*>(cipherBytes.data()),
-            static_cast<int>(cipherBytes.size())) != 1)
+            cipherBytes.size()))
         {
             outUtf8PlainText.clear();
             return false;
@@ -1791,19 +1961,23 @@ namespace GB_AES
             return false;
         }
 
-        outUtf8PlainText.resize(static_cast<size_t>(outLen1 + outLen2));
+        if (outLen2 < 0)
+        {
+            outUtf8PlainText.clear();
+            return false;
+        }
+
+        size_t finalSize = 0;
+        if (!SafeAddSizeT(outLen1, static_cast<size_t>(outLen2), finalSize))
+        {
+            outUtf8PlainText.clear();
+            return false;
+        }
+        outUtf8PlainText.resize(finalSize);
         return true;
     }
 
-    std::string GB_AesEncryptToBase64(
-        const std::string& utf8PlainText,
-        const std::string& keyBytes,
-        const std::string& ivBytes,
-        const GB_AesOptions& options,
-        std::string& outGcmTagBytes,
-        bool urlSafe,
-        bool noPadding
-    )
+    std::string GB_AesEncryptToBase64(const std::string& utf8PlainText, const std::string& keyBytes, const std::string& ivBytes, const GB_AesOptions& options, std::string& outGcmTagBytes, bool urlSafe, bool noPadding)
     {
         outGcmTagBytes.clear();
 
@@ -1816,16 +1990,7 @@ namespace GB_AES
         return GB_Base64Encode(cipherBytes, urlSafe, noPadding);
     }
 
-    bool GB_AesDecryptFromBase64(
-        const std::string& base64CipherText,
-        const std::string& keyBytes,
-        const std::string& ivBytes,
-        const GB_AesOptions& options,
-        const std::string& gcmTagBytes,
-        std::string& outUtf8PlainText,
-        bool urlSafe,
-        bool noPadding
-    )
+    bool GB_AesDecryptFromBase64(const std::string& base64CipherText, const std::string& keyBytes, const std::string& ivBytes, const GB_AesOptions& options, const std::string& gcmTagBytes, std::string& outUtf8PlainText, bool urlSafe, bool noPadding)
     {
         outUtf8PlainText.clear();
 
@@ -1838,13 +2003,7 @@ namespace GB_AES
         return GB_AesDecrypt(cipherBytes, keyBytes, ivBytes, options, gcmTagBytes, outUtf8PlainText);
     }
 
-    std::string GB_AesEncryptToBase64Packed(
-        const std::string& utf8PlainText,
-        const std::string& keyBytes,
-        const GB_AesOptions& options,
-        bool urlSafe,
-        bool noPadding
-    )
+    std::string GB_AesEncryptToBase64Packed(const std::string& utf8PlainText, const std::string& keyBytes, const GB_AesOptions& options, bool urlSafe, bool noPadding)
     {
         GB_AesOptions normalizedOptions = options;
         NormalizeAesOptionsForCipher(normalizedOptions);
@@ -1884,14 +2043,7 @@ namespace GB_AES
         return GB_Base64Encode(payload, urlSafe, noPadding);
     }
 
-    bool GB_AesDecryptFromBase64Packed(
-        const std::string& base64Packed,
-        const std::string& keyBytes,
-        const GB_AesOptions& options,
-        std::string& outUtf8PlainText,
-        bool urlSafe,
-        bool noPadding
-    )
+    bool GB_AesDecryptFromBase64Packed(const std::string& base64Packed, const std::string& keyBytes, const GB_AesOptions& options, std::string& outUtf8PlainText, bool urlSafe, bool noPadding)
     {
         outUtf8PlainText.clear();
 
@@ -1933,14 +2085,7 @@ namespace GB_AES
         return GB_AesDecrypt(cipherBytes, keyBytes, ivBytes, normalizedOptions, tagBytes, outUtf8PlainText);
     }
 
-    bool GB_DeriveAesKeyAndIv_Pbkdf2HmacSha256(
-        const std::string& passwordUtf8,
-        const std::string& saltBytes,
-        uint32_t iterations,
-        const GB_AesOptions& options,
-        std::string& outKeyBytes,
-        std::string& outIvBytes
-    )
+    bool GB_DeriveAesKeyAndIv_Pbkdf2HmacSha256(const std::string& passwordUtf8, const std::string& saltBytes, uint32_t iterations, const GB_AesOptions& options, std::string& outKeyBytes, std::string& outIvBytes)
     {
         outKeyBytes.clear();
         outIvBytes.clear();
