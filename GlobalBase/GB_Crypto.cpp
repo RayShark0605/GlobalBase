@@ -1259,6 +1259,758 @@ namespace GB_Argon2
     }
 } // namespace GB_Argon2
 
+namespace GB_AES
+{
+    static void NormalizeAesOptionsForCipher(GB_AesOptions& options)
+    {
+        // 只对 ECB/CBC 允许 padding；其他模式强制关闭 padding。
+        if (options.mode != GB_AesMode::Ecb && options.mode != GB_AesMode::Cbc)
+        {
+            options.pkcs7Padding = false;
+        }
 
+        if (options.mode == GB_AesMode::Gcm)
+        {
+            if (options.gcmTagLength == 0)
+            {
+                options.gcmTagLength = 16;
+            }
+        }
+    }
+
+    static size_t GetRecommendedIvLength(GB_AesMode mode)
+    {
+        switch (mode)
+        {
+        case GB_AesMode::Ecb:
+            return 0;
+        case GB_AesMode::Gcm:
+            // NIST SP 800-38D 常用推荐：96-bit nonce（12 字节）。
+            return 12;
+        default:
+            // CBC/CFB/OFB/CTR：AES block size 为 16 字节。
+            return 16;
+        }
+    }
+
+    static bool IsValidAesKeyBits(size_t keyBits)
+    {
+        return keyBits == 128 || keyBits == 192 || keyBits == 256;
+    }
+
+    static size_t GetAesKeyBytesCount(size_t keyBits)
+    {
+        if (keyBits == 128)
+        {
+            return 16;
+        }
+        if (keyBits == 192)
+        {
+            return 24;
+        }
+        if (keyBits == 256)
+        {
+            return 32;
+        }
+        return 0;
+    }
+
+    static bool ValidateAesParams(
+        const std::string& keyBytes,
+        const std::string& ivBytes,
+        const GB_AesOptions& options,
+        size_t& outIvLength
+    )
+    {
+        outIvLength = options.ivLength;
+        if (outIvLength == 0)
+        {
+            outIvLength = GetRecommendedIvLength(options.mode);
+        }
+
+        if (!IsValidAesKeyBits(options.keyBits))
+        {
+            return false;
+        }
+
+        const size_t expectedKeyBytes = GetAesKeyBytesCount(options.keyBits);
+        if (expectedKeyBytes == 0 || keyBytes.size() != expectedKeyBytes)
+        {
+            return false;
+        }
+
+        if (options.mode == GB_AesMode::Ecb)
+        {
+            // ECB 不使用 IV。
+            return true;
+        }
+
+        if (options.mode == GB_AesMode::Gcm)
+        {
+            // GCM 允许任意 IV 长度（需要额外设置 IVLEN）。但不能为空。
+            if (ivBytes.empty())
+            {
+                return false;
+            }
+            return true;
+        }
+
+        // CBC/CFB/OFB/CTR：OpenSSL EVP 的 AES 期望 IV=16 字节。
+        if (ivBytes.size() != 16)
+        {
+            return false;
+        }
+
+        return true;
+    }
+
+    static const EVP_CIPHER* GetAesCipher(GB_AesMode mode, size_t keyBits)
+    {
+        if (!IsValidAesKeyBits(keyBits))
+        {
+            return nullptr;
+        }
+
+        switch (mode)
+        {
+        case GB_AesMode::Ecb:
+            if (keyBits == 128) return ::EVP_aes_128_ecb();
+            if (keyBits == 192) return ::EVP_aes_192_ecb();
+            return ::EVP_aes_256_ecb();
+
+        case GB_AesMode::Cbc:
+            if (keyBits == 128) return ::EVP_aes_128_cbc();
+            if (keyBits == 192) return ::EVP_aes_192_cbc();
+            return ::EVP_aes_256_cbc();
+
+        case GB_AesMode::Cfb128:
+            if (keyBits == 128) return ::EVP_aes_128_cfb128();
+            if (keyBits == 192) return ::EVP_aes_192_cfb128();
+            return ::EVP_aes_256_cfb128();
+
+        case GB_AesMode::Ofb:
+            if (keyBits == 128) return ::EVP_aes_128_ofb();
+            if (keyBits == 192) return ::EVP_aes_192_ofb();
+            return ::EVP_aes_256_ofb();
+
+        case GB_AesMode::Ctr:
+            if (keyBits == 128) return ::EVP_aes_128_ctr();
+            if (keyBits == 192) return ::EVP_aes_192_ctr();
+            return ::EVP_aes_256_ctr();
+
+        case GB_AesMode::Gcm:
+            if (keyBits == 128) return ::EVP_aes_128_gcm();
+            if (keyBits == 192) return ::EVP_aes_192_gcm();
+            return ::EVP_aes_256_gcm();
+
+        default:
+            return nullptr;
+        }
+    }
+
+    struct EvpCipherCtxDeleter
+    {
+        void operator()(EVP_CIPHER_CTX* ctx) const
+        {
+            if (ctx != nullptr)
+            {
+                ::EVP_CIPHER_CTX_free(ctx);
+            }
+        }
+    };
+
+    static bool GenerateRandomBytes(size_t bytesCount, std::string& outBytes)
+    {
+        outBytes.clear();
+
+        if (bytesCount == 0)
+        {
+            return true;
+        }
+
+        if (bytesCount > static_cast<size_t>(std::numeric_limits<int>::max()))
+        {
+            return false;
+        }
+
+        outBytes.resize(bytesCount);
+        if (RAND_bytes(reinterpret_cast<unsigned char*>(&outBytes[0]), static_cast<int>(bytesCount)) != 1)
+        {
+            outBytes.clear();
+            return false;
+        }
+
+        return true;
+    }
+
+    bool GB_AesEncrypt(
+        const std::string& utf8PlainText,
+        const std::string& keyBytes,
+        const std::string& ivBytes,
+        const GB_AesOptions& options,
+        std::string& outCipherBytes,
+        std::string& outGcmTagBytes
+    )
+    {
+        outCipherBytes.clear();
+        outGcmTagBytes.clear();
+
+        GB_AesOptions normalizedOptions = options;
+        NormalizeAesOptionsForCipher(normalizedOptions);
+
+#if OPENSSL_VERSION_NUMBER >= 0x30000000L
+        EnsureOpenSslProvidersLoaded();
+#endif
+
+        size_t ignoredIvLength = 0;
+        if (!ValidateAesParams(keyBytes, ivBytes, normalizedOptions, ignoredIvLength))
+        {
+            return false;
+        }
+
+        const EVP_CIPHER* cipher = GetAesCipher(normalizedOptions.mode, normalizedOptions.keyBits);
+        if (cipher == nullptr)
+        {
+            return false;
+        }
+
+        std::unique_ptr<EVP_CIPHER_CTX, EvpCipherCtxDeleter> ctx(::EVP_CIPHER_CTX_new());
+        if (ctx.get() == nullptr)
+        {
+            return false;
+        }
+
+        const unsigned char* keyPtr = reinterpret_cast<const unsigned char*>(keyBytes.data());
+        const unsigned char* ivPtr = ivBytes.empty() ? nullptr : reinterpret_cast<const unsigned char*>(ivBytes.data());
+
+        if (normalizedOptions.mode == GB_AesMode::Gcm)
+        {
+            // 1) 初始化 cipher（不设置 key/iv）
+            if (::EVP_EncryptInit_ex(ctx.get(), cipher, nullptr, nullptr, nullptr) != 1)
+            {
+                return false;
+            }
+
+            // 2) 设置 IV 长度（默认 12；非 12 时显式设置）
+            if (!ivBytes.empty() && ivBytes.size() != GetRecommendedIvLength(GB_AesMode::Gcm))
+            {
+                if (::EVP_CIPHER_CTX_ctrl(ctx.get(), EVP_CTRL_GCM_SET_IVLEN, static_cast<int>(ivBytes.size()), nullptr) != 1)
+                {
+                    return false;
+                }
+            }
+
+            // 3) 设置 key/iv
+            if (::EVP_EncryptInit_ex(ctx.get(), nullptr, nullptr, keyPtr, ivPtr) != 1)
+            {
+                return false;
+            }
+
+            // 4) AAD（可选）
+            if (!normalizedOptions.aadBytes.empty())
+            {
+                int aadOutLen = 0;
+                if (::EVP_EncryptUpdate(
+                    ctx.get(),
+                    nullptr,
+                    &aadOutLen,
+                    reinterpret_cast<const unsigned char*>(normalizedOptions.aadBytes.data()),
+                    static_cast<int>(normalizedOptions.aadBytes.size())) != 1)
+                {
+                    return false;
+                }
+            }
+
+            // 5) Encrypt
+            const int blockSize = ::EVP_CIPHER_block_size(cipher);
+            size_t maxOutSize = utf8PlainText.size() + static_cast<size_t>(std::max(blockSize, 0));
+            if (maxOutSize == 0)
+            {
+                maxOutSize = 1;
+            }
+
+            outCipherBytes.resize(maxOutSize);
+
+            int outLen1 = 0;
+            if (::EVP_EncryptUpdate(
+                ctx.get(),
+                reinterpret_cast<unsigned char*>(&outCipherBytes[0]),
+                &outLen1,
+                utf8PlainText.empty() ? nullptr : reinterpret_cast<const unsigned char*>(utf8PlainText.data()),
+                static_cast<int>(utf8PlainText.size())) != 1)
+            {
+                outCipherBytes.clear();
+                return false;
+            }
+
+            int outLen2 = 0;
+            if (::EVP_EncryptFinal_ex(ctx.get(), reinterpret_cast<unsigned char*>(&outCipherBytes[0]) + outLen1, &outLen2) != 1)
+            {
+                outCipherBytes.clear();
+                return false;
+            }
+
+            outCipherBytes.resize(static_cast<size_t>(outLen1 + outLen2));
+
+            // 6) Get TAG
+            if (normalizedOptions.gcmTagLength == 0 || normalizedOptions.gcmTagLength > static_cast<size_t>(std::numeric_limits<int>::max()))
+            {
+                outCipherBytes.clear();
+                return false;
+            }
+
+            outGcmTagBytes.resize(normalizedOptions.gcmTagLength);
+
+            if (::EVP_CIPHER_CTX_ctrl(
+                ctx.get(),
+                EVP_CTRL_GCM_GET_TAG,
+                static_cast<int>(normalizedOptions.gcmTagLength),
+                &outGcmTagBytes[0]) != 1)
+            {
+                outCipherBytes.clear();
+                outGcmTagBytes.clear();
+                return false;
+            }
+
+            return true;
+        }
+
+        // 非 GCM：ECB/CBC/CFB/OFB/CTR
+        if (::EVP_EncryptInit_ex(ctx.get(), cipher, nullptr, keyPtr, ivPtr) != 1)
+        {
+            return false;
+        }
+
+        // padding：仅 ECB/CBC 允许
+        if (::EVP_CIPHER_CTX_set_padding(ctx.get(), normalizedOptions.pkcs7Padding ? 1 : 0) != 1)
+        {
+            return false;
+        }
+
+        const int blockSize = ::EVP_CIPHER_block_size(cipher);
+        size_t maxOutSize = utf8PlainText.size() + static_cast<size_t>(std::max(blockSize, 0));
+        if (maxOutSize == 0)
+        {
+            maxOutSize = 1;
+        }
+
+        outCipherBytes.resize(maxOutSize);
+
+        int outLen1 = 0;
+        if (::EVP_EncryptUpdate(
+            ctx.get(),
+            reinterpret_cast<unsigned char*>(&outCipherBytes[0]),
+            &outLen1,
+            utf8PlainText.empty() ? nullptr : reinterpret_cast<const unsigned char*>(utf8PlainText.data()),
+            static_cast<int>(utf8PlainText.size())) != 1)
+        {
+            outCipherBytes.clear();
+            return false;
+        }
+
+        int outLen2 = 0;
+        if (::EVP_EncryptFinal_ex(ctx.get(), reinterpret_cast<unsigned char*>(&outCipherBytes[0]) + outLen1, &outLen2) != 1)
+        {
+            outCipherBytes.clear();
+            return false;
+        }
+
+        outCipherBytes.resize(static_cast<size_t>(outLen1 + outLen2));
+        return true;
+    }
+
+    bool GB_AesDecrypt(
+        const std::string& cipherBytes,
+        const std::string& keyBytes,
+        const std::string& ivBytes,
+        const GB_AesOptions& options,
+        const std::string& gcmTagBytes,
+        std::string& outUtf8PlainText
+    )
+    {
+        outUtf8PlainText.clear();
+
+        GB_AesOptions normalizedOptions = options;
+        NormalizeAesOptionsForCipher(normalizedOptions);
+
+#if OPENSSL_VERSION_NUMBER >= 0x30000000L
+        EnsureOpenSslProvidersLoaded();
+#endif
+
+        size_t ignoredIvLength = 0;
+        if (!ValidateAesParams(keyBytes, ivBytes, normalizedOptions, ignoredIvLength))
+        {
+            return false;
+        }
+
+        const EVP_CIPHER* cipher = GetAesCipher(normalizedOptions.mode, normalizedOptions.keyBits);
+        if (cipher == nullptr)
+        {
+            return false;
+        }
+
+        std::unique_ptr<EVP_CIPHER_CTX, EvpCipherCtxDeleter> ctx(::EVP_CIPHER_CTX_new());
+        if (ctx.get() == nullptr)
+        {
+            return false;
+        }
+
+        const unsigned char* keyPtr = reinterpret_cast<const unsigned char*>(keyBytes.data());
+        const unsigned char* ivPtr = ivBytes.empty() ? nullptr : reinterpret_cast<const unsigned char*>(ivBytes.data());
+
+        if (normalizedOptions.mode == GB_AesMode::Gcm)
+        {
+            if (normalizedOptions.gcmTagLength == 0)
+            {
+                return false;
+            }
+
+            if (gcmTagBytes.size() != normalizedOptions.gcmTagLength)
+            {
+                return false;
+            }
+
+            // 1) Init cipher
+            if (::EVP_DecryptInit_ex(ctx.get(), cipher, nullptr, nullptr, nullptr) != 1)
+            {
+                return false;
+            }
+
+            // 2) Set IV length if non-default
+            if (!ivBytes.empty() && ivBytes.size() != GetRecommendedIvLength(GB_AesMode::Gcm))
+            {
+                if (::EVP_CIPHER_CTX_ctrl(ctx.get(), EVP_CTRL_GCM_SET_IVLEN, static_cast<int>(ivBytes.size()), nullptr) != 1)
+                {
+                    return false;
+                }
+            }
+
+            // 3) Set key/iv
+            if (::EVP_DecryptInit_ex(ctx.get(), nullptr, nullptr, keyPtr, ivPtr) != 1)
+            {
+                return false;
+            }
+
+            // 4) AAD
+            if (!normalizedOptions.aadBytes.empty())
+            {
+                int aadOutLen = 0;
+                if (::EVP_DecryptUpdate(
+                    ctx.get(),
+                    nullptr,
+                    &aadOutLen,
+                    reinterpret_cast<const unsigned char*>(normalizedOptions.aadBytes.data()),
+                    static_cast<int>(normalizedOptions.aadBytes.size())) != 1)
+                {
+                    return false;
+                }
+            }
+
+            // 5) Decrypt (Update)
+            const int blockSize = ::EVP_CIPHER_block_size(cipher);
+            size_t maxOutSize = cipherBytes.size() + static_cast<size_t>(std::max(blockSize, 0));
+            if (maxOutSize == 0)
+            {
+                maxOutSize = 1;
+            }
+
+            outUtf8PlainText.resize(maxOutSize);
+
+            int outLen1 = 0;
+            if (::EVP_DecryptUpdate(
+                ctx.get(),
+                reinterpret_cast<unsigned char*>(&outUtf8PlainText[0]),
+                &outLen1,
+                cipherBytes.empty() ? nullptr : reinterpret_cast<const unsigned char*>(cipherBytes.data()),
+                static_cast<int>(cipherBytes.size())) != 1)
+            {
+                outUtf8PlainText.clear();
+                return false;
+            }
+
+            // 6) Set expected TAG (before Final)
+            if (::EVP_CIPHER_CTX_ctrl(
+                ctx.get(),
+                EVP_CTRL_GCM_SET_TAG,
+                static_cast<int>(gcmTagBytes.size()),
+                const_cast<char*>(gcmTagBytes.data())) != 1)
+            {
+                outUtf8PlainText.clear();
+                return false;
+            }
+
+            // 7) Final: will verify tag
+            int outLen2 = 0;
+            const int finalOk = ::EVP_DecryptFinal_ex(ctx.get(), reinterpret_cast<unsigned char*>(&outUtf8PlainText[0]) + outLen1, &outLen2);
+            if (finalOk != 1)
+            {
+                outUtf8PlainText.clear();
+                return false;
+            }
+
+            outUtf8PlainText.resize(static_cast<size_t>(outLen1 + outLen2));
+            return true;
+        }
+
+        // 非 GCM
+        if (::EVP_DecryptInit_ex(ctx.get(), cipher, nullptr, keyPtr, ivPtr) != 1)
+        {
+            return false;
+        }
+
+        if (::EVP_CIPHER_CTX_set_padding(ctx.get(), normalizedOptions.pkcs7Padding ? 1 : 0) != 1)
+        {
+            return false;
+        }
+
+        const int blockSize = ::EVP_CIPHER_block_size(cipher);
+        size_t maxOutSize = cipherBytes.size() + static_cast<size_t>(std::max(blockSize, 0));
+        if (maxOutSize == 0)
+        {
+            maxOutSize = 1;
+        }
+
+        outUtf8PlainText.resize(maxOutSize);
+
+        int outLen1 = 0;
+        if (::EVP_DecryptUpdate(
+            ctx.get(),
+            reinterpret_cast<unsigned char*>(&outUtf8PlainText[0]),
+            &outLen1,
+            cipherBytes.empty() ? nullptr : reinterpret_cast<const unsigned char*>(cipherBytes.data()),
+            static_cast<int>(cipherBytes.size())) != 1)
+        {
+            outUtf8PlainText.clear();
+            return false;
+        }
+
+        int outLen2 = 0;
+        if (::EVP_DecryptFinal_ex(ctx.get(), reinterpret_cast<unsigned char*>(&outUtf8PlainText[0]) + outLen1, &outLen2) != 1)
+        {
+            outUtf8PlainText.clear();
+            return false;
+        }
+
+        outUtf8PlainText.resize(static_cast<size_t>(outLen1 + outLen2));
+        return true;
+    }
+
+    std::string GB_AesEncryptToBase64(
+        const std::string& utf8PlainText,
+        const std::string& keyBytes,
+        const std::string& ivBytes,
+        const GB_AesOptions& options,
+        std::string& outGcmTagBytes,
+        bool urlSafe,
+        bool noPadding
+    )
+    {
+        outGcmTagBytes.clear();
+
+        std::string cipherBytes;
+        if (!GB_AesEncrypt(utf8PlainText, keyBytes, ivBytes, options, cipherBytes, outGcmTagBytes))
+        {
+            return std::string();
+        }
+
+        return GB_Base64Encode(cipherBytes, urlSafe, noPadding);
+    }
+
+    bool GB_AesDecryptFromBase64(
+        const std::string& base64CipherText,
+        const std::string& keyBytes,
+        const std::string& ivBytes,
+        const GB_AesOptions& options,
+        const std::string& gcmTagBytes,
+        std::string& outUtf8PlainText,
+        bool urlSafe,
+        bool noPadding
+    )
+    {
+        outUtf8PlainText.clear();
+
+        std::string cipherBytes;
+        if (!GB_Base64Decode(base64CipherText, cipherBytes, urlSafe, noPadding))
+        {
+            return false;
+        }
+
+        return GB_AesDecrypt(cipherBytes, keyBytes, ivBytes, options, gcmTagBytes, outUtf8PlainText);
+    }
+
+    std::string GB_AesEncryptToBase64Packed(
+        const std::string& utf8PlainText,
+        const std::string& keyBytes,
+        const GB_AesOptions& options,
+        bool urlSafe,
+        bool noPadding
+    )
+    {
+        GB_AesOptions normalizedOptions = options;
+        NormalizeAesOptionsForCipher(normalizedOptions);
+
+        const size_t keyBytesCount = GetAesKeyBytesCount(normalizedOptions.keyBits);
+        if (keyBytesCount == 0 || keyBytes.size() != keyBytesCount)
+        {
+            return std::string();
+        }
+
+        size_t ivLength = normalizedOptions.ivLength;
+        if (ivLength == 0)
+        {
+            ivLength = GetRecommendedIvLength(normalizedOptions.mode);
+        }
+
+        std::string ivBytes;
+        if (!GenerateRandomBytes(ivLength, ivBytes))
+        {
+            return std::string();
+        }
+
+        std::string cipherBytes;
+        std::string tagBytes;
+
+        if (!GB_AesEncrypt(utf8PlainText, keyBytes, ivBytes, normalizedOptions, cipherBytes, tagBytes))
+        {
+            return std::string();
+        }
+
+        std::string payload;
+        payload.reserve(ivBytes.size() + cipherBytes.size() + tagBytes.size());
+        payload.append(ivBytes);
+        payload.append(cipherBytes);
+        payload.append(tagBytes);
+
+        return GB_Base64Encode(payload, urlSafe, noPadding);
+    }
+
+    bool GB_AesDecryptFromBase64Packed(
+        const std::string& base64Packed,
+        const std::string& keyBytes,
+        const GB_AesOptions& options,
+        std::string& outUtf8PlainText,
+        bool urlSafe,
+        bool noPadding
+    )
+    {
+        outUtf8PlainText.clear();
+
+        GB_AesOptions normalizedOptions = options;
+        NormalizeAesOptionsForCipher(normalizedOptions);
+
+        const size_t keyBytesCount = GetAesKeyBytesCount(normalizedOptions.keyBits);
+        if (keyBytesCount == 0 || keyBytes.size() != keyBytesCount)
+        {
+            return false;
+        }
+
+        std::string payload;
+        if (!GB_Base64Decode(base64Packed, payload, urlSafe, noPadding))
+        {
+            return false;
+        }
+
+        size_t ivLength = normalizedOptions.ivLength;
+        if (ivLength == 0)
+        {
+            ivLength = GetRecommendedIvLength(normalizedOptions.mode);
+        }
+
+        const size_t tagLength = (normalizedOptions.mode == GB_AesMode::Gcm) ? normalizedOptions.gcmTagLength : 0;
+
+        if (payload.size() < ivLength + tagLength)
+        {
+            return false;
+        }
+
+        const size_t cipherOffset = ivLength;
+        const size_t cipherLength = payload.size() - ivLength - tagLength;
+
+        const std::string ivBytes = (ivLength > 0) ? payload.substr(0, ivLength) : std::string();
+        const std::string cipherBytes = (cipherLength > 0) ? payload.substr(cipherOffset, cipherLength) : std::string();
+        const std::string tagBytes = (tagLength > 0) ? payload.substr(cipherOffset + cipherLength, tagLength) : std::string();
+
+        return GB_AesDecrypt(cipherBytes, keyBytes, ivBytes, normalizedOptions, tagBytes, outUtf8PlainText);
+    }
+
+    bool GB_DeriveAesKeyAndIv_Pbkdf2HmacSha256(
+        const std::string& passwordUtf8,
+        const std::string& saltBytes,
+        uint32_t iterations,
+        const GB_AesOptions& options,
+        std::string& outKeyBytes,
+        std::string& outIvBytes
+    )
+    {
+        outKeyBytes.clear();
+        outIvBytes.clear();
+
+        if (iterations < 1)
+        {
+            return false;
+        }
+
+        if (saltBytes.empty())
+        {
+            return false;
+        }
+
+        GB_AesOptions normalizedOptions = options;
+        NormalizeAesOptionsForCipher(normalizedOptions);
+
+#if OPENSSL_VERSION_NUMBER >= 0x30000000L
+        EnsureOpenSslProvidersLoaded();
+#endif
+
+        const size_t keyBytesCount = GetAesKeyBytesCount(normalizedOptions.keyBits);
+        if (keyBytesCount == 0)
+        {
+            return false;
+        }
+
+        size_t ivLength = normalizedOptions.ivLength;
+        if (ivLength == 0)
+        {
+            ivLength = GetRecommendedIvLength(normalizedOptions.mode);
+        }
+
+        const size_t totalLength = keyBytesCount + ivLength;
+        if (totalLength == 0 || totalLength > static_cast<size_t>(std::numeric_limits<int>::max()))
+        {
+            return false;
+        }
+
+        std::string derivedBytes;
+        derivedBytes.resize(totalLength);
+
+        const int ok = ::PKCS5_PBKDF2_HMAC(
+            passwordUtf8.empty() ? "" : passwordUtf8.data(),
+            static_cast<int>(passwordUtf8.size()),
+            reinterpret_cast<const unsigned char*>(saltBytes.data()),
+            static_cast<int>(saltBytes.size()),
+            static_cast<int>(iterations),
+            ::EVP_sha256(),
+            static_cast<int>(derivedBytes.size()),
+            reinterpret_cast<unsigned char*>(&derivedBytes[0])
+        );
+
+        if (ok != 1)
+        {
+            derivedBytes.clear();
+            return false;
+        }
+
+        outKeyBytes = derivedBytes.substr(0, keyBytesCount);
+        outIvBytes = (ivLength > 0) ? derivedBytes.substr(keyBytesCount, ivLength) : std::string();
+
+        // 尝试清理派生缓冲区（避免在内存中长时间残留）。
+        if (!derivedBytes.empty())
+        {
+            ::OPENSSL_cleanse(&derivedBytes[0], derivedBytes.size());
+        }
+
+        return true;
+    }
+}
 
 

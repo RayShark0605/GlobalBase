@@ -181,4 +181,168 @@ namespace GB_Argon2
     GLOBALBASE_PORT bool GB_Argon2Verify(const std::string& utf8Text, const std::string& encodedHash);
 } // namespace GB_Argon2
 
+namespace GB_AES
+{
+    enum class GB_AesMode
+    {
+        Ecb = 0,
+        Cbc,
+        Cfb128,
+        Ofb,
+        Ctr,
+        Gcm
+    };
+
+    /**
+     * @brief AES 加解密参数。
+     *
+     * @remarks
+     * - utf8PlainText / outUtf8PlainText 均按“字节序列”处理，不做 Unicode 归一化与 UTF-8 合法性校验。
+     * - ECB/CBC 可选 PKCS#7 padding（OpenSSL EVP 默认即为该 padding）；若关闭 padding，则输入长度必须为 16 的倍数。
+     * - CFB/OFB/CTR 为流模式，忽略 pkcs7Padding（内部会强制关闭 EVP padding）。
+     * - GCM 为 AEAD 模式，会额外产生 tag；解密时必须提供正确 tag，否则校验失败。
+     */
+    struct GB_AesOptions
+    {
+        GB_AesMode mode = GB_AesMode::Cbc;
+
+        // AES key 长度（bit）：仅支持 128/192/256。
+        size_t keyBits = 256;
+
+        // 仅对 ECB/CBC 有效：是否启用 PKCS#7 padding。
+        bool pkcs7Padding = true;
+
+        // 对“自动生成/解析 iv”的辅助字段：
+        // - 0 表示使用推荐默认值：ECB=0；GCM=12；其他模式=16。
+        size_t ivLength = 0;
+
+        // GCM 的 tag 长度（字节），常用 16（128-bit）。
+        size_t gcmTagLength = 16;
+
+        // GCM 的 AAD（附加认证数据），可为空。
+        std::string aadBytes = "";
+    };
+
+    /**
+     * @brief 使用 AES 对 UTF-8 字符串加密，输出二进制密文（以及可选的 GCM tag）。
+     *
+     * @param utf8PlainText 输入明文（UTF-8，按字节序列处理）。
+     * @param keyBytes AES key 字节序列；长度必须与 options.keyBits 匹配（16/24/32）。
+     * @param ivBytes IV/nonce 字节序列：
+     *        - ECB：忽略，可为空；
+     *        - CBC/CFB/OFB/CTR：必须为 16 字节；
+     *        - GCM：建议 12 字节（也可为其他长度，会通过 EVP_CTRL_GCM_SET_IVLEN 设置）。
+     * @param options AES 参数。
+     * @param outCipherBytes 输出密文（二进制）。
+     * @param outGcmTagBytes 输出 GCM tag（二进制）；仅当 mode=Gcm 时有效（否则清空）。
+     * @return true 成功；false 参数非法或 OpenSSL 失败。
+     */
+    GLOBALBASE_PORT bool GB_AesEncrypt(const std::string& utf8PlainText, const std::string& keyBytes, const std::string& ivBytes, const GB_AesOptions& options, std::string& outCipherBytes, std::string& outGcmTagBytes);
+
+    /**
+     * @brief 使用 AES 解密二进制密文为 UTF-8 字符串（按字节序列输出）。
+     *
+     * @param cipherBytes 输入密文（二进制）。
+     * @param keyBytes AES key 字节序列；长度必须与 options.keyBits 匹配（16/24/32）。
+     * @param ivBytes IV/nonce 字节序列（要求同 GB_AesEncrypt）。
+     * @param options AES 参数。
+     * @param gcmTagBytes GCM tag（二进制）；仅当 mode=Gcm 时需要提供。
+     * @param outUtf8PlainText 输出明文（UTF-8，按字节序列处理）。
+     * @return true 成功；false 解密失败（含参数非法、padding 错误、GCM tag 校验失败等）。
+     */
+    GLOBALBASE_PORT bool GB_AesDecrypt(const std::string& cipherBytes, const std::string& keyBytes, const std::string& ivBytes, const GB_AesOptions& options, const std::string& gcmTagBytes, std::string& outUtf8PlainText);
+
+    /**
+     * @brief AES 加密并输出 Base64 文本（仅编码密文字节；GCM tag 需另行保存/传输）。
+     *
+     * @param utf8PlainText 明文（UTF-8，按字节序列处理）。
+     * @param keyBytes AES key 字节序列。
+     * @param ivBytes IV/nonce 字节序列。
+     * @param options AES 参数。
+     * @param outGcmTagBytes 输出 GCM tag（二进制），仅 mode=Gcm 时有效。
+     * @param urlSafe 是否使用 base64url 字母表。
+     * @param noPadding 是否省略 '=' padding。
+     * @return Base64 密文；失败返回空串。
+     */
+    GLOBALBASE_PORT std::string GB_AesEncryptToBase64(const std::string& utf8PlainText, const std::string& keyBytes, const std::string& ivBytes, const GB_AesOptions& options, std::string& outGcmTagBytes, bool urlSafe = false, bool noPadding = false);
+
+    /**
+     * @brief 从 Base64 文本解密为 UTF-8 字符串（Base64 仅包含密文；GCM tag 需另行提供）。
+     *
+     * @param base64CipherText Base64 密文文本。
+     * @param keyBytes AES key 字节序列。
+     * @param ivBytes IV/nonce 字节序列。
+     * @param options AES 参数。
+     * @param gcmTagBytes GCM tag（二进制），仅 mode=Gcm 时需要提供。
+     * @param outUtf8PlainText 输出明文（UTF-8，按字节序列处理）。
+     * @param urlSafe 是否使用 base64url 字母表。
+     * @param noPadding 是否允许省略 '=' padding。
+     * @return true 成功；false 解码或解密失败。
+     */
+    GLOBALBASE_PORT bool GB_AesDecryptFromBase64(const std::string& base64CipherText, const std::string& keyBytes, const std::string& ivBytes, const GB_AesOptions& options, const std::string& gcmTagBytes, std::string& outUtf8PlainText, bool urlSafe = false, bool noPadding = false);
+
+    /**
+     * @brief AES 加密并生成“打包”Base64：payload = iv || cipher || (tag)。
+     *
+     * @remarks
+     * - 该接口会根据 options.mode/ivLength 自动生成随机 iv/nonce：
+     *   - ECB：不生成；
+     *   - GCM：默认 12 字节；
+     *   - 其他模式：默认 16 字节。
+     * - 返回的 Base64 仅包含二进制 payload，不包含算法名等元数据；
+     *   解密时需使用一致的 options（模式/keyBits/padding/tagLength/ivLength）。
+     *
+     * @param utf8PlainText 明文（UTF-8，按字节序列处理）。
+     * @param keyBytes AES key 字节序列。
+     * @param options AES 参数。
+     * @param urlSafe 是否使用 base64url 字母表。
+     * @param noPadding 是否省略 '=' padding。
+     * @return Base64(payload)；失败返回空串。
+     */
+    GLOBALBASE_PORT std::string GB_AesEncryptToBase64Packed(const std::string& utf8PlainText, const std::string& keyBytes, const GB_AesOptions& options = GB_AesOptions(), bool urlSafe = true, bool noPadding = true);
+
+    /**
+     * @brief 从“打包”Base64 解密：payload = iv || cipher || (tag)。
+     *
+     * @param base64Packed Base64(payload) 文本。
+     * @param keyBytes AES key 字节序列。
+     * @param options AES 参数（需与加密一致）。
+     * @param outUtf8PlainText 输出明文（UTF-8，按字节序列处理）。
+     * @param urlSafe 是否使用 base64url 字母表。
+     * @param noPadding 是否允许省略 '=' padding。
+     * @return true 成功；false 解析/解码/解密失败。
+     */
+    GLOBALBASE_PORT bool GB_AesDecryptFromBase64Packed(const std::string& base64Packed, const std::string& keyBytes, const GB_AesOptions& options, std::string& outUtf8PlainText, bool urlSafe = true, bool noPadding = true);
+
+    /**
+     * @brief 使用 PBKDF2-HMAC-SHA256 从密码派生 AES key 与 IV。
+     *
+     * @remarks
+     * - PBKDF2 依据 PKCS#5 / RFC 2898，跨语言实现非常普遍；
+     * - outKeyBytes/outIvBytes 为二进制字节序列；
+     * - ECB 模式下 outIvBytes 为空串。
+     *
+     * @param passwordUtf8 密码（UTF-8，按字节序列处理）。
+     * @param saltBytes salt（二进制字节序列，建议至少 8 字节）。
+     * @param iterations 迭代次数（>=1）。
+     * @param options AES 参数（决定 keyBits 与 ivLength 默认值）。
+     * @param outKeyBytes 输出 key。
+     * @param outIvBytes 输出 iv/nonce。
+     * @return true 成功；false 失败。
+     */
+    GLOBALBASE_PORT bool GB_DeriveAesKeyAndIv_Pbkdf2HmacSha256(const std::string& passwordUtf8, const std::string& saltBytes, uint32_t iterations, const GB_AesOptions& options, std::string& outKeyBytes, std::string& outIvBytes);
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
 #endif
