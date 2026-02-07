@@ -834,7 +834,7 @@ namespace GB_Argon2
 
         return &bytes[0];
     }
-    
+
     static bool DeriveArgon2BytesOnce(const std::string& passwordBytes, const std::string& saltBytes, const GB_Argon2::GB_Argon2Options& options, bool includeThreadsParam, std::string& outDerivedBytes)
     {
         outDerivedBytes.clear();
@@ -2225,6 +2225,7 @@ namespace GB_AES
 
         std::string derivedBytes;
         derivedBytes.resize(totalLength);
+        StringCleansingGuard derivedGuard(derivedBytes);
 
         const int ok = ::PKCS5_PBKDF2_HMAC(
             passwordUtf8.empty() ? "" : passwordUtf8.data(),
@@ -2239,18 +2240,11 @@ namespace GB_AES
 
         if (ok != 1)
         {
-            derivedBytes.clear();
             return false;
         }
 
         outKeyBytes = derivedBytes.substr(0, keyBytesCount);
         outIvBytes = (ivLength > 0) ? derivedBytes.substr(keyBytesCount, ivLength) : std::string();
-
-        // 尝试清理派生缓冲区（避免在内存中长时间残留）。
-        if (!derivedBytes.empty())
-        {
-            ::OPENSSL_cleanse(&derivedBytes[0], derivedBytes.size());
-        }
 
         return true;
     }
@@ -2417,6 +2411,11 @@ namespace GB_RSA
             char* dataPtr = nullptr;
             const long dataLen = ::BIO_get_mem_data(bio, &dataPtr);
             if (dataLen < 0 || dataPtr == nullptr)
+            {
+                return false;
+            }
+
+            if (static_cast<unsigned long long>(dataLen) > static_cast<unsigned long long>((std::numeric_limits<size_t>::max)()))
             {
                 return false;
             }
@@ -3324,6 +3323,8 @@ namespace GB_RSA
             return false;
         }
 
+        StringCleansingGuard payloadGuard(payloadBytes);
+
         size_t maxPlainBlockSize = 0;
         if (!ComputeMaxPlaintextBlockSize(publicKey.get(), options, maxPlainBlockSize))
         {
@@ -3453,6 +3454,7 @@ namespace GB_RSA
         size_t remaining = cipherBytes.size();
 
         std::string payloadBytes;
+        StringCleansingGuard payloadGuard(payloadBytes);
         payloadBytes.reserve(cipherBytes.size());
 
         while (remaining > 0)
@@ -4592,6 +4594,13 @@ namespace GB_ECC
         }
 
         if (::EVP_PKEY_base_id(ephemeralPublicKey.get()) != EVP_PKEY_EC)
+        {
+            return false;
+        }
+
+        const int receiverCurveNid = GetCurveNidFromEvpPkey(receiverPrivateKey.get());
+        const int ephemeralCurveNid = GetCurveNidFromEvpPkey(ephemeralPublicKey.get());
+        if (receiverCurveNid == 0 || ephemeralCurveNid == 0 || receiverCurveNid != ephemeralCurveNid)
         {
             return false;
         }
