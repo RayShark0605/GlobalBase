@@ -737,8 +737,12 @@ namespace GB_Argon2
             options.lanes = 1;
         }
 
-        // Argon2 要求 m >= 8 * p（单位 KiB）。
-        const uint32_t minMemoryCost = options.lanes * 8;
+        // Argon2 要求 m >= 8 * p（单位 KiB）。注意 lanes 可能较大，避免 32bit 乘法溢出。
+        const uint64_t minMemoryCost64 = static_cast<uint64_t>(options.lanes) * 8ULL;
+        const uint32_t minMemoryCost = (minMemoryCost64 > static_cast<uint64_t>(std::numeric_limits<uint32_t>::max()))
+            ? std::numeric_limits<uint32_t>::max()
+            : static_cast<uint32_t>(minMemoryCost64);
+
         if (options.memoryCostKiB < minMemoryCost)
         {
             options.memoryCostKiB = minMemoryCost;
@@ -886,76 +890,123 @@ namespace GB_Argon2
 
         OSSL_PARAM params[16];
         size_t paramCount = 0;
+        constexpr size_t paramsCapacity = sizeof(params) / sizeof(params[0]);
 
-        params[paramCount++] = ::OSSL_PARAM_construct_uint32(
+        auto AddParam = [&](const OSSL_PARAM& param) -> bool
+            {
+                if (paramCount + 1 >= paramsCapacity)
+                {
+                    return false;
+                }
+
+                params[paramCount++] = param;
+                return true;
+            };
+
+        if (!AddParam(::OSSL_PARAM_construct_uint32(
             OSSL_KDF_PARAM_ARGON2_LANES,
             &normalizedOptions.lanes
-        );
-        params[paramCount++] = ::OSSL_PARAM_construct_uint32(
+        )))
+        {
+            return false;
+        }
+
+        if (!AddParam(::OSSL_PARAM_construct_uint32(
             OSSL_KDF_PARAM_ARGON2_MEMCOST,
             &normalizedOptions.memoryCostKiB
-        );
-        params[paramCount++] = ::OSSL_PARAM_construct_uint32(
+        )))
+        {
+            return false;
+        }
+
+        if (!AddParam(::OSSL_PARAM_construct_uint32(
             OSSL_KDF_PARAM_ITER,
             &normalizedOptions.iterations
-        );
+        )))
+        {
+            return false;
+        }
 
         if (useThreadsParam)
         {
-            params[paramCount++] = ::OSSL_PARAM_construct_uint32(
+            if (!AddParam(::OSSL_PARAM_construct_uint32(
                 OSSL_KDF_PARAM_THREADS,
                 &threads
-            );
+            )))
+            {
+                return false;
+            }
         }
 
-        params[paramCount++] = ::OSSL_PARAM_construct_size_t(
+        if (!AddParam(::OSSL_PARAM_construct_size_t(
             OSSL_KDF_PARAM_SIZE,
             &derivedLength
-        );
+        )))
+        {
+            return false;
+        }
 
-        params[paramCount++] = ::OSSL_PARAM_construct_uint32(
+        if (!AddParam(::OSSL_PARAM_construct_uint32(
             OSSL_KDF_PARAM_ARGON2_VERSION,
             &normalizedOptions.version
-        );
+        )))
+        {
+            return false;
+        }
 
 #if defined(OSSL_KDF_PARAM_EARLY_CLEAN)
-        params[paramCount++] = ::OSSL_PARAM_construct_uint32(
+        if (!AddParam(::OSSL_PARAM_construct_uint32(
             OSSL_KDF_PARAM_EARLY_CLEAN,
             &earlyClean
-        );
+        )))
+        {
+            return false;
+        }
 #else
         (void)earlyClean;
 #endif
 
-        params[paramCount++] = ::OSSL_PARAM_construct_octet_string(
+        if (!AddParam(::OSSL_PARAM_construct_octet_string(
             OSSL_KDF_PARAM_SALT,
             GetOctetStringPointerForOpenSsl(saltCopy),
             saltCopy.size()
-        );
+        )))
+        {
+            return false;
+        }
 
         if (!secretCopy.empty())
         {
-            params[paramCount++] = ::OSSL_PARAM_construct_octet_string(
+            if (!AddParam(::OSSL_PARAM_construct_octet_string(
                 OSSL_KDF_PARAM_SECRET,
                 GetOctetStringPointerForOpenSsl(secretCopy),
                 secretCopy.size()
-            );
+            )))
+            {
+                return false;
+            }
         }
 
         if (!adCopy.empty())
         {
-            params[paramCount++] = ::OSSL_PARAM_construct_octet_string(
+            if (!AddParam(::OSSL_PARAM_construct_octet_string(
                 OSSL_KDF_PARAM_ARGON2_AD,
                 GetOctetStringPointerForOpenSsl(adCopy),
                 adCopy.size()
-            );
+            )))
+            {
+                return false;
+            }
         }
 
-        params[paramCount++] = ::OSSL_PARAM_construct_octet_string(
+        if (!AddParam(::OSSL_PARAM_construct_octet_string(
             OSSL_KDF_PARAM_PASSWORD,
             GetOctetStringPointerForOpenSsl(passwordCopy),
             passwordCopy.size()
-        );
+        )))
+        {
+            return false;
+        }
 
         params[paramCount++] = ::OSSL_PARAM_construct_end();
 
@@ -1349,6 +1400,28 @@ namespace GB_AES
             // CBC/CFB/OFB/CTR：AES block size 为 16 字节。
             return 16;
         }
+    }
+
+    static size_t GetIvLengthForPacked(GB_AesMode mode, size_t requestedIvLength)
+    {
+        if (mode == GB_AesMode::Ecb)
+        {
+            return 0;
+        }
+
+        if (mode == GB_AesMode::Gcm)
+        {
+            // GCM 允许非 12 字节 IV，但 12 字节是最常见/推荐的长度。
+            if (requestedIvLength == 0)
+            {
+                return GetRecommendedIvLength(GB_AesMode::Gcm);
+            }
+            return requestedIvLength;
+        }
+
+        // 其它 AES block 模式：IV 长度必须为 16 字节。
+        (void)requestedIvLength;
+        return 16;
     }
 
     static bool IsValidAesKeyBits(size_t keyBits)
@@ -1822,6 +1895,11 @@ namespace GB_AES
                 return false;
             }
 
+            if (normalizedOptions.gcmTagLength > static_cast<size_t>((std::numeric_limits<int>::max)()))
+            {
+                return false;
+            }
+
             // 1) Init cipher
             if (::EVP_DecryptInit_ex(ctx.get(), cipher, nullptr, nullptr, nullptr) != 1)
             {
@@ -2021,11 +2099,7 @@ namespace GB_AES
             return std::string();
         }
 
-        size_t ivLength = normalizedOptions.ivLength;
-        if (ivLength == 0)
-        {
-            ivLength = GetRecommendedIvLength(normalizedOptions.mode);
-        }
+        const size_t ivLength = GetIvLengthForPacked(normalizedOptions.mode, normalizedOptions.ivLength);
 
         std::string ivBytes;
         if (!GenerateRandomBytes(ivLength, ivBytes))
@@ -2069,11 +2143,7 @@ namespace GB_AES
             return false;
         }
 
-        size_t ivLength = normalizedOptions.ivLength;
-        if (ivLength == 0)
-        {
-            ivLength = GetRecommendedIvLength(normalizedOptions.mode);
-        }
+        const size_t ivLength = GetIvLengthForPacked(normalizedOptions.mode, normalizedOptions.ivLength);
 
         const size_t tagLength = (normalizedOptions.mode == GB_AesMode::Gcm) ? normalizedOptions.gcmTagLength : 0;
 
@@ -2120,11 +2190,7 @@ namespace GB_AES
             return false;
         }
 
-        size_t ivLength = normalizedOptions.ivLength;
-        if (ivLength == 0)
-        {
-            ivLength = GetRecommendedIvLength(normalizedOptions.mode);
-        }
+        const size_t ivLength = GetIvLengthForPacked(normalizedOptions.mode, normalizedOptions.ivLength);
 
         const size_t totalLength = keyBytesCount + ivLength;
         if (totalLength == 0 || totalLength > static_cast<size_t>(std::numeric_limits<int>::max()))
@@ -2260,6 +2326,11 @@ namespace GB_RSA
                 return std::string();
             }
 
+            if (input.size() > static_cast<size_t>((std::numeric_limits<int>::max)()))
+            {
+                return std::string();
+            }
+
             char* escaped = ::curl_easy_escape(handle.get(), input.data(), static_cast<int>(input.size()));
             if (escaped == nullptr)
             {
@@ -2282,6 +2353,11 @@ namespace GB_RSA
 
             std::unique_ptr<CURL, CurlDeleter> handle(::curl_easy_init());
             if (handle.get() == nullptr)
+            {
+                return false;
+            }
+
+            if (input.size() > static_cast<size_t>((std::numeric_limits<int>::max)()))
             {
                 return false;
             }
@@ -2409,6 +2485,12 @@ namespace GB_RSA
         {
             outBytes.clear();
 
+            constexpr uint32_t maxDecompressedSize = 256U * 1024U * 1024U;
+            if (expectedOutputSize > maxDecompressedSize)
+            {
+                return false;
+            }
+
             if (compressedBytes.empty() && expectedOutputSize == 0)
             {
                 // zlib 对空数据的压缩结果并非空串；但若遇到边界输入，这里直接视为成功。
@@ -2477,6 +2559,14 @@ namespace GB_RSA
 
                 if (zRet == Z_STREAM_END)
                 {
+                    // 严格要求输入正好用尽：不允许在 deflate 流结束后仍残留额外字节（可能是拼接/污染数据）。
+                    if (remaining != 0 || stream.avail_in != 0)
+                    {
+                        ::inflateEnd(&stream);
+                        outBytes.clear();
+                        return false;
+                    }
+
                     break;
                 }
 
