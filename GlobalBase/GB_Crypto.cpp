@@ -56,37 +56,34 @@
 namespace
 {
 #if OPENSSL_VERSION_NUMBER >= 0x30000000L
-    struct OsslProviderDeleter
+    // 注意：OSSL_PROVIDER_unload 在进程退出时的析构顺序中可能引发崩溃（例如 libcrypto 已先行清理内部锁）。
+    // 因此这里选择“加载一次，进程生命周期内保持加载”，避免静态析构阶段调用 unload。
+    static OSSL_PROVIDER*& GetDefaultProviderRaw()
     {
-        void operator()(OSSL_PROVIDER* provider) const
-        {
-            if (provider != nullptr)
-            {
-                ::OSSL_PROVIDER_unload(provider);
-            }
-        }
-    };
-
-    static std::unique_ptr<OSSL_PROVIDER, OsslProviderDeleter>& GetDefaultProvider()
-    {
-        static std::unique_ptr<OSSL_PROVIDER, OsslProviderDeleter> provider;
+        static OSSL_PROVIDER* provider = nullptr;
         return provider;
     }
 
-    static std::unique_ptr<OSSL_PROVIDER, OsslProviderDeleter>& GetLegacyProvider()
+    static OSSL_PROVIDER*& GetLegacyProviderRaw()
     {
-        static std::unique_ptr<OSSL_PROVIDER, OsslProviderDeleter> provider;
+        static OSSL_PROVIDER* provider = nullptr;
         return provider;
     }
 
     static void LoadOpenSslProviders()
     {
         // "default" 通常已加载，但显式加载可提升跨平台一致性。
-        GetDefaultProvider().reset(::OSSL_PROVIDER_load(nullptr, "default"));
+        if (GetDefaultProviderRaw() == nullptr)
+        {
+            GetDefaultProviderRaw() = ::OSSL_PROVIDER_load(nullptr, "default");
+        }
 
         // "legacy" 用于部分传统算法（例如某些发行版/配置下的 MD5/MD4 等）。
         // 若加载失败也不作为错误处理。
-        GetLegacyProvider().reset(::OSSL_PROVIDER_load(nullptr, "legacy"));
+        if (GetLegacyProviderRaw() == nullptr)
+        {
+            GetLegacyProviderRaw() = ::OSSL_PROVIDER_load(nullptr, "legacy");
+        }
     }
 
     static void EnsureOpenSslProvidersLoaded()
@@ -234,6 +231,31 @@ namespace
         }
 
         out = a * b;
+        return true;
+    }
+
+
+    static bool GenerateRandomBytes(size_t bytesCount, std::string& outBytes)
+    {
+        outBytes.clear();
+
+        if (bytesCount == 0)
+        {
+            return true;
+        }
+
+        if (bytesCount > static_cast<size_t>(std::numeric_limits<int>::max()))
+        {
+            return false;
+        }
+
+        outBytes.resize(bytesCount);
+        if (::RAND_bytes(reinterpret_cast<unsigned char*>(&outBytes[0]), static_cast<int>(bytesCount)) != 1)
+        {
+            outBytes.clear();
+            return false;
+        }
+
         return true;
     }
 
@@ -680,29 +702,6 @@ namespace GB_Argon2
         return 0;
     }
 
-    static bool GenerateRandomBytes(size_t bytesCount, std::string& outBytes)
-    {
-        outBytes.clear();
-
-        if (bytesCount == 0)
-        {
-            return false;
-        }
-
-        if (bytesCount > static_cast<size_t>(std::numeric_limits<int>::max()))
-        {
-            return false;
-        }
-
-        outBytes.resize(bytesCount);
-        if (RAND_bytes(reinterpret_cast<unsigned char*>(&outBytes[0]), static_cast<int>(bytesCount)) != 1)
-        {
-            outBytes.clear();
-            return false;
-        }
-
-        return true;
-    }
 
     struct EvpKdfDeleter
     {
@@ -2029,7 +2028,7 @@ namespace GB_AES
         }
 
         std::string ivBytes;
-        if (!GB_Argon2::GenerateRandomBytes(ivLength, ivBytes))
+        if (!GenerateRandomBytes(ivLength, ivBytes))
         {
             return std::string();
         }
@@ -2429,7 +2428,9 @@ namespace GB_RSA
 
             if (expectedOutputSize > 0)
             {
-                outBytes.reserve(static_cast<size_t>(expectedOutputSize));
+                // 仅用于性能优化，避免被异常/恶意输入触发巨额 reserve（潜在 DoS）。
+                const size_t reserveSize = std::min<size_t>(static_cast<size_t>(expectedOutputSize), 32U * 1024U * 1024U);
+                outBytes.reserve(reserveSize);
             }
 
             std::vector<unsigned char> buffer;
@@ -3198,6 +3199,13 @@ namespace GB_RSA
             return false;
         }
 
+        const int keyBytesInt = ::EVP_PKEY_size(publicKey.get());
+        if (keyBytesInt <= 0)
+        {
+            return false;
+        }
+        const size_t keyBytes = static_cast<size_t>(keyBytesInt);
+
         std::string payloadBytes;
         if (!BuildRsaPayload(utf8PlainText, options, payloadBytes))
         {
@@ -3209,32 +3217,45 @@ namespace GB_RSA
         {
             return false;
         }
-
-        const int keyBytesInt = ::EVP_PKEY_size(publicKey.get());
-        if (keyBytesInt <= 0)
+        if (maxPlainBlockSize == 0)
         {
             return false;
         }
-        const size_t keyBytes = static_cast<size_t>(keyBytesInt);
 
-        if (options.padding == GB_RsaPaddingMode::NoPadding)
+        if (!payloadBytes.empty() && (payloadBytes.size() % maxPlainBlockSize != 0) && options.padding == GB_RsaPaddingMode::NoPadding)
         {
-            // NoPadding：每块必须刚好 keyBytes。
-            if (payloadBytes.size() % keyBytes != 0)
-            {
-                return false;
-            }
+            // NoPadding 需要每块输入长度严格等于 keyBytes，本库此处不做自动补齐。
+            return false;
         }
 
-        const size_t blocks = (payloadBytes.empty()) ? 0 : ((payloadBytes.size() + maxPlainBlockSize - 1) / maxPlainBlockSize);
-        size_t reserveCipher = 0;
-        if (blocks > 0)
+        // 分块 RSA：密文每块固定为 keyBytes。
+        size_t blocks = 0;
+        if (!payloadBytes.empty())
         {
-            if (!SafeMulSizeT(blocks, keyBytes, reserveCipher))
-            {
-                return false;
-            }
-            outCipherBytes.reserve(reserveCipher);
+            blocks = (payloadBytes.size() + maxPlainBlockSize - 1) / maxPlainBlockSize;
+        }
+
+        size_t reserveBytes = 0;
+        if (!SafeMulSizeT(blocks, keyBytes, reserveBytes))
+        {
+            return false;
+        }
+        outCipherBytes.reserve(reserveBytes);
+
+        std::unique_ptr<EVP_PKEY_CTX, EvpPkeyCtxDeleter> ctx(::EVP_PKEY_CTX_new(publicKey.get(), nullptr));
+        if (ctx.get() == nullptr)
+        {
+            return false;
+        }
+
+        if (::EVP_PKEY_encrypt_init(ctx.get()) != 1)
+        {
+            return false;
+        }
+
+        if (!ConfigureRsaEncryptDecryptContext(ctx.get(), options))
+        {
+            return false;
         }
 
         const unsigned char* inputPtr = payloadBytes.empty() ? nullptr : reinterpret_cast<const unsigned char*>(payloadBytes.data());
@@ -3242,56 +3263,25 @@ namespace GB_RSA
 
         while (remaining > 0)
         {
-            const size_t chunkSize = (remaining > maxPlainBlockSize) ? maxPlainBlockSize : remaining;
-
-            std::unique_ptr<EVP_PKEY_CTX, EvpPkeyCtxDeleter> ctx(::EVP_PKEY_CTX_new(publicKey.get(), nullptr));
-            if (ctx.get() == nullptr)
-            {
-                outCipherBytes.clear();
-                return false;
-            }
-
-            if (::EVP_PKEY_encrypt_init(ctx.get()) != 1)
-            {
-                outCipherBytes.clear();
-                return false;
-            }
-
-            if (!ConfigureRsaEncryptDecryptContext(ctx.get(), options))
-            {
-                outCipherBytes.clear();
-                return false;
-            }
-
-            size_t outLen = 0;
-            if (::EVP_PKEY_encrypt(ctx.get(), nullptr, &outLen, inputPtr, chunkSize) != 1)
-            {
-                outCipherBytes.clear();
-                return false;
-            }
-
-            if (outLen != keyBytes)
-            {
-                // RSA 加密输出应为固定 keyBytes。
-                outCipherBytes.clear();
-                return false;
-            }
+            const size_t chunkSize = std::min(remaining, maxPlainBlockSize);
 
             const size_t oldSize = outCipherBytes.size();
             size_t newSize = 0;
-            if (!SafeAddSizeT(oldSize, outLen, newSize))
+            if (!SafeAddSizeT(oldSize, keyBytes, newSize))
             {
                 outCipherBytes.clear();
                 return false;
             }
             outCipherBytes.resize(newSize);
 
+            size_t outLen = keyBytes;
             if (::EVP_PKEY_encrypt(ctx.get(), reinterpret_cast<unsigned char*>(&outCipherBytes[oldSize]), &outLen, inputPtr, chunkSize) != 1)
             {
                 outCipherBytes.clear();
                 return false;
             }
 
+            // RSA 输出应固定等于 keyBytes。
             if (outLen != keyBytes)
             {
                 outCipherBytes.clear();
@@ -3331,6 +3321,22 @@ namespace GB_RSA
             return false;
         }
 
+        std::unique_ptr<EVP_PKEY_CTX, EvpPkeyCtxDeleter> ctx(::EVP_PKEY_CTX_new(privateKey.get(), nullptr));
+        if (ctx.get() == nullptr)
+        {
+            return false;
+        }
+
+        if (::EVP_PKEY_decrypt_init(ctx.get()) != 1)
+        {
+            return false;
+        }
+
+        if (!ConfigureRsaEncryptDecryptContext(ctx.get(), options))
+        {
+            return false;
+        }
+
         const unsigned char* inputPtr = cipherBytes.empty() ? nullptr : reinterpret_cast<const unsigned char*>(cipherBytes.data());
         size_t remaining = cipherBytes.size();
 
@@ -3339,46 +3345,24 @@ namespace GB_RSA
 
         while (remaining > 0)
         {
-            std::unique_ptr<EVP_PKEY_CTX, EvpPkeyCtxDeleter> ctx(::EVP_PKEY_CTX_new(privateKey.get(), nullptr));
-            if (ctx.get() == nullptr)
-            {
-                return false;
-            }
-
-            if (::EVP_PKEY_decrypt_init(ctx.get()) != 1)
-            {
-                return false;
-            }
-
-            if (!ConfigureRsaEncryptDecryptContext(ctx.get(), options))
-            {
-                return false;
-            }
-
-            size_t outLen = 0;
-            if (::EVP_PKEY_decrypt(ctx.get(), nullptr, &outLen, inputPtr, keyBytes) != 1)
-            {
-                return false;
-            }
-
-            if (outLen > static_cast<size_t>((std::numeric_limits<int>::max)()))
-            {
-                return false;
-            }
-
             const size_t oldSize = payloadBytes.size();
             size_t newSize = 0;
-            if (!SafeAddSizeT(oldSize, outLen, newSize))
+            if (!SafeAddSizeT(oldSize, keyBytes, newSize))
             {
                 return false;
             }
             payloadBytes.resize(newSize);
 
+            size_t outLen = keyBytes;
             if (::EVP_PKEY_decrypt(ctx.get(), reinterpret_cast<unsigned char*>(&payloadBytes[oldSize]), &outLen, inputPtr, keyBytes) != 1)
             {
                 return false;
             }
 
+            if (outLen > keyBytes)
+            {
+                return false;
+            }
             payloadBytes.resize(oldSize + outLen);
 
             inputPtr += keyBytes;
