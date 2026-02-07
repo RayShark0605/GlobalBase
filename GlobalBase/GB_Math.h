@@ -6,6 +6,7 @@
 #include <numeric>
 #include <limits>
 #include <random>
+#include <string>
 
 #ifdef min
 #undef min
@@ -196,7 +197,13 @@ inline double GB_RandomDouble(double minValue, double maxValue)
 	return distribution(generator);
 }
 
+// 生成指定长度的随机字符串（UTF-8 编码）
+// - length：生成的“字符数量”（基于 characterPool 中的 char32_t 码点个数，不是字节数）
+// - characterPool：字符池（Unicode 码点）；为空时返回空串
+GLOBALBASE_PORT std::string GB_RandomString(size_t length, const std::vector<char32_t>& characterPool);
 
+// 使用默认字符池生成随机字符串（a-z, A-Z, 0-9, '_', '-'）
+GLOBALBASE_PORT std::string GB_RandomString(size_t length);
 
 
 #endif

@@ -1649,6 +1649,28 @@ wstring GB_Utf8ToWString(const string& utf8Str)
 #endif
 }
 
+vector<char32_t> GB_Utf8StringToChar32Vector(const string& utf8Str)
+{
+    const size_t size = GB_GetUtf8Length(utf8Str);
+    vector<char32_t> result;
+    result.reserve(size);
+
+    size_t pos = 0;
+    while (pos < utf8Str.size())
+    {
+        char32_t cp = 0;
+        size_t nextPos = pos;
+        bool ok = internal::DecodeOne(utf8Str, pos, cp, nextPos);
+        if (ok)
+        {
+            result.push_back(cp);
+        }
+        pos = nextPos;
+    }
+    result.shrink_to_fit();
+    return result;
+}
+
 // 获取 UTF-8 字符串的长度（以 UTF-8 字符/码点 为单位）
 size_t GB_GetUtf8Length(const string& utf8Str)
 {

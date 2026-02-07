@@ -152,5 +152,8 @@
     <ClCompile Include="GB_Network.cpp">
       <Filter>源文件</Filter>
     </ClCompile>
+    <ClCompile Include="GB_Math.cpp">
+      <Filter>源文件</Filter>
+    </ClCompile>
   </ItemGroup>
 </Project>

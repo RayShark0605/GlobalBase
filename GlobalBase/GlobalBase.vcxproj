@@ -50,6 +50,7 @@
     <ClCompile Include="GB_FileSystem.cpp" />
     <ClCompile Include="GB_IO.cpp" />
     <ClCompile Include="GB_Logger.cpp" />
+    <ClCompile Include="GB_Math.cpp" />
     <ClCompile Include="GB_Network.cpp" />
     <ClCompile Include="GB_Process.cpp" />
     <ClCompile Include="GB_ReadWriteLock.cpp" />
