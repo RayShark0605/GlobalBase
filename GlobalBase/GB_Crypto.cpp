@@ -19,6 +19,13 @@
 #include <openssl/bn.h>
 #include <openssl/x509.h>
 
+#include <openssl/ec.h>
+#include <openssl/hmac.h>
+
+#if OPENSSL_VERSION_NUMBER >= 0x10101000L
+#include <openssl/kdf.h>
+#endif
+
 #include <curl/curl.h>
 
 #if OPENSSL_VERSION_NUMBER >= 0x30000000L
@@ -93,7 +100,6 @@ namespace
         std::call_once(onceFlag, LoadOpenSslProviders);
     }
 
-
     struct EvpMdDeleter
     {
         void operator()(EVP_MD* md) const
@@ -162,7 +168,6 @@ namespace
         outTable[static_cast<unsigned char>('=')] = -2;
         return true;
     }
-
 
     static const std::array<int8_t, 256>& GetBase64DecodeTable(bool urlSafe)
     {
@@ -265,7 +270,6 @@ namespace
         out = a * b;
         return true;
     }
-
 
     static bool GenerateRandomBytes(size_t bytesCount, std::string& outBytes)
     {
@@ -413,7 +417,6 @@ namespace
         return BytesToLowerHexString(digestBytes, static_cast<size_t>(digestSize));
     }
 
-
     static std::string Uint32ToLowerHex8(uint32_t value)
     {
         std::string result;
@@ -428,7 +431,6 @@ namespace
 
         return result;
     }
-
 }
 
 std::string GB_Base64Encode(const std::string& utf8Text, bool urlSafe, bool noPadding)
@@ -667,6 +669,31 @@ std::string GB_Crc32Hash(const std::string& utf8Text)
     return Uint32ToLowerHex8(static_cast<uint32_t>(crc));
 }
 
+static void SecureCleanseBuffer(void* data, size_t size)
+{
+    if (data != nullptr && size > 0)
+    {
+        ::OPENSSL_cleanse(data, size);
+    }
+}
+
+class StringCleansingGuard
+{
+public:
+    explicit StringCleansingGuard(std::string& bytes) : m_bytes(bytes) {}
+
+    ~StringCleansingGuard()
+    {
+        if (!m_bytes.empty())
+        {
+            SecureCleanseBuffer(&m_bytes[0], m_bytes.size());
+        }
+    }
+
+private:
+    std::string& m_bytes;
+};
+
 namespace GB_Argon2
 {
 #if OPENSSL_VERSION_NUMBER >= 0x30200000L
@@ -728,7 +755,6 @@ namespace GB_Argon2
         }
         return 0;
     }
-
 
     struct EvpKdfDeleter
     {
@@ -808,32 +834,7 @@ namespace GB_Argon2
 
         return &bytes[0];
     }
-
-    static void SecureCleanseBuffer(void* data, size_t size)
-    {
-        if (data != nullptr && size > 0)
-        {
-            ::OPENSSL_cleanse(data, size);
-        }
-    }
-
-    class StringCleansingGuard
-    {
-    public:
-        explicit StringCleansingGuard(std::string& bytes) : m_bytes(bytes) {}
-
-        ~StringCleansingGuard()
-        {
-            if (!m_bytes.empty())
-            {
-                SecureCleanseBuffer(&m_bytes[0], m_bytes.size());
-            }
-        }
-
-    private:
-        std::string& m_bytes;
-    };
-
+    
     static bool DeriveArgon2BytesOnce(const std::string& passwordBytes, const std::string& saltBytes, const GB_Argon2::GB_Argon2Options& options, bool includeThreadsParam, std::string& outDerivedBytes)
     {
         outDerivedBytes.clear();
@@ -1072,7 +1073,6 @@ namespace GB_Argon2
 
         return DeriveArgon2BytesOnce(passwordBytes, saltBytes, options, false, outDerivedBytes);
     }
-
 
     static void SplitStringByChar(const std::string& text, char delimiter, std::vector<std::string>& outParts, bool keepEmpty)
     {
@@ -3534,6 +3534,1135 @@ namespace GB_RSA
     }
 }
 
+namespace GB_ECC
+{
+    namespace
+    {
+        struct BioDeleter
+        {
+            void operator()(BIO* bio) const
+            {
+                if (bio != nullptr)
+                {
+                    ::BIO_free(bio);
+                }
+            }
+        };
+
+        struct EvpPkeyDeleter
+        {
+            void operator()(EVP_PKEY* pkey) const
+            {
+                if (pkey != nullptr)
+                {
+                    ::EVP_PKEY_free(pkey);
+                }
+            }
+        };
+
+        struct EvpPkeyCtxDeleter
+        {
+            void operator()(EVP_PKEY_CTX* ctx) const
+            {
+                if (ctx != nullptr)
+                {
+                    ::EVP_PKEY_CTX_free(ctx);
+                }
+            }
+        };
+
+        struct EcKeyDeleter
+        {
+            void operator()(EC_KEY* ecKey) const
+            {
+                if (ecKey != nullptr)
+                {
+                    ::EC_KEY_free(ecKey);
+                }
+            }
+        };
+
+        static bool BioToBytes(BIO* bio, std::string& outBytes)
+        {
+            outBytes.clear();
+
+            if (bio == nullptr)
+            {
+                return false;
+            }
+
+            char* dataPtr = nullptr;
+            const long dataLen = ::BIO_get_mem_data(bio, &dataPtr);
+            if (dataLen < 0 || dataPtr == nullptr)
+            {
+                return false;
+            }
+
+            outBytes.assign(dataPtr, static_cast<size_t>(dataLen));
+            return true;
+        }
+
+        static std::unique_ptr<BIO, BioDeleter> CreateReadOnlyBioFromBytes(const std::string& bytes)
+        {
+            if (bytes.size() > static_cast<size_t>((std::numeric_limits<int>::max)()))
+            {
+                return std::unique_ptr<BIO, BioDeleter>();
+            }
+
+            // BIO_new_mem_buf 不会拷贝数据，因此必须保证 bytes 的生命周期覆盖 BIO 使用期。
+            // 本函数内部立刻进行解析，不会跨越该作用域。
+            return std::unique_ptr<BIO, BioDeleter>(::BIO_new_mem_buf(bytes.data(), static_cast<int>(bytes.size())));
+        }
+
+        static bool IsLikelyPem(const std::string& keyBytes)
+        {
+            return keyBytes.find("-----BEGIN") != std::string::npos;
+        }
+
+        static void WriteUint16Be(uint16_t value, char outBytes[2])
+        {
+            outBytes[0] = static_cast<char>((value >> 8) & 0xFF);
+            outBytes[1] = static_cast<char>((value) & 0xFF);
+        }
+
+        static void WriteUint32Be(uint32_t value, char outBytes[4])
+        {
+            outBytes[0] = static_cast<char>((value >> 24) & 0xFF);
+            outBytes[1] = static_cast<char>((value >> 16) & 0xFF);
+            outBytes[2] = static_cast<char>((value >> 8) & 0xFF);
+            outBytes[3] = static_cast<char>((value) & 0xFF);
+        }
+
+        static uint16_t ReadUint16Be(const unsigned char* bytes)
+        {
+            return static_cast<uint16_t>(
+                (static_cast<uint16_t>(bytes[0]) << 8) |
+                (static_cast<uint16_t>(bytes[1])));
+        }
+
+        static uint32_t ReadUint32Be(const unsigned char* bytes)
+        {
+            return
+                (static_cast<uint32_t>(bytes[0]) << 24) |
+                (static_cast<uint32_t>(bytes[1]) << 16) |
+                (static_cast<uint32_t>(bytes[2]) << 8) |
+                (static_cast<uint32_t>(bytes[3]));
+        }
+
+        static int GetCurveNidFromEvpPkey(EVP_PKEY* key)
+        {
+            if (key == nullptr)
+            {
+                return 0;
+            }
+
+            if (::EVP_PKEY_base_id(key) != EVP_PKEY_EC)
+            {
+                return 0;
+            }
+
+            std::unique_ptr<EC_KEY, EcKeyDeleter> ecKey(::EVP_PKEY_get1_EC_KEY(key));
+            if (ecKey.get() == nullptr)
+            {
+                return 0;
+            }
+
+            const EC_GROUP* group = ::EC_KEY_get0_group(ecKey.get());
+            if (group == nullptr)
+            {
+                return 0;
+            }
+
+            return ::EC_GROUP_get_curve_name(group);
+        }
+
+        static int GetCurveNidFromCurve(GB_EccCurve curve)
+        {
+            switch (curve)
+            {
+            case GB_EccCurve::P256:
+                return NID_X9_62_prime256v1;
+            case GB_EccCurve::P384:
+                return NID_secp384r1;
+            case GB_EccCurve::P521:
+                return NID_secp521r1;
+            case GB_EccCurve::Secp256k1:
+                return NID_secp256k1;
+            default:
+                return NID_X9_62_prime256v1;
+            }
+        }
+
+        static std::unique_ptr<EVP_PKEY, EvpPkeyDeleter> GenerateEcKeyPairByCurveNid(int curveNid)
+        {
+            if (curveNid == 0)
+            {
+                return std::unique_ptr<EVP_PKEY, EvpPkeyDeleter>();
+            }
+
+#if OPENSSL_VERSION_NUMBER >= 0x30000000L
+            EnsureOpenSslProvidersLoaded();
+#endif
+
+            std::unique_ptr<EVP_PKEY_CTX, EvpPkeyCtxDeleter> ctx(::EVP_PKEY_CTX_new_id(EVP_PKEY_EC, nullptr));
+            if (ctx.get() == nullptr)
+            {
+                return std::unique_ptr<EVP_PKEY, EvpPkeyDeleter>();
+            }
+
+            if (::EVP_PKEY_keygen_init(ctx.get()) != 1)
+            {
+                return std::unique_ptr<EVP_PKEY, EvpPkeyDeleter>();
+            }
+
+            if (::EVP_PKEY_CTX_set_ec_paramgen_curve_nid(ctx.get(), curveNid) <= 0)
+            {
+                return std::unique_ptr<EVP_PKEY, EvpPkeyDeleter>();
+            }
+
+#if OPENSSL_VERSION_NUMBER >= 0x10100000L
+            // 使用命名曲线表示，跨语言兼容性更好。
+            if (::EVP_PKEY_CTX_set_ec_param_enc(ctx.get(), OPENSSL_EC_NAMED_CURVE) <= 0)
+            {
+                return std::unique_ptr<EVP_PKEY, EvpPkeyDeleter>();
+            }
+#endif
+
+            EVP_PKEY* rawKey = nullptr;
+            if (::EVP_PKEY_keygen(ctx.get(), &rawKey) != 1)
+            {
+                return std::unique_ptr<EVP_PKEY, EvpPkeyDeleter>();
+            }
+
+            return std::unique_ptr<EVP_PKEY, EvpPkeyDeleter>(rawKey);
+        }
+
+        static bool ExportPublicKeyToDerSpki(EVP_PKEY* key, std::string& outDerBytes)
+        {
+            outDerBytes.clear();
+
+            if (key == nullptr)
+            {
+                return false;
+            }
+
+            std::unique_ptr<BIO, BioDeleter> bio(::BIO_new(::BIO_s_mem()));
+            if (bio.get() == nullptr)
+            {
+                return false;
+            }
+
+            if (::i2d_PUBKEY_bio(bio.get(), key) != 1)
+            {
+                return false;
+            }
+
+            return BioToBytes(bio.get(), outDerBytes);
+        }
+
+        static std::unique_ptr<EVP_PKEY, EvpPkeyDeleter> LoadPublicKeyFromBytes(const std::string& publicKeyBytes, GB_EccPublicKeyFormat publicKeyFormat)
+        {
+            if (publicKeyBytes.empty())
+            {
+                return std::unique_ptr<EVP_PKEY, EvpPkeyDeleter>();
+            }
+
+            const bool isPem = IsLikelyPem(publicKeyBytes);
+
+            auto tryPemSpki = [&]() -> std::unique_ptr<EVP_PKEY, EvpPkeyDeleter> {
+                std::unique_ptr<BIO, BioDeleter> bio = CreateReadOnlyBioFromBytes(publicKeyBytes);
+                if (bio.get() == nullptr)
+                {
+                    return std::unique_ptr<EVP_PKEY, EvpPkeyDeleter>();
+                }
+                EVP_PKEY* pkey = ::PEM_read_bio_PUBKEY(bio.get(), nullptr, nullptr, nullptr);
+                return std::unique_ptr<EVP_PKEY, EvpPkeyDeleter>(pkey);
+                };
+
+            auto tryDerSpki = [&]() -> std::unique_ptr<EVP_PKEY, EvpPkeyDeleter> {
+                std::unique_ptr<BIO, BioDeleter> bio = CreateReadOnlyBioFromBytes(publicKeyBytes);
+                if (bio.get() == nullptr)
+                {
+                    return std::unique_ptr<EVP_PKEY, EvpPkeyDeleter>();
+                }
+                EVP_PKEY* pkey = ::d2i_PUBKEY_bio(bio.get(), nullptr);
+                return std::unique_ptr<EVP_PKEY, EvpPkeyDeleter>(pkey);
+                };
+
+            std::unique_ptr<EVP_PKEY, EvpPkeyDeleter> pkey;
+
+            if (publicKeyFormat == GB_EccPublicKeyFormat::PemSubjectPublicKeyInfo)
+            {
+                pkey = tryPemSpki();
+            }
+            else if (publicKeyFormat == GB_EccPublicKeyFormat::DerSubjectPublicKeyInfo)
+            {
+                pkey = tryDerSpki();
+            }
+            else
+            {
+                if (isPem)
+                {
+                    pkey = tryPemSpki();
+                    if (pkey.get() == nullptr)
+                    {
+                        pkey = tryDerSpki();
+                    }
+                }
+                else
+                {
+                    pkey = tryDerSpki();
+                    if (pkey.get() == nullptr)
+                    {
+                        pkey = tryPemSpki();
+                    }
+                }
+            }
+
+            if (pkey.get() == nullptr)
+            {
+                return std::unique_ptr<EVP_PKEY, EvpPkeyDeleter>();
+            }
+
+            if (::EVP_PKEY_base_id(pkey.get()) != EVP_PKEY_EC)
+            {
+                return std::unique_ptr<EVP_PKEY, EvpPkeyDeleter>();
+            }
+
+            return pkey;
+        }
+
+        static std::unique_ptr<EVP_PKEY, EvpPkeyDeleter> LoadPrivateKeyFromBytes(const std::string& privateKeyBytes, GB_EccPrivateKeyFormat privateKeyFormat)
+        {
+            if (privateKeyBytes.empty())
+            {
+                return std::unique_ptr<EVP_PKEY, EvpPkeyDeleter>();
+            }
+
+            const bool isPem = IsLikelyPem(privateKeyBytes);
+
+            auto tryPemPkcs8 = [&]() -> std::unique_ptr<EVP_PKEY, EvpPkeyDeleter> {
+                std::unique_ptr<BIO, BioDeleter> bio = CreateReadOnlyBioFromBytes(privateKeyBytes);
+                if (bio.get() == nullptr)
+                {
+                    return std::unique_ptr<EVP_PKEY, EvpPkeyDeleter>();
+                }
+                EVP_PKEY* pkey = ::PEM_read_bio_PrivateKey(bio.get(), nullptr, nullptr, nullptr);
+                return std::unique_ptr<EVP_PKEY, EvpPkeyDeleter>(pkey);
+                };
+
+            auto tryPemSec1 = [&]() -> std::unique_ptr<EVP_PKEY, EvpPkeyDeleter> {
+                std::unique_ptr<BIO, BioDeleter> bio = CreateReadOnlyBioFromBytes(privateKeyBytes);
+                if (bio.get() == nullptr)
+                {
+                    return std::unique_ptr<EVP_PKEY, EvpPkeyDeleter>();
+                }
+                std::unique_ptr<EC_KEY, EcKeyDeleter> ecKey(::PEM_read_bio_ECPrivateKey(bio.get(), nullptr, nullptr, nullptr));
+                if (ecKey.get() == nullptr)
+                {
+                    return std::unique_ptr<EVP_PKEY, EvpPkeyDeleter>();
+                }
+                std::unique_ptr<EVP_PKEY, EvpPkeyDeleter> pkey(::EVP_PKEY_new());
+                if (pkey.get() == nullptr)
+                {
+                    return std::unique_ptr<EVP_PKEY, EvpPkeyDeleter>();
+                }
+                if (::EVP_PKEY_assign_EC_KEY(pkey.get(), ecKey.get()) != 1)
+                {
+                    return std::unique_ptr<EVP_PKEY, EvpPkeyDeleter>();
+                }
+                ecKey.release();
+                return pkey;
+                };
+
+            auto tryDerPkcs8 = [&]() -> std::unique_ptr<EVP_PKEY, EvpPkeyDeleter> {
+                std::unique_ptr<BIO, BioDeleter> bio = CreateReadOnlyBioFromBytes(privateKeyBytes);
+                if (bio.get() == nullptr)
+                {
+                    return std::unique_ptr<EVP_PKEY, EvpPkeyDeleter>();
+                }
+                EVP_PKEY* pkey = ::d2i_PrivateKey_bio(bio.get(), nullptr);
+                return std::unique_ptr<EVP_PKEY, EvpPkeyDeleter>(pkey);
+                };
+
+            auto tryDerSec1 = [&]() -> std::unique_ptr<EVP_PKEY, EvpPkeyDeleter> {
+                std::unique_ptr<BIO, BioDeleter> bio = CreateReadOnlyBioFromBytes(privateKeyBytes);
+                if (bio.get() == nullptr)
+                {
+                    return std::unique_ptr<EVP_PKEY, EvpPkeyDeleter>();
+                }
+                std::unique_ptr<EC_KEY, EcKeyDeleter> ecKey(::d2i_ECPrivateKey_bio(bio.get(), nullptr));
+                if (ecKey.get() == nullptr)
+                {
+                    return std::unique_ptr<EVP_PKEY, EvpPkeyDeleter>();
+                }
+                std::unique_ptr<EVP_PKEY, EvpPkeyDeleter> pkey(::EVP_PKEY_new());
+                if (pkey.get() == nullptr)
+                {
+                    return std::unique_ptr<EVP_PKEY, EvpPkeyDeleter>();
+                }
+                if (::EVP_PKEY_assign_EC_KEY(pkey.get(), ecKey.get()) != 1)
+                {
+                    return std::unique_ptr<EVP_PKEY, EvpPkeyDeleter>();
+                }
+                ecKey.release();
+                return pkey;
+                };
+
+            std::unique_ptr<EVP_PKEY, EvpPkeyDeleter> pkey;
+
+            if (privateKeyFormat == GB_EccPrivateKeyFormat::PemPkcs8)
+            {
+                pkey = tryPemPkcs8();
+            }
+            else if (privateKeyFormat == GB_EccPrivateKeyFormat::PemSec1)
+            {
+                pkey = tryPemSec1();
+            }
+            else if (privateKeyFormat == GB_EccPrivateKeyFormat::DerPkcs8)
+            {
+                pkey = tryDerPkcs8();
+            }
+            else if (privateKeyFormat == GB_EccPrivateKeyFormat::DerSec1)
+            {
+                pkey = tryDerSec1();
+            }
+            else
+            {
+                if (isPem)
+                {
+                    pkey = tryPemPkcs8();
+                    if (pkey.get() == nullptr)
+                    {
+                        pkey = tryPemSec1();
+                    }
+                }
+                else
+                {
+                    pkey = tryDerPkcs8();
+                    if (pkey.get() == nullptr)
+                    {
+                        pkey = tryDerSec1();
+                    }
+                }
+            }
+
+            if (pkey.get() == nullptr)
+            {
+                return std::unique_ptr<EVP_PKEY, EvpPkeyDeleter>();
+            }
+
+            if (::EVP_PKEY_base_id(pkey.get()) != EVP_PKEY_EC)
+            {
+                return std::unique_ptr<EVP_PKEY, EvpPkeyDeleter>();
+            }
+
+            return pkey;
+        }
+
+        static bool DeriveSharedSecretEcdh(EVP_PKEY* privateKey, EVP_PKEY* peerPublicKey, std::string& outSharedSecret)
+        {
+            outSharedSecret.clear();
+
+            if (privateKey == nullptr || peerPublicKey == nullptr)
+            {
+                return false;
+            }
+
+            std::unique_ptr<EVP_PKEY_CTX, EvpPkeyCtxDeleter> ctx(::EVP_PKEY_CTX_new(privateKey, nullptr));
+            if (ctx.get() == nullptr)
+            {
+                return false;
+            }
+
+            if (::EVP_PKEY_derive_init(ctx.get()) != 1)
+            {
+                return false;
+            }
+
+            if (::EVP_PKEY_derive_set_peer(ctx.get(), peerPublicKey) != 1)
+            {
+                return false;
+            }
+
+            size_t secretLen = 0;
+            if (::EVP_PKEY_derive(ctx.get(), nullptr, &secretLen) != 1)
+            {
+                return false;
+            }
+
+            if (secretLen == 0 || secretLen > static_cast<size_t>((std::numeric_limits<int>::max)()))
+            {
+                return false;
+            }
+
+            outSharedSecret.resize(secretLen);
+            if (::EVP_PKEY_derive(ctx.get(), reinterpret_cast<unsigned char*>(&outSharedSecret[0]), &secretLen) != 1)
+            {
+                outSharedSecret.clear();
+                return false;
+            }
+
+            outSharedSecret.resize(secretLen);
+            return true;
+        }
+
+        static bool HkdfSha256DeriveBytes(const std::string& ikmBytes, const std::string& saltBytes, const std::string& infoBytes, size_t outLength, std::string& outKeyBytes)
+        {
+            outKeyBytes.clear();
+
+            if (outLength == 0)
+            {
+                return true;
+            }
+
+            if (outLength > 1024U * 1024U)
+            {
+                // 明显不合理的长度，避免被滥用。
+                return false;
+            }
+
+            constexpr size_t hashLen = 32;
+
+#if OPENSSL_VERSION_NUMBER >= 0x10101000L
+            // 优先使用 OpenSSL 内置 HKDF（EVP_PKEY_HKDF）。文档说明其参数设置方式与 EVP_PKEY_derive 用法。
+            std::unique_ptr<EVP_PKEY_CTX, EvpPkeyCtxDeleter> pctx(::EVP_PKEY_CTX_new_id(EVP_PKEY_HKDF, nullptr));
+            if (pctx.get() == nullptr)
+            {
+                return false;
+            }
+
+            if (::EVP_PKEY_derive_init(pctx.get()) != 1)
+            {
+                return false;
+            }
+
+            if (::EVP_PKEY_CTX_set_hkdf_md(pctx.get(), ::EVP_sha256()) != 1)
+            {
+                return false;
+            }
+
+            if (!saltBytes.empty())
+            {
+                if (::EVP_PKEY_CTX_set1_hkdf_salt(pctx.get(), reinterpret_cast<const unsigned char*>(saltBytes.data()), static_cast<int>(saltBytes.size())) != 1)
+                {
+                    return false;
+                }
+            }
+            else
+            {
+                // HKDF 允许空 salt（等价于全 0 salt），这里显式传空更符合直觉。
+                if (::EVP_PKEY_CTX_set1_hkdf_salt(pctx.get(), nullptr, 0) != 1)
+                {
+                    return false;
+                }
+            }
+
+            if (::EVP_PKEY_CTX_set1_hkdf_key(pctx.get(), reinterpret_cast<const unsigned char*>(ikmBytes.data()), static_cast<int>(ikmBytes.size())) != 1)
+            {
+                return false;
+            }
+
+            if (!infoBytes.empty())
+            {
+                if (::EVP_PKEY_CTX_add1_hkdf_info(pctx.get(), reinterpret_cast<const unsigned char*>(infoBytes.data()), static_cast<int>(infoBytes.size())) != 1)
+                {
+                    return false;
+                }
+            }
+
+            outKeyBytes.resize(outLength);
+            size_t len = outLength;
+            if (::EVP_PKEY_derive(pctx.get(), reinterpret_cast<unsigned char*>(&outKeyBytes[0]), &len) != 1)
+            {
+                outKeyBytes.clear();
+                return false;
+            }
+
+            if (len != outLength)
+            {
+                outKeyBytes.clear();
+                return false;
+            }
+
+            return true;
+#else
+            // --- 兼容实现：HKDF-SHA256（RFC 5869）---
+            // Extract: PRK = HMAC(salt, IKM)
+            std::array<unsigned char, hashLen> prk;
+            unsigned int prkLen = 0;
+
+            std::array<unsigned char, hashLen> zeroSalt;
+            std::memset(&zeroSalt[0], 0, zeroSalt.size());
+
+            const unsigned char* saltPtr = saltBytes.empty()
+                ? &zeroSalt[0]
+                : reinterpret_cast<const unsigned char*>(saltBytes.data());
+            const int saltLen = saltBytes.empty()
+                ? static_cast<int>(zeroSalt.size())
+                : static_cast<int>(saltBytes.size());
+
+            if (saltLen < 0)
+            {
+                return false;
+            }
+
+            if (::HMAC(::EVP_sha256(),
+                saltPtr,
+                saltLen,
+                reinterpret_cast<const unsigned char*>(ikmBytes.data()),
+                ikmBytes.size(),
+                &prk[0],
+                &prkLen) == nullptr)
+            {
+                return false;
+            }
+
+            if (prkLen != hashLen)
+            {
+                return false;
+            }
+
+            // Expand
+            const size_t n = (outLength + hashLen - 1) / hashLen;
+            if (n == 0 || n > 255)
+            {
+                return false;
+            }
+
+            outKeyBytes.resize(outLength);
+
+            std::array<unsigned char, hashLen> t;
+            size_t written = 0;
+
+            std::vector<unsigned char> hmacInput;
+            hmacInput.reserve(hashLen + infoBytes.size() + 1);
+
+            for (size_t i = 1; i <= n; i++)
+            {
+                hmacInput.clear();
+                if (i > 1)
+                {
+                    hmacInput.insert(hmacInput.end(), t.begin(), t.end());
+                }
+
+                if (!infoBytes.empty())
+                {
+                    hmacInput.insert(
+                        hmacInput.end(),
+                        reinterpret_cast<const unsigned char*>(infoBytes.data()),
+                        reinterpret_cast<const unsigned char*>(infoBytes.data()) + infoBytes.size());
+                }
+
+                hmacInput.push_back(static_cast<unsigned char>(i));
+
+                unsigned int tLen = 0;
+                if (::HMAC(::EVP_sha256(),
+                    &prk[0],
+                    static_cast<int>(prk.size()),
+                    &hmacInput[0],
+                    hmacInput.size(),
+                    &t[0],
+                    &tLen) == nullptr)
+                {
+                    outKeyBytes.clear();
+                    return false;
+                }
+
+                if (tLen != hashLen)
+                {
+                    outKeyBytes.clear();
+                    return false;
+                }
+
+                const size_t toCopy = std::min(hashLen, outLength - written);
+                std::memcpy(&outKeyBytes[written], &t[0], toCopy);
+                written += toCopy;
+            }
+
+            return (written == outLength);
+#endif
+        }
+
+        static bool ValidateCryptOptions(GB_EccCryptOptions& options)
+        {
+            if (options.aesKeyBits != 128 && options.aesKeyBits != 256)
+            {
+                return false;
+            }
+
+            if (options.nonceLength == 0)
+            {
+                options.nonceLength = 12;
+            }
+
+            if (options.gcmTagLength == 0)
+            {
+                options.gcmTagLength = 16;
+            }
+
+            if (options.nonceLength > 64)
+            {
+                return false;
+            }
+
+            if (options.gcmTagLength < 8 || options.gcmTagLength > 16)
+            {
+                return false;
+            }
+
+            return true;
+        }
+
+        static bool BuildHeaderBytes(uint16_t epkDerLen, const GB_EccCryptOptions& options, uint32_t plainLen, std::string& outHeaderBytes)
+        {
+            outHeaderBytes.clear();
+
+            // "GBE1" || version(1) || flags(0) || epkLen(2be) || nonceLen(1) || tagLen(1) || aesKeyBits(2be) || plainLen(4be)
+            const size_t headerSize = 4 + 1 + 1 + 2 + 1 + 1 + 2 + 4;
+
+            outHeaderBytes.reserve(headerSize);
+            outHeaderBytes.append("GBE1", 4);
+            outHeaderBytes.push_back(static_cast<char>(1)); // version
+            outHeaderBytes.push_back(static_cast<char>(0)); // flags (reserved)
+
+            char u16Bytes[2];
+            WriteUint16Be(epkDerLen, u16Bytes);
+            outHeaderBytes.append(u16Bytes, 2);
+
+            outHeaderBytes.push_back(static_cast<char>(options.nonceLength));
+            outHeaderBytes.push_back(static_cast<char>(options.gcmTagLength));
+
+            WriteUint16Be(static_cast<uint16_t>(options.aesKeyBits), u16Bytes);
+            outHeaderBytes.append(u16Bytes, 2);
+
+            char u32Bytes[4];
+            WriteUint32Be(plainLen, u32Bytes);
+            outHeaderBytes.append(u32Bytes, 4);
+
+            return (outHeaderBytes.size() == headerSize);
+        }
+
+    } // anonymous namespace
+
+    bool GB_GenerateEccKeyPair(const GB_EccKeyGenOptions& options, std::string& outPublicKeyBytes, std::string& outPrivateKeyBytes)
+    {
+        outPublicKeyBytes.clear();
+        outPrivateKeyBytes.clear();
+
+#if OPENSSL_VERSION_NUMBER >= 0x30000000L
+        EnsureOpenSslProvidersLoaded();
+#endif
+
+        const int curveNid = GetCurveNidFromCurve(options.curve);
+        std::unique_ptr<EVP_PKEY, EvpPkeyDeleter> keyPair = GenerateEcKeyPairByCurveNid(curveNid);
+        if (keyPair.get() == nullptr)
+        {
+            return false;
+        }
+
+        // --- Export public key ---
+        {
+            std::unique_ptr<BIO, BioDeleter> bio(::BIO_new(::BIO_s_mem()));
+            if (bio.get() == nullptr)
+            {
+                return false;
+            }
+
+            bool writeOk = false;
+            switch (options.publicKeyFormat)
+            {
+            case GB_EccPublicKeyFormat::PemSubjectPublicKeyInfo:
+                writeOk = (::PEM_write_bio_PUBKEY(bio.get(), keyPair.get()) == 1);
+                break;
+            case GB_EccPublicKeyFormat::DerSubjectPublicKeyInfo:
+                writeOk = (::i2d_PUBKEY_bio(bio.get(), keyPair.get()) == 1);
+                break;
+            default:
+                writeOk = (::PEM_write_bio_PUBKEY(bio.get(), keyPair.get()) == 1);
+                break;
+            }
+
+            if (!writeOk)
+            {
+                return false;
+            }
+
+            if (!BioToBytes(bio.get(), outPublicKeyBytes))
+            {
+                return false;
+            }
+        }
+
+        // --- Export private key ---
+        {
+            std::unique_ptr<BIO, BioDeleter> bio(::BIO_new(::BIO_s_mem()));
+            if (bio.get() == nullptr)
+            {
+                outPublicKeyBytes.clear();
+                return false;
+            }
+
+            bool writeOk = false;
+            switch (options.privateKeyFormat)
+            {
+            case GB_EccPrivateKeyFormat::PemPkcs8:
+                writeOk = (::PEM_write_bio_PKCS8PrivateKey(bio.get(), keyPair.get(), nullptr, nullptr, 0, nullptr, nullptr) == 1);
+                break;
+            case GB_EccPrivateKeyFormat::PemSec1:
+            {
+                std::unique_ptr<EC_KEY, EcKeyDeleter> ecKey(::EVP_PKEY_get1_EC_KEY(keyPair.get()));
+                writeOk = (ecKey.get() != nullptr) && (::PEM_write_bio_ECPrivateKey(bio.get(), ecKey.get(), nullptr, nullptr, 0, nullptr, nullptr) == 1);
+                break;
+            }
+            case GB_EccPrivateKeyFormat::DerPkcs8:
+                writeOk = (::i2d_PKCS8PrivateKey_bio(bio.get(), keyPair.get(), nullptr, nullptr, 0, nullptr, nullptr) == 1);
+                break;
+            case GB_EccPrivateKeyFormat::DerSec1:
+            {
+                std::unique_ptr<EC_KEY, EcKeyDeleter> ecKey(::EVP_PKEY_get1_EC_KEY(keyPair.get()));
+                writeOk = (ecKey.get() != nullptr) && (::i2d_ECPrivateKey_bio(bio.get(), ecKey.get()) == 1);
+                break;
+            }
+            default:
+                writeOk = (::PEM_write_bio_PKCS8PrivateKey(bio.get(), keyPair.get(), nullptr, nullptr, 0, nullptr, nullptr) == 1);
+                break;
+            }
+
+            if (!writeOk)
+            {
+                outPublicKeyBytes.clear();
+                return false;
+            }
+
+            if (!BioToBytes(bio.get(), outPrivateKeyBytes))
+            {
+                outPublicKeyBytes.clear();
+                outPrivateKeyBytes.clear();
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    bool GB_EccEncrypt(const std::string& utf8PlainText, const std::string& publicKeyBytes, GB_EccPublicKeyFormat publicKeyFormat, const GB_EccCryptOptions& options, std::string& outCipherBytes)
+    {
+        outCipherBytes.clear();
+
+        GB_EccCryptOptions normalizedOptions = options;
+        if (!ValidateCryptOptions(normalizedOptions))
+        {
+            return false;
+        }
+
+        if (utf8PlainText.size() > static_cast<size_t>((std::numeric_limits<uint32_t>::max)()))
+        {
+            return false;
+        }
+
+#if OPENSSL_VERSION_NUMBER >= 0x30000000L
+        EnsureOpenSslProvidersLoaded();
+#endif
+
+        std::unique_ptr<EVP_PKEY, EvpPkeyDeleter> receiverPublicKey = LoadPublicKeyFromBytes(publicKeyBytes, publicKeyFormat);
+        if (receiverPublicKey.get() == nullptr)
+        {
+            return false;
+        }
+
+        const int curveNid = GetCurveNidFromEvpPkey(receiverPublicKey.get());
+        if (curveNid == 0)
+        {
+            return false;
+        }
+
+        std::unique_ptr<EVP_PKEY, EvpPkeyDeleter> ephemeralKeyPair = GenerateEcKeyPairByCurveNid(curveNid);
+        if (ephemeralKeyPair.get() == nullptr)
+        {
+            return false;
+        }
+
+        // 导出临时公钥（DER SPKI）
+        std::string epkDerBytes;
+        if (!ExportPublicKeyToDerSpki(ephemeralKeyPair.get(), epkDerBytes))
+        {
+            return false;
+        }
+
+        if (epkDerBytes.size() > static_cast<size_t>((std::numeric_limits<uint16_t>::max)()))
+        {
+            return false;
+        }
+
+        // 生成 GCM nonce
+        std::string nonceBytes;
+        if (!GenerateRandomBytes(normalizedOptions.nonceLength, nonceBytes))
+        {
+            return false;
+        }
+
+        // ECDH 共享密钥
+        std::string sharedSecretBytes;
+        if (!DeriveSharedSecretEcdh(ephemeralKeyPair.get(), receiverPublicKey.get(), sharedSecretBytes))
+        {
+            return false;
+        }
+        StringCleansingGuard sharedSecretGuard(sharedSecretBytes);
+
+        // HKDF 派生 AES key（salt 使用 nonce）
+        const size_t aesKeyLen = normalizedOptions.aesKeyBits / 8;
+        std::string aesKeyBytes;
+        if (!HkdfSha256DeriveBytes(sharedSecretBytes, nonceBytes, normalizedOptions.hkdfInfoBytes, aesKeyLen, aesKeyBytes))
+        {
+            return false;
+        }
+        StringCleansingGuard aesKeyGuard(aesKeyBytes);
+
+        // header（会作为 AAD 一部分进行认证）
+        std::string headerBytes;
+        const uint32_t plainLen = static_cast<uint32_t>(utf8PlainText.size());
+        if (!BuildHeaderBytes(static_cast<uint16_t>(epkDerBytes.size()), normalizedOptions, plainLen, headerBytes))
+        {
+            return false;
+        }
+
+        std::string finalAadBytes = normalizedOptions.aadBytes;
+        finalAadBytes.append(headerBytes);
+
+        // AES-GCM 加密
+        GB_AES::GB_AesOptions aesOptions;
+        aesOptions.mode = GB_AES::GB_AesMode::Gcm;
+        aesOptions.keyBits = normalizedOptions.aesKeyBits;
+        aesOptions.gcmTagLength = normalizedOptions.gcmTagLength;
+        aesOptions.aadBytes = finalAadBytes;
+
+        std::string cipherBytes;
+        std::string gcmTagBytes;
+        if (!GB_AES::GB_AesEncrypt(utf8PlainText, aesKeyBytes, nonceBytes, aesOptions, cipherBytes, gcmTagBytes))
+        {
+            return false;
+        }
+
+        // payload = header || epkDer || nonce || cipher || tag
+        size_t totalSize = 0;
+        if (!SafeAddSizeT(headerBytes.size(), epkDerBytes.size(), totalSize))
+        {
+            return false;
+        }
+        if (!SafeAddSizeT(totalSize, nonceBytes.size(), totalSize))
+        {
+            return false;
+        }
+        if (!SafeAddSizeT(totalSize, cipherBytes.size(), totalSize))
+        {
+            return false;
+        }
+        if (!SafeAddSizeT(totalSize, gcmTagBytes.size(), totalSize))
+        {
+            return false;
+        }
+
+        outCipherBytes.reserve(totalSize);
+        outCipherBytes.append(headerBytes);
+        outCipherBytes.append(epkDerBytes);
+        outCipherBytes.append(nonceBytes);
+        outCipherBytes.append(cipherBytes);
+        outCipherBytes.append(gcmTagBytes);
+
+        return true;
+    }
+
+    bool GB_EccDecrypt(const std::string& cipherBytes, const std::string& privateKeyBytes, GB_EccPrivateKeyFormat privateKeyFormat, const GB_EccCryptOptions& options, std::string& outUtf8PlainText)
+    {
+        outUtf8PlainText.clear();
+
+        GB_EccCryptOptions normalizedOptions = options;
+        if (!ValidateCryptOptions(normalizedOptions))
+        {
+            return false;
+        }
+
+#if OPENSSL_VERSION_NUMBER >= 0x30000000L
+        EnsureOpenSslProvidersLoaded();
+#endif
+
+        std::unique_ptr<EVP_PKEY, EvpPkeyDeleter> receiverPrivateKey = LoadPrivateKeyFromBytes(privateKeyBytes, privateKeyFormat);
+        if (receiverPrivateKey.get() == nullptr)
+        {
+            return false;
+        }
+
+        // 解析 header
+        const size_t headerSize = 4 + 1 + 1 + 2 + 1 + 1 + 2 + 4;
+        if (cipherBytes.size() < headerSize)
+        {
+            return false;
+        }
+
+        if (cipherBytes.compare(0, 4, "GBE1") != 0)
+        {
+            return false;
+        }
+
+        const unsigned char version = static_cast<unsigned char>(cipherBytes[4]);
+        if (version != 1)
+        {
+            return false;
+        }
+
+        // flags 预留
+        (void)cipherBytes[5];
+
+        const unsigned char* u8Ptr = reinterpret_cast<const unsigned char*>(cipherBytes.data());
+        const uint16_t epkLen = ReadUint16Be(u8Ptr + 6);
+        const uint8_t nonceLen = static_cast<uint8_t>(u8Ptr[8]);
+        const uint8_t tagLen = static_cast<uint8_t>(u8Ptr[9]);
+        const uint16_t aesKeyBits = ReadUint16Be(u8Ptr + 10);
+        const uint32_t plainLen = ReadUint32Be(u8Ptr + 12);
+
+        if (epkLen == 0)
+        {
+            return false;
+        }
+
+        if (nonceLen == 0 || nonceLen > 64)
+        {
+            return false;
+        }
+
+        if (tagLen < 8 || tagLen > 16)
+        {
+            return false;
+        }
+
+        if ((aesKeyBits != 128 && aesKeyBits != 256) || aesKeyBits != normalizedOptions.aesKeyBits)
+        {
+            return false;
+        }
+
+        if (nonceLen != normalizedOptions.nonceLength || tagLen != normalizedOptions.gcmTagLength)
+        {
+            // options 与 payload 不一致：为了避免隐性降级/解析错误，这里直接拒绝。
+            return false;
+        }
+
+        // body lengths
+        size_t offset = headerSize;
+
+        if (cipherBytes.size() < offset + epkLen + nonceLen + tagLen)
+        {
+            return false;
+        }
+
+        const std::string epkDerBytes = cipherBytes.substr(offset, epkLen);
+        offset += epkLen;
+
+        const std::string nonceBytes = cipherBytes.substr(offset, nonceLen);
+        offset += nonceLen;
+
+        const size_t remaining = cipherBytes.size() - offset;
+        if (remaining < tagLen)
+        {
+            return false;
+        }
+
+        const size_t cipherLen = remaining - tagLen;
+
+        const std::string encryptedBytes = cipherBytes.substr(offset, cipherLen);
+        offset += cipherLen;
+
+        const std::string gcmTagBytes = cipherBytes.substr(offset, tagLen);
+
+        // 解析临时公钥
+        std::unique_ptr<EVP_PKEY, EvpPkeyDeleter> ephemeralPublicKey;
+        {
+            std::unique_ptr<BIO, BioDeleter> bio = CreateReadOnlyBioFromBytes(epkDerBytes);
+            if (bio.get() == nullptr)
+            {
+                return false;
+            }
+            EVP_PKEY* rawKey = ::d2i_PUBKEY_bio(bio.get(), nullptr);
+            ephemeralPublicKey.reset(rawKey);
+        }
+
+        if (ephemeralPublicKey.get() == nullptr)
+        {
+            return false;
+        }
+
+        if (::EVP_PKEY_base_id(ephemeralPublicKey.get()) != EVP_PKEY_EC)
+        {
+            return false;
+        }
+
+        // 共享密钥（ECDH）
+        std::string sharedSecretBytes;
+        if (!DeriveSharedSecretEcdh(receiverPrivateKey.get(), ephemeralPublicKey.get(), sharedSecretBytes))
+        {
+            return false;
+        }
+        StringCleansingGuard sharedSecretGuard(sharedSecretBytes);
+
+        // HKDF 派生 AES key（salt=nonce）
+        const size_t aesKeyLen = normalizedOptions.aesKeyBits / 8;
+        std::string aesKeyBytes;
+        if (!HkdfSha256DeriveBytes(sharedSecretBytes, nonceBytes, normalizedOptions.hkdfInfoBytes, aesKeyLen, aesKeyBytes))
+        {
+            return false;
+        }
+        StringCleansingGuard aesKeyGuard(aesKeyBytes);
+
+        // header 作为 AAD 一部分
+        const std::string headerBytes = cipherBytes.substr(0, headerSize);
+        std::string finalAadBytes = normalizedOptions.aadBytes;
+        finalAadBytes.append(headerBytes);
+
+        GB_AES::GB_AesOptions aesOptions;
+        aesOptions.mode = GB_AES::GB_AesMode::Gcm;
+        aesOptions.keyBits = normalizedOptions.aesKeyBits;
+        aesOptions.gcmTagLength = normalizedOptions.gcmTagLength;
+        aesOptions.aadBytes = finalAadBytes;
+
+        std::string plainBytes;
+        if (!GB_AES::GB_AesDecrypt(encryptedBytes, aesKeyBytes, nonceBytes, aesOptions, gcmTagBytes, plainBytes))
+        {
+            return false;
+        }
+
+        if (plainBytes.size() != static_cast<size_t>(plainLen))
+        {
+            return false;
+        }
+
+        outUtf8PlainText.swap(plainBytes);
+        return true;
+    }
+
+    std::string GB_EccEncryptToBase64(const std::string& utf8PlainText, const std::string& publicKeyBytes, GB_EccPublicKeyFormat publicKeyFormat, const GB_EccCryptOptions& options, bool urlSafe, bool noPadding)
+    {
+        std::string cipherBytes;
+        if (!GB_EccEncrypt(utf8PlainText, publicKeyBytes, publicKeyFormat, options, cipherBytes))
+        {
+            return std::string();
+        }
+
+        return ::GB_Base64Encode(cipherBytes, urlSafe, noPadding);
+    }
+
+    bool GB_EccDecryptFromBase64(const std::string& base64CipherText, const std::string& privateKeyBytes, std::string& outUtf8PlainText, GB_EccPrivateKeyFormat privateKeyFormat, const GB_EccCryptOptions& options, bool urlSafe, bool noPadding)
+    {
+        outUtf8PlainText.clear();
+
+        std::string cipherBytes;
+        if (!::GB_Base64Decode(base64CipherText, cipherBytes, urlSafe, noPadding))
+        {
+            return false;
+        }
+
+        return GB_EccDecrypt(cipherBytes, privateKeyBytes, privateKeyFormat, options, outUtf8PlainText);
+    }
+}
 
 
 #if OPENSSL_VERSION_NUMBER >= 0x30000000L

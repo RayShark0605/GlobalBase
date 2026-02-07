@@ -506,5 +506,158 @@ namespace GB_RSA
     GLOBALBASE_PORT bool GB_RsaDecryptFromBase64(const std::string& base64CipherText, const std::string& privateKeyBytes, GB_RsaPrivateKeyFormat privateKeyFormat, const GB_RsaCryptOptions& options, std::string& outUtf8PlainText, bool urlSafe = true, bool noPadding = true, bool urlEscaped = false);
 }
 
+namespace GB_ECC
+{
+    enum class GB_EccCurve
+    {
+        P256 = 0,     // prime256v1 / secp256r1
+        P384,         // secp384r1
+        P521,         // secp521r1
+        Secp256k1     // secp256k1
+    };
+
+    enum class GB_EccPublicKeyFormat
+    {
+        Auto = 0,
+
+        // PEM: "-----BEGIN PUBLIC KEY-----"（X.509 SubjectPublicKeyInfo）
+        PemSubjectPublicKeyInfo,
+
+        // DER: X.509 SubjectPublicKeyInfo（二进制）
+        DerSubjectPublicKeyInfo
+    };
+
+    enum class GB_EccPrivateKeyFormat
+    {
+        Auto = 0,
+
+        // PEM: "-----BEGIN PRIVATE KEY-----"（PKCS#8 PrivateKeyInfo，默认写出格式）
+        PemPkcs8,
+
+        // PEM: "-----BEGIN EC PRIVATE KEY-----"（SEC1 ECPrivateKey）
+        PemSec1,
+
+        // DER: PKCS#8 PrivateKeyInfo（二进制）
+        DerPkcs8,
+
+        // DER: SEC1 ECPrivateKey（二进制）
+        DerSec1
+    };
+
+    /**
+     * @brief ECC 密钥生成参数。
+     *
+     * @remarks
+     * - 输出 key 的 std::string 为“字节序列”：
+     *   - PEM 输出为可打印文本；
+     *   - DER 输出为二进制（可能包含 '\0'）。
+     * - 建议使用命名曲线（Named Curve）与 SubjectPublicKeyInfo/PKCS#8，跨语言兼容性最好。
+     */
+    struct GB_EccKeyGenOptions
+    {
+        GB_EccCurve curve = GB_EccCurve::P256;
+        GB_EccPublicKeyFormat publicKeyFormat = GB_EccPublicKeyFormat::PemSubjectPublicKeyInfo;
+        GB_EccPrivateKeyFormat privateKeyFormat = GB_EccPrivateKeyFormat::PemPkcs8;
+    };
+
+    /**
+     * @brief ECC “混合加密”参数（ECDH + HKDF-SHA256 + AES-GCM）。
+     *
+     * @remarks
+     * - 纯 ECC（EC 公钥）并不直接提供类似 RSA 的“直接加密任意长度明文”的能力；
+     *   通常做法是：用 ECDH 派生共享密钥，再用对称算法（如 AES-GCM）加密数据。
+     * - 下面的 GB_EccEncrypt/GB_EccDecrypt 采用每条消息生成一次“临时（ephemeral）EC 密钥对”，具备前向安全性。
+     * - 输出/输入 cipherBytes 是自描述的二进制 payload，内部包含临时公钥与 GCM 所需参数。
+     * - options.aadBytes 为可选 AAD（附加认证数据），加解密双方必须保持一致；它不会被打包进 payload。
+     */
+    struct GB_EccCryptOptions
+    {
+        // AES key 长度（bit）：仅支持 128/256。默认 256。
+        size_t aesKeyBits = 256;
+
+        // GCM nonce 长度（字节），建议 12。
+        size_t nonceLength = 12;
+
+        // GCM tag 长度（字节），常用 16。
+        size_t gcmTagLength = 16;
+
+        // 附加认证数据（AAD），可为空；不会被打包进 payload。
+        std::string aadBytes = "";
+
+        // HKDF info（上下文绑定），可为空；建议保持默认。
+        std::string hkdfInfoBytes = "GB_ECC_HKDF_v1";
+    };
+
+    /**
+     * @brief 生成一对 ECC 公钥与私钥。
+     *
+     * @param options 密钥生成参数（曲线/输出格式）。
+     * @param outPublicKeyBytes 输出公钥（PEM 或 DER）。
+     * @param outPrivateKeyBytes 输出私钥（PEM 或 DER）。
+     * @return true 成功；false 失败。
+     */
+    GLOBALBASE_PORT bool GB_GenerateEccKeyPair(const GB_EccKeyGenOptions& options, std::string& outPublicKeyBytes, std::string& outPrivateKeyBytes);
+
+    /**
+     * @brief 使用接收方 ECC 公钥加密 UTF-8 字符串，输出二进制 payload。
+     *
+     * @remarks
+     * payload 格式（二进制）：
+     * - header:
+     *   - "GBE1"(4) || version(1=1) || flags(1) || epkLen(2be) || nonceLen(1) || tagLen(1) || aesKeyBits(2be) || plainLen(4be)
+     * - body:
+     *   - epkDerSpki(epkLen) || nonce(nonceLen) || cipher(*) || tag(tagLen)
+     *
+     * 其中 epkDerSpki 为临时公钥（DER SubjectPublicKeyInfo）。
+     *
+     * @param utf8PlainText 明文（UTF-8，按字节序列处理）。
+     * @param publicKeyBytes 接收方公钥（PEM 或 DER）。
+     * @param publicKeyFormat 公钥格式。
+     * @param options ECC 混合加密参数。
+     * @param outCipherBytes 输出 payload（二进制）。
+     * @return true 成功；false 失败。
+     */
+    GLOBALBASE_PORT bool GB_EccEncrypt(const std::string& utf8PlainText, const std::string& publicKeyBytes, GB_EccPublicKeyFormat publicKeyFormat, const GB_EccCryptOptions& options, std::string& outCipherBytes);
+
+    /**
+     * @brief 使用接收方 ECC 私钥解密二进制 payload 为 UTF-8 字符串。
+     *
+     * @param cipherBytes 输入 payload（二进制，来自 GB_EccEncrypt）。
+     * @param privateKeyBytes 接收方私钥（PEM 或 DER）。
+     * @param privateKeyFormat 私钥格式。
+     * @param options ECC 混合加密参数（需与加密保持一致，尤其是 aadBytes/hkdfInfoBytes 等）。
+     * @param outUtf8PlainText 输出明文（UTF-8，按字节序列处理）。
+     * @return true 成功；false 失败（含解析失败、GCM tag 校验失败等）。
+     */
+    GLOBALBASE_PORT bool GB_EccDecrypt(const std::string& cipherBytes, const std::string& privateKeyBytes, GB_EccPrivateKeyFormat privateKeyFormat, const GB_EccCryptOptions& options, std::string& outUtf8PlainText);
+
+    /**
+     * @brief ECC 加密并输出 Base64 文本（Base64(payload)）。
+     *
+     * @param utf8PlainText 明文（UTF-8，按字节序列处理）。
+     * @param publicKeyBytes 接收方公钥（PEM 或 DER）。
+     * @param publicKeyFormat 公钥格式。
+     * @param options ECC 混合加密参数。
+     * @param urlSafe 是否使用 base64url 字母表。
+     * @param noPadding 是否省略 '=' padding。
+     * @return Base64(payload)；失败返回空串。
+     */
+    GLOBALBASE_PORT std::string GB_EccEncryptToBase64(const std::string& utf8PlainText, const std::string& publicKeyBytes, GB_EccPublicKeyFormat publicKeyFormat = GB_EccPublicKeyFormat::Auto, const GB_EccCryptOptions& options = GB_EccCryptOptions(), bool urlSafe = true, bool noPadding = true);
+
+    /**
+     * @brief 从 Base64 文本解密为 UTF-8 字符串。
+     *
+     * @param base64CipherText Base64(payload) 文本。
+     * @param privateKeyBytes 接收方私钥（PEM 或 DER）。
+     * @param privateKeyFormat 私钥格式。
+     * @param options ECC 混合加密参数（需与加密保持一致）。
+     * @param outUtf8PlainText 输出明文（UTF-8，按字节序列处理）。
+     * @param urlSafe 是否使用 base64url 字母表。
+     * @param noPadding 是否允许省略 '=' padding。
+     * @return true 成功；false 失败。
+     */
+    GLOBALBASE_PORT bool GB_EccDecryptFromBase64(const std::string& base64CipherText, const std::string& privateKeyBytes, std::string& outUtf8PlainText, GB_EccPrivateKeyFormat privateKeyFormat = GB_EccPrivateKeyFormat::Auto, const GB_EccCryptOptions& options = GB_EccCryptOptions(), bool urlSafe = true, bool noPadding = true);
+}
+
 
 #endif
