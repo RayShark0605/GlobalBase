@@ -105,7 +105,8 @@ namespace GB_Argon2
      * - iterations    对应参数 t（迭代次数）。
      * - lanes         对应参数 p（并行度/lanes）。
      * - threads       为 OpenSSL 的线程提示参数（OSSL_KDF_PARAM_THREADS）。
-     *   若 threads=0，则不向 OpenSSL 传递该参数（更稳妥，避免某些构建未启用内置线程池导致 derive 失败）。
+     *   本库不会调用 OSSL_set_max_threads 修改全局线程池配置；若线程池未启用或上限不足，将自动降级为单线程。
+     *   若 threads=0，则不向 OpenSSL 传递该参数。
      * - secret 与 associatedData 按“字节序列”传入（octet string），不做 UTF-8 合法性校验。
      */
     struct GB_Argon2Options
@@ -117,7 +118,10 @@ namespace GB_Argon2
         uint32_t memoryCostKiB = 65536;
         uint32_t lanes = 4;
 
-        // 0 表示不传递 threads 参数；否则会传递并尝试启用 OpenSSL 内置并行。
+        // 0 表示不传递 threads 参数。
+        // >0 表示向 OpenSSL 传递 OSSL_KDF_PARAM_THREADS 作为“并行度提示”。
+        // 注意：OpenSSL 的线程池上限是 libctx 全局配置项（OSSL_set_max_threads）。本库不会修改该全局状态；
+        // 若线程池未启用或上限不足，则会在内部将 threads 降级为 1。
         uint32_t threads = 0;
 
         // Argon2 version: 0x10 或 0x13（默认 0x13，对应 v=19）。
@@ -214,6 +218,7 @@ namespace GB_AES
 
         // 对“自动生成/解析 iv”的辅助字段：
         // - 0 表示使用推荐默认值：ECB=0；GCM=12；其他模式=16。
+        // - 非 GCM 模式下，IV 长度固定为 16（ECB 例外为 0）；若设置为其它值，内部会按固定值处理。
         size_t ivLength = 0;
 
         // GCM 的 tag 长度（字节），常用 16（128-bit）。

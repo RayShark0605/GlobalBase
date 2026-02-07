@@ -1,6 +1,7 @@
 ﻿#include "GB_Crypto.h"
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <cstring>
 #include <limits>
@@ -160,6 +161,37 @@ namespace
         // 允许 padding。
         outTable[static_cast<unsigned char>('=')] = -2;
         return true;
+    }
+
+
+    static const std::array<int8_t, 256>& GetBase64DecodeTable(bool urlSafe)
+    {
+        if (urlSafe)
+        {
+            static const std::array<int8_t, 256> table = []() -> std::array<int8_t, 256>
+                {
+                    std::array<int8_t, 256> tempTable;
+                    if (!BuildBase64DecodeTable(true, tempTable.data()))
+                    {
+                        tempTable.fill(-1);
+                        tempTable[static_cast<unsigned char>('=')] = -2;
+                    }
+                    return tempTable;
+                }();
+            return table;
+        }
+
+        static const std::array<int8_t, 256> table = []() -> std::array<int8_t, 256>
+            {
+                std::array<int8_t, 256> tempTable;
+                if (!BuildBase64DecodeTable(false, tempTable.data()))
+                {
+                    tempTable.fill(-1);
+                    tempTable[static_cast<unsigned char>('=')] = -2;
+                }
+                return tempTable;
+            }();
+        return table;
     }
 
     static bool NormalizeBase64Input(const std::string& input, bool noPadding, std::string& outNormalized)
@@ -500,12 +532,7 @@ bool GB_Base64Decode(const std::string& base64Text, std::string& outUtf8Text, bo
     {
         return true;
     }
-
-    int8_t decodeTable[256];
-    if (!BuildBase64DecodeTable(urlSafe, decodeTable))
-    {
-        return false;
-    }
+    const std::array<int8_t, 256>& decodeTable = GetBase64DecodeTable(urlSafe);
 
     const size_t inputSize = normalized.size();
     if (inputSize % 4 != 0)
@@ -769,25 +796,6 @@ namespace GB_Argon2
         }
     }
 
-    static void EnsureOpenSslMaxThreads(uint32_t threads)
-    {
-        if (threads <= 1)
-        {
-            return;
-        }
-
-        static std::mutex mutex;
-        std::lock_guard<std::mutex> lock(mutex);
-
-        const uint64_t currentMaxThreads = ::OSSL_get_max_threads(nullptr);
-        if (currentMaxThreads < static_cast<uint64_t>(threads))
-        {
-            // 该设置属于 OpenSSL libctx 的全局状态：为了避免并发下“先增后降”的竞态，
-            // 这里采用“只增不降”的策略。
-            ::OSSL_set_max_threads(nullptr, static_cast<uint64_t>(threads));
-        }
-    }
-
     static void* GetOctetStringPointerForOpenSsl(std::string& bytes)
     {
         // OpenSSL 的 OSSL_PARAM_construct_octet_string 需要非 const 的 void*。
@@ -867,10 +875,27 @@ namespace GB_Argon2
         const bool useThreadsParam = includeThreadsParam && (normalizedOptions.threads > 0);
         uint32_t threads = useThreadsParam ? normalizedOptions.threads : 0;
 
-        // threads > 1 需要启用 OpenSSL 内置线程池（OSSL_set_max_threads）。
+        // OpenSSL 的线程池是按 libctx 全局配置的（OSSL_set_max_threads）。
+        // 本库不主动修改全局状态：若线程池未启用或上限不足，则将 threads 降级为 1（等价于不并行）。
         if (threads > 1)
         {
-            EnsureOpenSslMaxThreads(threads);
+            const uint64_t maxThreads64 = ::OSSL_get_max_threads(nullptr);
+            if (maxThreads64 == 0)
+            {
+                threads = 1;
+            }
+            else if (maxThreads64 < static_cast<uint64_t>(threads))
+            {
+                const uint64_t clamped = std::min<uint64_t>(
+                    maxThreads64,
+                    static_cast<uint64_t>(std::numeric_limits<uint32_t>::max())
+                );
+                threads = static_cast<uint32_t>(clamped);
+                if (threads < 1)
+                {
+                    threads = 1;
+                }
+            }
         }
 
         // OSSL_PARAM_construct_octet_string 需要可写的 void*，这里拷贝一份来避免 const_cast。
@@ -2514,10 +2539,7 @@ namespace GB_RSA
                 const size_t reserveSize = std::min<size_t>(static_cast<size_t>(expectedOutputSize), 32U * 1024U * 1024U);
                 outBytes.reserve(reserveSize);
             }
-
-            std::vector<unsigned char> buffer;
-            buffer.resize(16 * 1024);
-
+            std::array<unsigned char, 16 * 1024> buffer;
             int zRet = Z_OK;
             while (true)
             {
