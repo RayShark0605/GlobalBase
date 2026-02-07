@@ -2,7 +2,7 @@
 #define GLOBALBASE_FILESYSTEM_H_H
 
 #include "GlobalBasePort.h"
-
+#include "GB_BaseTypes.h"
 #include <string>
 #include <vector>
 
@@ -263,6 +263,17 @@ GLOBALBASE_PORT std::string GB_GetHomeDirectory();
  */
 GLOBALBASE_PORT std::string GB_GetDownloadsDirectory();
 
-
+/**
+ * @brief 根据文件二进制流（magic number / container 特征）尽可能猜测文件后缀名。
+ *
+ * @param fileBytes 文件二进制数据（GB_ByteBuffer，UTF-8 无关）。通常至少提供文件头若干 KB 会更可靠。
+ * @return std::string 可能的后缀名（UTF-8，小写，包含前导点，例如 ".png"、".mp4"、".webp"）。
+ *         若无法判断则返回空字符串。
+ *
+ * @remarks
+ * - 该接口属于“尽力而为”的启发式判断：仅依赖文件内容特征，不依赖文件名。
+ * - 对于容器格式（如 ISO-BMFF：mp4/mov/heic/avif 等），可能需要更多字节才能更准确地区分。
+ */
+GLOBALBASE_PORT std::string GB_GuessFileExt(const GB_ByteBuffer& fileBytes);
 
 #endif

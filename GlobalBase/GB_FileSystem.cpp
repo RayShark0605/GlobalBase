@@ -1342,6 +1342,161 @@ namespace internal
         return GB_WStringToUtf8(valueW);
     }
 #endif
+
+    static bool MatchBytesAt(const GB_ByteBuffer& buffer, size_t offset, const unsigned char* bytes, size_t bytesCount)
+    {
+        if (bytes == nullptr || bytesCount == 0)
+        {
+            return false;
+        }
+        if (buffer.size() < offset + bytesCount)
+        {
+            return false;
+        }
+        return std::memcmp(buffer.data() + offset, bytes, bytesCount) == 0;
+    }
+
+    static bool MatchAsciiAt(const GB_ByteBuffer& buffer, size_t offset, const char* text)
+    {
+        if (text == nullptr)
+        {
+            return false;
+        }
+
+        const size_t len = std::strlen(text);
+        return MatchBytesAt(buffer, offset, reinterpret_cast<const unsigned char*>(text), len);
+    }
+
+    static bool ContainsAsciiInFirstBytes(const GB_ByteBuffer& buffer, const std::string& needle, size_t maxBytes)
+    {
+        if (needle.empty() || buffer.empty())
+        {
+            return false;
+        }
+
+        const size_t scanSize = std::min(buffer.size(), maxBytes);
+        if (scanSize < needle.size())
+        {
+            return false;
+        }
+
+        const auto begin = buffer.begin();
+        const auto end = begin + static_cast<std::ptrdiff_t>(scanSize);
+        return std::search(begin, end, needle.begin(), needle.end()) != end;
+    }
+
+    static std::string GuessIsoBmffExt(const GB_ByteBuffer& buffer)
+    {
+        // ISO Base Media File Format family:
+        // size(4 bytes, big-endian) + 'ftyp'(4 bytes) + major_brand(4 bytes) ...
+        if (buffer.size() < 12)
+        {
+            return "";
+        }
+
+        if (!MatchAsciiAt(buffer, 4, "ftyp"))
+        {
+            return "";
+        }
+
+        std::string majorBrand;
+        majorBrand.resize(4);
+        for (size_t i = 0; i < 4; i++)
+        {
+            majorBrand[i] = static_cast<char>(buffer[8 + i]);
+        }
+
+        if (majorBrand == "qt  ")
+        {
+            return ".mov";
+        }
+
+        // 3GPP brands
+        if (majorBrand.size() >= 3 && majorBrand[0] == '3' && majorBrand[1] == 'g' && majorBrand[2] == 'p')
+        {
+            return ".3gp";
+        }
+        if (majorBrand.size() >= 3 && majorBrand[0] == '3' && majorBrand[1] == 'g' && majorBrand[2] == '2')
+        {
+            return ".3g2";
+        }
+
+        // HEIF/HEIC family (common brands)
+        if (majorBrand == "heic" || majorBrand == "heix" || majorBrand == "hevc" || majorBrand == "hevx"
+            || majorBrand == "mif1" || majorBrand == "msf1")
+        {
+            return ".heic";
+        }
+
+        // AVIF
+        if (majorBrand == "avif" || majorBrand == "avis")
+        {
+            return ".avif";
+        }
+
+        return ".mp4";
+    }
+
+    static std::string GuessZipDerivedExt(const GB_ByteBuffer& buffer)
+    {
+        const unsigned char pk0304[] = { 0x50, 0x4B, 0x03, 0x04 };
+        const unsigned char pk0506[] = { 0x50, 0x4B, 0x05, 0x06 };
+        const unsigned char pk0708[] = { 0x50, 0x4B, 0x07, 0x08 };
+
+        const bool isZip =
+            MatchBytesAt(buffer, 0, pk0304, sizeof(pk0304)) ||
+            MatchBytesAt(buffer, 0, pk0506, sizeof(pk0506)) ||
+            MatchBytesAt(buffer, 0, pk0708, sizeof(pk0708));
+
+        if (!isZip)
+        {
+            return "";
+        }
+
+        const size_t scanLimit = 64 * 1024;
+
+        // OOXML (docx/xlsx/pptx): look for Content_Types and typical folder names
+        if (ContainsAsciiInFirstBytes(buffer, "[Content_Types].xml", scanLimit))
+        {
+            if (ContainsAsciiInFirstBytes(buffer, "word/", scanLimit))
+            {
+                return ".docx";
+            }
+            if (ContainsAsciiInFirstBytes(buffer, "xl/", scanLimit))
+            {
+                return ".xlsx";
+            }
+            if (ContainsAsciiInFirstBytes(buffer, "ppt/", scanLimit))
+            {
+                return ".pptx";
+            }
+            return ".zip";
+        }
+
+        // Java / Android
+        if (ContainsAsciiInFirstBytes(buffer, "META-INF/MANIFEST.MF", scanLimit))
+        {
+            return ".jar";
+        }
+        if (ContainsAsciiInFirstBytes(buffer, "AndroidManifest.xml", scanLimit) || ContainsAsciiInFirstBytes(buffer, "classes.dex", scanLimit))
+        {
+            return ".apk";
+        }
+
+        // Google Earth
+        if (ContainsAsciiInFirstBytes(buffer, "doc.kml", scanLimit))
+        {
+            return ".kmz";
+        }
+
+        // EPUB
+        if (ContainsAsciiInFirstBytes(buffer, "application/epub+zip", scanLimit))
+        {
+            return ".epub";
+        }
+
+        return ".zip";
+    }
 }
 
 bool GB_IsFileExists(const std::string& filePathUtf8)
@@ -2099,3 +2254,186 @@ std::string GB_GetDownloadsDirectory()
     return internal::NormalizeDirectoryPathUtf8(homeUtf8 + "Downloads");
 #endif
 }
+
+std::string GB_GuessFileExt(const GB_ByteBuffer& fileBytes)
+{
+    if (fileBytes.empty())
+    {
+        return "";
+    }
+
+    const size_t size = fileBytes.size();
+
+    // ---- CAD ----
+    if (size >= 6 && internal::MatchAsciiAt(fileBytes, 0, "AC10"))
+    {
+        // DWG 版本号通常是 "AC10xx"（ASCII）。
+        return ".dwg";
+    }
+
+    // ---- Executables / objects ----
+    if (size >= 4 && fileBytes[0] == 0x7F && fileBytes[1] == 'E' && fileBytes[2] == 'L' && fileBytes[3] == 'F')
+    {
+        return ".elf";
+    }
+    if (size >= 2 && fileBytes[0] == 'M' && fileBytes[1] == 'Z')
+    {
+        return ".exe";
+    }
+
+    // ---- Documents ----
+    if (size >= 5 && fileBytes[0] == '%' && fileBytes[1] == 'P' && fileBytes[2] == 'D' && fileBytes[3] == 'F' && fileBytes[4] == '-')
+    {
+        return ".pdf";
+    }
+
+    // ---- Images ----
+    {
+        const unsigned char pngSig[] = { 0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A };
+        if (internal::MatchBytesAt(fileBytes, 0, pngSig, sizeof(pngSig)))
+        {
+            return ".png";
+        }
+    }
+    if (size >= 3 && fileBytes[0] == 0xFF && fileBytes[1] == 0xD8 && fileBytes[2] == 0xFF)
+    {
+        return ".jpg";
+    }
+    if (size >= 6 && (internal::MatchAsciiAt(fileBytes, 0, "GIF87a") || internal::MatchAsciiAt(fileBytes, 0, "GIF89a")))
+    {
+        return ".gif";
+    }
+    if (size >= 2 && fileBytes[0] == 'B' && fileBytes[1] == 'M')
+    {
+        return ".bmp";
+    }
+    if (size >= 4 && ((fileBytes[0] == 'I' && fileBytes[1] == 'I' && fileBytes[2] == 0x2A && fileBytes[3] == 0x00)
+        || (fileBytes[0] == 'M' && fileBytes[1] == 'M' && fileBytes[2] == 0x00 && fileBytes[3] == 0x2A)))
+    {
+        return ".tif";
+    }
+    if (size >= 4 && fileBytes[0] == 0x00 && fileBytes[1] == 0x00 && fileBytes[2] == 0x01 && fileBytes[3] == 0x00)
+    {
+        return ".ico";
+    }
+
+    // ---- Containers / archives ----
+    {
+        const std::string zipDerived = internal::GuessZipDerivedExt(fileBytes);
+        if (!zipDerived.empty())
+        {
+            return zipDerived;
+        }
+    }
+    if (size >= 6 && fileBytes[0] == 0x37 && fileBytes[1] == 0x7A && fileBytes[2] == 0xBC && fileBytes[3] == 0xAF
+        && fileBytes[4] == 0x27 && fileBytes[5] == 0x1C)
+    {
+        return ".7z";
+    }
+    if (size >= 7 && internal::MatchAsciiAt(fileBytes, 0, "Rar!\x1A\x07"))
+    {
+        return ".rar";
+    }
+    if (size >= 2 && fileBytes[0] == 0x1F && fileBytes[1] == 0x8B)
+    {
+        return ".gz";
+    }
+    if (size >= 3 && fileBytes[0] == 'B' && fileBytes[1] == 'Z' && fileBytes[2] == 'h')
+    {
+        return ".bz2";
+    }
+    if (size >= 6 && fileBytes[0] == 0xFD && fileBytes[1] == 0x37 && fileBytes[2] == 0x7A && fileBytes[3] == 0x58
+        && fileBytes[4] == 0x5A && fileBytes[5] == 0x00)
+    {
+        return ".xz";
+    }
+
+    // ---- Media containers ----
+    {
+        const std::string isobmffExt = internal::GuessIsoBmffExt(fileBytes);
+        if (!isobmffExt.empty())
+        {
+            return isobmffExt;
+        }
+    }
+    if (size >= 4 && fileBytes[0] == 0x1A && fileBytes[1] == 0x45 && fileBytes[2] == 0xDF && fileBytes[3] == 0xA3)
+    {
+        // EBML (Matroska/WebM) documents start with 1A 45 DF A3.
+        const bool isWebm = internal::ContainsAsciiInFirstBytes(fileBytes, "webm", 4096);
+        return isWebm ? ".webm" : ".mkv";
+    }
+    if (size >= 12 && internal::MatchAsciiAt(fileBytes, 0, "RIFF"))
+    {
+        if (internal::MatchAsciiAt(fileBytes, 8, "WAVE"))
+        {
+            return ".wav";
+        }
+        if (internal::MatchAsciiAt(fileBytes, 8, "AVI "))
+        {
+            return ".avi";
+        }
+        if (internal::MatchAsciiAt(fileBytes, 8, "WEBP"))
+        {
+            return ".webp";
+        }
+        return ".riff";
+    }
+    if (size >= 4 && internal::MatchAsciiAt(fileBytes, 0, "fLaC"))
+    {
+        return ".flac";
+    }
+    if (size >= 4 && internal::MatchAsciiAt(fileBytes, 0, "OggS"))
+    {
+        return ".ogg";
+    }
+    if (size >= 3 && internal::MatchAsciiAt(fileBytes, 0, "ID3"))
+    {
+        return ".mp3";
+    }
+    if (size >= 2 && fileBytes[0] == 0xFF && (fileBytes[1] & 0xE0) == 0xE0)
+    {
+        // MPEG audio frame sync (heuristic).
+        return ".mp3";
+    }
+
+    // ---- Databases ----
+    {
+        const unsigned char sqliteSig[] = { 'S','Q','L','i','t','e',' ','f','o','r','m','a','t',' ','3', 0x00 };
+        if (size >= sizeof(sqliteSig) && internal::MatchBytesAt(fileBytes, 0, sqliteSig, sizeof(sqliteSig)))
+        {
+            return ".sqlite";
+        }
+    }
+
+    // ---- Text-like (heuristic) ----
+    // Try detect XML/HTML by leading whitespace + '<'
+    {
+        const size_t scanSize = std::min<size_t>(size, 64);
+        size_t index = 0;
+        while (index < scanSize)
+        {
+            const unsigned char ch = fileBytes[index];
+            if (ch == ' ' || ch == '\t' || ch == '\r' || ch == '\n')
+            {
+                index++;
+                continue;
+            }
+            if (ch == '<')
+            {
+                if (internal::ContainsAsciiInFirstBytes(fileBytes, "<?xml", 256))
+                {
+                    return ".xml";
+                }
+                if (internal::ContainsAsciiInFirstBytes(fileBytes, "<html", 256) || internal::ContainsAsciiInFirstBytes(fileBytes, "<!DOCTYPE html", 256))
+                {
+                    return ".html";
+                }
+                return ".xml";
+            }
+            break;
+        }
+    }
+
+    return "";
+}
+
