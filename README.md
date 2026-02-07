@@ -318,7 +318,7 @@ int main(int argc, char* argv[])
 
 ---
 
-## ⚠️ 设计取向与已知注意点
+## ⚠️ 设计原则与已知注意点
 
 - 这是一个“作者自用 + 学习沉淀”的工具库：**实用优先，但不承诺权威级完备性**。
 - `GB_Crypto` / `GB_Network` 依赖三方库（libcurl/OpenSSL/zlib），项目已做集成；Windows 下为延迟加载。
