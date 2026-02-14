@@ -335,9 +335,6 @@ namespace
         *fileSize = (high << 32) | low;
         return true;
     }
-#ifndef FIND_FIRST_EX_LARGE_FETCH
-#define FIND_FIRST_EX_LARGE_FETCH 0x00000002
-#endif
 #ifndef COPY_FILE_NO_BUFFERING
 #define COPY_FILE_NO_BUFFERING 0x00001000
 #endif
@@ -787,6 +784,9 @@ namespace
 
         if (firstError.hasError.load(std::memory_order_acquire))
         {
+            // 拷贝失败时尽量删除目标文件，避免留下半成品文件。
+            (void)::DeleteFileW(destPath.c_str());
+
             if (errorMessage != nullptr)
             {
                 std::lock_guard<std::mutex> lock(firstError.mutex);
@@ -929,6 +929,8 @@ struct GB_SmbAccessor::Impl
 private:
     void RememberConnectedShare(const std::wstring& shareName, bool persistent) const;
     void ForgetConnectedShare(const std::wstring& shareName) const;
+
+    bool DisconnectShareInternal(const std::wstring& shareName, bool force, bool updateProfile, std::wstring* errorMessage) const;
 
     std::wstring GetServerNameForUnc() const;
     std::wstring GetServerNameForNetApi() const;
@@ -1281,9 +1283,30 @@ bool GB_SmbAccessor::Impl::ConnectShare(const std::wstring& shareName, bool pers
     const DWORD result = ::WNetAddConnection2W(&netResource, passwordPtr, userNamePtr, flags);
     if (result != NO_ERROR)
     {
+        // 连接已存在时：视为成功（常见于重复调用 ConnectShare）。
+        if (result == ERROR_ALREADY_ASSIGNED
+            || result == ERROR_DEVICE_ALREADY_REMEMBERED
+#ifdef ERROR_ALREADY_CONNECTED
+            || result == ERROR_ALREADY_CONNECTED
+#endif
+            )
+        {
+            RememberConnectedShare(shareName, persistent);
+            return true;
+        }
+
         if (errorMessage != nullptr)
         {
-            *errorMessage = L"WNetAddConnection2W failed: " + FormatWin32ErrorMessage(result);
+            if (result == ERROR_SESSION_CREDENTIAL_CONFLICT)
+            {
+                *errorMessage = L"WNetAddConnection2W failed: existing connection to the server uses different credentials. "
+                    L"Please disconnect the existing connection first, then retry. "
+                    + FormatWin32ErrorMessage(result);
+            }
+            else
+            {
+                *errorMessage = L"WNetAddConnection2W failed: " + FormatWin32ErrorMessage(result);
+            }
         }
         return false;
     }
@@ -1292,7 +1315,7 @@ bool GB_SmbAccessor::Impl::ConnectShare(const std::wstring& shareName, bool pers
     return true;
 }
 
-bool GB_SmbAccessor::Impl::DisconnectShare(const std::wstring& shareName, bool force, std::wstring* errorMessage) const
+bool GB_SmbAccessor::Impl::DisconnectShareInternal(const std::wstring& shareName, bool force, bool updateProfile, std::wstring* errorMessage) const
 {
     if (errorMessage != nullptr)
     {
@@ -1301,9 +1324,17 @@ bool GB_SmbAccessor::Impl::DisconnectShare(const std::wstring& shareName, bool f
 
     const std::wstring remoteName = GetUncRoot(shareName);
 
-    const DWORD result = ::WNetCancelConnection2W(remoteName.c_str(), 0, force ? TRUE : FALSE);
+    const DWORD flags = updateProfile ? CONNECT_UPDATE_PROFILE : 0;
+    const DWORD result = ::WNetCancelConnection2W(remoteName.c_str(), flags, force ? TRUE : FALSE);
     if (result != NO_ERROR)
     {
+        // 没有连接时也视为“已断开”。
+        if (result == ERROR_NOT_CONNECTED)
+        {
+            ForgetConnectedShare(shareName);
+            return true;
+        }
+
         if (errorMessage != nullptr)
         {
             *errorMessage = L"WNetCancelConnection2W failed: " + FormatWin32ErrorMessage(result);
@@ -1313,6 +1344,12 @@ bool GB_SmbAccessor::Impl::DisconnectShare(const std::wstring& shareName, bool f
 
     ForgetConnectedShare(shareName);
     return true;
+}
+
+bool GB_SmbAccessor::Impl::DisconnectShare(const std::wstring& shareName, bool force, std::wstring* errorMessage) const
+{
+    // 对外显式断开：同步更新 Profile，避免 persistent 连接残留。
+    return DisconnectShareInternal(shareName, force, true, errorMessage);
 }
 
 bool GB_SmbAccessor::Impl::ListDirectory(const std::wstring& shareName, const std::wstring& relativeDir, std::vector<std::wstring>* childNames, bool includeDirectories, bool includeFiles, std::wstring* errorMessage) const
@@ -4251,6 +4288,11 @@ std::string GB_SmbAccessor::GetUncPath(const std::string& shareNameUtf8, const s
 }
 
 #else
+
+// 非 Windows 平台：提供一个空的 Impl 定义以满足 std::unique_ptr 的完整类型要求。
+struct GB_SmbAccessor::Impl
+{
+};
 
 GB_SmbAccessor::GB_SmbAccessor(const std::string& hostOrIpUtf8, AddressType addressType)
     : impl_(nullptr)
