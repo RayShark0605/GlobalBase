@@ -17,6 +17,14 @@
 #include <vector>
 #include "GlobalBasePort.h"
 
+#ifdef min
+#undef min
+#endif
+
+#ifdef max
+#undef max
+#endif
+
 // "把 (function, tuple<args...>) 展开调用"的工具
 namespace threadpool_detail
 {

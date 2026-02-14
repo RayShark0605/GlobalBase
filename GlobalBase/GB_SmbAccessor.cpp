@@ -1,10 +1,24 @@
 ﻿#include "GB_SmbAccessor.h"
 #include "GB_ThreadPool.h"
+#include "GB_Utf8String.h"
 #ifdef _WIN32
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#include <windows.h>
+#include <winnetwk.h>
+#include <lm.h>
+
+#ifdef _MSC_VER
+#  pragma comment(lib, "Ws2_32.lib")
+#  pragma comment(lib, "Mpr.lib")
+#  pragma comment(lib, "Netapi32.lib")
+#endif
+
 #include <algorithm>
 #include <atomic>
 #include <memory>
 #include <mutex>
+#include <thread>
 
 namespace
 {
@@ -675,7 +689,7 @@ namespace
                 {
                     return;
                 }
-            
+
                 WinHandleGuard sourceHandle(::CreateFileW(sourcePath.c_str(), GENERIC_READ, shareMode, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr));
                 if (!sourceHandle.IsValid())
                 {
@@ -683,7 +697,7 @@ namespace
                     firstError.SetOnce(std::wstring(context) + L" CreateFileW(source) failed: " + FormatWin32ErrorMessageLocal(err));
                     return;
                 }
-            
+
                 WinHandleGuard destHandle(::CreateFileW(destPath.c_str(), GENERIC_WRITE, shareMode, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr));
                 if (!destHandle.IsValid())
                 {
@@ -691,10 +705,10 @@ namespace
                     firstError.SetOnce(std::wstring(context) + L" CreateFileW(dest worker) failed: " + FormatWin32ErrorMessageLocal(err));
                     return;
                 }
-            
+
                 std::vector<uint8_t> buffer;
                 buffer.resize(static_cast<size_t>(kParallelChunkBytes));
-            
+
                 while (!firstError.hasError.load(std::memory_order_acquire))
                 {
                     const uint64_t chunkIndex = nextChunkIndex.fetch_add(1, std::memory_order_acq_rel);
@@ -703,9 +717,9 @@ namespace
                     {
                         break;
                     }
-            
+
                     const uint32_t bytesToCopy = static_cast<uint32_t>(std::min<uint64_t>(kParallelChunkBytes, fileSize - offset));
-            
+
                     LARGE_INTEGER li;
                     li.QuadPart = static_cast<LONGLONG>(offset);
                     if (!::SetFilePointerEx(sourceHandle.Get(), li, nullptr, FILE_BEGIN))
@@ -714,7 +728,7 @@ namespace
                         firstError.SetOnce(std::wstring(context) + L" SetFilePointerEx(source) failed: " + FormatWin32ErrorMessageLocal(err));
                         break;
                     }
-            
+
                     uint32_t totalRead = 0;
                     while (totalRead < bytesToCopy && !firstError.hasError.load(std::memory_order_acquire))
                     {
@@ -733,12 +747,12 @@ namespace
                         }
                         totalRead += static_cast<uint32_t>(readBytes);
                     }
-            
+
                     if (firstError.hasError.load(std::memory_order_acquire))
                     {
                         break;
                     }
-            
+
                     li.QuadPart = static_cast<LONGLONG>(offset);
                     if (!::SetFilePointerEx(destHandle.Get(), li, nullptr, FILE_BEGIN))
                     {
@@ -746,7 +760,7 @@ namespace
                         firstError.SetOnce(std::wstring(context) + L" SetFilePointerEx(dest) failed: " + FormatWin32ErrorMessageLocal(err));
                         break;
                     }
-            
+
                     uint32_t totalWritten = 0;
                     while (totalWritten < bytesToCopy && !firstError.hasError.load(std::memory_order_acquire))
                     {
@@ -766,7 +780,7 @@ namespace
                         totalWritten += static_cast<uint32_t>(writtenBytes);
                     }
                 }
-            });
+                });
         }
 
         pool.WaitIdle();
@@ -786,16 +800,184 @@ namespace
     }
 }
 
-GB_SmbAccessor::GB_SmbAccessor(const std::wstring& hostOrIp, AddressType addressType): hostOrIp_(hostOrIp), addressType_(addressType), credentials_(), useLongPathPrefix_(false)
+
+struct GB_SmbAccessor::Impl
 {
+    struct Credentials
+    {
+        std::wstring domain;
+        std::wstring userName;
+        std::wstring password;
+    };
+
+    struct ShareInfo
+    {
+        std::wstring name;
+        uint32_t type = 0;
+        std::wstring remark;
+    };
+
+    struct ConnectedShareRecord
+    {
+        std::wstring shareName;
+        bool persistent = false;
+    };
+
+    Impl(const std::wstring& hostOrIp, AddressType addressType);
+    Impl(const std::wstring& hostOrIp, AddressType addressType, const Credentials& credentials);
+    ~Impl();
+
+    void SetCredentials(const Credentials& credentials);
+    void SetUseLongPathPrefix(bool useLongPathPrefix);
+
+    bool TestTcp445(int timeoutMs, std::wstring* errorMessage) const;
+    bool TestSmbConnection(std::wstring* errorMessage) const;
+
+    bool GetShares(std::vector<std::wstring>* shareNames, bool includeSpecialShares, std::wstring* errorMessage) const;
+    bool GetShareInfos(std::vector<ShareInfo>* shares, bool includeSpecialShares, std::wstring* errorMessage) const;
+
+    bool ConnectShare(const std::wstring& shareName, bool persistent, std::wstring* errorMessage) const;
+    bool DisconnectShare(const std::wstring& shareName, bool force, std::wstring* errorMessage) const;
+
+    bool ListDirectory(const std::wstring& shareName,
+        const std::wstring& relativeDir,
+        std::vector<std::wstring>* childNames,
+        bool includeDirectories,
+        bool includeFiles,
+        std::wstring* errorMessage) const;
+
+    bool FileExists(const std::wstring& shareName, const std::wstring& relativePath) const;
+    bool DirectoryExists(const std::wstring& shareName, const std::wstring& relativePath) const;
+
+    bool CreateDirectoryRecursive(const std::wstring& shareName, const std::wstring& relativeDir, std::wstring* errorMessage) const;
+    bool DeleteFileRemote(const std::wstring& shareName, const std::wstring& relativePath, std::wstring* errorMessage) const;
+
+    bool CopyFileFromLocalInternal(const std::wstring& localPath,
+        const std::wstring& shareName,
+        const std::wstring& remoteRelativePath,
+        bool overwrite,
+        bool skipEnsureParentDir,
+        std::wstring* errorMessage) const;
+
+    bool CopyFileToLocalInternal(const std::wstring& shareName,
+        const std::wstring& remoteRelativePath,
+        const std::wstring& localPath,
+        bool overwrite,
+        bool skipEnsureParentDir,
+        std::wstring* errorMessage) const;
+
+    bool CopyFileFromLocal(const std::wstring& localPath,
+        const std::wstring& shareName,
+        const std::wstring& remoteRelativePath,
+        bool overwrite,
+        std::wstring* errorMessage) const;
+
+    bool CopyFileToLocal(const std::wstring& shareName,
+        const std::wstring& remoteRelativePath,
+        const std::wstring& localPath,
+        bool overwrite,
+        std::wstring* errorMessage) const;
+
+    bool CopyFileFromLocalParallel(const std::wstring& localPath,
+        const std::wstring& shareName,
+        const std::wstring& remoteRelativePath,
+        bool overwrite,
+        std::wstring* errorMessage,
+        size_t threadCount) const;
+
+    bool CopyFileToLocalParallel(const std::wstring& shareName,
+        const std::wstring& remoteRelativePath,
+        const std::wstring& localPath,
+        bool overwrite,
+        std::wstring* errorMessage,
+        size_t threadCount) const;
+
+    bool CopyDirectoryFromLocalParallel(const std::wstring& localDirectory,
+        const std::wstring& shareName,
+        const std::wstring& remoteRelativePath,
+        bool overwrite,
+        std::wstring* errorMessage,
+        size_t threadCount) const;
+
+    bool CopyDirectoryToLocalParallel(const std::wstring& shareName,
+        const std::wstring& remoteRelativePath,
+        const std::wstring& localDirectory,
+        bool overwrite,
+        std::wstring* errorMessage,
+        size_t threadCount) const;
+
+    bool CopyDirectoryFromLocal(const std::wstring& localDirectory,
+        const std::wstring& shareName,
+        const std::wstring& remoteRelativePath,
+        bool overwrite,
+        std::wstring* errorMessage) const;
+
+    bool CopyDirectoryToLocal(const std::wstring& shareName,
+        const std::wstring& remoteRelativePath,
+        const std::wstring& localDirectory,
+        bool overwrite,
+        std::wstring* errorMessage) const;
+
+    bool GetFileSizeRemote(const std::wstring& shareName,
+        const std::wstring& remoteRelativePath,
+        uint64_t* fileSize,
+        std::wstring* errorMessage) const;
+
+    std::wstring GetUncRoot(const std::wstring& shareName) const;
+    std::wstring GetUncPath(const std::wstring& shareName, const std::wstring& relativePath) const;
+
+private:
+    void RememberConnectedShare(const std::wstring& shareName, bool persistent) const;
+    void ForgetConnectedShare(const std::wstring& shareName) const;
+
+    std::wstring GetServerNameForUnc() const;
+    std::wstring GetServerNameForNetApi() const;
+
+    std::wstring BuildUncRootInternal(const std::wstring& shareName, bool useLongPathPrefix) const;
+    std::wstring BuildUncPathInternal(const std::wstring& shareName, const std::wstring& relativePath, bool useLongPathPrefix) const;
+
+    static std::wstring ConvertIpv6LiteralToUncHost(const std::wstring& ipv6Literal);
+
+    static std::wstring FormatWin32ErrorMessage(DWORD errorCode);
+    static std::wstring NormalizeSlashes(const std::wstring& path);
+    static std::wstring JoinPath(const std::wstring& a, const std::wstring& b);
+    static std::wstring GetParentPath(const std::wstring& fullPath);
+    static bool CreateLocalDirectoryRecursive(const std::wstring& fullDirectory, std::wstring* errorMessage);
+
+private:
+    std::wstring hostOrIp_;
+    AddressType addressType_;
+    Credentials credentials_;
+    bool useLongPathPrefix_;
+
+    mutable std::mutex connectedSharesMutex_;
+    mutable std::vector<ConnectedShareRecord> connectedShares_;
+};
+
+GB_SmbAccessor::Impl::Impl(const std::wstring& hostOrIp, AddressType addressType) : hostOrIp_(hostOrIp), addressType_(addressType), credentials_(), useLongPathPrefix_(false)
+{
+    if (addressType_ == AddressType::IPv6Literal)
+    {
+        if (hostOrIp_.size() >= 2 && hostOrIp_.front() == L'[' && hostOrIp_.back() == L']')
+        {
+            hostOrIp_ = hostOrIp_.substr(1, hostOrIp_.size() - 2);
+        }
+    }
 }
 
-GB_SmbAccessor::GB_SmbAccessor(const std::wstring& hostOrIp, AddressType addressType, const Credentials& credentials)
+GB_SmbAccessor::Impl::Impl(const std::wstring& hostOrIp, AddressType addressType, const Credentials& credentials)
     : hostOrIp_(hostOrIp), addressType_(addressType), credentials_(credentials), useLongPathPrefix_(false)
 {
+    if (addressType_ == AddressType::IPv6Literal)
+    {
+        if (hostOrIp_.size() >= 2 && hostOrIp_.front() == L'[' && hostOrIp_.back() == L']')
+        {
+            hostOrIp_ = hostOrIp_.substr(1, hostOrIp_.size() - 2);
+        }
+    }
 }
 
-GB_SmbAccessor::~GB_SmbAccessor()
+GB_SmbAccessor::Impl::~Impl()
 {
     std::vector<ConnectedShareRecord> sharesToDisconnect;
     {
@@ -810,17 +992,17 @@ GB_SmbAccessor::~GB_SmbAccessor()
     }
 }
 
-void GB_SmbAccessor::SetCredentials(const Credentials& credentials)
+void GB_SmbAccessor::Impl::SetCredentials(const Credentials& credentials)
 {
     credentials_ = credentials;
 }
 
-void GB_SmbAccessor::SetUseLongPathPrefix(bool useLongPathPrefix)
+void GB_SmbAccessor::Impl::SetUseLongPathPrefix(bool useLongPathPrefix)
 {
     useLongPathPrefix_ = useLongPathPrefix;
 }
 
-bool GB_SmbAccessor::TestTcp445(int timeoutMs, std::wstring* errorMessage) const
+bool GB_SmbAccessor::Impl::TestTcp445(int timeoutMs, std::wstring* errorMessage) const
 {
     if (errorMessage != nullptr)
     {
@@ -944,7 +1126,7 @@ bool GB_SmbAccessor::TestTcp445(int timeoutMs, std::wstring* errorMessage) const
     return connected;
 }
 
-bool GB_SmbAccessor::TestSmbConnection(std::wstring* errorMessage) const
+bool GB_SmbAccessor::Impl::TestSmbConnection(std::wstring* errorMessage) const
 {
     // IPC$ 属于特殊共享；测试连通性时常用它
     const bool ok = ConnectShare(L"IPC$", false, errorMessage);
@@ -957,7 +1139,7 @@ bool GB_SmbAccessor::TestSmbConnection(std::wstring* errorMessage) const
     return ok;
 }
 
-bool GB_SmbAccessor::GetShares(std::vector<std::wstring>* shareNames, bool includeSpecialShares, std::wstring* errorMessage) const
+bool GB_SmbAccessor::Impl::GetShares(std::vector<std::wstring>* shareNames, bool includeSpecialShares, std::wstring* errorMessage) const
 {
     if (shareNames == nullptr)
     {
@@ -980,7 +1162,7 @@ bool GB_SmbAccessor::GetShares(std::vector<std::wstring>* shareNames, bool inclu
     return true;
 }
 
-bool GB_SmbAccessor::GetShareInfos(std::vector<ShareInfo>* shares, bool includeSpecialShares, std::wstring* errorMessage) const
+bool GB_SmbAccessor::Impl::GetShareInfos(std::vector<ShareInfo>* shares, bool includeSpecialShares, std::wstring* errorMessage) const
 {
     if (errorMessage != nullptr)
     {
@@ -1062,7 +1244,7 @@ bool GB_SmbAccessor::GetShareInfos(std::vector<ShareInfo>* shares, bool includeS
     return true;
 }
 
-bool GB_SmbAccessor::ConnectShare(const std::wstring& shareName, bool persistent, std::wstring* errorMessage) const
+bool GB_SmbAccessor::Impl::ConnectShare(const std::wstring& shareName, bool persistent, std::wstring* errorMessage) const
 {
     if (errorMessage != nullptr)
     {
@@ -1110,7 +1292,7 @@ bool GB_SmbAccessor::ConnectShare(const std::wstring& shareName, bool persistent
     return true;
 }
 
-bool GB_SmbAccessor::DisconnectShare(const std::wstring& shareName, bool force, std::wstring* errorMessage) const
+bool GB_SmbAccessor::Impl::DisconnectShare(const std::wstring& shareName, bool force, std::wstring* errorMessage) const
 {
     if (errorMessage != nullptr)
     {
@@ -1133,7 +1315,7 @@ bool GB_SmbAccessor::DisconnectShare(const std::wstring& shareName, bool force, 
     return true;
 }
 
-bool GB_SmbAccessor::ListDirectory(const std::wstring& shareName, const std::wstring& relativeDir, std::vector<std::wstring>* childNames, bool includeDirectories, bool includeFiles, std::wstring* errorMessage) const
+bool GB_SmbAccessor::Impl::ListDirectory(const std::wstring& shareName, const std::wstring& relativeDir, std::vector<std::wstring>* childNames, bool includeDirectories, bool includeFiles, std::wstring* errorMessage) const
 {
     if (errorMessage != nullptr)
     {
@@ -1157,13 +1339,13 @@ bool GB_SmbAccessor::ListDirectory(const std::wstring& shareName, const std::wst
     WIN32_FIND_DATAW findData;
     ::ZeroMemory(&findData, sizeof(findData));
 
-    HANDLE handle = ::FindFirstFileW(searchPattern.c_str(), &findData);
+    HANDLE handle = FindFirstFileExCompatible(searchPattern, &findData, true);
     if (handle == INVALID_HANDLE_VALUE)
     {
         const DWORD err = ::GetLastError();
         if (errorMessage != nullptr)
         {
-            *errorMessage = L"FindFirstFileW failed: " + FormatWin32ErrorMessage(err);
+            *errorMessage = L"FindFirstFileExW failed: " + FormatWin32ErrorMessage(err);
         }
         return false;
     }
@@ -1207,7 +1389,7 @@ bool GB_SmbAccessor::ListDirectory(const std::wstring& shareName, const std::wst
     return true;
 }
 
-bool GB_SmbAccessor::FileExists(const std::wstring& shareName, const std::wstring& relativePath) const
+bool GB_SmbAccessor::Impl::FileExists(const std::wstring& shareName, const std::wstring& relativePath) const
 {
     const std::wstring fullPath = BuildUncPathInternal(shareName, relativePath, useLongPathPrefix_);
     const DWORD attrs = ::GetFileAttributesW(fullPath.c_str());
@@ -1218,7 +1400,7 @@ bool GB_SmbAccessor::FileExists(const std::wstring& shareName, const std::wstrin
     return (attrs & FILE_ATTRIBUTE_DIRECTORY) == 0;
 }
 
-bool GB_SmbAccessor::DirectoryExists(const std::wstring& shareName, const std::wstring& relativePath) const
+bool GB_SmbAccessor::Impl::DirectoryExists(const std::wstring& shareName, const std::wstring& relativePath) const
 {
     const std::wstring fullPath = BuildUncPathInternal(shareName, relativePath, useLongPathPrefix_);
     const DWORD attrs = ::GetFileAttributesW(fullPath.c_str());
@@ -1229,7 +1411,7 @@ bool GB_SmbAccessor::DirectoryExists(const std::wstring& shareName, const std::w
     return (attrs & FILE_ATTRIBUTE_DIRECTORY) != 0;
 }
 
-bool GB_SmbAccessor::CreateDirectoryRecursive(const std::wstring& shareName, const std::wstring& relativeDir, std::wstring* errorMessage) const
+bool GB_SmbAccessor::Impl::CreateDirectoryRecursive(const std::wstring& shareName, const std::wstring& relativeDir, std::wstring* errorMessage) const
 {
     if (errorMessage != nullptr)
     {
@@ -1352,7 +1534,7 @@ bool GB_SmbAccessor::CreateDirectoryRecursive(const std::wstring& shareName, con
     return true;
 }
 
-bool GB_SmbAccessor::DeleteFileRemote(const std::wstring& shareName, const std::wstring& relativePath, std::wstring* errorMessage) const
+bool GB_SmbAccessor::Impl::DeleteFileRemote(const std::wstring& shareName, const std::wstring& relativePath, std::wstring* errorMessage) const
 {
     if (errorMessage != nullptr)
     {
@@ -1375,7 +1557,7 @@ bool GB_SmbAccessor::DeleteFileRemote(const std::wstring& shareName, const std::
 }
 
 
-bool GB_SmbAccessor::CopyFileFromLocalInternal(const std::wstring& localPath, const std::wstring& shareName, const std::wstring& remoteRelativePath, bool overwrite, bool skipEnsureParentDir, std::wstring* errorMessage) const
+bool GB_SmbAccessor::Impl::CopyFileFromLocalInternal(const std::wstring& localPath, const std::wstring& shareName, const std::wstring& remoteRelativePath, bool overwrite, bool skipEnsureParentDir, std::wstring* errorMessage) const
 {
     if (errorMessage != nullptr)
     {
@@ -1407,7 +1589,7 @@ bool GB_SmbAccessor::CopyFileFromLocalInternal(const std::wstring& localPath, co
     return CopyFileBestEffort(localPath, remotePath, overwrite, useNoBuffering, errorMessage, L"CopyFile(local->remote)");
 }
 
-bool GB_SmbAccessor::CopyFileToLocalInternal(const std::wstring& shareName, const std::wstring& remoteRelativePath, const std::wstring& localPath, bool overwrite, bool skipEnsureParentDir, std::wstring* errorMessage) const
+bool GB_SmbAccessor::Impl::CopyFileToLocalInternal(const std::wstring& shareName, const std::wstring& remoteRelativePath, const std::wstring& localPath, bool overwrite, bool skipEnsureParentDir, std::wstring* errorMessage) const
 {
     if (errorMessage != nullptr)
     {
@@ -1439,19 +1621,19 @@ bool GB_SmbAccessor::CopyFileToLocalInternal(const std::wstring& shareName, cons
     return CopyFileBestEffort(remotePath, localPath, overwrite, useNoBuffering, errorMessage, L"CopyFile(remote->local)");
 }
 
-bool GB_SmbAccessor::CopyFileFromLocal(const std::wstring& localPath, const std::wstring& shareName, const std::wstring& remoteRelativePath, bool overwrite, std::wstring* errorMessage) const
+bool GB_SmbAccessor::Impl::CopyFileFromLocal(const std::wstring& localPath, const std::wstring& shareName, const std::wstring& remoteRelativePath, bool overwrite, std::wstring* errorMessage) const
 {
     return CopyFileFromLocalInternal(localPath, shareName, remoteRelativePath, overwrite, false, errorMessage);
 }
 
 
-bool GB_SmbAccessor::CopyFileToLocal(const std::wstring& shareName, const std::wstring& remoteRelativePath, const std::wstring& localPath, bool overwrite, std::wstring* errorMessage) const
+bool GB_SmbAccessor::Impl::CopyFileToLocal(const std::wstring& shareName, const std::wstring& remoteRelativePath, const std::wstring& localPath, bool overwrite, std::wstring* errorMessage) const
 {
     return CopyFileToLocalInternal(shareName, remoteRelativePath, localPath, overwrite, false, errorMessage);
 }
 
 
-bool GB_SmbAccessor::CopyFileFromLocalParallel(const std::wstring& localPath, const std::wstring& shareName, const std::wstring& remoteRelativePath,
+bool GB_SmbAccessor::Impl::CopyFileFromLocalParallel(const std::wstring& localPath, const std::wstring& shareName, const std::wstring& remoteRelativePath,
     bool overwrite, std::wstring* errorMessage, size_t threadCount) const
 {
     if (errorMessage != nullptr)
@@ -1484,7 +1666,7 @@ bool GB_SmbAccessor::CopyFileFromLocalParallel(const std::wstring& localPath, co
 }
 
 
-bool GB_SmbAccessor::CopyFileToLocalParallel(const std::wstring& shareName, const std::wstring& remoteRelativePath, const std::wstring& localPath,
+bool GB_SmbAccessor::Impl::CopyFileToLocalParallel(const std::wstring& shareName, const std::wstring& remoteRelativePath, const std::wstring& localPath,
     bool overwrite, std::wstring* errorMessage, size_t threadCount) const
 {
     if (errorMessage != nullptr)
@@ -1517,7 +1699,7 @@ bool GB_SmbAccessor::CopyFileToLocalParallel(const std::wstring& shareName, cons
 }
 
 
-bool GB_SmbAccessor::CopyDirectoryFromLocalParallel(const std::wstring& localDirectory, const std::wstring& shareName, const std::wstring& remoteRelativePath,
+bool GB_SmbAccessor::Impl::CopyDirectoryFromLocalParallel(const std::wstring& localDirectory, const std::wstring& shareName, const std::wstring& remoteRelativePath,
     bool overwrite, std::wstring* errorMessage, size_t threadCount) const
 {
     if (errorMessage != nullptr)
@@ -1566,20 +1748,20 @@ bool GB_SmbAccessor::CopyDirectoryFromLocalParallel(const std::wstring& localDir
         {
             return true;
         }
-    
+
         std::wstring fullDir = BuildUncPathInternal(shareName, remoteRel, useLongPathPrefix_);
         fullDir = NormalizeSlashes(fullDir);
         while (!fullDir.empty() && fullDir.back() == L'\\')
         {
             fullDir.pop_back();
         }
-    
+
         const BOOL ok = ::CreateDirectoryW(fullDir.c_str(), nullptr);
         if (ok)
         {
             return true;
         }
-    
+
         const DWORD err = ::GetLastError();
         if (err == ERROR_ALREADY_EXISTS)
         {
@@ -1594,13 +1776,13 @@ bool GB_SmbAccessor::CopyDirectoryFromLocalParallel(const std::wstring& localDir
             }
             return false;
         }
-    
+
         if (ensureErrorMessage != nullptr)
         {
             *ensureErrorMessage = L"CreateDirectoryW(remote) failed: " + FormatWin32ErrorMessage(err);
         }
         return false;
-    };
+        };
 
     std::vector<DirTask> taskStack;
     taskStack.reserve(64);
@@ -1709,7 +1891,7 @@ bool GB_SmbAccessor::CopyDirectoryFromLocalParallel(const std::wstring& localDir
                         {
                             firstError.SetOnce(localError);
                         }
-                    });
+                        });
                 }
             }
 
@@ -1747,7 +1929,7 @@ bool GB_SmbAccessor::CopyDirectoryFromLocalParallel(const std::wstring& localDir
 }
 
 
-bool GB_SmbAccessor::CopyDirectoryToLocalParallel(const std::wstring& shareName, const std::wstring& remoteRelativePath, const std::wstring& localDirectory,
+bool GB_SmbAccessor::Impl::CopyDirectoryToLocalParallel(const std::wstring& shareName, const std::wstring& remoteRelativePath, const std::wstring& localDirectory,
     bool overwrite, std::wstring* errorMessage, size_t threadCount) const
 {
     if (errorMessage != nullptr)
@@ -2047,7 +2229,7 @@ bool GB_SmbAccessor::CopyDirectoryToLocalParallel(const std::wstring& shareName,
 }
 
 
-bool GB_SmbAccessor::CopyDirectoryFromLocal(const std::wstring& localDirectory, const std::wstring& shareName, const std::wstring& remoteRelativePath, bool overwrite, std::wstring* errorMessage) const
+bool GB_SmbAccessor::Impl::CopyDirectoryFromLocal(const std::wstring& localDirectory, const std::wstring& shareName, const std::wstring& remoteRelativePath, bool overwrite, std::wstring* errorMessage) const
 {
     if (errorMessage != nullptr)
     {
@@ -2125,7 +2307,7 @@ bool GB_SmbAccessor::CopyDirectoryFromLocal(const std::wstring& localDirectory, 
             *ensureErrorMessage = L"CreateDirectoryW(remote) failed: " + FormatWin32ErrorMessage(err);
         }
         return false;
-    };
+        };
 
     std::vector<DirTask> taskStack;
     taskStack.reserve(64);
@@ -2237,7 +2419,7 @@ bool GB_SmbAccessor::CopyDirectoryFromLocal(const std::wstring& localDirectory, 
     return true;
 }
 
-bool GB_SmbAccessor::CopyDirectoryToLocal(const std::wstring& shareName, const std::wstring& remoteRelativePath, const std::wstring& localDirectory, bool overwrite, std::wstring* errorMessage) const
+bool GB_SmbAccessor::Impl::CopyDirectoryToLocal(const std::wstring& shareName, const std::wstring& remoteRelativePath, const std::wstring& localDirectory, bool overwrite, std::wstring* errorMessage) const
 {
     if (errorMessage != nullptr)
     {
@@ -2309,7 +2491,7 @@ bool GB_SmbAccessor::CopyDirectoryToLocal(const std::wstring& shareName, const s
             *ensureErrorMessage = L"CreateDirectoryW(local) failed: " + FormatWin32ErrorMessage(err);
         }
         return false;
-    };
+        };
 
     std::vector<DirTask> taskStack;
     taskStack.reserve(64);
@@ -2422,7 +2604,7 @@ bool GB_SmbAccessor::CopyDirectoryToLocal(const std::wstring& shareName, const s
     return true;
 }
 
-bool GB_SmbAccessor::GetFileSizeRemote(const std::wstring& shareName, const std::wstring& remoteRelativePath, uint64_t* fileSize, std::wstring* errorMessage) const
+bool GB_SmbAccessor::Impl::GetFileSizeRemote(const std::wstring& shareName, const std::wstring& remoteRelativePath, uint64_t* fileSize, std::wstring* errorMessage) const
 {
     if (errorMessage != nullptr)
     {
@@ -2449,23 +2631,33 @@ bool GB_SmbAccessor::GetFileSizeRemote(const std::wstring& shareName, const std:
         return false;
     }
 
+    if ((data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0)
+    {
+        if (errorMessage != nullptr)
+        {
+            *errorMessage = L"Path is a directory: " + remotePath;
+        }
+        return false;
+    }
+
+
     const uint64_t high = static_cast<uint64_t>(data.nFileSizeHigh);
     const uint64_t low = static_cast<uint64_t>(data.nFileSizeLow);
     *fileSize = (high << 32) | low;
     return true;
 }
 
-std::wstring GB_SmbAccessor::GetUncRoot(const std::wstring& shareName) const
+std::wstring GB_SmbAccessor::Impl::GetUncRoot(const std::wstring& shareName) const
 {
     return BuildUncRootInternal(shareName, false);
 }
 
-std::wstring GB_SmbAccessor::GetUncPath(const std::wstring& shareName, const std::wstring& relativePath) const
+std::wstring GB_SmbAccessor::Impl::GetUncPath(const std::wstring& shareName, const std::wstring& relativePath) const
 {
     return BuildUncPathInternal(shareName, relativePath, false);
 }
 
-std::wstring GB_SmbAccessor::FormatWin32ErrorMessage(uint32_t errorCode)
+std::wstring GB_SmbAccessor::Impl::FormatWin32ErrorMessage(DWORD errorCode)
 {
     wchar_t* buffer = nullptr;
 
@@ -2499,7 +2691,7 @@ std::wstring GB_SmbAccessor::FormatWin32ErrorMessage(uint32_t errorCode)
     return message;
 }
 
-std::wstring GB_SmbAccessor::NormalizeSlashes(const std::wstring& path)
+std::wstring GB_SmbAccessor::Impl::NormalizeSlashes(const std::wstring& path)
 {
     std::wstring out = path;
     for (size_t i = 0; i < out.size(); i++)
@@ -2512,7 +2704,7 @@ std::wstring GB_SmbAccessor::NormalizeSlashes(const std::wstring& path)
     return out;
 }
 
-std::wstring GB_SmbAccessor::JoinPath(const std::wstring& left, const std::wstring& right)
+std::wstring GB_SmbAccessor::Impl::JoinPath(const std::wstring& left, const std::wstring& right)
 {
     if (left.empty())
     {
@@ -2530,7 +2722,7 @@ std::wstring GB_SmbAccessor::JoinPath(const std::wstring& left, const std::wstri
     return left + L"\\" + right;
 }
 
-std::wstring GB_SmbAccessor::GetParentPath(const std::wstring& path)
+std::wstring GB_SmbAccessor::Impl::GetParentPath(const std::wstring& path)
 {
     std::wstring normalized = NormalizeSlashes(path);
 
@@ -2563,7 +2755,7 @@ std::wstring GB_SmbAccessor::GetParentPath(const std::wstring& path)
     return normalized.substr(0, pos);
 }
 
-bool GB_SmbAccessor::CreateLocalDirectoryRecursive(const std::wstring& fullDirectory, std::wstring* errorMessage)
+bool GB_SmbAccessor::Impl::CreateLocalDirectoryRecursive(const std::wstring& fullDirectory, std::wstring* errorMessage)
 {
     if (errorMessage != nullptr)
     {
@@ -2703,7 +2895,7 @@ bool GB_SmbAccessor::CreateLocalDirectoryRecursive(const std::wstring& fullDirec
     return true;
 }
 
-void GB_SmbAccessor::RememberConnectedShare(const std::wstring& shareName, bool persistent) const
+void GB_SmbAccessor::Impl::RememberConnectedShare(const std::wstring& shareName, bool persistent) const
 {
     std::lock_guard<std::mutex> lock(connectedSharesMutex_);
 
@@ -2722,7 +2914,7 @@ void GB_SmbAccessor::RememberConnectedShare(const std::wstring& shareName, bool 
     connectedShares_.push_back(record);
 }
 
-void GB_SmbAccessor::ForgetConnectedShare(const std::wstring& shareName) const
+void GB_SmbAccessor::Impl::ForgetConnectedShare(const std::wstring& shareName) const
 {
     std::lock_guard<std::mutex> lock(connectedSharesMutex_);
 
@@ -2736,7 +2928,7 @@ void GB_SmbAccessor::ForgetConnectedShare(const std::wstring& shareName) const
     }
 }
 
-std::wstring GB_SmbAccessor::GetServerNameForUnc() const
+std::wstring GB_SmbAccessor::Impl::GetServerNameForUnc() const
 {
     if (addressType_ == AddressType::IPv6Literal)
     {
@@ -2745,14 +2937,14 @@ std::wstring GB_SmbAccessor::GetServerNameForUnc() const
     return hostOrIp_;
 }
 
-std::wstring GB_SmbAccessor::GetServerNameForNetApi() const
+std::wstring GB_SmbAccessor::Impl::GetServerNameForNetApi() const
 {
     // NetShareEnum 的 servername 形如 \\server
     const std::wstring server = GetServerNameForUnc();
     return L"\\\\" + server;
 }
 
-std::wstring GB_SmbAccessor::BuildUncRootInternal(const std::wstring& shareName, bool useLongPathPrefix) const
+std::wstring GB_SmbAccessor::Impl::BuildUncRootInternal(const std::wstring& shareName, bool useLongPathPrefix) const
 {
     const std::wstring server = GetServerNameForUnc();
 
@@ -2765,7 +2957,7 @@ std::wstring GB_SmbAccessor::BuildUncRootInternal(const std::wstring& shareName,
     return L"\\\\" + server + L"\\" + shareName;
 }
 
-std::wstring GB_SmbAccessor::BuildUncPathInternal(const std::wstring& shareName, const std::wstring& relativePath, bool useLongPathPrefix) const
+std::wstring GB_SmbAccessor::Impl::BuildUncPathInternal(const std::wstring& shareName, const std::wstring& relativePath, bool useLongPathPrefix) const
 {
     std::wstring root = BuildUncRootInternal(shareName, useLongPathPrefix);
     std::wstring rel = NormalizeSlashes(relativePath);
@@ -2789,16 +2981,22 @@ std::wstring GB_SmbAccessor::BuildUncPathInternal(const std::wstring& shareName,
     return JoinPath(root, rel);
 }
 
-std::wstring GB_SmbAccessor::ConvertIpv6LiteralToUncHost(const std::wstring& ipv6Literal)
+std::wstring GB_SmbAccessor::Impl::ConvertIpv6LiteralToUncHost(const std::wstring& ipv6Literal)
 {
+    std::wstring normalizedIpv6 = ipv6Literal;
+    if (normalizedIpv6.size() >= 2 && normalizedIpv6.front() == L'[' && normalizedIpv6.back() == L']')
+    {
+        normalizedIpv6 = normalizedIpv6.substr(1, normalizedIpv6.size() - 2);
+    }
+
     // UNC 下 IPv6 的常用写法：把 ':' -> '-'，追加 ".ipv6-literal.net"
     // scope id 的 '%' 需要转写（常见规则：'%' -> 's'）
     std::wstring out;
-    out.reserve(ipv6Literal.size() + 32);
+    out.reserve(normalizedIpv6.size() + 32);
 
-    for (size_t i = 0; i < ipv6Literal.size(); i++)
+    for (size_t i = 0; i < normalizedIpv6.size(); i++)
     {
-        const wchar_t ch = ipv6Literal[i];
+        const wchar_t ch = normalizedIpv6[i];
         if (ch == L':')
         {
             out.push_back(L'-');
@@ -2818,4 +3016,1507 @@ std::wstring GB_SmbAccessor::ConvertIpv6LiteralToUncHost(const std::wstring& ipv
 }
 
 
+
+namespace
+{
+    static bool TryConvertUtf8ToWStringChecked(const std::string& inputUtf8, std::wstring& outputW)
+    {
+        if (!GB_IsUtf8(inputUtf8))
+        {
+            outputW.clear();
+            return false;
+        }
+
+        outputW = GB_Utf8ToWString(inputUtf8);
+        if (!inputUtf8.empty() && outputW.empty())
+        {
+            return false;
+        }
+        return true;
+    }
+
+    static std::string ConvertWStringToUtf8Checked(const std::wstring& inputW, bool* ok)
+    {
+        if (ok != nullptr)
+        {
+            *ok = true;
+        }
+
+        if (inputW.empty())
+        {
+            return std::string();
+        }
+
+        const std::string outputUtf8 = GB_WStringToUtf8(inputW);
+        if (outputUtf8.empty())
+        {
+            if (ok != nullptr)
+            {
+                *ok = false;
+            }
+        }
+        return outputUtf8;
+    }
+
+    static bool ConvertWStringVectorToUtf8(const std::vector<std::wstring>& inputW, std::vector<std::string>& outputUtf8)
+    {
+        outputUtf8.clear();
+        outputUtf8.reserve(inputW.size());
+
+        for (const auto& itemW : inputW)
+        {
+            bool ok = true;
+            const std::string itemUtf8 = ConvertWStringToUtf8Checked(itemW, &ok);
+            if (!ok)
+            {
+                outputUtf8.clear();
+                return false;
+            }
+            outputUtf8.push_back(itemUtf8);
+        }
+        return true;
+    }
+
+
+    static bool IsValidShareNameUtf8(const std::string& shareNameUtf8)
+    {
+        if (shareNameUtf8.empty())
+        {
+            return false;
+        }
+        return shareNameUtf8.find_first_of("\\/") == std::string::npos;
+    }
+}
+
+GB_SmbAccessor::GB_SmbAccessor(const std::string& hostOrIpUtf8, AddressType addressType)
+    : impl_(nullptr)
+    , hostOrIpValidUtf8_(true)
+{
+    std::wstring hostOrIpW;
+    hostOrIpValidUtf8_ = TryConvertUtf8ToWStringChecked(hostOrIpUtf8, hostOrIpW);
+    if (!hostOrIpValidUtf8_)
+    {
+        hostOrIpW.clear();
+    }
+
+    impl_.reset(new Impl(hostOrIpW, addressType));
+}
+
+GB_SmbAccessor::GB_SmbAccessor(const std::string& hostOrIpUtf8, AddressType addressType, const Credentials& credentialsUtf8)
+    : impl_(nullptr)
+    , hostOrIpValidUtf8_(true)
+{
+    std::wstring hostOrIpW;
+    hostOrIpValidUtf8_ = TryConvertUtf8ToWStringChecked(hostOrIpUtf8, hostOrIpW);
+    if (!hostOrIpValidUtf8_)
+    {
+        hostOrIpW.clear();
+    }
+
+    Impl::Credentials credentialsW;
+    bool credentialsValid = true;
+    credentialsValid = credentialsValid && TryConvertUtf8ToWStringChecked(credentialsUtf8.domain, credentialsW.domain);
+    credentialsValid = credentialsValid && TryConvertUtf8ToWStringChecked(credentialsUtf8.userName, credentialsW.userName);
+    credentialsValid = credentialsValid && TryConvertUtf8ToWStringChecked(credentialsUtf8.password, credentialsW.password);
+
+    if (!credentialsValid)
+    {
+        credentialsW = Impl::Credentials();
+    }
+
+    impl_.reset(new Impl(hostOrIpW, addressType, credentialsW));
+}
+
+GB_SmbAccessor::~GB_SmbAccessor() = default;
+
+GB_SmbAccessor::GB_SmbAccessor(GB_SmbAccessor&& other) noexcept = default;
+
+GB_SmbAccessor& GB_SmbAccessor::operator=(GB_SmbAccessor&& other) noexcept = default;
+
+void GB_SmbAccessor::SetCredentials(const Credentials& credentialsUtf8)
+{
+    if (!impl_)
+    {
+        return;
+    }
+
+    Impl::Credentials credentialsW;
+    const bool credentialsValid =
+        TryConvertUtf8ToWStringChecked(credentialsUtf8.domain, credentialsW.domain)
+        && TryConvertUtf8ToWStringChecked(credentialsUtf8.userName, credentialsW.userName)
+        && TryConvertUtf8ToWStringChecked(credentialsUtf8.password, credentialsW.password);
+
+    if (!credentialsValid)
+    {
+        // 无法通过返回值反馈错误（接口为 void），这里选择清空凭据避免误用。
+        credentialsW = Impl::Credentials();
+    }
+
+    impl_->SetCredentials(credentialsW);
+}
+
+void GB_SmbAccessor::SetUseLongPathPrefix(bool useLongPathPrefix)
+{
+    if (!impl_)
+    {
+        return;
+    }
+
+    impl_->SetUseLongPathPrefix(useLongPathPrefix);
+}
+
+bool GB_SmbAccessor::TestTcp445(int timeoutMs, std::string& errorMessageUtf8) const
+{
+    errorMessageUtf8.clear();
+
+    if (!impl_)
+    {
+        errorMessageUtf8 = "Internal error: impl is null.";
+        return false;
+    }
+
+    if (!hostOrIpValidUtf8_)
+    {
+        errorMessageUtf8 = "hostOrIpUtf8 is not valid UTF-8.";
+        return false;
+    }
+
+    std::wstring errorW;
+    const bool ok = impl_->TestTcp445(timeoutMs, &errorW);
+
+    if (!ok)
+    {
+        bool convertOk = true;
+        errorMessageUtf8 = ConvertWStringToUtf8Checked(errorW, &convertOk);
+        if (!convertOk)
+        {
+            errorMessageUtf8 = "Failed to convert error message to UTF-8.";
+        }
+    }
+    return ok;
+}
+
+bool GB_SmbAccessor::TestSmbConnection(std::string& errorMessageUtf8) const
+{
+    errorMessageUtf8.clear();
+
+    if (!impl_)
+    {
+        errorMessageUtf8 = "Internal error: impl is null.";
+        return false;
+    }
+
+    if (!hostOrIpValidUtf8_)
+    {
+        errorMessageUtf8 = "hostOrIpUtf8 is not valid UTF-8.";
+        return false;
+    }
+
+    std::wstring errorW;
+    const bool ok = impl_->TestSmbConnection(&errorW);
+
+    if (!ok)
+    {
+        bool convertOk = true;
+        errorMessageUtf8 = ConvertWStringToUtf8Checked(errorW, &convertOk);
+        if (!convertOk)
+        {
+            errorMessageUtf8 = "Failed to convert error message to UTF-8.";
+        }
+    }
+    return ok;
+}
+
+bool GB_SmbAccessor::GetShares(std::vector<std::string>& shareNamesUtf8, bool includeSpecialShares, std::string& errorMessageUtf8) const
+{
+    shareNamesUtf8.clear();
+    errorMessageUtf8.clear();
+
+    if (!impl_)
+    {
+        errorMessageUtf8 = "Internal error: impl is null.";
+        return false;
+    }
+
+    if (!hostOrIpValidUtf8_)
+    {
+        errorMessageUtf8 = "hostOrIpUtf8 is not valid UTF-8.";
+        return false;
+    }
+
+    std::vector<std::wstring> shareNamesW;
+    std::wstring errorW;
+
+    const bool ok = impl_->GetShares(&shareNamesW, includeSpecialShares, &errorW);
+    if (!ok)
+    {
+        bool convertOk = true;
+        errorMessageUtf8 = ConvertWStringToUtf8Checked(errorW, &convertOk);
+        if (!convertOk)
+        {
+            errorMessageUtf8 = "Failed to convert error message to UTF-8.";
+        }
+        return false;
+    }
+
+    if (!ConvertWStringVectorToUtf8(shareNamesW, shareNamesUtf8))
+    {
+        errorMessageUtf8 = "Failed to convert share names to UTF-8.";
+        shareNamesUtf8.clear();
+        return false;
+    }
+
+    return true;
+}
+
+bool GB_SmbAccessor::GetShareInfos(std::vector<ShareInfo>& sharesUtf8, bool includeSpecialShares, std::string& errorMessageUtf8) const
+{
+    sharesUtf8.clear();
+    errorMessageUtf8.clear();
+
+    if (!impl_)
+    {
+        errorMessageUtf8 = "Internal error: impl is null.";
+        return false;
+    }
+
+    if (!hostOrIpValidUtf8_)
+    {
+        errorMessageUtf8 = "hostOrIpUtf8 is not valid UTF-8.";
+        return false;
+    }
+
+    std::vector<Impl::ShareInfo> sharesW;
+    std::wstring errorW;
+
+    const bool ok = impl_->GetShareInfos(&sharesW, includeSpecialShares, &errorW);
+    if (!ok)
+    {
+        bool convertOk = true;
+        errorMessageUtf8 = ConvertWStringToUtf8Checked(errorW, &convertOk);
+        if (!convertOk)
+        {
+            errorMessageUtf8 = "Failed to convert error message to UTF-8.";
+        }
+        return false;
+    }
+
+    sharesUtf8.reserve(sharesW.size());
+    for (const auto& itemW : sharesW)
+    {
+        bool okName = true;
+        bool okRemark = true;
+
+        ShareInfo item;
+        item.name = ConvertWStringToUtf8Checked(itemW.name, &okName);
+        item.type = itemW.type;
+        item.remark = ConvertWStringToUtf8Checked(itemW.remark, &okRemark);
+
+        if (!okName || !okRemark)
+        {
+            errorMessageUtf8 = "Failed to convert share info to UTF-8.";
+            sharesUtf8.clear();
+            return false;
+        }
+
+        sharesUtf8.push_back(std::move(item));
+    }
+
+    return true;
+}
+
+bool GB_SmbAccessor::ConnectShare(const std::string& shareNameUtf8, bool persistent, std::string& errorMessageUtf8) const
+{
+    errorMessageUtf8.clear();
+
+    if (!impl_)
+    {
+        errorMessageUtf8 = "Internal error: impl is null.";
+        return false;
+    }
+
+    if (!hostOrIpValidUtf8_)
+    {
+        errorMessageUtf8 = "hostOrIpUtf8 is not valid UTF-8.";
+        return false;
+    }
+
+    if (!IsValidShareNameUtf8(shareNameUtf8))
+    {
+        errorMessageUtf8 = "shareNameUtf8 is invalid. It must be a share name without path separators.";
+        return false;
+    }
+
+    std::wstring shareNameW;
+    if (!TryConvertUtf8ToWStringChecked(shareNameUtf8, shareNameW))
+    {
+        errorMessageUtf8 = "shareNameUtf8 is not valid UTF-8.";
+        return false;
+    }
+
+    std::wstring errorW;
+    const bool ok = impl_->ConnectShare(shareNameW, persistent, &errorW);
+    if (!ok)
+    {
+        bool convertOk = true;
+        errorMessageUtf8 = ConvertWStringToUtf8Checked(errorW, &convertOk);
+        if (!convertOk)
+        {
+            errorMessageUtf8 = "Failed to convert error message to UTF-8.";
+        }
+    }
+    return ok;
+}
+
+bool GB_SmbAccessor::DisconnectShare(const std::string& shareNameUtf8, bool force, std::string& errorMessageUtf8) const
+{
+    errorMessageUtf8.clear();
+
+    if (!impl_)
+    {
+        errorMessageUtf8 = "Internal error: impl is null.";
+        return false;
+    }
+
+    if (!hostOrIpValidUtf8_)
+    {
+        errorMessageUtf8 = "hostOrIpUtf8 is not valid UTF-8.";
+        return false;
+    }
+
+    if (!IsValidShareNameUtf8(shareNameUtf8))
+    {
+        errorMessageUtf8 = "shareNameUtf8 is invalid. It must be a share name without path separators.";
+        return false;
+    }
+
+    std::wstring shareNameW;
+    if (!TryConvertUtf8ToWStringChecked(shareNameUtf8, shareNameW))
+    {
+        errorMessageUtf8 = "shareNameUtf8 is not valid UTF-8.";
+        return false;
+    }
+
+    std::wstring errorW;
+    const bool ok = impl_->DisconnectShare(shareNameW, force, &errorW);
+    if (!ok)
+    {
+        bool convertOk = true;
+        errorMessageUtf8 = ConvertWStringToUtf8Checked(errorW, &convertOk);
+        if (!convertOk)
+        {
+            errorMessageUtf8 = "Failed to convert error message to UTF-8.";
+        }
+    }
+    return ok;
+}
+
+bool GB_SmbAccessor::ListDirectory(const std::string& shareNameUtf8,
+    const std::string& relativeDirUtf8,
+    std::vector<std::string>& childNamesUtf8,
+    bool includeDirectories,
+    bool includeFiles,
+    std::string& errorMessageUtf8) const
+{
+    childNamesUtf8.clear();
+    errorMessageUtf8.clear();
+
+    if (!impl_)
+    {
+        errorMessageUtf8 = "Internal error: impl is null.";
+        return false;
+    }
+
+    if (!hostOrIpValidUtf8_)
+    {
+        errorMessageUtf8 = "hostOrIpUtf8 is not valid UTF-8.";
+        return false;
+    }
+
+    if (!IsValidShareNameUtf8(shareNameUtf8))
+    {
+        errorMessageUtf8 = "shareNameUtf8 is invalid. It must be a share name without path separators.";
+        return false;
+    }
+
+    std::wstring shareNameW;
+    std::wstring relativeDirW;
+
+    if (!TryConvertUtf8ToWStringChecked(shareNameUtf8, shareNameW))
+    {
+        errorMessageUtf8 = "shareNameUtf8 is not valid UTF-8.";
+        return false;
+    }
+    if (!TryConvertUtf8ToWStringChecked(relativeDirUtf8, relativeDirW))
+    {
+        errorMessageUtf8 = "relativeDirUtf8 is not valid UTF-8.";
+        return false;
+    }
+
+    std::vector<std::wstring> childNamesW;
+    std::wstring errorW;
+
+    const bool ok = impl_->ListDirectory(shareNameW, relativeDirW, &childNamesW, includeDirectories, includeFiles, &errorW);
+    if (!ok)
+    {
+        bool convertOk = true;
+        errorMessageUtf8 = ConvertWStringToUtf8Checked(errorW, &convertOk);
+        if (!convertOk)
+        {
+            errorMessageUtf8 = "Failed to convert error message to UTF-8.";
+        }
+        return false;
+    }
+
+    if (!ConvertWStringVectorToUtf8(childNamesW, childNamesUtf8))
+    {
+        errorMessageUtf8 = "Failed to convert child names to UTF-8.";
+        childNamesUtf8.clear();
+        return false;
+    }
+
+    return true;
+}
+
+bool GB_SmbAccessor::FileExists(const std::string& shareNameUtf8, const std::string& relativePathUtf8) const
+{
+    if (!impl_)
+    {
+        return false;
+    }
+
+    if (!hostOrIpValidUtf8_)
+    {
+        return false;
+    }
+
+    if (!IsValidShareNameUtf8(shareNameUtf8))
+    {
+        return false;
+    }
+
+    std::wstring shareNameW;
+    std::wstring relativePathW;
+
+    if (!TryConvertUtf8ToWStringChecked(shareNameUtf8, shareNameW))
+    {
+        return false;
+    }
+    if (!TryConvertUtf8ToWStringChecked(relativePathUtf8, relativePathW))
+    {
+        return false;
+    }
+
+    return impl_->FileExists(shareNameW, relativePathW);
+}
+
+bool GB_SmbAccessor::DirectoryExists(const std::string& shareNameUtf8, const std::string& relativePathUtf8) const
+{
+    if (!impl_)
+    {
+        return false;
+    }
+
+    if (!hostOrIpValidUtf8_)
+    {
+        return false;
+    }
+
+    if (!IsValidShareNameUtf8(shareNameUtf8))
+    {
+        return false;
+    }
+
+    std::wstring shareNameW;
+    std::wstring relativePathW;
+
+    if (!TryConvertUtf8ToWStringChecked(shareNameUtf8, shareNameW))
+    {
+        return false;
+    }
+    if (!TryConvertUtf8ToWStringChecked(relativePathUtf8, relativePathW))
+    {
+        return false;
+    }
+
+    return impl_->DirectoryExists(shareNameW, relativePathW);
+}
+
+bool GB_SmbAccessor::CreateDirectoryRecursive(const std::string& shareNameUtf8, const std::string& relativeDirUtf8, std::string& errorMessageUtf8) const
+{
+    errorMessageUtf8.clear();
+
+    if (!impl_)
+    {
+        errorMessageUtf8 = "Internal error: impl is null.";
+        return false;
+    }
+
+    if (!hostOrIpValidUtf8_)
+    {
+        errorMessageUtf8 = "hostOrIpUtf8 is not valid UTF-8.";
+        return false;
+    }
+
+    if (!IsValidShareNameUtf8(shareNameUtf8))
+    {
+        errorMessageUtf8 = "shareNameUtf8 is invalid. It must be a share name without path separators.";
+        return false;
+    }
+
+    std::wstring shareNameW;
+    std::wstring relativeDirW;
+
+    if (!TryConvertUtf8ToWStringChecked(shareNameUtf8, shareNameW))
+    {
+        errorMessageUtf8 = "shareNameUtf8 is not valid UTF-8.";
+        return false;
+    }
+    if (!TryConvertUtf8ToWStringChecked(relativeDirUtf8, relativeDirW))
+    {
+        errorMessageUtf8 = "relativeDirUtf8 is not valid UTF-8.";
+        return false;
+    }
+
+    std::wstring errorW;
+    const bool ok = impl_->CreateDirectoryRecursive(shareNameW, relativeDirW, &errorW);
+    if (!ok)
+    {
+        bool convertOk = true;
+        errorMessageUtf8 = ConvertWStringToUtf8Checked(errorW, &convertOk);
+        if (!convertOk)
+        {
+            errorMessageUtf8 = "Failed to convert error message to UTF-8.";
+        }
+    }
+    return ok;
+}
+
+bool GB_SmbAccessor::DeleteFileRemote(const std::string& shareNameUtf8, const std::string& relativePathUtf8, std::string& errorMessageUtf8) const
+{
+    errorMessageUtf8.clear();
+
+    if (!impl_)
+    {
+        errorMessageUtf8 = "Internal error: impl is null.";
+        return false;
+    }
+
+    if (!hostOrIpValidUtf8_)
+    {
+        errorMessageUtf8 = "hostOrIpUtf8 is not valid UTF-8.";
+        return false;
+    }
+
+    if (!IsValidShareNameUtf8(shareNameUtf8))
+    {
+        errorMessageUtf8 = "shareNameUtf8 is invalid. It must be a share name without path separators.";
+        return false;
+    }
+
+    std::wstring shareNameW;
+    std::wstring relativePathW;
+
+    if (!TryConvertUtf8ToWStringChecked(shareNameUtf8, shareNameW))
+    {
+        errorMessageUtf8 = "shareNameUtf8 is not valid UTF-8.";
+        return false;
+    }
+    if (!TryConvertUtf8ToWStringChecked(relativePathUtf8, relativePathW))
+    {
+        errorMessageUtf8 = "relativePathUtf8 is not valid UTF-8.";
+        return false;
+    }
+
+    std::wstring errorW;
+    const bool ok = impl_->DeleteFileRemote(shareNameW, relativePathW, &errorW);
+    if (!ok)
+    {
+        bool convertOk = true;
+        errorMessageUtf8 = ConvertWStringToUtf8Checked(errorW, &convertOk);
+        if (!convertOk)
+        {
+            errorMessageUtf8 = "Failed to convert error message to UTF-8.";
+        }
+    }
+    return ok;
+}
+
+bool GB_SmbAccessor::CopyFileFromLocal(const std::string& localPathUtf8,
+    const std::string& shareNameUtf8,
+    const std::string& remoteRelativePathUtf8,
+    bool overwrite,
+    std::string& errorMessageUtf8) const
+{
+    errorMessageUtf8.clear();
+
+    if (!impl_)
+    {
+        errorMessageUtf8 = "Internal error: impl is null.";
+        return false;
+    }
+
+    if (!hostOrIpValidUtf8_)
+    {
+        errorMessageUtf8 = "hostOrIpUtf8 is not valid UTF-8.";
+        return false;
+    }
+
+    if (!IsValidShareNameUtf8(shareNameUtf8))
+    {
+        errorMessageUtf8 = "shareNameUtf8 is invalid. It must be a share name without path separators.";
+        return false;
+    }
+
+    std::wstring localPathW;
+    std::wstring shareNameW;
+    std::wstring remoteRelativePathW;
+
+    if (!TryConvertUtf8ToWStringChecked(localPathUtf8, localPathW))
+    {
+        errorMessageUtf8 = "localPathUtf8 is not valid UTF-8.";
+        return false;
+    }
+    if (!TryConvertUtf8ToWStringChecked(shareNameUtf8, shareNameW))
+    {
+        errorMessageUtf8 = "shareNameUtf8 is not valid UTF-8.";
+        return false;
+    }
+    if (!TryConvertUtf8ToWStringChecked(remoteRelativePathUtf8, remoteRelativePathW))
+    {
+        errorMessageUtf8 = "remoteRelativePathUtf8 is not valid UTF-8.";
+        return false;
+    }
+
+    std::wstring errorW;
+    const bool ok = impl_->CopyFileFromLocal(localPathW, shareNameW, remoteRelativePathW, overwrite, &errorW);
+    if (!ok)
+    {
+        bool convertOk = true;
+        errorMessageUtf8 = ConvertWStringToUtf8Checked(errorW, &convertOk);
+        if (!convertOk)
+        {
+            errorMessageUtf8 = "Failed to convert error message to UTF-8.";
+        }
+    }
+    return ok;
+}
+
+bool GB_SmbAccessor::CopyFileToLocal(const std::string& shareNameUtf8,
+    const std::string& remoteRelativePathUtf8,
+    const std::string& localPathUtf8,
+    bool overwrite,
+    std::string& errorMessageUtf8) const
+{
+    errorMessageUtf8.clear();
+
+    if (!impl_)
+    {
+        errorMessageUtf8 = "Internal error: impl is null.";
+        return false;
+    }
+
+    if (!hostOrIpValidUtf8_)
+    {
+        errorMessageUtf8 = "hostOrIpUtf8 is not valid UTF-8.";
+        return false;
+    }
+
+    if (!IsValidShareNameUtf8(shareNameUtf8))
+    {
+        errorMessageUtf8 = "shareNameUtf8 is invalid. It must be a share name without path separators.";
+        return false;
+    }
+
+    std::wstring shareNameW;
+    std::wstring remoteRelativePathW;
+    std::wstring localPathW;
+
+    if (!TryConvertUtf8ToWStringChecked(shareNameUtf8, shareNameW))
+    {
+        errorMessageUtf8 = "shareNameUtf8 is not valid UTF-8.";
+        return false;
+    }
+    if (!TryConvertUtf8ToWStringChecked(remoteRelativePathUtf8, remoteRelativePathW))
+    {
+        errorMessageUtf8 = "remoteRelativePathUtf8 is not valid UTF-8.";
+        return false;
+    }
+    if (!TryConvertUtf8ToWStringChecked(localPathUtf8, localPathW))
+    {
+        errorMessageUtf8 = "localPathUtf8 is not valid UTF-8.";
+        return false;
+    }
+
+    std::wstring errorW;
+    const bool ok = impl_->CopyFileToLocal(shareNameW, remoteRelativePathW, localPathW, overwrite, &errorW);
+    if (!ok)
+    {
+        bool convertOk = true;
+        errorMessageUtf8 = ConvertWStringToUtf8Checked(errorW, &convertOk);
+        if (!convertOk)
+        {
+            errorMessageUtf8 = "Failed to convert error message to UTF-8.";
+        }
+    }
+    return ok;
+}
+
+bool GB_SmbAccessor::CopyFileFromLocalParallel(const std::string& localPathUtf8,
+    const std::string& shareNameUtf8,
+    const std::string& remoteRelativePathUtf8,
+    bool overwrite,
+    std::string& errorMessageUtf8,
+    size_t threadCount) const
+{
+    errorMessageUtf8.clear();
+
+    if (!impl_)
+    {
+        errorMessageUtf8 = "Internal error: impl is null.";
+        return false;
+    }
+
+    if (!hostOrIpValidUtf8_)
+    {
+        errorMessageUtf8 = "hostOrIpUtf8 is not valid UTF-8.";
+        return false;
+    }
+
+    if (!IsValidShareNameUtf8(shareNameUtf8))
+    {
+        errorMessageUtf8 = "shareNameUtf8 is invalid. It must be a share name without path separators.";
+        return false;
+    }
+
+    std::wstring localPathW;
+    std::wstring shareNameW;
+    std::wstring remoteRelativePathW;
+
+    if (!TryConvertUtf8ToWStringChecked(localPathUtf8, localPathW))
+    {
+        errorMessageUtf8 = "localPathUtf8 is not valid UTF-8.";
+        return false;
+    }
+    if (!TryConvertUtf8ToWStringChecked(shareNameUtf8, shareNameW))
+    {
+        errorMessageUtf8 = "shareNameUtf8 is not valid UTF-8.";
+        return false;
+    }
+    if (!TryConvertUtf8ToWStringChecked(remoteRelativePathUtf8, remoteRelativePathW))
+    {
+        errorMessageUtf8 = "remoteRelativePathUtf8 is not valid UTF-8.";
+        return false;
+    }
+
+    std::wstring errorW;
+    const bool ok = impl_->CopyFileFromLocalParallel(localPathW, shareNameW, remoteRelativePathW, overwrite, &errorW, threadCount);
+    if (!ok)
+    {
+        bool convertOk = true;
+        errorMessageUtf8 = ConvertWStringToUtf8Checked(errorW, &convertOk);
+        if (!convertOk)
+        {
+            errorMessageUtf8 = "Failed to convert error message to UTF-8.";
+        }
+    }
+    return ok;
+}
+
+bool GB_SmbAccessor::CopyFileToLocalParallel(const std::string& shareNameUtf8,
+    const std::string& remoteRelativePathUtf8,
+    const std::string& localPathUtf8,
+    bool overwrite,
+    std::string& errorMessageUtf8,
+    size_t threadCount) const
+{
+    errorMessageUtf8.clear();
+
+    if (!impl_)
+    {
+        errorMessageUtf8 = "Internal error: impl is null.";
+        return false;
+    }
+
+    if (!hostOrIpValidUtf8_)
+    {
+        errorMessageUtf8 = "hostOrIpUtf8 is not valid UTF-8.";
+        return false;
+    }
+
+    if (!IsValidShareNameUtf8(shareNameUtf8))
+    {
+        errorMessageUtf8 = "shareNameUtf8 is invalid. It must be a share name without path separators.";
+        return false;
+    }
+
+    std::wstring shareNameW;
+    std::wstring remoteRelativePathW;
+    std::wstring localPathW;
+
+    if (!TryConvertUtf8ToWStringChecked(shareNameUtf8, shareNameW))
+    {
+        errorMessageUtf8 = "shareNameUtf8 is not valid UTF-8.";
+        return false;
+    }
+    if (!TryConvertUtf8ToWStringChecked(remoteRelativePathUtf8, remoteRelativePathW))
+    {
+        errorMessageUtf8 = "remoteRelativePathUtf8 is not valid UTF-8.";
+        return false;
+    }
+    if (!TryConvertUtf8ToWStringChecked(localPathUtf8, localPathW))
+    {
+        errorMessageUtf8 = "localPathUtf8 is not valid UTF-8.";
+        return false;
+    }
+
+    std::wstring errorW;
+    const bool ok = impl_->CopyFileToLocalParallel(shareNameW, remoteRelativePathW, localPathW, overwrite, &errorW, threadCount);
+    if (!ok)
+    {
+        bool convertOk = true;
+        errorMessageUtf8 = ConvertWStringToUtf8Checked(errorW, &convertOk);
+        if (!convertOk)
+        {
+            errorMessageUtf8 = "Failed to convert error message to UTF-8.";
+        }
+    }
+    return ok;
+}
+
+bool GB_SmbAccessor::CopyDirectoryFromLocalParallel(const std::string& localDirectoryUtf8,
+    const std::string& shareNameUtf8,
+    const std::string& remoteRelativePathUtf8,
+    bool overwrite,
+    std::string& errorMessageUtf8,
+    size_t threadCount) const
+{
+    errorMessageUtf8.clear();
+
+    if (!impl_)
+    {
+        errorMessageUtf8 = "Internal error: impl is null.";
+        return false;
+    }
+
+    if (!hostOrIpValidUtf8_)
+    {
+        errorMessageUtf8 = "hostOrIpUtf8 is not valid UTF-8.";
+        return false;
+    }
+
+    if (!IsValidShareNameUtf8(shareNameUtf8))
+    {
+        errorMessageUtf8 = "shareNameUtf8 is invalid. It must be a share name without path separators.";
+        return false;
+    }
+
+    std::wstring localDirectoryW;
+    std::wstring shareNameW;
+    std::wstring remoteRelativePathW;
+
+    if (!TryConvertUtf8ToWStringChecked(localDirectoryUtf8, localDirectoryW))
+    {
+        errorMessageUtf8 = "localDirectoryUtf8 is not valid UTF-8.";
+        return false;
+    }
+    if (!TryConvertUtf8ToWStringChecked(shareNameUtf8, shareNameW))
+    {
+        errorMessageUtf8 = "shareNameUtf8 is not valid UTF-8.";
+        return false;
+    }
+    if (!TryConvertUtf8ToWStringChecked(remoteRelativePathUtf8, remoteRelativePathW))
+    {
+        errorMessageUtf8 = "remoteRelativePathUtf8 is not valid UTF-8.";
+        return false;
+    }
+
+    std::wstring errorW;
+    const bool ok = impl_->CopyDirectoryFromLocalParallel(localDirectoryW, shareNameW, remoteRelativePathW, overwrite, &errorW, threadCount);
+    if (!ok)
+    {
+        bool convertOk = true;
+        errorMessageUtf8 = ConvertWStringToUtf8Checked(errorW, &convertOk);
+        if (!convertOk)
+        {
+            errorMessageUtf8 = "Failed to convert error message to UTF-8.";
+        }
+    }
+    return ok;
+}
+
+bool GB_SmbAccessor::CopyDirectoryToLocalParallel(const std::string& shareNameUtf8,
+    const std::string& remoteRelativePathUtf8,
+    const std::string& localDirectoryUtf8,
+    bool overwrite,
+    std::string& errorMessageUtf8,
+    size_t threadCount) const
+{
+    errorMessageUtf8.clear();
+
+    if (!impl_)
+    {
+        errorMessageUtf8 = "Internal error: impl is null.";
+        return false;
+    }
+
+    if (!hostOrIpValidUtf8_)
+    {
+        errorMessageUtf8 = "hostOrIpUtf8 is not valid UTF-8.";
+        return false;
+    }
+
+    if (!IsValidShareNameUtf8(shareNameUtf8))
+    {
+        errorMessageUtf8 = "shareNameUtf8 is invalid. It must be a share name without path separators.";
+        return false;
+    }
+
+    std::wstring shareNameW;
+    std::wstring remoteRelativePathW;
+    std::wstring localDirectoryW;
+
+    if (!TryConvertUtf8ToWStringChecked(shareNameUtf8, shareNameW))
+    {
+        errorMessageUtf8 = "shareNameUtf8 is not valid UTF-8.";
+        return false;
+    }
+    if (!TryConvertUtf8ToWStringChecked(remoteRelativePathUtf8, remoteRelativePathW))
+    {
+        errorMessageUtf8 = "remoteRelativePathUtf8 is not valid UTF-8.";
+        return false;
+    }
+    if (!TryConvertUtf8ToWStringChecked(localDirectoryUtf8, localDirectoryW))
+    {
+        errorMessageUtf8 = "localDirectoryUtf8 is not valid UTF-8.";
+        return false;
+    }
+
+    std::wstring errorW;
+    const bool ok = impl_->CopyDirectoryToLocalParallel(shareNameW, remoteRelativePathW, localDirectoryW, overwrite, &errorW, threadCount);
+    if (!ok)
+    {
+        bool convertOk = true;
+        errorMessageUtf8 = ConvertWStringToUtf8Checked(errorW, &convertOk);
+        if (!convertOk)
+        {
+            errorMessageUtf8 = "Failed to convert error message to UTF-8.";
+        }
+    }
+    return ok;
+}
+
+bool GB_SmbAccessor::CopyDirectoryFromLocal(const std::string& localDirectoryUtf8,
+    const std::string& shareNameUtf8,
+    const std::string& remoteRelativePathUtf8,
+    bool overwrite,
+    std::string& errorMessageUtf8) const
+{
+    errorMessageUtf8.clear();
+
+    if (!impl_)
+    {
+        errorMessageUtf8 = "Internal error: impl is null.";
+        return false;
+    }
+
+    if (!hostOrIpValidUtf8_)
+    {
+        errorMessageUtf8 = "hostOrIpUtf8 is not valid UTF-8.";
+        return false;
+    }
+
+    if (!IsValidShareNameUtf8(shareNameUtf8))
+    {
+        errorMessageUtf8 = "shareNameUtf8 is invalid. It must be a share name without path separators.";
+        return false;
+    }
+
+    std::wstring localDirectoryW;
+    std::wstring shareNameW;
+    std::wstring remoteRelativePathW;
+
+    if (!TryConvertUtf8ToWStringChecked(localDirectoryUtf8, localDirectoryW))
+    {
+        errorMessageUtf8 = "localDirectoryUtf8 is not valid UTF-8.";
+        return false;
+    }
+    if (!TryConvertUtf8ToWStringChecked(shareNameUtf8, shareNameW))
+    {
+        errorMessageUtf8 = "shareNameUtf8 is not valid UTF-8.";
+        return false;
+    }
+    if (!TryConvertUtf8ToWStringChecked(remoteRelativePathUtf8, remoteRelativePathW))
+    {
+        errorMessageUtf8 = "remoteRelativePathUtf8 is not valid UTF-8.";
+        return false;
+    }
+
+    std::wstring errorW;
+    const bool ok = impl_->CopyDirectoryFromLocal(localDirectoryW, shareNameW, remoteRelativePathW, overwrite, &errorW);
+    if (!ok)
+    {
+        bool convertOk = true;
+        errorMessageUtf8 = ConvertWStringToUtf8Checked(errorW, &convertOk);
+        if (!convertOk)
+        {
+            errorMessageUtf8 = "Failed to convert error message to UTF-8.";
+        }
+    }
+    return ok;
+}
+
+bool GB_SmbAccessor::CopyDirectoryToLocal(const std::string& shareNameUtf8,
+    const std::string& remoteRelativePathUtf8,
+    const std::string& localDirectoryUtf8,
+    bool overwrite,
+    std::string& errorMessageUtf8) const
+{
+    errorMessageUtf8.clear();
+
+    if (!impl_)
+    {
+        errorMessageUtf8 = "Internal error: impl is null.";
+        return false;
+    }
+
+    if (!hostOrIpValidUtf8_)
+    {
+        errorMessageUtf8 = "hostOrIpUtf8 is not valid UTF-8.";
+        return false;
+    }
+
+    if (!IsValidShareNameUtf8(shareNameUtf8))
+    {
+        errorMessageUtf8 = "shareNameUtf8 is invalid. It must be a share name without path separators.";
+        return false;
+    }
+
+    std::wstring shareNameW;
+    std::wstring remoteRelativePathW;
+    std::wstring localDirectoryW;
+
+    if (!TryConvertUtf8ToWStringChecked(shareNameUtf8, shareNameW))
+    {
+        errorMessageUtf8 = "shareNameUtf8 is not valid UTF-8.";
+        return false;
+    }
+    if (!TryConvertUtf8ToWStringChecked(remoteRelativePathUtf8, remoteRelativePathW))
+    {
+        errorMessageUtf8 = "remoteRelativePathUtf8 is not valid UTF-8.";
+        return false;
+    }
+    if (!TryConvertUtf8ToWStringChecked(localDirectoryUtf8, localDirectoryW))
+    {
+        errorMessageUtf8 = "localDirectoryUtf8 is not valid UTF-8.";
+        return false;
+    }
+
+    std::wstring errorW;
+    const bool ok = impl_->CopyDirectoryToLocal(shareNameW, remoteRelativePathW, localDirectoryW, overwrite, &errorW);
+    if (!ok)
+    {
+        bool convertOk = true;
+        errorMessageUtf8 = ConvertWStringToUtf8Checked(errorW, &convertOk);
+        if (!convertOk)
+        {
+            errorMessageUtf8 = "Failed to convert error message to UTF-8.";
+        }
+    }
+    return ok;
+}
+
+bool GB_SmbAccessor::GetFileSizeRemote(const std::string& shareNameUtf8,
+    const std::string& remoteRelativePathUtf8,
+    uint64_t& fileSize,
+    std::string& errorMessageUtf8) const
+{
+    fileSize = 0;
+    errorMessageUtf8.clear();
+
+    if (!impl_)
+    {
+        errorMessageUtf8 = "Internal error: impl is null.";
+        return false;
+    }
+
+    if (!hostOrIpValidUtf8_)
+    {
+        errorMessageUtf8 = "hostOrIpUtf8 is not valid UTF-8.";
+        return false;
+    }
+
+    if (!IsValidShareNameUtf8(shareNameUtf8))
+    {
+        errorMessageUtf8 = "shareNameUtf8 is invalid. It must be a share name without path separators.";
+        return false;
+    }
+
+    std::wstring shareNameW;
+    std::wstring remoteRelativePathW;
+
+    if (!TryConvertUtf8ToWStringChecked(shareNameUtf8, shareNameW))
+    {
+        errorMessageUtf8 = "shareNameUtf8 is not valid UTF-8.";
+        return false;
+    }
+    if (!TryConvertUtf8ToWStringChecked(remoteRelativePathUtf8, remoteRelativePathW))
+    {
+        errorMessageUtf8 = "remoteRelativePathUtf8 is not valid UTF-8.";
+        return false;
+    }
+
+    std::wstring errorW;
+    const bool ok = impl_->GetFileSizeRemote(shareNameW, remoteRelativePathW, &fileSize, &errorW);
+    if (!ok)
+    {
+        bool convertOk = true;
+        errorMessageUtf8 = ConvertWStringToUtf8Checked(errorW, &convertOk);
+        if (!convertOk)
+        {
+            errorMessageUtf8 = "Failed to convert error message to UTF-8.";
+        }
+    }
+    return ok;
+}
+
+std::string GB_SmbAccessor::GetUncRoot(const std::string& shareNameUtf8) const
+{
+    if (!impl_)
+    {
+        return std::string();
+    }
+
+    if (!hostOrIpValidUtf8_)
+    {
+        return "";
+    }
+
+    if (!IsValidShareNameUtf8(shareNameUtf8))
+    {
+        return std::string();
+    }
+
+    std::wstring shareNameW;
+    if (!TryConvertUtf8ToWStringChecked(shareNameUtf8, shareNameW))
+    {
+        return std::string();
+    }
+
+    bool ok = true;
+    const std::string resultUtf8 = ConvertWStringToUtf8Checked(impl_->GetUncRoot(shareNameW), &ok);
+    if (!ok)
+    {
+        return std::string();
+    }
+    return resultUtf8;
+}
+
+std::string GB_SmbAccessor::GetUncPath(const std::string& shareNameUtf8, const std::string& relativePathUtf8) const
+{
+    if (!impl_)
+    {
+        return std::string();
+    }
+
+    if (!hostOrIpValidUtf8_)
+    {
+        return "";
+    }
+
+    if (!IsValidShareNameUtf8(shareNameUtf8))
+    {
+        return std::string();
+    }
+
+    std::wstring shareNameW;
+    std::wstring relativePathW;
+
+    if (!TryConvertUtf8ToWStringChecked(shareNameUtf8, shareNameW))
+    {
+        return std::string();
+    }
+    if (!TryConvertUtf8ToWStringChecked(relativePathUtf8, relativePathW))
+    {
+        return std::string();
+    }
+
+    bool ok = true;
+    const std::string resultUtf8 = ConvertWStringToUtf8Checked(impl_->GetUncPath(shareNameW, relativePathW), &ok);
+    if (!ok)
+    {
+        return std::string();
+    }
+    return resultUtf8;
+}
+
+#else
+
+GB_SmbAccessor::GB_SmbAccessor(const std::string& hostOrIpUtf8, AddressType addressType)
+    : impl_(nullptr)
+    , hostOrIpValidUtf8_(!hostOrIpUtf8.empty())
+{
+    (void)addressType;
+}
+
+GB_SmbAccessor::GB_SmbAccessor(const std::string& hostOrIpUtf8, AddressType addressType, const Credentials& credentialsUtf8)
+    : impl_(nullptr)
+    , hostOrIpValidUtf8_(!hostOrIpUtf8.empty())
+{
+    (void)addressType;
+    (void)credentialsUtf8;
+}
+
+GB_SmbAccessor::~GB_SmbAccessor() = default;
+
+GB_SmbAccessor::GB_SmbAccessor(GB_SmbAccessor&& other) noexcept = default;
+GB_SmbAccessor& GB_SmbAccessor::operator=(GB_SmbAccessor&& other) noexcept = default;
+
+void GB_SmbAccessor::SetCredentials(const Credentials& credentialsUtf8)
+{
+    (void)credentialsUtf8;
+}
+
+void GB_SmbAccessor::SetUseLongPathPrefix(bool useLongPathPrefix)
+{
+    (void)useLongPathPrefix;
+}
+
+bool GB_SmbAccessor::TestTcp445(int timeoutMs, std::string& errorMessageUtf8) const
+{
+    (void)timeoutMs;
+    errorMessageUtf8 = "GB_SmbAccessor is only supported on Windows.";
+    return false;
+}
+
+bool GB_SmbAccessor::TestSmbConnection(std::string& errorMessageUtf8) const
+{
+    errorMessageUtf8 = "GB_SmbAccessor is only supported on Windows.";
+    return false;
+}
+
+bool GB_SmbAccessor::GetShares(std::vector<std::string>& shareNamesUtf8, bool includeSpecialShares, std::string& errorMessageUtf8) const
+{
+    shareNamesUtf8.clear();
+    (void)includeSpecialShares;
+    errorMessageUtf8 = "GB_SmbAccessor is only supported on Windows.";
+    return false;
+}
+
+bool GB_SmbAccessor::GetShareInfos(std::vector<ShareInfo>& sharesUtf8, bool includeSpecialShares, std::string& errorMessageUtf8) const
+{
+    sharesUtf8.clear();
+    (void)includeSpecialShares;
+    errorMessageUtf8 = "GB_SmbAccessor is only supported on Windows.";
+    return false;
+}
+
+bool GB_SmbAccessor::ConnectShare(const std::string& shareNameUtf8, bool persistent, std::string& errorMessageUtf8) const
+{
+    (void)shareNameUtf8;
+    (void)persistent;
+    errorMessageUtf8 = "GB_SmbAccessor is only supported on Windows.";
+    return false;
+}
+
+bool GB_SmbAccessor::DisconnectShare(const std::string& shareNameUtf8, bool force, std::string& errorMessageUtf8) const
+{
+    (void)shareNameUtf8;
+    (void)force;
+    errorMessageUtf8 = "GB_SmbAccessor is only supported on Windows.";
+    return false;
+}
+
+bool GB_SmbAccessor::ListDirectory(const std::string& shareNameUtf8,
+    const std::string& relativeDirUtf8,
+    std::vector<std::string>& childNamesUtf8,
+    bool includeDirectories,
+    bool includeFiles,
+    std::string& errorMessageUtf8) const
+{
+    (void)shareNameUtf8;
+    (void)relativeDirUtf8;
+    childNamesUtf8.clear();
+    (void)includeDirectories;
+    (void)includeFiles;
+    errorMessageUtf8 = "GB_SmbAccessor is only supported on Windows.";
+    return false;
+}
+
+bool GB_SmbAccessor::FileExists(const std::string& shareNameUtf8, const std::string& relativePathUtf8) const
+{
+    (void)shareNameUtf8;
+    (void)relativePathUtf8;
+    return false;
+}
+
+bool GB_SmbAccessor::DirectoryExists(const std::string& shareNameUtf8, const std::string& relativePathUtf8) const
+{
+    (void)shareNameUtf8;
+    (void)relativePathUtf8;
+    return false;
+}
+
+bool GB_SmbAccessor::CreateDirectoryRecursive(const std::string& shareNameUtf8, const std::string& relativeDirUtf8, std::string& errorMessageUtf8) const
+{
+    (void)shareNameUtf8;
+    (void)relativeDirUtf8;
+    errorMessageUtf8 = "GB_SmbAccessor is only supported on Windows.";
+    return false;
+}
+
+bool GB_SmbAccessor::DeleteFileRemote(const std::string& shareNameUtf8, const std::string& relativePathUtf8, std::string& errorMessageUtf8) const
+{
+    (void)shareNameUtf8;
+    (void)relativePathUtf8;
+    errorMessageUtf8 = "GB_SmbAccessor is only supported on Windows.";
+    return false;
+}
+
+bool GB_SmbAccessor::CopyFileFromLocal(const std::string& localPathUtf8,
+    const std::string& shareNameUtf8,
+    const std::string& remoteRelativePathUtf8,
+    bool overwrite,
+    std::string& errorMessageUtf8) const
+{
+    (void)localPathUtf8;
+    (void)shareNameUtf8;
+    (void)remoteRelativePathUtf8;
+    (void)overwrite;
+    errorMessageUtf8 = "GB_SmbAccessor is only supported on Windows.";
+    return false;
+}
+
+bool GB_SmbAccessor::CopyFileFromLocalParallel(const std::string& localPathUtf8,
+    const std::string& shareNameUtf8,
+    const std::string& remoteRelativePathUtf8,
+    bool overwrite,
+    std::string& errorMessageUtf8,
+    size_t threadCount) const
+{
+    (void)localPathUtf8;
+    (void)shareNameUtf8;
+    (void)remoteRelativePathUtf8;
+    (void)overwrite;
+    (void)threadCount;
+    errorMessageUtf8 = "GB_SmbAccessor is only supported on Windows.";
+    return false;
+}
+
+bool GB_SmbAccessor::CopyFileToLocal(const std::string& shareNameUtf8,
+    const std::string& remoteRelativePathUtf8,
+    const std::string& localPathUtf8,
+    bool overwrite,
+    std::string& errorMessageUtf8) const
+{
+    (void)shareNameUtf8;
+    (void)remoteRelativePathUtf8;
+    (void)localPathUtf8;
+    (void)overwrite;
+    errorMessageUtf8 = "GB_SmbAccessor is only supported on Windows.";
+    return false;
+}
+
+bool GB_SmbAccessor::CopyFileToLocalParallel(const std::string& shareNameUtf8,
+    const std::string& remoteRelativePathUtf8,
+    const std::string& localPathUtf8,
+    bool overwrite,
+    std::string& errorMessageUtf8,
+    size_t threadCount) const
+{
+    (void)shareNameUtf8;
+    (void)remoteRelativePathUtf8;
+    (void)localPathUtf8;
+    (void)overwrite;
+    (void)threadCount;
+    errorMessageUtf8 = "GB_SmbAccessor is only supported on Windows.";
+    return false;
+}
+
+bool GB_SmbAccessor::CopyDirectoryFromLocal(const std::string& localDirectoryUtf8,
+    const std::string& shareNameUtf8,
+    const std::string& remoteRelativePathUtf8,
+    bool overwrite,
+    std::string& errorMessageUtf8) const
+{
+    (void)localDirectoryUtf8;
+    (void)shareNameUtf8;
+    (void)remoteRelativePathUtf8;
+    (void)overwrite;
+    errorMessageUtf8 = "GB_SmbAccessor is only supported on Windows.";
+    return false;
+}
+
+bool GB_SmbAccessor::CopyDirectoryFromLocalParallel(const std::string& localDirectoryUtf8,
+    const std::string& shareNameUtf8,
+    const std::string& remoteRelativePathUtf8,
+    bool overwrite,
+    std::string& errorMessageUtf8,
+    size_t threadCount) const
+{
+    (void)localDirectoryUtf8;
+    (void)shareNameUtf8;
+    (void)remoteRelativePathUtf8;
+    (void)overwrite;
+    (void)threadCount;
+    errorMessageUtf8 = "GB_SmbAccessor is only supported on Windows.";
+    return false;
+}
+
+bool GB_SmbAccessor::CopyDirectoryToLocal(const std::string& shareNameUtf8,
+    const std::string& remoteRelativePathUtf8,
+    const std::string& localDirectoryUtf8,
+    bool overwrite,
+    std::string& errorMessageUtf8) const
+{
+    (void)shareNameUtf8;
+    (void)remoteRelativePathUtf8;
+    (void)localDirectoryUtf8;
+    (void)overwrite;
+    errorMessageUtf8 = "GB_SmbAccessor is only supported on Windows.";
+    return false;
+}
+
+bool GB_SmbAccessor::CopyDirectoryToLocalParallel(const std::string& shareNameUtf8,
+    const std::string& remoteRelativePathUtf8,
+    const std::string& localDirectoryUtf8,
+    bool overwrite,
+    std::string& errorMessageUtf8,
+    size_t threadCount) const
+{
+    (void)shareNameUtf8;
+    (void)remoteRelativePathUtf8;
+    (void)localDirectoryUtf8;
+    (void)overwrite;
+    (void)threadCount;
+    errorMessageUtf8 = "GB_SmbAccessor is only supported on Windows.";
+    return false;
+}
+
+bool GB_SmbAccessor::GetFileSizeRemote(const std::string& shareNameUtf8,
+    const std::string& remoteRelativePathUtf8,
+    uint64_t& fileSize,
+    std::string& errorMessageUtf8) const
+{
+    (void)shareNameUtf8;
+    (void)remoteRelativePathUtf8;
+    fileSize = 0;
+    errorMessageUtf8 = "GB_SmbAccessor is only supported on Windows.";
+    return false;
+}
+
+std::string GB_SmbAccessor::GetUncRoot(const std::string& shareNameUtf8) const
+{
+    (void)shareNameUtf8;
+    return std::string();
+}
+
+std::string GB_SmbAccessor::GetUncPath(const std::string& shareNameUtf8, const std::string& relativePathUtf8) const
+{
+    (void)shareNameUtf8;
+    (void)relativePathUtf8;
+    return std::string();
+}
+
 #endif
+
