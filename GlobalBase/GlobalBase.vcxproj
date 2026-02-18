@@ -23,6 +23,7 @@
     <ClInclude Include="GB_Crypto.h" />
     <ClInclude Include="GB_DataCache.h" />
     <ClInclude Include="GB_FileSystem.h" />
+    <ClInclude Include="GB_Interval.h" />
     <ClInclude Include="GB_IO.h" />
     <ClInclude Include="GB_Logger.h" />
     <ClInclude Include="GB_Math.h" />

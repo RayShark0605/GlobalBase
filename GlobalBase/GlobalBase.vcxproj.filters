@@ -90,6 +90,9 @@
     <ClInclude Include="GB_Network.h">
       <Filter>头文件</Filter>
     </ClInclude>
+    <ClInclude Include="GB_Interval.h">
+      <Filter>头文件</Filter>
+    </ClInclude>
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="GB_Utf8String.cpp">
