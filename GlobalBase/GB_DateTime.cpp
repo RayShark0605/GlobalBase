@@ -100,7 +100,6 @@ namespace
 	{
 		if (data == nullptr)
 		{
-			outDate = GB_Date::Invalid;
 			return false;
 		}
 
@@ -113,14 +112,12 @@ namespace
 			// YYYY-MM-DD
 			if (data[4] != '-' || data[7] != '-')
 			{
-				outDate = GB_Date::Invalid;
 				return false;
 			}
 			if (!ParseFixedDigits(data, length, 0, 4, parsedYear)
 				|| !ParseFixedDigits(data, length, 5, 2, parsedMonth)
 				|| !ParseFixedDigits(data, length, 8, 2, parsedDay))
 			{
-				outDate = GB_Date::Invalid;
 				return false;
 			}
 		}
@@ -129,27 +126,23 @@ namespace
 			// YYYYMMDD
 			if (!IsAllDigits(data, length))
 			{
-				outDate = GB_Date::Invalid;
 				return false;
 			}
 			if (!ParseFixedDigits(data, length, 0, 4, parsedYear)
 				|| !ParseFixedDigits(data, length, 4, 2, parsedMonth)
 				|| !ParseFixedDigits(data, length, 6, 2, parsedDay))
 			{
-				outDate = GB_Date::Invalid;
 				return false;
 			}
 		}
 		else
 		{
-			outDate = GB_Date::Invalid;
 			return false;
 		}
 
 		GB_Date date;
 		if (!date.Set(parsedYear, parsedMonth, parsedDay))
 		{
-			outDate = GB_Date::Invalid;
 			return false;
 		}
 
@@ -528,6 +521,288 @@ namespace
 		outTm = temp;
 		return true;
 	}
+
+	constexpr uint32_t kTimeBinaryVersion = 1;
+	constexpr size_t kIsoTimeStringLengthNoMs = 8;   // HH:MM:SS
+	constexpr size_t kIsoTimeStringLengthWithMs = 12; // HH:MM:SS.mmm
+	constexpr int kMillisecondsPerDay = 24 * 60 * 60 * 1000;
+	constexpr int kNullTimeEncodedValue = -2;
+
+	inline bool ParseFractionalMillisecondsSpan(const char* data, size_t length, int& outMillisecond)
+	{
+		if (data == nullptr)
+		{
+			return false;
+		}
+		if (length == 0 || length > 3)
+		{
+			return false;
+		}
+
+		int value = 0;
+		for (size_t i = 0; i < length; i++)
+		{
+			const char ch = data[i];
+			if (ch < '0' || ch > '9')
+			{
+				return false;
+			}
+			value = value * 10 + (ch - '0');
+		}
+
+		// ".1"  = 100ms, ".12" = 120ms, ".123" = 123ms
+		if (length == 1)
+		{
+			value *= 100;
+		}
+		else if (length == 2)
+		{
+			value *= 10;
+		}
+
+		outMillisecond = value;
+		return true;
+	}
+
+	inline bool ParseIsoTimeSpan(const char* data, size_t length, GB_Time& outTime)
+	{
+		if (data == nullptr)
+		{
+			return false;
+		}
+
+		// Support:
+		// - "HH:MM"
+		// - "HH:MM:SS"
+		// - "HH:MM:SS.mmm" / "HH:MM:SS,mmm"
+		size_t fractionalPos = length;
+		for (size_t i = 0; i < length; i++)
+		{
+			if (data[i] == '.' || data[i] == ',')
+			{
+				fractionalPos = i;
+				break;
+			}
+		}
+
+		const size_t mainLength = (fractionalPos < length) ? fractionalPos : length;
+		const bool hasFractional = (fractionalPos < length);
+
+		int hour = 0;
+		int minute = 0;
+		int second = 0;
+		int millisecond = 0;
+
+		if (mainLength == 5)
+		{
+			// HH:MM
+			// NOTE: We do NOT accept "HH:MM.xxx" because the fractional part is defined on seconds.
+			if (hasFractional)
+			{
+				return false;
+			}
+
+			if (data[2] != ':')
+			{
+				return false;
+			}
+			if (!ParseFixedDigits(data, mainLength, 0, 2, hour)
+				|| !ParseFixedDigits(data, mainLength, 3, 2, minute))
+			{
+				return false;
+			}
+		}
+		else if (mainLength == 8)
+		{
+			// HH:MM:SS
+			if (data[2] != ':' || data[5] != ':')
+			{
+				return false;
+			}
+			if (!ParseFixedDigits(data, mainLength, 0, 2, hour)
+				|| !ParseFixedDigits(data, mainLength, 3, 2, minute)
+				|| !ParseFixedDigits(data, mainLength, 6, 2, second))
+			{
+				return false;
+			}
+		}
+		else
+		{
+			return false;
+		}
+
+		if (hasFractional)
+		{
+			// Only "HH:MM:SS.xxx" is allowed.
+			if (mainLength != 8)
+			{
+				return false;
+			}
+
+			const size_t fractionalStart = fractionalPos + 1;
+			if (fractionalStart >= length)
+			{
+				return false;
+			}
+			const size_t fractionalLength = length - fractionalStart;
+			if (!ParseFractionalMillisecondsSpan(data + fractionalStart, fractionalLength, millisecond))
+			{
+				return false;
+			}
+		}
+
+		GB_Time time;
+		if (!time.Set(hour, minute, second, millisecond))
+		{
+			return false;
+		}
+
+		outTime = time;
+		return true;
+	}
+
+
+	inline bool DeserializeTimeFromSpan(GB_Time& time, const char* data, size_t length)
+	{
+		if (data == nullptr)
+		{
+			time.Reset();
+			return false;
+		}
+
+		size_t start = 0;
+		size_t end = 0;
+		GetTrimmedAsciiRange(data, length, start, end);
+		if (end <= start)
+		{
+			time.Reset();
+			return false;
+		}
+
+		const char* textData = data + start;
+		const size_t textLength = end - start;
+
+		// 1) Prefer our explicit serialization format.
+		//    GB_Time|version|encodedMsecs
+		if (StartsWith(textData, textLength, "GB_Time|", 8))
+		{
+			constexpr size_t prefixLength = 8;
+			size_t cursor = prefixLength;
+			size_t versionOffset = 0;
+			size_t versionLength = 0;
+			size_t valueOffset = 0;
+			size_t valueLength = 0;
+
+			if (!ReadDelimitedField(textData, textLength, cursor, '|', versionOffset, versionLength, false)
+				|| !ReadDelimitedField(textData, textLength, cursor, '|', valueOffset, valueLength, true))
+			{
+				time.Reset();
+				return false;
+			}
+			if (cursor != textLength)
+			{
+				time.Reset();
+				return false;
+			}
+			for (size_t i = valueOffset; i < valueOffset + valueLength; i++)
+			{
+				if (textData[i] == '|')
+				{
+					time.Reset();
+					return false;
+				}
+			}
+
+			int version = 0;
+			int encoded = 0;
+			if (!TryParseInt32Span(textData + versionOffset, versionLength, version)
+				|| !TryParseInt32Span(textData + valueOffset, valueLength, encoded))
+			{
+				time.Reset();
+				return false;
+			}
+
+			if (version != static_cast<int>(kTimeBinaryVersion))
+			{
+				time.Reset();
+				return false;
+			}
+
+			if (encoded == kNullTimeEncodedValue)
+			{
+				time.Reset();
+				return true;
+			}
+
+			if (encoded == -1)
+			{
+				time.Set(-1, 0, 0, 0);
+				return true;
+			}
+
+			time = GB_Time::CreateFromMillisecondsSinceStartOfDay(encoded);
+			return time.IsValid();
+		}
+
+		// 2) Fallback: accept ISO strings.
+		GB_Time parsed;
+		if (ParseIsoTimeSpan(textData, textLength, parsed))
+		{
+			time = parsed;
+			return true;
+		}
+
+		time.Reset();
+		return false;
+	}
+
+	inline bool DeserializeTimeFromBinary(GB_Time& time, const GB_ByteBuffer& buffer)
+	{
+		// Accept both our binary layout and (as fallback) textual data carried in a byte buffer.
+		// Binary layout (little-endian):
+		// [uint32 magic][uint32 version][int32 encodedMsecs]
+		if (buffer.empty())
+		{
+			time.Reset();
+			return false;
+		}
+
+		// Fast path: binary.
+		if (buffer.size() >= 12)
+		{
+			size_t offset = 0;
+			uint32_t magic = 0;
+			uint32_t version = 0;
+			int32_t encoded = 0;
+
+			if (ReadUInt32LE(buffer, offset, magic)
+				&& ReadUInt32LE(buffer, offset, version)
+				&& ReadInt32LE(buffer, offset, encoded))
+			{
+				if (magic == GB_ClassMagicNumber && version == kTimeBinaryVersion)
+				{
+					if (encoded == kNullTimeEncodedValue)
+					{
+						time.Reset();
+						return true;
+					}
+
+					if (encoded == -1)
+					{
+						time.Set(-1, 0, 0, 0);
+						return true;
+					}
+
+					time = GB_Time::CreateFromMillisecondsSinceStartOfDay(static_cast<int>(encoded));
+					return time.IsValid();
+				}
+			}
+		}
+
+		// Fallback: treat it as UTF-8 text (ASCII subset) and reuse textual deserializer.
+		const char* dataPtr = reinterpret_cast<const char*>(buffer.data());
+		return DeserializeTimeFromSpan(time, dataPtr, buffer.size());
+	}
 }
 
 const GB_Date GB_Date::Invalid = GB_Date();
@@ -748,7 +1023,7 @@ GB_Date GB_Date::CreateFromJulianDayNumber(long long julianDayNumber)
 	static const long long maxJdn = DateToJdnGregorian(9999, 12, 31);
 	if (julianDayNumber < minJdn || julianDayNumber > maxJdn)
 	{
-		return GB_Date::Invalid;
+		return GB_Date();
 	}
 
 	const GB_Date result = JdnToDateGregorian(julianDayNumber);
@@ -805,14 +1080,22 @@ bool GB_Date::ParseIsoString(const std::string& textUtf8, GB_Date& outDate)
 	GetTrimmedAsciiRange(textUtf8, start, end);
 	if (end <= start)
 	{
-		outDate = GB_Date::Invalid;
 		return false;
 	}
 
 	const char* textData = textUtf8.data() + start;
 	const size_t textLength = end - start;
-	return ParseIsoDateSpan(textData, textLength, outDate);
+
+	GB_Date parsed;
+	if (!ParseIsoDateSpan(textData, textLength, parsed))
+	{
+		return false;
+	}
+
+	outDate = parsed;
+	return true;
 }
+
 
 GB_Date GB_Date::AddDays(int days) const
 {
@@ -1019,4 +1302,438 @@ bool GB_Date::Deserialize(const std::string& data)
 bool GB_Date::Deserialize(const GB_ByteBuffer& data)
 {
 	return DeserializeDateFromBinary(*this, data);
+}
+
+const GB_Time GB_Time::Null = GB_Time();
+const GB_Time GB_Time::Invalid = GB_Time(-1, 0, 0, 0);
+const GB_Time GB_Time::MinValue = GB_Time(0, 0, 0, 0);
+const GB_Time GB_Time::MaxValue = GB_Time(23, 59, 59, 999);
+
+GB_Time::GB_Time() = default;
+
+GB_Time::GB_Time(int hour, int minute, int second, int millisecond)
+{
+	Set(hour, minute, second, millisecond);
+}
+
+bool GB_Time::IsNull() const
+{
+	return isNullTime;
+}
+
+bool GB_Time::IsValid() const
+{
+	if (isNullTime)
+	{
+		return false;
+	}
+
+	return millisecondsSinceStartOfDay >= 0 && millisecondsSinceStartOfDay < kMillisecondsPerDay;
+}
+
+void GB_Time::Reset()
+{
+	isNullTime = true;
+	millisecondsSinceStartOfDay = 0;
+}
+
+bool GB_Time::IsValidTime(int hour, int minute, int second, int millisecond)
+{
+	if (hour < 0 || hour > 23)
+	{
+		return false;
+	}
+	if (minute < 0 || minute > 59)
+	{
+		return false;
+	}
+	if (second < 0 || second > 59)
+	{
+		return false;
+	}
+	if (millisecond < 0 || millisecond > 999)
+	{
+		return false;
+	}
+	return true;
+}
+
+bool GB_Time::Set(int hour, int minute, int second, int millisecond)
+{
+	isNullTime = false;
+
+	if (!IsValidTime(hour, minute, second, millisecond))
+	{
+		millisecondsSinceStartOfDay = -1;
+		return false;
+	}
+
+	const int totalMilliseconds = ((hour * 60 + minute) * 60 + second) * 1000 + millisecond;
+	millisecondsSinceStartOfDay = totalMilliseconds;
+	return true;
+}
+
+int GB_Time::Hour() const
+{
+	if (!IsValid())
+	{
+		return 0;
+	}
+	return millisecondsSinceStartOfDay / (60 * 60 * 1000);
+}
+
+int GB_Time::Minute() const
+{
+	if (!IsValid())
+	{
+		return 0;
+	}
+	return (millisecondsSinceStartOfDay / (60 * 1000)) % 60;
+}
+
+int GB_Time::Second() const
+{
+	if (!IsValid())
+	{
+		return 0;
+	}
+	return (millisecondsSinceStartOfDay / 1000) % 60;
+}
+
+int GB_Time::Millisecond() const
+{
+	if (!IsValid())
+	{
+		return 0;
+	}
+	return millisecondsSinceStartOfDay % 1000;
+}
+
+int GB_Time::ToMillisecondsSinceStartOfDay() const
+{
+	if (!IsValid())
+	{
+		return -1;
+	}
+	return millisecondsSinceStartOfDay;
+}
+
+GB_Time GB_Time::CreateFromMillisecondsSinceStartOfDay(int millisecondsSinceStartOfDay)
+{
+	if (millisecondsSinceStartOfDay < 0 || millisecondsSinceStartOfDay >= kMillisecondsPerDay)
+	{
+		return GB_Time::Invalid;
+	}
+
+	GB_Time result;
+	result.isNullTime = false;
+	result.millisecondsSinceStartOfDay = millisecondsSinceStartOfDay;
+	return result;
+}
+
+std::string GB_Time::ToIsoString(bool includeMilliseconds) const
+{
+	if (!IsValid())
+	{
+		return {};
+	}
+
+	const int hour = Hour();
+	const int minute = Minute();
+	const int second = Second();
+	const int millisecond = Millisecond();
+
+	if (includeMilliseconds)
+	{
+		std::string result(kIsoTimeStringLengthWithMs, '0');
+		result[2] = ':';
+		result[5] = ':';
+		result[8] = '.';
+
+		result[0] = static_cast<char>('0' + (hour / 10) % 10);
+		result[1] = static_cast<char>('0' + (hour / 1) % 10);
+
+		result[3] = static_cast<char>('0' + (minute / 10) % 10);
+		result[4] = static_cast<char>('0' + (minute / 1) % 10);
+
+		result[6] = static_cast<char>('0' + (second / 10) % 10);
+		result[7] = static_cast<char>('0' + (second / 1) % 10);
+
+		result[9] = static_cast<char>('0' + (millisecond / 100) % 10);
+		result[10] = static_cast<char>('0' + (millisecond / 10) % 10);
+		result[11] = static_cast<char>('0' + (millisecond / 1) % 10);
+
+		return result;
+	}
+
+	std::string result(kIsoTimeStringLengthNoMs, '0');
+	result[2] = ':';
+	result[5] = ':';
+
+	result[0] = static_cast<char>('0' + (hour / 10) % 10);
+	result[1] = static_cast<char>('0' + (hour / 1) % 10);
+
+	result[3] = static_cast<char>('0' + (minute / 10) % 10);
+	result[4] = static_cast<char>('0' + (minute / 1) % 10);
+
+	result[6] = static_cast<char>('0' + (second / 10) % 10);
+	result[7] = static_cast<char>('0' + (second / 1) % 10);
+
+	return result;
+}
+
+GB_Time GB_Time::CreateFromIsoString(const std::string& textUtf8)
+{
+	GB_Time time;
+	if (!ParseIsoString(textUtf8, time))
+	{
+		return GB_Time(-1, 0, 0, 0);
+	}
+	return time;
+}
+
+bool GB_Time::ParseIsoString(const std::string& textUtf8, GB_Time& outTime)
+{
+	size_t start = 0;
+	size_t end = 0;
+	GetTrimmedAsciiRange(textUtf8, start, end);
+	if (end <= start)
+	{
+		return false;
+	}
+
+	const char* textData = textUtf8.data() + start;
+	const size_t textLength = end - start;
+
+	GB_Time parsed;
+	if (!ParseIsoTimeSpan(textData, textLength, parsed))
+	{
+		return false;
+	}
+
+	outTime = parsed;
+	return true;
+}
+
+
+GB_Time GB_Time::AddMSecs(int milliseconds) const
+{
+	if (!IsValid())
+	{
+		return GB_Time::Invalid;
+	}
+
+	const long long sum = static_cast<long long>(millisecondsSinceStartOfDay) + static_cast<long long>(milliseconds);
+	const long long normalized = ModFloor(sum, static_cast<long long>(kMillisecondsPerDay));
+	return GB_Time::CreateFromMillisecondsSinceStartOfDay(static_cast<int>(normalized));
+}
+
+GB_Time GB_Time::AddSecs(int seconds) const
+{
+	if (!IsValid())
+	{
+		return GB_Time::Invalid;
+	}
+
+	const long long delta = static_cast<long long>(seconds) * 1000LL;
+	const long long sum = static_cast<long long>(millisecondsSinceStartOfDay) + delta;
+	const long long normalized = ModFloor(sum, static_cast<long long>(kMillisecondsPerDay));
+	return GB_Time::CreateFromMillisecondsSinceStartOfDay(static_cast<int>(normalized));
+}
+
+int GB_Time::MsecsTo(const GB_Time& other) const
+{
+	if (!IsValid() || !other.IsValid())
+	{
+		return 0;
+	}
+
+	return other.millisecondsSinceStartOfDay - millisecondsSinceStartOfDay;
+}
+
+int GB_Time::SecsTo(const GB_Time& other) const
+{
+	if (!IsValid() || !other.IsValid())
+	{
+		return 0;
+	}
+
+	// 与 QTime::secsTo 类似：忽略毫秒（截断）。
+	const int ourSeconds = millisecondsSinceStartOfDay / 1000;
+	const int theirSeconds = other.millisecondsSinceStartOfDay / 1000;
+	return theirSeconds - ourSeconds;
+}
+
+GB_Time GB_Time::CurrentTime()
+{
+	const std::chrono::system_clock::time_point now = std::chrono::system_clock::now();
+	const std::chrono::system_clock::time_point nowSeconds =
+		std::chrono::time_point_cast<std::chrono::seconds>(now);
+	const std::time_t timeValue = std::chrono::system_clock::to_time_t(nowSeconds);
+
+	std::tm tmValue = {};
+	if (!GetLocalTm(timeValue, tmValue))
+	{
+		return GB_Time::Invalid;
+	}
+
+	const auto msDuration = std::chrono::duration_cast<std::chrono::milliseconds>(now - nowSeconds);
+	int millisecond = static_cast<int>(msDuration.count());
+	if (millisecond < 0)
+	{
+		millisecond = 0;
+	}
+	else if (millisecond > 999)
+	{
+		millisecond = 999;
+	}
+
+	GB_Time result;
+	if (!result.Set(tmValue.tm_hour, tmValue.tm_min, tmValue.tm_sec, millisecond))
+	{
+		return GB_Time::Invalid;
+	}
+
+	return result;
+}
+
+GB_Time GB_Time::UtcCurrentTime()
+{
+	const std::chrono::system_clock::time_point now = std::chrono::system_clock::now();
+	const std::chrono::system_clock::time_point nowSeconds =
+		std::chrono::time_point_cast<std::chrono::seconds>(now);
+	const std::time_t timeValue = std::chrono::system_clock::to_time_t(nowSeconds);
+
+	std::tm tmValue = {};
+	if (!GetGmTm(timeValue, tmValue))
+	{
+		return GB_Time::Invalid;
+	}
+
+	const auto msDuration = std::chrono::duration_cast<std::chrono::milliseconds>(now - nowSeconds);
+	int millisecond = static_cast<int>(msDuration.count());
+	if (millisecond < 0)
+	{
+		millisecond = 0;
+	}
+	else if (millisecond > 999)
+	{
+		millisecond = 999;
+	}
+
+	GB_Time result;
+	if (!result.Set(tmValue.tm_hour, tmValue.tm_min, tmValue.tm_sec, millisecond))
+	{
+		return GB_Time::Invalid;
+	}
+
+	return result;
+}
+
+bool GB_Time::operator==(const GB_Time& other) const
+{
+	if (isNullTime != other.isNullTime)
+	{
+		return false;
+	}
+
+	if (IsValid() != other.IsValid())
+	{
+		return false;
+	}
+
+	if (!IsValid())
+	{
+		// 都是空时间或无效时间
+		return true;
+	}
+
+	return millisecondsSinceStartOfDay == other.millisecondsSinceStartOfDay;
+}
+
+bool GB_Time::operator!=(const GB_Time& other) const
+{
+	return !(*this == other);
+}
+
+bool GB_Time::operator<(const GB_Time& other) const
+{
+	const int thisState = isNullTime ? 0 : (IsValid() ? 2 : 1);
+	const int otherState = other.isNullTime ? 0 : (other.IsValid() ? 2 : 1);
+
+	if (thisState != otherState)
+	{
+		return thisState < otherState;
+	}
+
+	if (thisState != 2)
+	{
+		return false;
+	}
+
+	return millisecondsSinceStartOfDay < other.millisecondsSinceStartOfDay;
+}
+
+bool GB_Time::operator<=(const GB_Time& other) const
+{
+	return !(*this > other);
+}
+
+bool GB_Time::operator>(const GB_Time& other) const
+{
+	return other < *this;
+}
+
+bool GB_Time::operator>=(const GB_Time& other) const
+{
+	return !(*this < other);
+}
+
+size_t GB_Time::GB_TimeHash::operator()(const GB_Time& time) const noexcept
+{
+	const int encoded = time.isNullTime ? kNullTimeEncodedValue : time.millisecondsSinceStartOfDay;
+	return std::hash<int>()(encoded);
+}
+
+std::string GB_Time::SerializeToString() const
+{
+	// Format: GB_Time|<version>|<encodedMsecs>
+	// - version starts at 1
+	// - 空时间编码为 -2
+	// - 无效时间编码为 -1
+	const int encoded = isNullTime ? kNullTimeEncodedValue : millisecondsSinceStartOfDay;
+
+	std::string result;
+	result.reserve(64);
+	result.append("GB_Time|");
+	result.append(std::to_string(static_cast<int>(kTimeBinaryVersion)));
+	result.push_back('|');
+	result.append(std::to_string(encoded));
+	return result;
+}
+
+GB_ByteBuffer GB_Time::SerializeToBinary() const
+{
+	// Layout (little-endian):
+	// [uint32 magic][uint32 version][int32 encodedMsecs]
+	const int encoded = isNullTime ? kNullTimeEncodedValue : millisecondsSinceStartOfDay;
+
+	GB_ByteBuffer buffer;
+	buffer.reserve(12);
+
+	AppendUInt32LE(buffer, GB_ClassMagicNumber);
+	AppendUInt32LE(buffer, kTimeBinaryVersion);
+	AppendInt32LE(buffer, static_cast<int32_t>(encoded));
+
+	return buffer;
+}
+
+bool GB_Time::Deserialize(const std::string& data)
+{
+	return DeserializeTimeFromSpan(*this, data.data(), data.size());
+}
+
+bool GB_Time::Deserialize(const GB_ByteBuffer& data)
+{
+	return DeserializeTimeFromBinary(*this, data);
 }

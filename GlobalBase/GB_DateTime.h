@@ -124,4 +124,101 @@ public:
 	bool Deserialize(const GB_ByteBuffer& data);
 };
 
+class GLOBALBASE_PORT GB_Time
+{
+public:
+	// “空时间”（默认构造得到的时间）：00:00:00.000，但 IsNull()=true 且 IsValid()=false。
+	static const GB_Time Null;
+
+	// 无效时间（例如 Set 失败后得到的状态）。IsNull()=false 且 IsValid()=false。
+	static const GB_Time Invalid;
+
+	// 最小有效时间（00:00:00.000）。
+	static const GB_Time MinValue;
+
+	// 最大有效时间（23:59:59.999）。
+	static const GB_Time MaxValue;
+
+	GB_Time();
+
+	GB_Time(int hour, int minute, int second = 0, int millisecond = 0);
+
+	// 是否为“空时间”（默认构造或 Reset 得到的状态）。
+	bool IsNull() const;
+
+	// 是否为有效时间（00:00:00.000 .. 23:59:59.999）。
+	bool IsValid() const;
+
+	// 设为空时间（IsNull()=true）。
+	void Reset();
+
+	// 设置时间。成功返回 true；失败则置为 Invalid 并返回 false。
+	bool Set(int hour, int minute, int second = 0, int millisecond = 0);
+
+	// 仅做合法性判定（不修改对象）。
+	static bool IsValidTime(int hour, int minute, int second, int millisecond);
+
+	int Hour() const;
+	int Minute() const;
+	int Second() const;
+	int Millisecond() const;
+
+	/**
+	 * @brief 转换为“自当天 00:00:00.000 起的毫秒数”。
+	 * @return 若有效则返回 [0, 86400000)；否则返回 -1。
+	 */
+	int ToMillisecondsSinceStartOfDay() const;
+
+	// 由毫秒数构造时间（[0, 86400000)）。非法则返回 Invalid。
+	static GB_Time CreateFromMillisecondsSinceStartOfDay(int millisecondsSinceStartOfDay);
+
+	// 输出 ISO 8601 扩展时间格式：HH:MM:SS 或 HH:MM:SS.mmm；无效时间返回空字符串。
+	std::string ToIsoString(bool includeMilliseconds = true) const;
+
+	// 从 ISO 8601 时间字符串解析（支持 "HH:MM" / "HH:MM:SS" / "HH:MM:SS.mmm" / "HH:MM:SS,mmm"，可带首尾空白）；失败返回 Invalid。
+	static GB_Time CreateFromIsoString(const std::string& textUtf8);
+
+	// 尝试解析 ISO 时间；成功写入 outTime 并返回 true。
+	static bool ParseIsoString(const std::string& textUtf8, GB_Time& outTime);
+
+	// 加/减毫秒与秒：结果按 24 小时回绕；若当前时间无效，则返回 Invalid。
+	GB_Time AddMSecs(int milliseconds) const;
+	GB_Time AddSecs(int seconds) const;
+
+	// 与 other 的毫秒/秒差：other - this；若任一无效则返回 0。
+	int MsecsTo(const GB_Time& other) const;
+	int SecsTo(const GB_Time& other) const;
+
+	// 获取本地/UTC 的当前时间（精确到毫秒）；若系统时间获取失败则返回 Invalid。
+	static GB_Time CurrentTime();
+	static GB_Time UtcCurrentTime();
+
+	bool operator==(const GB_Time& other) const;
+	bool operator!=(const GB_Time& other) const;
+	bool operator<(const GB_Time& other) const;
+	bool operator<=(const GB_Time& other) const;
+	bool operator>(const GB_Time& other) const;
+	bool operator>=(const GB_Time& other) const;
+
+	struct GB_TimeHash
+	{
+		size_t operator()(const GB_Time& time) const noexcept;
+	};
+
+	// 序列化。
+	std::string SerializeToString() const;
+	GB_ByteBuffer SerializeToBinary() const;
+
+	// 反序列化。
+	bool Deserialize(const std::string& data);
+	bool Deserialize(const GB_ByteBuffer& data);
+
+private:
+	// - 空时间：isNullTime=true，millisecondsSinceStartOfDay=0
+	// - 无效时间：isNullTime=false，millisecondsSinceStartOfDay=-1
+	// - 有效时间：isNullTime=false，millisecondsSinceStartOfDay in [0, 86400000)
+	int millisecondsSinceStartOfDay = 0;
+	bool isNullTime = true;
+};
+
 #endif
