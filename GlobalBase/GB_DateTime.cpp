@@ -432,47 +432,78 @@ namespace
 
 	inline bool DeserializeDateFromBinary(GB_Date& date, const GB_ByteBuffer& buffer)
 	{
-		// Accept both our binary layout and (as fallback) textual data carried in a byte buffer.
 		// Binary layout (little-endian):
 		// [uint32 magic][uint32 version][int32 year][int32 month][int32 day]
+		// 说明：
+		// - 如果 magic 匹配，则认为这是二进制格式；此时不再回退按文本解析（避免误解析）。
+		// - 如果版本不支持，直接失败。
+		constexpr size_t kExpectedBinarySize = 20;
+
 		if (buffer.empty())
 		{
 			date.Reset();
 			return false;
 		}
 
-		// Fast path: binary.
-		if (buffer.size() >= 20)
+		// If the magic matches, treat it as binary and be strict.
+		if (buffer.size() >= 4)
 		{
-			size_t offset = 0;
-			uint32_t magic = 0;
-			uint32_t version = 0;
-			int32_t parsedYear = 0;
-			int32_t parsedMonth = 0;
-			int32_t parsedDay = 0;
+			const uint32_t magic =
+				(static_cast<uint32_t>(buffer[0]) << 0)
+				| (static_cast<uint32_t>(buffer[1]) << 8)
+				| (static_cast<uint32_t>(buffer[2]) << 16)
+				| (static_cast<uint32_t>(buffer[3]) << 24);
 
-			if (ReadUInt32LE(buffer, offset, magic)
-				&& ReadUInt32LE(buffer, offset, version)
-				&& ReadInt32LE(buffer, offset, parsedYear)
-				&& ReadInt32LE(buffer, offset, parsedMonth)
-				&& ReadInt32LE(buffer, offset, parsedDay))
+			if (magic == GB_ClassMagicNumber)
 			{
-				if (magic == GB_ClassMagicNumber && version == kDateBinaryVersion)
+				if (buffer.size() < kExpectedBinarySize)
 				{
-					if (parsedYear == 0 && parsedMonth == 0 && parsedDay == 0)
-					{
-						date.Reset();
-						return true;
-					}
+					date.Reset();
+					return false;
+				}
 
-					if (!date.Set(static_cast<int>(parsedYear), static_cast<int>(parsedMonth), static_cast<int>(parsedDay)))
-					{
-						date.Reset();
-						return false;
-					}
+				size_t offset = 0;
+				uint32_t readMagic = 0;
+				uint32_t version = 0;
+				int32_t parsedYear = 0;
+				int32_t parsedMonth = 0;
+				int32_t parsedDay = 0;
 
+				if (!ReadUInt32LE(buffer, offset, readMagic)
+					|| !ReadUInt32LE(buffer, offset, version)
+					|| !ReadInt32LE(buffer, offset, parsedYear)
+					|| !ReadInt32LE(buffer, offset, parsedMonth)
+					|| !ReadInt32LE(buffer, offset, parsedDay))
+				{
+					date.Reset();
+					return false;
+				}
+
+				if (readMagic != GB_ClassMagicNumber)
+				{
+					date.Reset();
+					return false;
+				}
+
+				if (version != kDateBinaryVersion)
+				{
+					date.Reset();
+					return false;
+				}
+
+				if (parsedYear == 0 && parsedMonth == 0 && parsedDay == 0)
+				{
+					date.Reset();
 					return true;
 				}
+
+				if (!date.Set(static_cast<int>(parsedYear), static_cast<int>(parsedMonth), static_cast<int>(parsedDay)))
+				{
+					date.Reset();
+					return false;
+				}
+
+				return true;
 			}
 		}
 
@@ -480,6 +511,7 @@ namespace
 		const char* dataPtr = reinterpret_cast<const char*>(buffer.data());
 		return DeserializeDateFromSpan(date, dataPtr, buffer.size());
 	}
+
 
 	inline long long DateToJdnGregorian(int year, int month, int day)
 	{
@@ -785,44 +817,75 @@ namespace
 
 	inline bool DeserializeTimeFromBinary(GB_Time& time, const GB_ByteBuffer& buffer)
 	{
-		// Accept both our binary layout and (as fallback) textual data carried in a byte buffer.
 		// Binary layout (little-endian):
 		// [uint32 magic][uint32 version][int32 encodedMsecs]
+		// 说明：
+		// - 如果 magic 匹配，则认为这是二进制格式；此时不再回退按文本解析（避免误解析）。
+		// - 如果版本不支持，直接失败。
+		constexpr size_t kExpectedBinarySize = 12;
+
 		if (buffer.empty())
 		{
 			time = GB_Time::Invalid;
 			return false;
 		}
 
-		// Fast path: binary.
-		if (buffer.size() >= 12)
+		// If the magic matches, treat it as binary and be strict.
+		if (buffer.size() >= 4)
 		{
-			size_t offset = 0;
-			uint32_t magic = 0;
-			uint32_t version = 0;
-			int32_t encoded = 0;
+			const uint32_t magic =
+				(static_cast<uint32_t>(buffer[0]) << 0)
+				| (static_cast<uint32_t>(buffer[1]) << 8)
+				| (static_cast<uint32_t>(buffer[2]) << 16)
+				| (static_cast<uint32_t>(buffer[3]) << 24);
 
-			if (ReadUInt32LE(buffer, offset, magic)
-				&& ReadUInt32LE(buffer, offset, version)
-				&& ReadInt32LE(buffer, offset, encoded))
+			if (magic == GB_ClassMagicNumber)
 			{
-				if (magic == GB_ClassMagicNumber && version == kTimeBinaryVersion)
+				if (buffer.size() < kExpectedBinarySize)
 				{
-					if (encoded == kNullTimeEncodedValue)
-					{
-						time.Reset();
-						return true;
-					}
-
-					if (encoded == -1)
-					{
-						time = GB_Time::Invalid;
-						return true;
-					}
-
-					time = GB_Time::CreateFromMillisecondsSinceStartOfDay(static_cast<int>(encoded));
-					return time.IsValid();
+					time = GB_Time::Invalid;
+					return false;
 				}
+
+				size_t offset = 0;
+				uint32_t readMagic = 0;
+				uint32_t version = 0;
+				int32_t encoded = 0;
+
+				if (!ReadUInt32LE(buffer, offset, readMagic)
+					|| !ReadUInt32LE(buffer, offset, version)
+					|| !ReadInt32LE(buffer, offset, encoded))
+				{
+					time = GB_Time::Invalid;
+					return false;
+				}
+
+				if (readMagic != GB_ClassMagicNumber)
+				{
+					time = GB_Time::Invalid;
+					return false;
+				}
+
+				if (version != kTimeBinaryVersion)
+				{
+					time = GB_Time::Invalid;
+					return false;
+				}
+
+				if (encoded == kNullTimeEncodedValue)
+				{
+					time.Reset();
+					return true;
+				}
+
+				if (encoded == -1)
+				{
+					time = GB_Time::Invalid;
+					return true;
+				}
+
+				time = GB_Time::CreateFromMillisecondsSinceStartOfDay(static_cast<int>(encoded));
+				return time.IsValid();
 			}
 		}
 
@@ -830,6 +893,7 @@ namespace
 		const char* dataPtr = reinterpret_cast<const char*>(buffer.data());
 		return DeserializeTimeFromSpan(time, dataPtr, buffer.size());
 	}
+
 }
 
 const GB_Date GB_Date::Invalid = GB_Date();
@@ -1004,7 +1068,7 @@ int GB_Date::DayOfWeek() const
 	}
 
 	// ISO 8601: Monday=1 .. Sunday=7.
-	return static_cast<int>(jdn % 7LL) + 1;
+	return static_cast<int>(ModFloor(jdn, 7LL)) + 1;
 }
 
 bool GB_Date::ToDaysSinceEpoch(int& outDays) const
@@ -1622,8 +1686,18 @@ GB_Time GB_Time::CurrentTime()
 		millisecond = 999;
 	}
 
+	int second = tmValue.tm_sec;
+	if (second < 0)
+	{
+		second = 0;
+	}
+	else if (second > 59)
+	{
+		second = 59;
+	}
+
 	GB_Time result;
-	if (!result.Set(tmValue.tm_hour, tmValue.tm_min, tmValue.tm_sec, millisecond))
+	if (!result.Set(tmValue.tm_hour, tmValue.tm_min, second, millisecond))
 	{
 		return GB_Time::Invalid;
 	}
@@ -1655,8 +1729,18 @@ GB_Time GB_Time::UtcCurrentTime()
 		millisecond = 999;
 	}
 
+	int second = tmValue.tm_sec;
+	if (second < 0)
+	{
+		second = 0;
+	}
+	else if (second > 59)
+	{
+		second = 59;
+	}
+
 	GB_Time result;
-	if (!result.Set(tmValue.tm_hour, tmValue.tm_min, tmValue.tm_sec, millisecond))
+	if (!result.Set(tmValue.tm_hour, tmValue.tm_min, second, millisecond))
 	{
 		return GB_Time::Invalid;
 	}
