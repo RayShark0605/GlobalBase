@@ -12,10 +12,6 @@
 class GLOBALBASE_PORT GB_Date
 {
 public:
-	int year = 0;
-	int month = 0;
-	int day = 0;
-
 	// 无效日期（0-0-0）。
 	static const GB_Date Invalid;
 
@@ -122,6 +118,11 @@ public:
 	// 反序列化。
 	bool Deserialize(const std::string& data);
 	bool Deserialize(const GB_ByteBuffer& data);
+
+private:
+	int year = 0;
+	int month = 0;
+	int day = 0;
 };
 
 class GLOBALBASE_PORT GB_Time

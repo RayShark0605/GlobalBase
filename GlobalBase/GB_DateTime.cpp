@@ -20,6 +20,21 @@ namespace
 		return ch == ' ' || ch == '\t' || ch == '\n' || ch == '\r' || ch == '\f' || ch == '\v';
 	}
 
+	inline bool IsUtf8BomAt(const char* data, size_t length, size_t offset)
+	{
+		if (data == nullptr)
+		{
+			return false;
+		}
+		if (offset + 3 > length)
+		{
+			return false;
+		}
+		return static_cast<unsigned char>(data[offset + 0]) == 0xEF
+			&& static_cast<unsigned char>(data[offset + 1]) == 0xBB
+			&& static_cast<unsigned char>(data[offset + 2]) == 0xBF;
+	}
+
 	inline void GetTrimmedAsciiRange(const char* data, size_t length, size_t& start, size_t& end)
 	{
 		start = 0;
@@ -32,6 +47,16 @@ namespace
 		while (end > start && IsAsciiWhitespace(static_cast<unsigned char>(data[end - 1])))
 		{
 			end--;
+		}
+
+		// Tolerate UTF-8 BOM (EF BB BF) after trimming ASCII whitespace.
+		if (IsUtf8BomAt(data, length, start))
+		{
+			start += 3;
+			while (start < end && IsAsciiWhitespace(static_cast<unsigned char>(data[start])))
+			{
+				start++;
+			}
 		}
 	}
 
@@ -736,7 +761,7 @@ namespace
 
 			if (encoded == -1)
 			{
-				time.Set(-1, 0, 0, 0);
+				time = GB_Time::Invalid;
 				return true;
 			}
 
@@ -789,7 +814,7 @@ namespace
 
 					if (encoded == -1)
 					{
-						time.Set(-1, 0, 0, 0);
+						time = GB_Time::Invalid;
 						return true;
 					}
 
@@ -1254,6 +1279,10 @@ bool GB_Date::operator>=(const GB_Date& other) const
 
 size_t GB_Date::GB_DateHash::operator()(const GB_Date& date) const noexcept
 {
+	if (!date.IsValid())
+	{
+		return std::hash<int>()(0);
+	}
 	const long long packed = static_cast<long long>(date.year) * 10000LL
 		+ static_cast<long long>(date.month) * 100LL
 		+ static_cast<long long>(date.day);
@@ -1265,16 +1294,17 @@ std::string GB_Date::SerializeToString() const
 	// Format: GB_Date|<version>|<year>|<month>|<day>
 	// - version starts at 1
 	// - null date is represented as 0|0|0
+	const GB_Date normalized = IsValid() ? *this : GB_Date::Invalid;
 	std::string result;
 	result.reserve(64);
 	result.append("GB_Date|");
 	result.append(std::to_string(static_cast<int>(kDateBinaryVersion)));
 	result.push_back('|');
-	result.append(std::to_string(year));
+	result.append(std::to_string(normalized.year));
 	result.push_back('|');
-	result.append(std::to_string(month));
+	result.append(std::to_string(normalized.month));
 	result.push_back('|');
-	result.append(std::to_string(day));
+	result.append(std::to_string(normalized.day));
 	return result;
 }
 
@@ -1282,14 +1312,15 @@ GB_ByteBuffer GB_Date::SerializeToBinary() const
 {
 	// Layout (little-endian):
 	// [uint32 magic][uint32 version][int32 year][int32 month][int32 day]
+	const GB_Date normalized = IsValid() ? *this : GB_Date::Invalid;
 	GB_ByteBuffer buffer;
 	buffer.reserve(20);
 
 	AppendUInt32LE(buffer, GB_ClassMagicNumber);
 	AppendUInt32LE(buffer, kDateBinaryVersion);
-	AppendInt32LE(buffer, static_cast<int32_t>(year));
-	AppendInt32LE(buffer, static_cast<int32_t>(month));
-	AppendInt32LE(buffer, static_cast<int32_t>(day));
+	AppendInt32LE(buffer, static_cast<int32_t>(normalized.year));
+	AppendInt32LE(buffer, static_cast<int32_t>(normalized.month));
+	AppendInt32LE(buffer, static_cast<int32_t>(normalized.day));
 
 	return buffer;
 }
@@ -1438,10 +1469,11 @@ std::string GB_Time::ToIsoString(bool includeMilliseconds) const
 		return {};
 	}
 
-	const int hour = Hour();
-	const int minute = Minute();
-	const int second = Second();
-	const int millisecond = Millisecond();
+	const int totalMilliseconds = millisecondsSinceStartOfDay;
+	const int hour = totalMilliseconds / (60 * 60 * 1000);
+	const int minute = (totalMilliseconds / (60 * 1000)) % 60;
+	const int second = (totalMilliseconds / 1000) % 60;
+	const int millisecond = totalMilliseconds % 1000;
 
 	if (includeMilliseconds)
 	{
@@ -1487,7 +1519,7 @@ GB_Time GB_Time::CreateFromIsoString(const std::string& textUtf8)
 	GB_Time time;
 	if (!ParseIsoString(textUtf8, time))
 	{
-		return GB_Time(-1, 0, 0, 0);
+		return GB_Time::Invalid;
 	}
 	return time;
 }
