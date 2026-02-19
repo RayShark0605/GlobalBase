@@ -4,6 +4,7 @@
 #include <chrono>
 #include <cstdint>
 #include <ctime>
+#include <cstring>
 #include <limits>
 #include <string>
 #include <vector>
@@ -19,28 +20,49 @@ namespace
 		return ch == ' ' || ch == '\t' || ch == '\n' || ch == '\r' || ch == '\f' || ch == '\v';
 	}
 
-	inline std::string TrimAsciiWhitespace(const std::string& text)
+	inline void GetTrimmedAsciiRange(const char* data, size_t length, size_t& start, size_t& end)
 	{
-		size_t start = 0;
-		while (start < text.size() && IsAsciiWhitespace(static_cast<unsigned char>(text[start])))
+		start = 0;
+		end = length;
+		while (start < end && IsAsciiWhitespace(static_cast<unsigned char>(data[start])))
 		{
 			start++;
 		}
 
-		size_t end = text.size();
-		while (end > start && IsAsciiWhitespace(static_cast<unsigned char>(text[end - 1])))
+		while (end > start && IsAsciiWhitespace(static_cast<unsigned char>(data[end - 1])))
 		{
 			end--;
 		}
-
-		return text.substr(start, end - start);
 	}
 
-	inline bool IsAllDigits(const std::string& s)
+	inline void GetTrimmedAsciiRange(const std::string& text, size_t& start, size_t& end)
 	{
-		for (size_t i = 0; i < s.size(); i++)
+		GetTrimmedAsciiRange(text.data(), text.size(), start, end);
+	}
+
+	inline bool StartsWith(const char* data, size_t length, const char* prefix, size_t prefixLength)
+	{
+		if (data == nullptr || prefix == nullptr)
 		{
-			if (s[i] < '0' || s[i] > '9')
+			return false;
+		}
+		if (length < prefixLength)
+		{
+			return false;
+		}
+		return std::memcmp(data, prefix, prefixLength) == 0;
+	}
+
+	inline bool IsAllDigits(const char* data, size_t length)
+	{
+		if (data == nullptr)
+		{
+			return false;
+		}
+		for (size_t i = 0; i < length; i++)
+		{
+			const char ch = data[i];
+			if (ch < '0' || ch > '9')
 			{
 				return false;
 			}
@@ -48,9 +70,13 @@ namespace
 		return true;
 	}
 
-	inline bool ParseFixedDigits(const std::string& s, size_t offset, size_t count, int& outValue)
+	inline bool ParseFixedDigits(const char* data, size_t length, size_t offset, size_t count, int& outValue)
 	{
-		if (offset + count > s.size())
+		if (data == nullptr)
+		{
+			return false;
+		}
+		if (offset + count > length)
 		{
 			return false;
 		}
@@ -58,7 +84,7 @@ namespace
 		int value = 0;
 		for (size_t i = 0; i < count; i++)
 		{
-			const char ch = s[offset + i];
+			const char ch = data[offset + i];
 			if (ch < '0' || ch > '9')
 			{
 				return false;
@@ -70,33 +96,94 @@ namespace
 		return true;
 	}
 
-	inline bool TryParseInt32(const std::string& text, int& outValue)
+	inline bool ParseIsoDateSpan(const char* data, size_t length, GB_Date& outDate)
 	{
-		if (text.empty())
+		if (data == nullptr)
+		{
+			outDate = GB_Date::Invalid;
+			return false;
+		}
+
+		int parsedYear = 0;
+		int parsedMonth = 0;
+		int parsedDay = 0;
+
+		if (length == 10)
+		{
+			// YYYY-MM-DD
+			if (data[4] != '-' || data[7] != '-')
+			{
+				outDate = GB_Date::Invalid;
+				return false;
+			}
+			if (!ParseFixedDigits(data, length, 0, 4, parsedYear)
+				|| !ParseFixedDigits(data, length, 5, 2, parsedMonth)
+				|| !ParseFixedDigits(data, length, 8, 2, parsedDay))
+			{
+				outDate = GB_Date::Invalid;
+				return false;
+			}
+		}
+		else if (length == 8)
+		{
+			// YYYYMMDD
+			if (!IsAllDigits(data, length))
+			{
+				outDate = GB_Date::Invalid;
+				return false;
+			}
+			if (!ParseFixedDigits(data, length, 0, 4, parsedYear)
+				|| !ParseFixedDigits(data, length, 4, 2, parsedMonth)
+				|| !ParseFixedDigits(data, length, 6, 2, parsedDay))
+			{
+				outDate = GB_Date::Invalid;
+				return false;
+			}
+		}
+		else
+		{
+			outDate = GB_Date::Invalid;
+			return false;
+		}
+
+		GB_Date date;
+		if (!date.Set(parsedYear, parsedMonth, parsedDay))
+		{
+			outDate = GB_Date::Invalid;
+			return false;
+		}
+
+		outDate = date;
+		return true;
+	}
+
+	inline bool TryParseInt32Span(const char* data, size_t length, int& outValue)
+	{
+		if (data == nullptr || length == 0)
 		{
 			return false;
 		}
 
 		size_t i = 0;
 		bool negative = false;
-		if (text[0] == '+' || text[0] == '-')
+		if (data[0] == '+' || data[0] == '-')
 		{
-			negative = (text[0] == '-');
+			negative = (data[0] == '-');
 			i++;
-			if (i >= text.size())
+			if (i >= length)
 			{
 				return false;
 			}
 		}
 
-		constexpr static long long positiveLimit = static_cast<long long>(std::numeric_limits<int>::max());
-		constexpr static long long negativeLimitAbs = -static_cast<long long>(std::numeric_limits<int>::min());
+		const long long positiveLimit = static_cast<long long>(std::numeric_limits<int>::max());
+		const long long negativeLimitAbs = -static_cast<long long>(std::numeric_limits<int>::min());
 		const long long limitAbs = negative ? negativeLimitAbs : positiveLimit;
 
 		long long value = 0;
-		for (; i < text.size(); i++)
+		for (; i < length; i++)
 		{
-			const char ch = text[i];
+			const char ch = data[i];
 			if (ch < '0' || ch > '9')
 			{
 				return false;
@@ -112,13 +199,150 @@ namespace
 
 		if (negative)
 		{
-			// value is within [-INT_MIN], safe.
 			outValue = static_cast<int>(-value);
 			return true;
 		}
 
 		outValue = static_cast<int>(value);
 		return true;
+	}
+
+	inline bool ReadDelimitedField(const char* data, size_t length, size_t& cursor, char delimiter,
+		size_t& fieldOffset, size_t& fieldLength, bool isLast)
+	{
+		if (data == nullptr)
+		{
+			return false;
+		}
+		if (cursor > length)
+		{
+			return false;
+		}
+
+		fieldOffset = cursor;
+		if (isLast)
+		{
+			fieldLength = length - cursor;
+			cursor = length;
+			return fieldLength > 0;
+		}
+
+		size_t i = cursor;
+		while (i < length&& data[i] != delimiter)
+		{
+			i++;
+		}
+		if (i >= length)
+		{
+			return false;
+		}
+
+		fieldLength = i - cursor;
+		cursor = i + 1;
+		return fieldLength > 0;
+	}
+
+	inline bool DeserializeDateFromSpan(GB_Date& date, const char* data, size_t length)
+	{
+		if (data == nullptr)
+		{
+			date.Reset();
+			return false;
+		}
+
+		size_t start = 0;
+		size_t end = 0;
+		GetTrimmedAsciiRange(data, length, start, end);
+		if (end <= start)
+		{
+			date.Reset();
+			return false;
+		}
+
+		const char* textData = data + start;
+		const size_t textLength = end - start;
+
+		// 1) Prefer our explicit serialization format.
+		//    GB_Date|version|year|month|day
+		if (StartsWith(textData, textLength, "GB_Date|", 8))
+		{
+			constexpr size_t prefixLength = 8;
+			size_t cursor = prefixLength;
+			size_t versionOffset = 0;
+			size_t versionLength = 0;
+			size_t yearOffset = 0;
+			size_t yearLength = 0;
+			size_t monthOffset = 0;
+			size_t monthLength = 0;
+			size_t dayOffset = 0;
+			size_t dayLength = 0;
+
+			if (!ReadDelimitedField(textData, textLength, cursor, '|', versionOffset, versionLength, false)
+				|| !ReadDelimitedField(textData, textLength, cursor, '|', yearOffset, yearLength, false)
+				|| !ReadDelimitedField(textData, textLength, cursor, '|', monthOffset, monthLength, false)
+				|| !ReadDelimitedField(textData, textLength, cursor, '|', dayOffset, dayLength, true))
+			{
+				date.Reset();
+				return false;
+			}
+			if (cursor != textLength)
+			{
+				date.Reset();
+				return false;
+			}
+			for (size_t i = dayOffset; i < dayOffset + dayLength; i++)
+			{
+				if (textData[i] == '|')
+				{
+					date.Reset();
+					return false;
+				}
+			}
+
+			int version = 0;
+			int parsedYear = 0;
+			int parsedMonth = 0;
+			int parsedDay = 0;
+			if (!TryParseInt32Span(textData + versionOffset, versionLength, version)
+				|| !TryParseInt32Span(textData + yearOffset, yearLength, parsedYear)
+				|| !TryParseInt32Span(textData + monthOffset, monthLength, parsedMonth)
+				|| !TryParseInt32Span(textData + dayOffset, dayLength, parsedDay))
+			{
+				date.Reset();
+				return false;
+			}
+
+			if (version != static_cast<int>(kDateBinaryVersion))
+			{
+				date.Reset();
+				return false;
+			}
+
+			if (parsedYear == 0 && parsedMonth == 0 && parsedDay == 0)
+			{
+				date.Reset();
+				return true;
+			}
+
+			if (!date.Set(parsedYear, parsedMonth, parsedDay))
+			{
+				date.Reset();
+				return false;
+			}
+
+			return true;
+		}
+
+		// 2) Fallback: accept ISO strings.
+		GB_Date parsed;
+		if (ParseIsoDateSpan(textData, textLength, parsed))
+		{
+			date = parsed;
+			return true;
+		}
+
+		date.Reset();
+		return false;
 	}
 
 	// Floor division for possibly negative values.
@@ -183,6 +407,58 @@ namespace
 		}
 		value = static_cast<int32_t>(temp);
 		return true;
+	}
+
+
+	inline bool DeserializeDateFromBinary(GB_Date& date, const GB_ByteBuffer& buffer)
+	{
+		// Accept both our binary layout and (as fallback) textual data carried in a byte buffer.
+		// Binary layout (little-endian):
+		// [uint32 magic][uint32 version][int32 year][int32 month][int32 day]
+		if (buffer.empty())
+		{
+			date.Reset();
+			return false;
+		}
+
+		// Fast path: binary.
+		if (buffer.size() >= 20)
+		{
+			size_t offset = 0;
+			uint32_t magic = 0;
+			uint32_t version = 0;
+			int32_t parsedYear = 0;
+			int32_t parsedMonth = 0;
+			int32_t parsedDay = 0;
+
+			if (ReadUInt32LE(buffer, offset, magic)
+				&& ReadUInt32LE(buffer, offset, version)
+				&& ReadInt32LE(buffer, offset, parsedYear)
+				&& ReadInt32LE(buffer, offset, parsedMonth)
+				&& ReadInt32LE(buffer, offset, parsedDay))
+			{
+				if (magic == GB_ClassMagicNumber && version == kDateBinaryVersion)
+				{
+					if (parsedYear == 0 && parsedMonth == 0 && parsedDay == 0)
+					{
+						date.Reset();
+						return true;
+					}
+
+					if (!date.Set(static_cast<int>(parsedYear), static_cast<int>(parsedMonth), static_cast<int>(parsedDay)))
+					{
+						date.Reset();
+						return false;
+					}
+
+					return true;
+				}
+			}
+		}
+
+		// Fallback: treat it as UTF-8 text (ASCII subset) and reuse textual deserializer.
+		const char* dataPtr = reinterpret_cast<const char*>(buffer.data());
+		return DeserializeDateFromSpan(date, dataPtr, buffer.size());
 	}
 
 	inline long long DateToJdnGregorian(int year, int month, int day)
@@ -524,65 +800,18 @@ GB_Date GB_Date::CreateFromIsoString(const std::string& textUtf8)
 
 bool GB_Date::ParseIsoString(const std::string& textUtf8, GB_Date& outDate)
 {
-	const std::string text = TrimAsciiWhitespace(textUtf8);
-	if (text.empty())
+	size_t start = 0;
+	size_t end = 0;
+	GetTrimmedAsciiRange(textUtf8, start, end);
+	if (end <= start)
 	{
 		outDate = GB_Date::Invalid;
 		return false;
 	}
 
-	int parsedYear = 0;
-	int parsedMonth = 0;
-	int parsedDay = 0;
-
-	if (text.size() == 10)
-	{
-		// YYYY-MM-DD
-		if (text[4] != '-' || text[7] != '-')
-		{
-			outDate = GB_Date::Invalid;
-			return false;
-		}
-
-		if (!ParseFixedDigits(text, 0, 4, parsedYear)
-			|| !ParseFixedDigits(text, 5, 2, parsedMonth)
-			|| !ParseFixedDigits(text, 8, 2, parsedDay))
-		{
-			outDate = GB_Date::Invalid;
-			return false;
-		}
-	}
-	else if (text.size() == 8)
-	{
-		// YYYYMMDD
-		if (!IsAllDigits(text))
-		{
-			outDate = GB_Date::Invalid;
-			return false;
-		}
-		if (!ParseFixedDigits(text, 0, 4, parsedYear)
-			|| !ParseFixedDigits(text, 4, 2, parsedMonth)
-			|| !ParseFixedDigits(text, 6, 2, parsedDay))
-		{
-			outDate = GB_Date::Invalid;
-			return false;
-		}
-	}
-	else
-	{
-		outDate = GB_Date::Invalid;
-		return false;
-	}
-
-	GB_Date date;
-	if (!date.Set(parsedYear, parsedMonth, parsedDay))
-	{
-		outDate = GB_Date::Invalid;
-		return false;
-	}
-
-	outDate = date;
-	return true;
+	const char* textData = textUtf8.data() + start;
+	const size_t textLength = end - start;
+	return ParseIsoDateSpan(textData, textLength, outDate);
 }
 
 GB_Date GB_Date::AddDays(int days) const
@@ -784,137 +1013,10 @@ GB_ByteBuffer GB_Date::SerializeToBinary() const
 
 bool GB_Date::Deserialize(const std::string& data)
 {
-	const std::string text = TrimAsciiWhitespace(data);
-	if (text.empty())
-	{
-		Reset();
-		return false;
-	}
-
-	// 1) Prefer our explicit serialization format.
-	//    GB_Date|version|year|month|day
-	if (text.rfind("GB_Date|", 0) == 0)
-	{
-		// Avoid allocations/exception parsing for a low-level type.
-		constexpr size_t prefixLength = 8; // "GB_Date|"
-		const size_t p2 = text.find('|', prefixLength);
-		if (p2 == std::string::npos)
-		{
-			Reset();
-			return false;
-		}
-		const size_t p3 = text.find('|', p2 + 1);
-		if (p3 == std::string::npos)
-		{
-			Reset();
-			return false;
-		}
-		const size_t p4 = text.find('|', p3 + 1);
-		if (p4 == std::string::npos)
-		{
-			Reset();
-			return false;
-		}
-		if (text.find('|', p4 + 1) != std::string::npos)
-		{
-			Reset();
-			return false;
-		}
-
-		const std::string versionText = text.substr(prefixLength, p2 - prefixLength);
-		const std::string yearText = text.substr(p2 + 1, p3 - (p2 + 1));
-		const std::string monthText = text.substr(p3 + 1, p4 - (p3 + 1));
-		const std::string dayText = text.substr(p4 + 1);
-
-		int version = 0;
-		int parsedYear = 0;
-		int parsedMonth = 0;
-		int parsedDay = 0;
-
-		if (!TryParseInt32(versionText, version)
-			|| !TryParseInt32(yearText, parsedYear)
-			|| !TryParseInt32(monthText, parsedMonth)
-			|| !TryParseInt32(dayText, parsedDay))
-		{
-			Reset();
-			return false;
-		}
-
-		if (version != static_cast<int>(kDateBinaryVersion))
-		{
-			Reset();
-			return false;
-		}
-
-		if (parsedYear == 0 && parsedMonth == 0 && parsedDay == 0)
-		{
-			Reset();
-			return true;
-		}
-
-		if (!Set(parsedYear, parsedMonth, parsedDay))
-		{
-			Reset();
-			return false;
-		}
-
-		return true;
-	}
-
-	// 2) Fallback: accept ISO strings.
-	GB_Date parsed;
-	if (ParseIsoString(text, parsed))
-	{
-		*this = parsed;
-		return true;
-	}
-
-	Reset();
-	return false;
+	return DeserializeDateFromSpan(*this, data.data(), data.size());
 }
 
 bool GB_Date::Deserialize(const GB_ByteBuffer& data)
 {
-	if (data.size() < 20)
-	{
-		Reset();
-		return false;
-	}
-
-	size_t offset = 0;
-	uint32_t magic = 0;
-	uint32_t version = 0;
-	int32_t parsedYear = 0;
-	int32_t parsedMonth = 0;
-	int32_t parsedDay = 0;
-
-	if (!ReadUInt32LE(data, offset, magic)
-		|| !ReadUInt32LE(data, offset, version)
-		|| !ReadInt32LE(data, offset, parsedYear)
-		|| !ReadInt32LE(data, offset, parsedMonth)
-		|| !ReadInt32LE(data, offset, parsedDay))
-	{
-		Reset();
-		return false;
-	}
-
-	if (magic != GB_ClassMagicNumber || version != kDateBinaryVersion)
-	{
-		Reset();
-		return false;
-	}
-
-	if (parsedYear == 0 && parsedMonth == 0 && parsedDay == 0)
-	{
-		Reset();
-		return true;
-	}
-
-	if (!Set(static_cast<int>(parsedYear), static_cast<int>(parsedMonth), static_cast<int>(parsedDay)))
-	{
-		Reset();
-		return false;
-	}
-
-	return true;
+	return DeserializeDateFromBinary(*this, data);
 }
