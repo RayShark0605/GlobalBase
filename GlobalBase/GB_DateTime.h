@@ -116,6 +116,7 @@ public:
 	GB_ByteBuffer SerializeToBinary() const;
 
 	// 反序列化。
+	// 注意：当返回 false 时，对象会被重置为 GB_Date::Invalid（0-0-0）。
 	bool Deserialize(const std::string& data);
 	bool Deserialize(const GB_ByteBuffer& data);
 
@@ -211,6 +212,7 @@ public:
 	GB_ByteBuffer SerializeToBinary() const;
 
 	// 反序列化。
+	// 注意：当返回 false 时，对象会被重置为 GB_Time::Invalid。
 	bool Deserialize(const std::string& data);
 	bool Deserialize(const GB_ByteBuffer& data);
 

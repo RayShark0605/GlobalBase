@@ -368,8 +368,10 @@ namespace
 	{
 		// b > 0 assumed
 		long long q = a / b;
-		long long r = a % b;
-		if (r != 0 && ((r > 0) != (b > 0)))
+		const long long r = a % b;
+		// In C/C++, remainder has the sign of the dividend. For floor division (with b>0),
+		// we need to decrement the truncated quotient when the remainder is negative.
+		if (r < 0)
 		{
 			q--;
 		}
@@ -691,7 +693,7 @@ namespace
 	{
 		if (data == nullptr)
 		{
-			time.Reset();
+			time = GB_Time::Invalid;
 			return false;
 		}
 
@@ -700,7 +702,7 @@ namespace
 		GetTrimmedAsciiRange(data, length, start, end);
 		if (end <= start)
 		{
-			time.Reset();
+			time = GB_Time::Invalid;
 			return false;
 		}
 
@@ -721,19 +723,19 @@ namespace
 			if (!ReadDelimitedField(textData, textLength, cursor, '|', versionOffset, versionLength, false)
 				|| !ReadDelimitedField(textData, textLength, cursor, '|', valueOffset, valueLength, true))
 			{
-				time.Reset();
+				time = GB_Time::Invalid;
 				return false;
 			}
 			if (cursor != textLength)
 			{
-				time.Reset();
+				time = GB_Time::Invalid;
 				return false;
 			}
 			for (size_t i = valueOffset; i < valueOffset + valueLength; i++)
 			{
 				if (textData[i] == '|')
 				{
-					time.Reset();
+					time = GB_Time::Invalid;
 					return false;
 				}
 			}
@@ -743,13 +745,13 @@ namespace
 			if (!TryParseInt32Span(textData + versionOffset, versionLength, version)
 				|| !TryParseInt32Span(textData + valueOffset, valueLength, encoded))
 			{
-				time.Reset();
+				time = GB_Time::Invalid;
 				return false;
 			}
 
 			if (version != static_cast<int>(kTimeBinaryVersion))
 			{
-				time.Reset();
+				time = GB_Time::Invalid;
 				return false;
 			}
 
@@ -777,7 +779,7 @@ namespace
 			return true;
 		}
 
-		time.Reset();
+		time = GB_Time::Invalid;
 		return false;
 	}
 
@@ -788,7 +790,7 @@ namespace
 		// [uint32 magic][uint32 version][int32 encodedMsecs]
 		if (buffer.empty())
 		{
-			time.Reset();
+			time = GB_Time::Invalid;
 			return false;
 		}
 
