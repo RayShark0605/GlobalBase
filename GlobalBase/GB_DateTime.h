@@ -226,4 +226,99 @@ private:
 	bool isNullTime = true;
 };
 
+enum class GB_DateTimeSpec
+{
+	LocalTime = 0,
+	UtcTime = 1,
+	OffsetFromUtc = 2
+};
+
+class GLOBALBASE_PORT GB_DateTime
+{
+public:
+	static const GB_DateTime Invalid;
+
+	GB_DateTime();
+	GB_DateTime(const GB_Date& date, const GB_Time& time, GB_DateTimeSpec spec = GB_DateTimeSpec::LocalTime, int offsetFromUtcMinutes = 0);
+
+	bool IsValid() const;
+	void Reset();
+
+	GB_DateTimeSpec Spec() const;
+
+	// 若 Spec()==OffsetFromUtc：返回构造时的固定偏移；
+	// 若 Spec()==UtcTime：返回 0；
+	// 若 Spec()==LocalTime：返回该时间点在本地时区下的偏移（分钟）。若无法计算则返回 0。
+	int OffsetFromUtcMinutes() const;
+
+	// 返回与 Spec() 对应视角下的日期/时间。
+	GB_Date Date() const;
+	GB_Time Time() const;
+
+	// Unix epoch 起的毫秒/秒（UTC 绝对时间）。
+	long long ToUnixMilliseconds() const;
+	long long ToUnixSeconds() const;
+
+	static GB_DateTime CreateFromUnixMilliseconds(long long unixMilliseconds, GB_DateTimeSpec spec = GB_DateTimeSpec::UtcTime, int offsetFromUtcMinutes = 0);
+	static GB_DateTime CreateFromUnixSeconds(long long unixSeconds, GB_DateTimeSpec spec = GB_DateTimeSpec::UtcTime, int offsetFromUtcMinutes = 0);
+
+	// 当前时间。
+	static GB_DateTime Now();
+	static GB_DateTime UtcNow();
+
+	// 仅改变 Spec（同一时间点，不改变 unixMilliseconds）。
+	GB_DateTime ToUtc() const;
+	GB_DateTime ToLocal() const;
+	GB_DateTime ToOffsetFromUtc(int offsetFromUtcMinutes) const;
+
+	// ISO 8601 / RFC3339 风格：YYYY-MM-DDTHH:MM:SS[.mmm][Z|±HH:MM]
+	// 注意：当 Spec()==LocalTime 且 includeTzSuffix==true 时，若系统无法可靠计算本地 UTC 偏移，则不会附加时区后缀。
+	std::string ToIsoString(bool includeMilliseconds = true, bool includeTzSuffix = true) const;
+
+	// 解析 ISO 8601 / RFC3339 风格时间。
+	// 支持：
+	// - "YYYY-MM-DDTHH:MM:SS" / "YYYY-MM-DD HH:MM:SS"（可选 .mmm 或 ,mmm）
+	// - 可选时区后缀：Z / ±HH:MM / ±HHMM / ±HH
+	// - 若缺失时区后缀，则按 defaultSpec 解释（默认 LocalTime）。
+	static GB_DateTime CreateFromIsoString(const std::string& textUtf8, GB_DateTimeSpec defaultSpec = GB_DateTimeSpec::LocalTime);
+	static bool ParseIsoString(const std::string& textUtf8, GB_DateTime& outDateTime, GB_DateTimeSpec defaultSpec = GB_DateTimeSpec::LocalTime);
+
+	// 变换：AddMSecs/AddSecs 是“绝对时间点”加减；AddDays 使用“当前 Spec 视角下的日历加法”。
+	GB_DateTime AddMSecs(long long milliseconds) const;
+	GB_DateTime AddSecs(int seconds) const;
+	GB_DateTime AddDays(int days) const;
+
+	// 差值：other - this。
+	int64_t MsecsTo(const GB_DateTime& other) const;
+	double SecondsTo(const GB_DateTime& other) const;
+
+	bool operator==(const GB_DateTime& other) const;
+	bool operator!=(const GB_DateTime& other) const;
+	bool operator<(const GB_DateTime& other) const;
+	bool operator<=(const GB_DateTime& other) const;
+	bool operator>(const GB_DateTime& other) const;
+	bool operator>=(const GB_DateTime& other) const;
+
+	struct GB_DateTimeHash
+	{
+		size_t operator()(const GB_DateTime& dateTime) const noexcept;
+	};
+
+	// 序列化/反序列化。
+	std::string SerializeToString() const;
+	GB_ByteBuffer SerializeToBinary() const;
+
+	// 注意：当返回 false 时，对象会被重置为 GB_DateTime::Invalid。
+	// 若 data 识别为二进制格式（MagicNumber 匹配）但版本不支持，将直接返回 false（不会回退文本解析）。
+	bool Deserialize(const std::string& data);
+	bool Deserialize(const GB_ByteBuffer& data);
+
+private:
+	int64_t unixMilliseconds = 0;
+	GB_DateTimeSpec spec = GB_DateTimeSpec::LocalTime;
+	int offsetMinutes = 0; // 仅在 spec==OffsetFromUtc 时有效
+	bool valid = false;
+};
+
+
 #endif
