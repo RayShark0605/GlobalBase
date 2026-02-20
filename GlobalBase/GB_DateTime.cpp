@@ -1324,6 +1324,27 @@ GB_Date GB_Date::UtcToday()
 
 	return GB_Date(tmValue.tm_year + 1900, tmValue.tm_mon + 1, tmValue.tm_mday);
 }
+GB_DateTime GB_Date::ToDateTime(const GB_Time& time, GB_DateTimeSpec spec, int offsetFromUtcMinutes) const
+{
+	if (!IsValid() || !time.IsValid())
+	{
+		return GB_DateTime::Invalid;
+	}
+
+	return GB_DateTime(*this, time, spec, offsetFromUtcMinutes);
+}
+
+GB_DateTime GB_Date::ToDateTime(GB_DateTimeSpec spec, int offsetFromUtcMinutes) const
+{
+	if (!IsValid())
+	{
+		return GB_DateTime::Invalid;
+	}
+
+	return GB_DateTime(*this, GB_Time::MinValue, spec, offsetFromUtcMinutes);
+}
+
+
 
 bool GB_Date::operator==(const GB_Date& other) const
 {
@@ -1767,6 +1788,49 @@ GB_Time GB_Time::UtcCurrentTime()
 
 	return result;
 }
+GB_DateTime GB_Time::ToDateTime(const GB_Date& date, GB_DateTimeSpec spec, int offsetFromUtcMinutes) const
+{
+	if (!date.IsValid() || !IsValid())
+	{
+		return GB_DateTime::Invalid;
+	}
+
+	return GB_DateTime(date, *this, spec, offsetFromUtcMinutes);
+}
+
+GB_DateTime GB_Time::ToDateTime(GB_DateTimeSpec spec, int offsetFromUtcMinutes) const
+{
+	if (!IsValid())
+	{
+		return GB_DateTime::Invalid;
+	}
+
+	GB_Date date;
+
+	if (spec == GB_DateTimeSpec::UtcTime)
+	{
+		date = GB_Date::UtcToday();
+	}
+	else if (spec == GB_DateTimeSpec::LocalTime)
+	{
+		date = GB_Date::Today();
+	}
+	else
+	{
+		const GB_DateTime nowUtc = GB_DateTime::UtcNow();
+		if (!nowUtc.IsValid())
+		{
+			return GB_DateTime::Invalid;
+		}
+
+		const GB_DateTime nowOffset = nowUtc.ToOffsetFromUtc(offsetFromUtcMinutes);
+		date = nowOffset.Date();
+	}
+
+	return ToDateTime(date, spec, offsetFromUtcMinutes);
+}
+
+
 
 bool GB_Time::operator==(const GB_Time& other) const
 {

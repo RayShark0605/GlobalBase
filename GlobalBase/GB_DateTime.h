@@ -9,6 +9,19 @@
 #include <functional>
 #include <string>
 
+
+// 注意：OffsetFromUtc / OffsetFromUtcMinutes 采用 RFC3339/ISO8601 语义：
+// offset = local - UTC（即“加到 UTC 上得到本地时间”的分钟数）。
+enum class GB_DateTimeSpec
+{
+	LocalTime = 0,
+	UtcTime = 1,
+	OffsetFromUtc = 2
+};
+
+class GLOBALBASE_PORT GB_Time;
+class GLOBALBASE_PORT GB_DateTime;
+
 class GLOBALBASE_PORT GB_Date
 {
 public:
@@ -103,6 +116,24 @@ public:
 	// 获取本地/UTC 的“今天”日期；若系统时间获取失败则返回 Invalid。
 	static GB_Date Today();
 	static GB_Date UtcToday();
+
+	/**
+	 * @brief 将此日期与指定时间组合为 GB_DateTime。
+	 * @param time 时间（必须有效）。
+	 * @param spec 日期时间语义（本地/UTC/带偏移）。
+	 * @param offsetFromUtcMinutes 当 spec==GB_DateTimeSpec::OffsetFromUtc 时有效，语义为 local - UTC（分钟）。
+	 * @return 若日期或时间无效，则返回 GB_DateTime::Invalid。
+	 */
+	GB_DateTime ToDateTime(const GB_Time& time, GB_DateTimeSpec spec = GB_DateTimeSpec::LocalTime, int offsetFromUtcMinutes = 0) const;
+
+	/**
+	 * @brief 将此日期视作当天 00:00:00.000，转换为 GB_DateTime。
+	 * @param spec 日期时间语义（本地/UTC/带偏移）。
+	 * @param offsetFromUtcMinutes 当 spec==GB_DateTimeSpec::OffsetFromUtc 时有效，语义为 local - UTC（分钟）。
+	 * @return 若日期无效，则返回 GB_DateTime::Invalid。
+	 */
+	GB_DateTime ToDateTime(GB_DateTimeSpec spec = GB_DateTimeSpec::LocalTime, int offsetFromUtcMinutes = 0) const;
+
 
 	bool operator==(const GB_Date& other) const;
 	bool operator!=(const GB_Date& other) const;
@@ -201,6 +232,24 @@ public:
 	static GB_Time CurrentTime();
 	static GB_Time UtcCurrentTime();
 
+	/**
+	 * @brief 将此时间与指定日期组合为 GB_DateTime。
+	 * @param date 日期（必须有效）。
+	 * @param spec 日期时间语义（本地/UTC/带偏移）。
+	 * @param offsetFromUtcMinutes 当 spec==GB_DateTimeSpec::OffsetFromUtc 时有效，语义为 local - UTC（分钟）。
+	 * @return 若日期或时间无效，则返回 GB_DateTime::Invalid。
+	 */
+	GB_DateTime ToDateTime(const GB_Date& date, GB_DateTimeSpec spec = GB_DateTimeSpec::LocalTime, int offsetFromUtcMinutes = 0) const;
+
+	/**
+	 * @brief 将此时间与“今天”（随 spec 变化）组合为 GB_DateTime。
+	 * @param spec 日期时间语义（本地/UTC/带偏移）。
+	 * @param offsetFromUtcMinutes 当 spec==GB_DateTimeSpec::OffsetFromUtc 时有效，语义为 local - UTC（分钟）。
+	 * @return 若时间无效，或无法获取“今天”日期，则返回 GB_DateTime::Invalid。
+	 */
+	GB_DateTime ToDateTime(GB_DateTimeSpec spec = GB_DateTimeSpec::LocalTime, int offsetFromUtcMinutes = 0) const;
+
+
 	bool operator==(const GB_Time& other) const;
 	bool operator!=(const GB_Time& other) const;
 	bool operator<(const GB_Time& other) const;
@@ -231,14 +280,6 @@ private:
 	bool isNullTime = true;
 };
 
-// 注意：OffsetFromUtc / OffsetFromUtcMinutes 采用 RFC3339/ISO8601 语义：
-// offset = local - UTC（即“加到 UTC 上得到本地时间”的分钟数）。
-enum class GB_DateTimeSpec
-{
-	LocalTime = 0,
-	UtcTime = 1,
-	OffsetFromUtc = 2
-};
 
 class GLOBALBASE_PORT GB_DateTime
 {
