@@ -1910,6 +1910,34 @@ namespace
 		return unixMilliseconds >= GetMinUnixMillisecondsUtc() && unixMilliseconds <= GetMaxUnixMillisecondsUtc();
 	}
 
+	inline bool TryAddInt64(int64_t a, int64_t b, int64_t& outValue)
+	{
+		if (b > 0 && a > (std::numeric_limits<int64_t>::max() - b))
+		{
+			return false;
+		}
+		if (b < 0 && a < (std::numeric_limits<int64_t>::min() - b))
+		{
+			return false;
+		}
+
+		outValue = a + b;
+		return true;
+	}
+
+	inline int64_t SaturatingSubInt64(int64_t a, int64_t b)
+	{
+		if (b > 0 && a < (std::numeric_limits<int64_t>::min() + b))
+		{
+			return std::numeric_limits<int64_t>::min();
+		}
+		if (b < 0 && a >(std::numeric_limits<int64_t>::max() + b))
+		{
+			return std::numeric_limits<int64_t>::max();
+		}
+		return a - b;
+	}
+
 	inline bool TryParseInt64Span(const char* data, size_t length, int64_t& outValue)
 	{
 		if (data == nullptr)
@@ -2547,7 +2575,7 @@ namespace
 		// 计算该时间点的本地 UTC 偏移。
 		// 思路：localtime(timeValue) 得到“本地民用时间”结构体 localTm。
 		// 然后把 localTm 的年月日时分秒“当作 UTC”来换算回 epoch 秒（timegm/_mkgmtime）。
-		// 两者之差即为偏移：offsetSeconds = timeValue - utcSecondsFromLocalCivil。
+		// 两者之差即可得到该时刻的本地 UTC 偏移：offsetSeconds = utcSecondsFromLocalCivil - timeValue。
 		std::tm workUtcTm = localTm;
 		workUtcTm.tm_isdst = 0; // UTC 视角下无 DST 概念
 
@@ -2588,7 +2616,17 @@ namespace
 		}
 
 		const int64_t offsetSecondsFallback = static_cast<int64_t>(timeValue) - static_cast<int64_t>(localAsUtc);
-		const int64_t offsetMinutesFallback = DivFloor(offsetSecondsFallback, 60LL);
+		if ((offsetSecondsFallback % 60LL) != 0)
+		{
+			return false;
+		}
+
+		const int64_t offsetMinutesFallback = offsetSecondsFallback / 60LL;
+		if (offsetMinutesFallback < -static_cast<int64_t>(kMaxOffsetMinutesAbs)
+			|| offsetMinutesFallback > static_cast<int64_t>(kMaxOffsetMinutesAbs))
+		{
+			return false;
+		}
 		if (offsetMinutesFallback < static_cast<int64_t>(std::numeric_limits<int>::min())
 			|| offsetMinutesFallback > static_cast<int64_t>(std::numeric_limits<int>::max()))
 		{
@@ -2616,8 +2654,18 @@ namespace
 			return false;
 		}
 
-		const int64_t offsetSeconds = static_cast<int64_t>(timeValue) - static_cast<int64_t>(utcSecondsFromLocalCivil);
-		const int64_t offsetMinutes = DivFloor(offsetSeconds, 60LL);
+		const int64_t offsetSeconds = static_cast<int64_t>(utcSecondsFromLocalCivil) - static_cast<int64_t>(timeValue);
+		if ((offsetSeconds % 60LL) != 0)
+		{
+			return false;
+		}
+
+		const int64_t offsetMinutes = offsetSeconds / 60LL;
+		if (offsetMinutes < -static_cast<int64_t>(kMaxOffsetMinutesAbs)
+			|| offsetMinutes > static_cast<int64_t>(kMaxOffsetMinutesAbs))
+		{
+			return false;
+		}
 		if (offsetMinutes < static_cast<int64_t>(std::numeric_limits<int>::min())
 			|| offsetMinutes > static_cast<int64_t>(std::numeric_limits<int>::max()))
 		{
@@ -2950,7 +2998,14 @@ GB_DateTime GB_DateTime::CreateFromUnixMilliseconds(long long unixMilliseconds, 
 
 GB_DateTime GB_DateTime::CreateFromUnixSeconds(long long unixSeconds, GB_DateTimeSpec spec, int offsetFromUtcMinutes)
 {
-	const int64_t unixMs = static_cast<int64_t>(unixSeconds) * kMillisecondsPerSecond;
+	const int64_t seconds = static_cast<int64_t>(unixSeconds);
+	if (seconds > (std::numeric_limits<int64_t>::max() / kMillisecondsPerSecond)
+		|| seconds < (std::numeric_limits<int64_t>::min() / kMillisecondsPerSecond))
+	{
+		return GB_DateTime::Invalid;
+	}
+
+	const int64_t unixMs = seconds * kMillisecondsPerSecond;
 	return CreateFromUnixMilliseconds(unixMs, spec, offsetFromUtcMinutes);
 }
 
@@ -3005,9 +3060,24 @@ std::string GB_DateTime::ToIsoString(bool includeMilliseconds, bool includeTzSuf
 		return {};
 	}
 
-	const GB_Date date = Date();
-	const GB_Time time = Time();
-	if (!date.IsValid() || !time.IsValid())
+	GB_Date date;
+	GB_Time time;
+	bool ok = false;
+
+	if (spec == GB_DateTimeSpec::UtcTime)
+	{
+		ok = TryGetUtcComponentsFromUnixMilliseconds(unixMilliseconds, 0, date, time);
+	}
+	else if (spec == GB_DateTimeSpec::OffsetFromUtc)
+	{
+		ok = TryGetUtcComponentsFromUnixMilliseconds(unixMilliseconds, offsetMinutes, date, time);
+	}
+	else
+	{
+		ok = TryGetLocalComponentsFromUnixMilliseconds(unixMilliseconds, date, time);
+	}
+
+	if (!ok || !date.IsValid() || !time.IsValid())
 	{
 		return {};
 	}
@@ -3040,7 +3110,7 @@ std::string GB_DateTime::ToIsoString(bool includeMilliseconds, bool includeTzSuf
 		int computedOffset = 0;
 		if (!TryGetLocalOffsetMinutesFromUnixMilliseconds(unixMilliseconds, computedOffset))
 		{
-			// Cannot reliably obtain the local UTC offset for this instant; do not emit a misleading suffix.
+			// 无法可靠计算该时间点的本地 UTC 偏移；为了避免误导，直接不输出时区后缀。
 			return result;
 		}
 		offset = computedOffset;
@@ -3095,7 +3165,12 @@ GB_DateTime GB_DateTime::AddMSecs(long long milliseconds) const
 		return GB_DateTime::Invalid;
 	}
 
-	const int64_t sum = unixMilliseconds + static_cast<int64_t>(milliseconds);
+	int64_t sum = 0;
+	if (!TryAddInt64(unixMilliseconds, static_cast<int64_t>(milliseconds), sum))
+	{
+		return GB_DateTime::Invalid;
+	}
+
 	return CreateFromUnixMilliseconds(sum, spec, offsetMinutes);
 }
 
@@ -3139,7 +3214,7 @@ int64_t GB_DateTime::MsecsTo(const GB_DateTime& other) const
 		return 0;
 	}
 
-	return other.unixMilliseconds - unixMilliseconds;
+	return SaturatingSubInt64(other.unixMilliseconds, unixMilliseconds);
 }
 
 double GB_DateTime::SecondsTo(const GB_DateTime& other) const
@@ -3149,7 +3224,7 @@ double GB_DateTime::SecondsTo(const GB_DateTime& other) const
 		return 0.0;
 	}
 
-	const int64_t deltaMs = other.unixMilliseconds - unixMilliseconds;
+	const int64_t deltaMs = MsecsTo(other);
 	return static_cast<double>(deltaMs) / 1000.0;
 }
 

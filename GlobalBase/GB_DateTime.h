@@ -231,6 +231,8 @@ private:
 	bool isNullTime = true;
 };
 
+// 注意：OffsetFromUtc / OffsetFromUtcMinutes 采用 RFC3339/ISO8601 语义：
+// offset = local - UTC（即“加到 UTC 上得到本地时间”的分钟数）。
 enum class GB_DateTimeSpec
 {
 	LocalTime = 0,
