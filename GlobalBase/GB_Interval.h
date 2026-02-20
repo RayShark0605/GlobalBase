@@ -333,6 +333,15 @@ using GB_DoubleInterval = GB_Interval<double>;
 
 using GB_IntInterval = GB_Interval<int>;
 
+class GB_Date;
+using GB_DateInterval = GB_Interval<GB_Date>;
+
+class GB_Time;
+using GB_TimeInterval = GB_Interval<GB_Time>;
+
+class GB_DateTime;
+using GB_DateTimeInterval = GB_Interval<GB_DateTime>;
+
 // ============================
 // Template Implementations
 // ============================
