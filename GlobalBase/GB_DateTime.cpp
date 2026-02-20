@@ -15,6 +15,11 @@ namespace
 	constexpr uint32_t kDateBinaryVersion = 1;
 	constexpr size_t kIsoDateStringLength = 10; // YYYY-MM-DD
 
+#if !defined(_WIN32)
+	extern "C" std::time_t timegm(::tm* timeptr);
+#endif
+
+
 	inline bool IsAsciiWhitespace(unsigned char ch)
 	{
 		return ch == ' ' || ch == '\t' || ch == '\n' || ch == '\r' || ch == '\f' || ch == '\v';
@@ -1273,6 +1278,21 @@ int GB_Date::DaysTo(const GB_Date& other) const
 	return b - a;
 }
 
+int GB_Date::Year() const
+{
+	return IsValid() ? year : 0;
+}
+
+int GB_Date::Month() const
+{
+	return IsValid() ? month : 0;
+}
+
+int GB_Date::Day() const
+{
+	return IsValid() ? day : 0;
+}
+
 GB_Date GB_Date::Today()
 {
 	const std::chrono::system_clock::time_point now = std::chrono::system_clock::now();
@@ -1347,7 +1367,7 @@ size_t GB_Date::GB_DateHash::operator()(const GB_Date& date) const noexcept
 {
 	if (!date.IsValid())
 	{
-		return std::hash<int>()(0);
+		return std::hash<uint64_t>()(0xCBF29CE484222325ULL);
 	}
 	const long long packed = static_cast<long long>(date.year) * 10000LL
 		+ static_cast<long long>(date.month) * 100LL
@@ -1913,7 +1933,11 @@ namespace
 			}
 		}
 
-		int64_t value = 0;
+		const uint64_t maxAbs = negative
+			? (static_cast<uint64_t>(std::numeric_limits<int64_t>::max()) + 1ULL)
+			: static_cast<uint64_t>(std::numeric_limits<int64_t>::max());
+
+		uint64_t value = 0;
 		for (; i < length; i++)
 		{
 			const char ch = data[i];
@@ -1921,17 +1945,28 @@ namespace
 			{
 				return false;
 			}
-			const int digit = ch - '0';
+			const uint64_t digit = static_cast<uint64_t>(ch - '0');
 
-			// overflow check
-			if (value > (std::numeric_limits<int64_t>::max() - digit) / 10)
+			if (value > (maxAbs - digit) / 10ULL)
 			{
 				return false;
 			}
-			value = value * 10 + digit;
+			value = value * 10ULL + digit;
 		}
 
-		outValue = negative ? -value : value;
+		if (!negative)
+		{
+			outValue = static_cast<int64_t>(value);
+			return true;
+		}
+
+		if (value == maxAbs)
+		{
+			outValue = std::numeric_limits<int64_t>::min();
+			return true;
+		}
+
+		outValue = -static_cast<int64_t>(value);
 		return true;
 	}
 
@@ -2502,18 +2537,34 @@ namespace
 		}
 
 		const std::time_t timeValue = static_cast<std::time_t>(unixSeconds);
+
+		std::tm localTm = {};
+		if (!GetLocalTm(timeValue, localTm))
+		{
+			return false;
+		}
+
+		// 计算该时间点的本地 UTC 偏移。
+		// 思路：localtime(timeValue) 得到“本地民用时间”结构体 localTm。
+		// 然后把 localTm 的年月日时分秒“当作 UTC”来换算回 epoch 秒（timegm/_mkgmtime）。
+		// 两者之差即为偏移：offsetSeconds = timeValue - utcSecondsFromLocalCivil。
+		std::tm workUtcTm = localTm;
+		workUtcTm.tm_isdst = 0; // UTC 视角下无 DST 概念
+
+		std::time_t utcSecondsFromLocalCivil = static_cast<std::time_t>(-1);
+
+#if defined(_WIN32)
+		utcSecondsFromLocalCivil = _mkgmtime(&workUtcTm);
+#elif defined(__linux__) || defined(__APPLE__) || defined(__unix__) || defined(__FreeBSD__) || defined(__NetBSD__)
+		utcSecondsFromLocalCivil = timegm(&workUtcTm);
+#else
+		// Fallback（极少数平台）：保持原始实现的思路（可能在 DST 边界出现 false-negative）。
 		std::tm gmTm = {};
 		if (!GetGmTm(timeValue, gmTm))
 		{
 			return false;
 		}
 
-		// Convert the UTC broken-down time to a local epoch seconds by interpreting it as local time.
-		// NOTE:
-		// - std::mktime() may normalize the input struct (and some implementations may adjust
-		//   non-existent local times around DST transitions).
-		// - It may also return (time_t)-1 both for failure and for a valid timestamp, so we must
-		//   validate via a localtime() round-trip instead of using a simple sentinel check.
 		std::tm requestedLocalTm = gmTm;
 		requestedLocalTm.tm_isdst = -1;
 
@@ -2536,7 +2587,36 @@ namespace
 			return false;
 		}
 
-		const int64_t offsetSeconds = static_cast<int64_t>(timeValue) - static_cast<int64_t>(localAsUtc);
+		const int64_t offsetSecondsFallback = static_cast<int64_t>(timeValue) - static_cast<int64_t>(localAsUtc);
+		const int64_t offsetMinutesFallback = DivFloor(offsetSecondsFallback, 60LL);
+		if (offsetMinutesFallback < static_cast<int64_t>(std::numeric_limits<int>::min())
+			|| offsetMinutesFallback > static_cast<int64_t>(std::numeric_limits<int>::max()))
+		{
+			return false;
+		}
+
+		outOffsetMinutes = static_cast<int>(offsetMinutesFallback);
+		return true;
+#endif
+
+		// round-trip validation (处理 time_t == -1 等边界；并确保转换结果一致)
+		std::tm checkUtcTm = {};
+		if (!GetGmTm(utcSecondsFromLocalCivil, checkUtcTm))
+		{
+			return false;
+		}
+
+		if (checkUtcTm.tm_year != workUtcTm.tm_year
+			|| checkUtcTm.tm_mon != workUtcTm.tm_mon
+			|| checkUtcTm.tm_mday != workUtcTm.tm_mday
+			|| checkUtcTm.tm_hour != workUtcTm.tm_hour
+			|| checkUtcTm.tm_min != workUtcTm.tm_min
+			|| checkUtcTm.tm_sec != workUtcTm.tm_sec)
+		{
+			return false;
+		}
+
+		const int64_t offsetSeconds = static_cast<int64_t>(timeValue) - static_cast<int64_t>(utcSecondsFromLocalCivil);
 		const int64_t offsetMinutes = DivFloor(offsetSeconds, 60LL);
 		if (offsetMinutes < static_cast<int64_t>(std::numeric_limits<int>::min())
 			|| offsetMinutes > static_cast<int64_t>(std::numeric_limits<int>::max()))
@@ -2594,18 +2674,10 @@ namespace
 			return false;
 		}
 
-		const std::string isoDate = date.ToIsoString();
-		if (isoDate.size() != 10)
-		{
-			return false;
-		}
-
-		int year = 0;
-		int month = 0;
-		int day = 0;
-		if (!ParseFixedDigits(isoDate.data(), isoDate.size(), 0, 4, year)
-			|| !ParseFixedDigits(isoDate.data(), isoDate.size(), 5, 2, month)
-			|| !ParseFixedDigits(isoDate.data(), isoDate.size(), 8, 2, day))
+		const int year = date.Year();
+		const int month = date.Month();
+		const int day = date.Day();
+		if (year == 0 || month == 0 || day == 0)
 		{
 			return false;
 		}
@@ -3135,7 +3207,7 @@ size_t GB_DateTime::GB_DateTimeHash::operator()(const GB_DateTime& dateTime) con
 {
 	if (!dateTime.IsValid())
 	{
-		return std::hash<int>()(0);
+		return std::hash<uint64_t>()(0xCBF29CE484222325ULL);
 	}
 
 	return std::hash<int64_t>()(dateTime.ToUnixMilliseconds());

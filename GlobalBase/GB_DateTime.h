@@ -95,6 +95,11 @@ public:
 	// 与 other 的天数差：other - this；若任一无效则返回 0。
 	int DaysTo(const GB_Date& other) const;
 
+	// 获取年月日；无效日期返回 0。
+	int Year() const;
+	int Month() const;
+	int Day() const;
+
 	// 获取本地/UTC 的“今天”日期；若系统时间获取失败则返回 Invalid。
 	static GB_Date Today();
 	static GB_Date UtcToday();
