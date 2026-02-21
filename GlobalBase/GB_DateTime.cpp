@@ -5,6 +5,12 @@
 #include <cstdint>
 #include <ctime>
 #include <cstring>
+
+#include <cmath>
+#include <cstdio>
+#include <iomanip>
+#include <locale>
+#include <sstream>
 #include <limits>
 #include <string>
 #include <vector>
@@ -3396,4 +3402,1300 @@ bool GB_DateTime::Deserialize(const std::string& data)
 bool GB_DateTime::Deserialize(const GB_ByteBuffer& data)
 {
 	return DeserializeDateTimeFromBinary(*this, data);
+}
+
+
+// -------------------------------------------------------------------------------------------------
+// GB_TimeDuration
+// -------------------------------------------------------------------------------------------------
+
+namespace
+{
+	inline bool IsAsciiAlpha(char ch)
+	{
+		return (ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z');
+	}
+
+	inline char ToAsciiUpper(char ch)
+	{
+		if (ch >= 'a' && ch <= 'z')
+		{
+			return static_cast<char>(ch - 'a' + 'A');
+		}
+		return ch;
+	}
+
+	inline bool TryParseDoubleSpan(const char* data, size_t length, double& outValue)
+	{
+		if (data == nullptr)
+		{
+			return false;
+		}
+		if (length == 0)
+		{
+			return false;
+		}
+
+		size_t i = 0;
+		bool negative = false;
+		if (data[i] == '+' || data[i] == '-')
+		{
+			negative = (data[i] == '-');
+			i++;
+			if (i >= length)
+			{
+				return false;
+			}
+		}
+
+		// integer part
+		bool hasDigits = false;
+		long long integerPart = 0;
+		for (; i < length; i++)
+		{
+			const char ch = data[i];
+			if (ch < '0' || ch > '9')
+			{
+				break;
+			}
+			hasDigits = true;
+
+			const int digit = (ch - '0');
+			if (integerPart > (std::numeric_limits<long long>::max() - digit) / 10LL)
+			{
+				return false;
+			}
+			integerPart = integerPart * 10LL + digit;
+		}
+
+		long double value = static_cast<long double>(integerPart);
+
+		// fraction
+		if (i < length && (data[i] == '.' || data[i] == ','))
+		{
+			i++;
+
+			long double base = 1.0L;
+			for (; i < length; i++)
+			{
+				const char ch = data[i];
+				if (ch < '0' || ch > '9')
+				{
+					break;
+				}
+				hasDigits = true;
+
+				base *= 10.0L;
+				value += static_cast<long double>(ch - '0') / base;
+			}
+		}
+
+		if (!hasDigits)
+		{
+			return false;
+		}
+
+		if (i != length)
+		{
+			// No exponent, no trailing garbage.
+			return false;
+		}
+
+		if (negative)
+		{
+			value = -value;
+		}
+
+		const double asDouble = static_cast<double>(value);
+		if (!std::isfinite(asDouble))
+		{
+			return false;
+		}
+
+		outValue = asDouble;
+		return true;
+	}
+
+	inline bool IsAlmostInteger(double value, double epsilon)
+	{
+		if (!std::isfinite(value))
+		{
+			return false;
+		}
+
+		const double nearest = std::round(value);
+		return std::fabs(value - nearest) <= epsilon;
+	}
+
+	inline int ClampLongLongToInt(long long value);
+
+	inline int NegateIntSaturating(int value)
+	{
+		if (value == std::numeric_limits<int>::min())
+		{
+			// Avoid UB: -INT_MIN cannot be represented by int.
+			return std::numeric_limits<int>::max();
+		}
+		return -value;
+	}
+
+	inline int AddIntSaturating(int a, int b)
+	{
+		const long long sum = static_cast<long long>(a) + static_cast<long long>(b);
+		return ClampLongLongToInt(sum);
+	}
+
+	inline int SubIntSaturating(int a, int b)
+	{
+		const long long diff = static_cast<long long>(a) - static_cast<long long>(b);
+		return ClampLongLongToInt(diff);
+	}
+
+	inline std::string DoubleToStringTrim(double value)
+	{
+		// Using "%.15g" to avoid trailing zeros and excessive digits.
+		char buffer[96] = {};
+		std::snprintf(buffer, sizeof(buffer), "%.15g", value);
+		return std::string(buffer);
+	}
+
+	inline bool TryAddToIntChecked(int value, long long delta, int& outValue)
+	{
+		const long long sum = static_cast<long long>(value) + delta;
+		if (sum < static_cast<long long>(std::numeric_limits<int>::min())
+			|| sum > static_cast<long long>(std::numeric_limits<int>::max()))
+		{
+			return false;
+		}
+
+		outValue = static_cast<int>(sum);
+		return true;
+	}
+
+
+	inline int ClampLongLongToInt(long long value)
+	{
+		if (value < static_cast<long long>(std::numeric_limits<int>::min()))
+		{
+			return std::numeric_limits<int>::min();
+		}
+		if (value > static_cast<long long>(std::numeric_limits<int>::max()))
+		{
+			return std::numeric_limits<int>::max();
+		}
+		return static_cast<int>(value);
+	}
+
+	inline bool TryParseIso8601DurationSpan(const char* data, size_t length, GB_TimeDuration& outDuration)
+	{
+		if (data == nullptr)
+		{
+			return false;
+		}
+
+		size_t start = 0;
+		size_t end = 0;
+		GetTrimmedAsciiRange(data, length, start, end);
+		if (end <= start)
+		{
+			return false;
+		}
+
+		const char* textData = data + start;
+		const size_t textLength = end - start;
+
+		size_t i = 0;
+		int overallSign = 1;
+		if (textData[i] == '+' || textData[i] == '-')
+		{
+			overallSign = (textData[i] == '-') ? -1 : 1;
+			i++;
+			if (i >= textLength)
+			{
+				return false;
+			}
+		}
+
+		if (ToAsciiUpper(textData[i]) != 'P')
+		{
+			return false;
+		}
+		i++;
+
+		bool inTime = false;
+		bool hasAny = false;
+
+		bool hasYears = false;
+		bool hasMonths = false;
+		bool hasWeeks = false;
+		bool hasDays = false;
+		bool hasHours = false;
+		bool hasMinutes = false;
+		bool hasSeconds = false;
+
+		GB_TimeDuration duration;
+
+		while (i < textLength)
+		{
+			const char ch = textData[i];
+			if (ToAsciiUpper(ch) == 'T')
+			{
+				inTime = true;
+				i++;
+				continue;
+			}
+
+			// component sign (non-standard but useful)
+			int componentSign = 1;
+			if (textData[i] == '+' || textData[i] == '-')
+			{
+				componentSign = (textData[i] == '-') ? -1 : 1;
+				i++;
+				if (i >= textLength)
+				{
+					return false;
+				}
+			}
+
+			const size_t numberStart = i;
+			bool seenDotOrComma = false;
+			for (; i < textLength; i++)
+			{
+				const char nch = textData[i];
+				if (nch >= '0' && nch <= '9')
+				{
+					continue;
+				}
+				if ((nch == '.' || nch == ',') && !seenDotOrComma)
+				{
+					seenDotOrComma = true;
+					continue;
+				}
+				break;
+			}
+
+			if (i == numberStart)
+			{
+				return false;
+			}
+
+			if (i >= textLength)
+			{
+				return false;
+			}
+
+			const char unit = ToAsciiUpper(textData[i]);
+			const size_t numberLength = i - numberStart;
+			const int signedFactor = overallSign * componentSign;
+
+			if (unit == 'S')
+			{
+				if (!inTime)
+				{
+					// "P...S" is invalid.
+					return false;
+				}
+
+				if (hasSeconds)
+				{
+					return false;
+				}
+
+				double secondsValue = 0.0;
+				if (!TryParseDoubleSpan(textData + numberStart, numberLength, secondsValue))
+				{
+					return false;
+				}
+
+				duration.seconds = secondsValue * static_cast<double>(signedFactor);
+				hasSeconds = true;
+				hasAny = true;
+			}
+			else
+			{
+				if (seenDotOrComma)
+				{
+					// Only seconds may be fractional.
+					return false;
+				}
+
+				int value = 0;
+				if (!TryParseInt32Span(textData + numberStart, numberLength, value))
+				{
+					return false;
+				}
+
+				value *= signedFactor;
+
+				if (!inTime)
+				{
+					if (unit == 'Y')
+					{
+						if (hasYears)
+						{
+							return false;
+						}
+						duration.years = value;
+						hasYears = true;
+						hasAny = true;
+					}
+					else if (unit == 'M')
+					{
+						if (hasMonths)
+						{
+							return false;
+						}
+						duration.months = value;
+						hasMonths = true;
+						hasAny = true;
+					}
+					else if (unit == 'W')
+					{
+						if (hasWeeks)
+						{
+							return false;
+						}
+						duration.weeks = value;
+						hasWeeks = true;
+						hasAny = true;
+					}
+					else if (unit == 'D')
+					{
+						if (hasDays)
+						{
+							return false;
+						}
+						duration.days = value;
+						hasDays = true;
+						hasAny = true;
+					}
+					else
+					{
+						return false;
+					}
+				}
+				else
+				{
+					if (unit == 'H')
+					{
+						if (hasHours)
+						{
+							return false;
+						}
+						duration.hours = value;
+						hasHours = true;
+						hasAny = true;
+					}
+					else if (unit == 'M')
+					{
+						if (hasMinutes)
+						{
+							return false;
+						}
+						duration.minutes = value;
+						hasMinutes = true;
+						hasAny = true;
+					}
+					else
+					{
+						return false;
+					}
+				}
+			}
+
+			i++; // consume unit
+		}
+
+		if (!hasAny)
+		{
+			return false;
+		}
+
+		outDuration = duration;
+		return true;
+	}
+
+	inline bool TryParseTokenDurationSpan(const char* data, size_t length, GB_TimeDuration& outDuration)
+	{
+		if (data == nullptr)
+		{
+			return false;
+		}
+
+		size_t start = 0;
+		size_t end = 0;
+		GetTrimmedAsciiRange(data, length, start, end);
+		if (end <= start)
+		{
+			return false;
+		}
+
+		const char* textData = data + start;
+		const size_t textLength = end - start;
+
+		GB_TimeDuration duration;
+		bool hasAny = false;
+
+		size_t i = 0;
+		while (i < textLength)
+		{
+			while (i < textLength && (IsAsciiWhitespace(static_cast<unsigned char>(textData[i])) || textData[i] == ',' || textData[i] == ';'))
+			{
+				i++;
+			}
+			if (i >= textLength)
+			{
+				break;
+			}
+
+			const size_t tokenStart = i;
+			while (i < textLength && !IsAsciiWhitespace(static_cast<unsigned char>(textData[i])) && textData[i] != ',' && textData[i] != ';')
+			{
+				i++;
+			}
+			const size_t tokenEnd = i;
+			if (tokenEnd <= tokenStart)
+			{
+				continue;
+			}
+
+			// split into number + unit suffix
+			size_t j = tokenStart;
+			if (textData[j] == '+' || textData[j] == '-')
+			{
+				j++;
+			}
+
+			bool seenDotOrComma = false;
+			while (j < tokenEnd)
+			{
+				const char ch = textData[j];
+				if (ch >= '0' && ch <= '9')
+				{
+					j++;
+					continue;
+				}
+				if ((ch == '.' || ch == ',') && !seenDotOrComma)
+				{
+					seenDotOrComma = true;
+					j++;
+					continue;
+				}
+				break;
+			}
+
+			if (j == tokenStart || (j == tokenStart + 1 && (textData[tokenStart] == '+' || textData[tokenStart] == '-')))
+			{
+				return false;
+			}
+
+			const size_t numberLength = j - tokenStart;
+			const size_t unitStart = j;
+			const size_t unitLength = tokenEnd - unitStart;
+
+			double numberValue = 0.0;
+			if (!TryParseDoubleSpan(textData + tokenStart, numberLength, numberValue))
+			{
+				return false;
+			}
+
+			auto unitEqualsIgnoreCase = [&](const char* unitLiteral) -> bool
+				{
+					const size_t literalLength = std::strlen(unitLiteral);
+					if (unitLength != literalLength)
+					{
+						return false;
+					}
+					for (size_t k = 0; k < unitLength; k++)
+					{
+						if (ToAsciiUpper(textData[unitStart + k]) != ToAsciiUpper(unitLiteral[k]))
+						{
+							return false;
+						}
+					}
+					return true;
+				};
+
+			auto unitIsSingleChar = [&](char c) -> bool
+				{
+					return unitLength == 1 && ToAsciiUpper(textData[unitStart]) == ToAsciiUpper(c);
+				};
+
+			if (unitLength == 0)
+			{
+				// No unit: interpret as seconds.
+				duration.seconds += numberValue;
+				hasAny = true;
+				continue;
+			}
+
+			if (unitIsSingleChar('Y') || unitEqualsIgnoreCase("YEAR") || unitEqualsIgnoreCase("YEARS"))
+			{
+				if (!IsAlmostInteger(numberValue, 1e-12))
+				{
+					return false;
+				}
+				int newYears = 0;
+				if (!TryAddToIntChecked(duration.years, static_cast<long long>(numberValue), newYears))
+				{
+					return false;
+				}
+				duration.years = newYears;
+				hasAny = true;
+			}
+			else if (unitEqualsIgnoreCase("MO") || unitEqualsIgnoreCase("MON") || unitEqualsIgnoreCase("MONTH") || unitEqualsIgnoreCase("MONTHS"))
+			{
+				if (!IsAlmostInteger(numberValue, 1e-12))
+				{
+					return false;
+				}
+				int newMonths = 0;
+				if (!TryAddToIntChecked(duration.months, static_cast<long long>(numberValue), newMonths))
+				{
+					return false;
+				}
+				duration.months = newMonths;
+				hasAny = true;
+			}
+			else if (unitIsSingleChar('W') || unitEqualsIgnoreCase("WEEK") || unitEqualsIgnoreCase("WEEKS"))
+			{
+				if (!IsAlmostInteger(numberValue, 1e-12))
+				{
+					return false;
+				}
+				int newWeeks = 0;
+				if (!TryAddToIntChecked(duration.weeks, static_cast<long long>(numberValue), newWeeks))
+				{
+					return false;
+				}
+				duration.weeks = newWeeks;
+				hasAny = true;
+			}
+			else if (unitIsSingleChar('D') || unitEqualsIgnoreCase("DAY") || unitEqualsIgnoreCase("DAYS"))
+			{
+				if (!IsAlmostInteger(numberValue, 1e-12))
+				{
+					return false;
+				}
+				int newDays = 0;
+				if (!TryAddToIntChecked(duration.days, static_cast<long long>(numberValue), newDays))
+				{
+					return false;
+				}
+				duration.days = newDays;
+				hasAny = true;
+			}
+			else if (unitIsSingleChar('H') || unitEqualsIgnoreCase("HR") || unitEqualsIgnoreCase("HOUR") || unitEqualsIgnoreCase("HOURS"))
+			{
+				if (!IsAlmostInteger(numberValue, 1e-12))
+				{
+					return false;
+				}
+				int newHours = 0;
+				if (!TryAddToIntChecked(duration.hours, static_cast<long long>(numberValue), newHours))
+				{
+					return false;
+				}
+				duration.hours = newHours;
+				hasAny = true;
+			}
+			else if (unitIsSingleChar('M') || unitEqualsIgnoreCase("MIN") || unitEqualsIgnoreCase("MINS") || unitEqualsIgnoreCase("MINUTE") || unitEqualsIgnoreCase("MINUTES"))
+			{
+				if (!IsAlmostInteger(numberValue, 1e-12))
+				{
+					return false;
+				}
+				int newMinutes = 0;
+				if (!TryAddToIntChecked(duration.minutes, static_cast<long long>(numberValue), newMinutes))
+				{
+					return false;
+				}
+				duration.minutes = newMinutes;
+				hasAny = true;
+			}
+			else if (unitIsSingleChar('S') || unitEqualsIgnoreCase("SEC") || unitEqualsIgnoreCase("SECS") || unitEqualsIgnoreCase("SECOND") || unitEqualsIgnoreCase("SECONDS"))
+			{
+				duration.seconds += numberValue;
+				hasAny = true;
+			}
+			else if (unitEqualsIgnoreCase("MS") || unitEqualsIgnoreCase("MSEC") || unitEqualsIgnoreCase("MSECS") || unitEqualsIgnoreCase("MILLISECOND") || unitEqualsIgnoreCase("MILLISECONDS"))
+			{
+				duration.seconds += numberValue / 1000.0;
+				hasAny = true;
+			}
+			else
+			{
+				return false;
+			}
+		}
+
+		if (!hasAny)
+		{
+			return false;
+		}
+
+		outDuration = duration;
+		return true;
+	}
+
+	inline bool TryGetTimePartMilliseconds(const GB_TimeDuration& duration, int64_t& outMilliseconds)
+	{
+		// years/months are ignored here (they are calendar-based).
+		if (!std::isfinite(duration.seconds))
+		{
+			return false;
+		}
+
+		int64_t total = 0;
+
+		const int64_t weeksMs = static_cast<int64_t>(duration.weeks) * 7LL * kMillisecondsPerDay64;
+		if (!TryAddInt64(total, weeksMs, total))
+		{
+			return false;
+		}
+
+		const int64_t daysMs = static_cast<int64_t>(duration.days) * kMillisecondsPerDay64;
+		if (!TryAddInt64(total, daysMs, total))
+		{
+			return false;
+		}
+
+		const int64_t hoursMs = static_cast<int64_t>(duration.hours) * 60LL * 60LL * kMillisecondsPerSecond;
+		if (!TryAddInt64(total, hoursMs, total))
+		{
+			return false;
+		}
+
+		const int64_t minutesMs = static_cast<int64_t>(duration.minutes) * 60LL * kMillisecondsPerSecond;
+		if (!TryAddInt64(total, minutesMs, total))
+		{
+			return false;
+		}
+
+		const double secondsMsDouble = duration.seconds * 1000.0;
+		if (!std::isfinite(secondsMsDouble))
+		{
+			return false;
+		}
+		if (secondsMsDouble > static_cast<double>(std::numeric_limits<int64_t>::max())
+			|| secondsMsDouble < static_cast<double>(std::numeric_limits<int64_t>::min()))
+		{
+			return false;
+		}
+		if (secondsMsDouble > static_cast<double>(std::numeric_limits<int64_t>::max())
+			|| secondsMsDouble < static_cast<double>(std::numeric_limits<int64_t>::min()))
+		{
+			return false;
+		}
+		const int64_t secondsMs = static_cast<int64_t>(std::llround(secondsMsDouble));
+		if (!TryAddInt64(total, secondsMs, total))
+		{
+			return false;
+		}
+
+		outMilliseconds = total;
+		return true;
+	}
+
+
+	inline bool TryGetClockPartMilliseconds(const GB_TimeDuration& duration, int64_t& outMilliseconds)
+	{
+		if (!std::isfinite(duration.seconds))
+		{
+			return false;
+		}
+
+		int64_t total = 0;
+
+		const int64_t hoursMs = static_cast<int64_t>(duration.hours) * 60LL * 60LL * kMillisecondsPerSecond;
+		if (!TryAddInt64(total, hoursMs, total))
+		{
+			return false;
+		}
+
+		const int64_t minutesMs = static_cast<int64_t>(duration.minutes) * 60LL * kMillisecondsPerSecond;
+		if (!TryAddInt64(total, minutesMs, total))
+		{
+			return false;
+		}
+
+		const double secondsMsDouble = duration.seconds * 1000.0;
+		if (!std::isfinite(secondsMsDouble))
+		{
+			return false;
+		}
+		if (secondsMsDouble > static_cast<double>(std::numeric_limits<int64_t>::max())
+			|| secondsMsDouble < static_cast<double>(std::numeric_limits<int64_t>::min()))
+		{
+			return false;
+		}
+
+		const int64_t secondsMs = static_cast<int64_t>(std::llround(secondsMsDouble));
+		if (!TryAddInt64(total, secondsMs, total))
+		{
+			return false;
+		}
+
+		outMilliseconds = total;
+		return true;
+	}
+}
+
+GB_TimeDuration GB_TimeDuration::CreateFromSeconds(double seconds)
+{
+	GB_TimeDuration duration;
+	duration.seconds = seconds;
+	return duration;
+}
+
+GB_TimeDuration GB_TimeDuration::CreateFromMinutes(long long minutes)
+{
+	GB_TimeDuration duration;
+	duration.minutes = ClampLongLongToInt(minutes);
+	return duration;
+}
+
+GB_TimeDuration GB_TimeDuration::CreateFromHours(long long hours)
+{
+	GB_TimeDuration duration;
+	duration.hours = ClampLongLongToInt(hours);
+	return duration;
+}
+
+GB_TimeDuration GB_TimeDuration::CreateFromDays(long long days)
+{
+	GB_TimeDuration duration;
+	duration.days = ClampLongLongToInt(days);
+	return duration;
+}
+
+GB_TimeDuration GB_TimeDuration::CreateFromWeeks(long long weeks)
+{
+	GB_TimeDuration duration;
+	duration.weeks = ClampLongLongToInt(weeks);
+	return duration;
+}
+
+GB_TimeDuration GB_TimeDuration::CreateFromMonths(long long months)
+{
+	GB_TimeDuration duration;
+	duration.months = ClampLongLongToInt(months);
+	return duration;
+}
+
+GB_TimeDuration GB_TimeDuration::CreateFromYears(long long years)
+{
+	GB_TimeDuration duration;
+	duration.years = ClampLongLongToInt(years);
+	return duration;
+}
+
+bool GB_TimeDuration::HasCalendarPart() const
+{
+	return years != 0 || months != 0;
+}
+
+GB_TimeDuration GB_TimeDuration::Negated() const
+{
+	GB_TimeDuration result;
+	result.years = NegateIntSaturating(years);
+	result.months = NegateIntSaturating(months);
+	result.weeks = NegateIntSaturating(weeks);
+	result.days = NegateIntSaturating(days);
+	result.hours = NegateIntSaturating(hours);
+	result.minutes = NegateIntSaturating(minutes);
+	result.seconds = -seconds;
+	return result;
+}
+
+GB_TimeDuration GB_TimeDuration::operator-() const
+{
+	return Negated();
+}
+
+GB_TimeDuration GB_TimeDuration::operator+(const GB_TimeDuration& other) const
+{
+	GB_TimeDuration result = *this;
+	result += other;
+	return result;
+}
+
+GB_TimeDuration GB_TimeDuration::operator-(const GB_TimeDuration& other) const
+{
+	GB_TimeDuration result = *this;
+	result -= other;
+	return result;
+}
+
+GB_TimeDuration& GB_TimeDuration::operator+=(const GB_TimeDuration& other)
+{
+	years = AddIntSaturating(years, other.years);
+	months = AddIntSaturating(months, other.months);
+	weeks = AddIntSaturating(weeks, other.weeks);
+	days = AddIntSaturating(days, other.days);
+	hours = AddIntSaturating(hours, other.hours);
+	minutes = AddIntSaturating(minutes, other.minutes);
+	seconds += other.seconds;
+	return *this;
+}
+
+GB_TimeDuration& GB_TimeDuration::operator-=(const GB_TimeDuration& other)
+{
+	years = SubIntSaturating(years, other.years);
+	months = SubIntSaturating(months, other.months);
+	weeks = SubIntSaturating(weeks, other.weeks);
+	days = SubIntSaturating(days, other.days);
+	hours = SubIntSaturating(hours, other.hours);
+	minutes = SubIntSaturating(minutes, other.minutes);
+	seconds -= other.seconds;
+	return *this;
+}
+
+GB_TimeDuration GB_TimeDuration::CreateFromString(const std::string& textUtf8, bool& ok)
+{
+	GB_TimeDuration duration;
+	ok = false;
+
+	size_t start = 0;
+	size_t end = 0;
+	GetTrimmedAsciiRange(textUtf8, start, end);
+	if (end <= start)
+	{
+		return duration;
+	}
+
+	const char* textData = textUtf8.data() + start;
+	const size_t textLength = end - start;
+
+	// 1) ISO 8601 duration (PnYnMnWnDTnHnMnS), tolerate leading '+'/'-'.
+	GB_TimeDuration parsed;
+	if (TryParseIso8601DurationSpan(textData, textLength, parsed))
+	{
+		duration = parsed;
+		ok = true;
+		return duration;
+	}
+
+	// 2) Token form: "1y 2mo 3w 4d 5h 6m 7.5s" / "1500ms" / "10" (seconds)
+	if (TryParseTokenDurationSpan(textData, textLength, parsed))
+	{
+		duration = parsed;
+		ok = true;
+		return duration;
+	}
+
+	return duration;
+}
+
+bool GB_TimeDuration::IsNull() const
+{
+	return years == 0
+		&& months == 0
+		&& weeks == 0
+		&& days == 0
+		&& hours == 0
+		&& minutes == 0
+		&& seconds == 0.0;
+}
+
+bool GB_TimeDuration::operator==(const GB_TimeDuration& other) const
+{
+	return years == other.years
+		&& months == other.months
+		&& weeks == other.weeks
+		&& days == other.days
+		&& hours == other.hours
+		&& minutes == other.minutes
+		&& seconds == other.seconds;
+}
+
+bool GB_TimeDuration::operator!=(const GB_TimeDuration& other) const
+{
+	return !(*this == other);
+}
+
+std::string GB_TimeDuration::ToString() const
+{
+	// ISO 8601 style: PnYnMnWnDTnHnMnS
+	if (IsNull())
+	{
+		return "PT0S";
+	}
+
+	std::string result;
+	result.reserve(64);
+	result.push_back('P');
+
+	auto AppendIntComponent = [&](int value, char suffix)
+		{
+			if (value == 0)
+			{
+				return;
+			}
+			result.append(std::to_string(value));
+			result.push_back(suffix);
+		};
+
+	AppendIntComponent(years, 'Y');
+	AppendIntComponent(months, 'M');
+	AppendIntComponent(weeks, 'W');
+	AppendIntComponent(days, 'D');
+
+	const bool hasTime = (hours != 0) || (minutes != 0) || (seconds != 0.0);
+	if (hasTime)
+	{
+		result.push_back('T');
+		AppendIntComponent(hours, 'H');
+		AppendIntComponent(minutes, 'M');
+		if (seconds != 0.0)
+		{
+			result.append(DoubleToStringTrim(seconds));
+			result.push_back('S');
+		}
+	}
+	return result;
+}
+
+double GB_TimeDuration::ToTotalSecondsApprox() const
+{
+	// 注意：年/月是日历分量，不存在严格的固定秒数。
+	// 这里采用近似换算：year=365d, month=30d，仅用于估算/显示。
+	const long double yearSeconds = static_cast<long double>(years) * 365.0L * 86400.0L;
+	const long double monthSeconds = static_cast<long double>(months) * 30.0L * 86400.0L;
+	const long double weekSeconds = static_cast<long double>(weeks) * 7.0L * 86400.0L;
+	const long double daySeconds = static_cast<long double>(days) * 86400.0L;
+	const long double hourSeconds = static_cast<long double>(hours) * 3600.0L;
+	const long double minuteSeconds = static_cast<long double>(minutes) * 60.0L;
+	const long double secondSeconds = static_cast<long double>(seconds);
+
+	const long double total = yearSeconds + monthSeconds + weekSeconds + daySeconds + hourSeconds + minuteSeconds + secondSeconds;
+	return static_cast<double>(total);
+}
+
+long long GB_TimeDuration::ToSeconds() const
+{
+	// 与 ToTotalSecondsApprox() 一致，返回“近似总秒数”，并向 0 截断。
+	const double total = ToTotalSecondsApprox();
+	if (!std::isfinite(total))
+	{
+		return 0;
+	}
+
+	if (total >= static_cast<double>(std::numeric_limits<long long>::max()))
+	{
+		return std::numeric_limits<long long>::max();
+	}
+	if (total <= static_cast<double>(std::numeric_limits<long long>::min()))
+	{
+		return std::numeric_limits<long long>::min();
+	}
+
+	return static_cast<long long>(total);
+}
+
+bool GB_TimeDuration::TryToFixedSeconds(long long& outSeconds) const
+{
+	outSeconds = 0;
+
+	if (years != 0 || months != 0)
+	{
+		return false;
+	}
+
+	if (!std::isfinite(seconds))
+	{
+		return false;
+	}
+
+	if (!IsAlmostInteger(seconds, 1e-12))
+	{
+		return false;
+	}
+
+	if (seconds > static_cast<double>(std::numeric_limits<long long>::max())
+		|| seconds < static_cast<double>(std::numeric_limits<long long>::min()))
+	{
+		return false;
+	}
+
+	const long long secondsPart = static_cast<long long>(std::llround(seconds));
+
+	int64_t total = 0;
+
+	const int64_t weeksSeconds = static_cast<int64_t>(weeks) * 7LL * 86400LL;
+	if (!TryAddInt64(total, weeksSeconds, total))
+	{
+		return false;
+	}
+
+	const int64_t daysSeconds = static_cast<int64_t>(days) * 86400LL;
+	if (!TryAddInt64(total, daysSeconds, total))
+	{
+		return false;
+	}
+
+	const int64_t hoursSeconds = static_cast<int64_t>(hours) * 3600LL;
+	if (!TryAddInt64(total, hoursSeconds, total))
+	{
+		return false;
+	}
+
+	const int64_t minutesSeconds = static_cast<int64_t>(minutes) * 60LL;
+	if (!TryAddInt64(total, minutesSeconds, total))
+	{
+		return false;
+	}
+
+	if (!TryAddInt64(total, static_cast<int64_t>(secondsPart), total))
+	{
+		return false;
+	}
+
+	if (total < static_cast<int64_t>(std::numeric_limits<long long>::min())
+		|| total > static_cast<int64_t>(std::numeric_limits<long long>::max()))
+	{
+		return false;
+	}
+
+	outSeconds = static_cast<long long>(total);
+	return true;
+}
+
+bool GB_TimeDuration::TryToFixedMilliseconds(int64_t& outMilliseconds) const
+{
+	outMilliseconds = 0;
+
+	if (years != 0 || months != 0)
+	{
+		return false;
+	}
+
+	if (!std::isfinite(seconds))
+	{
+		return false;
+	}
+
+	const double secondsMsDouble = seconds * 1000.0;
+	if (!std::isfinite(secondsMsDouble))
+	{
+		return false;
+	}
+	if (secondsMsDouble > static_cast<double>(std::numeric_limits<int64_t>::max())
+		|| secondsMsDouble < static_cast<double>(std::numeric_limits<int64_t>::min()))
+	{
+		return false;
+	}
+
+	if (!IsAlmostInteger(secondsMsDouble, 1e-6))
+	{
+		return false;
+	}
+	const int64_t secondsMs = static_cast<int64_t>(std::llround(secondsMsDouble));
+
+	int64_t total = 0;
+
+	const int64_t weeksMs = static_cast<int64_t>(weeks) * 7LL * kMillisecondsPerDay64;
+	if (!TryAddInt64(total, weeksMs, total))
+	{
+		return false;
+	}
+
+	const int64_t daysMs = static_cast<int64_t>(days) * kMillisecondsPerDay64;
+	if (!TryAddInt64(total, daysMs, total))
+	{
+		return false;
+	}
+
+	const int64_t hoursMs = static_cast<int64_t>(hours) * 60LL * 60LL * kMillisecondsPerSecond;
+	if (!TryAddInt64(total, hoursMs, total))
+	{
+		return false;
+	}
+
+	const int64_t minutesMs = static_cast<int64_t>(minutes) * 60LL * kMillisecondsPerSecond;
+	if (!TryAddInt64(total, minutesMs, total))
+	{
+		return false;
+	}
+
+	if (!TryAddInt64(total, secondsMs, total))
+	{
+		return false;
+	}
+
+	outMilliseconds = total;
+	return true;
+}
+
+GB_DateTime GB_TimeDuration::AddToDateTime(const GB_DateTime& dateTime) const
+{
+	if (!dateTime.IsValid())
+	{
+		return GB_DateTime::Invalid;
+	}
+
+	GB_DateTime result = dateTime;
+
+	// 1) Calendar part in the current Spec() view.
+	if (years != 0 || months != 0 || weeks != 0 || days != 0)
+	{
+		const GB_Date baseDate = result.Date();
+		const GB_Time baseTime = result.Time();
+		if (!baseDate.IsValid() || !baseTime.IsValid())
+		{
+			return GB_DateTime::Invalid;
+		}
+
+		GB_Date newDate = baseDate;
+
+		if (years != 0)
+		{
+			newDate = newDate.AddYears(years);
+			if (!newDate.IsValid())
+			{
+				return GB_DateTime::Invalid;
+			}
+		}
+
+		if (months != 0)
+		{
+			newDate = newDate.AddMonths(months);
+			if (!newDate.IsValid())
+			{
+				return GB_DateTime::Invalid;
+			}
+		}
+
+		const int64_t totalDays64 = static_cast<int64_t>(weeks) * 7LL + static_cast<int64_t>(days);
+		if (totalDays64 < static_cast<int64_t>(std::numeric_limits<int>::min())
+			|| totalDays64 > static_cast<int64_t>(std::numeric_limits<int>::max()))
+		{
+			return GB_DateTime::Invalid;
+		}
+
+		if (totalDays64 != 0)
+		{
+			newDate = newDate.AddDays(static_cast<int>(totalDays64));
+			if (!newDate.IsValid())
+			{
+				return GB_DateTime::Invalid;
+			}
+		}
+
+		if (result.Spec() == GB_DateTimeSpec::OffsetFromUtc)
+		{
+			result = GB_DateTime(newDate, baseTime, GB_DateTimeSpec::OffsetFromUtc, result.OffsetFromUtcMinutes());
+		}
+		else
+		{
+			result = GB_DateTime(newDate, baseTime, result.Spec(), 0);
+		}
+
+		if (!result.IsValid())
+		{
+			return GB_DateTime::Invalid;
+		}
+	}
+
+	// 2) Fixed time part (absolute milliseconds shift).
+	if (hours != 0 || minutes != 0 || seconds != 0.0)
+	{
+		int64_t timeMs = 0;
+		if (!TryGetClockPartMilliseconds(*this, timeMs))
+		{
+			return GB_DateTime::Invalid;
+		}
+		result = result.AddMSecs(static_cast<long long>(timeMs));
+	}
+
+	return result;
+}
+
+// -------------------------------------------------------------------------------------------------
+// GB_Date / GB_Time / GB_DateTime operators with GB_TimeDuration
+// -------------------------------------------------------------------------------------------------
+
+GB_Date GB_Date::operator+(const GB_TimeDuration& duration) const
+{
+	if (!IsValid())
+	{
+		return GB_Date::Invalid;
+	}
+
+	GB_Date result = *this;
+
+	if (duration.years != 0)
+	{
+		result = result.AddYears(duration.years);
+		if (!result.IsValid())
+		{
+			return GB_Date::Invalid;
+		}
+	}
+
+	if (duration.months != 0)
+	{
+		result = result.AddMonths(duration.months);
+		if (!result.IsValid())
+		{
+			return GB_Date::Invalid;
+		}
+	}
+
+	const int64_t totalDays64 = static_cast<int64_t>(duration.weeks) * 7LL + static_cast<int64_t>(duration.days);
+	if (totalDays64 < static_cast<int64_t>(std::numeric_limits<int>::min())
+		|| totalDays64 > static_cast<int64_t>(std::numeric_limits<int>::max()))
+	{
+		return GB_Date::Invalid;
+	}
+
+	if (totalDays64 != 0)
+	{
+		result = result.AddDays(static_cast<int>(totalDays64));
+		if (!result.IsValid())
+		{
+			return GB_Date::Invalid;
+		}
+	}
+
+	// hours/minutes/seconds are ignored for GB_Date.
+	return result;
+}
+
+GB_Date GB_Date::operator-(const GB_TimeDuration& duration) const
+{
+	return (*this) + (-duration);
+}
+
+GB_Time GB_Time::operator+(const GB_TimeDuration& duration) const
+{
+	if (!IsValid())
+	{
+		return GB_Time::Invalid;
+	}
+
+	// Only fixed-length units affect GB_Time; years/months are ignored.
+	int64_t deltaMs = 0;
+	if (!TryGetTimePartMilliseconds(duration, deltaMs))
+	{
+		return GB_Time::Invalid;
+	}
+
+	const int64_t deltaInDay = ModFloor(deltaMs, static_cast<int64_t>(kMillisecondsPerDay));
+	return AddMSecs(static_cast<int>(deltaInDay));
+}
+
+GB_Time GB_Time::operator-(const GB_TimeDuration& duration) const
+{
+	return (*this) + (-duration);
+}
+
+GB_DateTime GB_DateTime::operator+(const GB_TimeDuration& duration) const
+{
+	return duration.AddToDateTime(*this);
+}
+
+GB_DateTime GB_DateTime::operator-(const GB_TimeDuration& duration) const
+{
+	return (-duration).AddToDateTime(*this);
 }

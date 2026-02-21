@@ -21,6 +21,7 @@ enum class GB_DateTimeSpec
 
 class GLOBALBASE_PORT GB_Time;
 class GLOBALBASE_PORT GB_DateTime;
+class GLOBALBASE_PORT GB_TimeDuration;
 
 class GLOBALBASE_PORT GB_Date
 {
@@ -134,13 +135,16 @@ public:
 	 */
 	GB_DateTime ToDateTime(GB_DateTimeSpec spec = GB_DateTimeSpec::LocalTime, int offsetFromUtcMinutes = 0) const;
 
-
 	bool operator==(const GB_Date& other) const;
 	bool operator!=(const GB_Date& other) const;
 	bool operator<(const GB_Date& other) const;
 	bool operator<=(const GB_Date& other) const;
 	bool operator>(const GB_Date& other) const;
 	bool operator>=(const GB_Date& other) const;
+
+	GB_Date operator+(const GB_TimeDuration& duration) const;
+
+	GB_Date operator-(const GB_TimeDuration& duration) const;
 
 	struct GB_DateHash
 	{
@@ -257,6 +261,10 @@ public:
 	bool operator>(const GB_Time& other) const;
 	bool operator>=(const GB_Time& other) const;
 
+	GB_Time operator+(const GB_TimeDuration& duration) const;
+
+	GB_Time operator-(const GB_TimeDuration& duration) const;
+
 	struct GB_TimeHash
 	{
 		size_t operator()(const GB_Time& time) const noexcept;
@@ -279,7 +287,6 @@ private:
 	int millisecondsSinceStartOfDay = 0;
 	bool isNullTime = true;
 };
-
 
 class GLOBALBASE_PORT GB_DateTime
 {
@@ -347,6 +354,10 @@ public:
 	bool operator>(const GB_DateTime& other) const;
 	bool operator>=(const GB_DateTime& other) const;
 
+	GB_DateTime operator+(const GB_TimeDuration& duration) const;
+
+	GB_DateTime operator-(const GB_TimeDuration& duration) const;
+
 	struct GB_DateTimeHash
 	{
 		size_t operator()(const GB_DateTime& dateTime) const noexcept;
@@ -366,6 +377,64 @@ private:
 	GB_DateTimeSpec spec = GB_DateTimeSpec::LocalTime;
 	int offsetMinutes = 0; // 仅在 spec==OffsetFromUtc 时有效
 	bool valid = false;
+};
+
+class GLOBALBASE_PORT GB_TimeDuration
+{
+public:
+	int years = 0;
+	int months = 0;
+	int weeks = 0;
+	int days = 0;
+	int hours = 0;
+	int minutes = 0;
+	double seconds = 0;
+
+	// 便捷构造（固定长度单位）。
+	static GB_TimeDuration CreateFromSeconds(double seconds);
+	static GB_TimeDuration CreateFromMinutes(long long minutes);
+	static GB_TimeDuration CreateFromHours(long long hours);
+	static GB_TimeDuration CreateFromDays(long long days);
+	static GB_TimeDuration CreateFromWeeks(long long weeks);
+	static GB_TimeDuration CreateFromMonths(long long months);
+	static GB_TimeDuration CreateFromYears(long long years);
+
+	// 是否包含“日历相关”的分量（年/月）。年/月无法精确换算为固定秒数。
+	bool HasCalendarPart() const;
+
+	// 取相反数。
+	GB_TimeDuration Negated() const;
+	GB_TimeDuration operator-() const;
+
+	// 组合运算（逐分量相加/相减）。
+	GB_TimeDuration operator+(const GB_TimeDuration& other) const;
+	GB_TimeDuration operator-(const GB_TimeDuration& other) const;
+	GB_TimeDuration& operator+=(const GB_TimeDuration& other);
+	GB_TimeDuration& operator-=(const GB_TimeDuration& other);
+
+	// 注意：对 years/months/weeks/days/hours/minutes 这些 int 分量做加减时，若发生溢出，
+	// 将采用“饱和”方式截断到 int 的上下界，以避免 C++ 有符号整数溢出的未定义行为。
+
+	// 近似总秒数（年=365天，月=30天，仅用于估算/显示，不建议用于严肃计时）。
+	double ToTotalSecondsApprox() const;
+
+	// 尝试精确换算为固定秒/毫秒（要求 years==0 且 months==0；且 seconds 可被精确表示）。
+	bool TryToFixedSeconds(long long& outSeconds) const;
+	bool TryToFixedMilliseconds(int64_t& outMilliseconds) const;
+
+	static GB_TimeDuration CreateFromString(const std::string& textUtf8, bool& ok);
+
+	bool IsNull() const;
+
+	bool operator==(const GB_TimeDuration& other) const;
+
+	bool operator!=(const GB_TimeDuration& other) const;
+
+	std::string ToString() const;
+
+	long long ToSeconds() const;
+
+	GB_DateTime AddToDateTime(const GB_DateTime& dateTime) const;
 };
 
 
