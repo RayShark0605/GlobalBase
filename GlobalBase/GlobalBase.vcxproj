@@ -198,6 +198,7 @@
       </LanguageStandard>
       <OpenMPSupport>true</OpenMPSupport>
       <MultiProcessorCompilation>true</MultiProcessorCompilation>
+      <FavorSizeOrSpeed>Speed</FavorSizeOrSpeed>
     </ClCompile>
     <Link>
       <SubSystem>Windows</SubSystem>
@@ -205,6 +206,7 @@
       <EnableUAC>false</EnableUAC>
       <AdditionalDependencies>libcurl.lib;libcrypto.lib;zlib.lib;delayimp.lib;%(AdditionalDependencies)</AdditionalDependencies>
       <AdditionalOptions>/DELAYLOAD:libcurl.dll /DELAYLOAD:libcrypto-3-x64.dll /DELAYLOAD:zlib1.dll %(AdditionalOptions)</AdditionalOptions>
+      <LinkTimeCodeGeneration>UseLinkTimeCodeGeneration</LinkTimeCodeGeneration>
     </Link>
   </ItemDefinitionGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
