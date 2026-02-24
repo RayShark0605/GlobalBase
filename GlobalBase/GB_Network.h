@@ -261,7 +261,7 @@ public:
     enum class UrlEncodingMode
     {
         Rfc3986,        ///< RFC 3986 百分号编码（空格编码为 %20）。
-        FormUrlEncoded  ///< application/x-www-form-urlencoded（空格编码为 '+'）。
+        FormUrlEncoded  ///< application/x-www-form-urlencoded（空格编码为 '+'；并遵循 WHATWG URL 的 application/x-www-form-urlencoded 编码集合，例如 '*' 不编码，'~' 会被编码为 %7E）。
     };
 
     /**
