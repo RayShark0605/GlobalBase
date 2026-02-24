@@ -4618,10 +4618,80 @@ namespace
         return (c == '-' || c == '.' || c == '_' || c == '~');
     }
 
+    static inline int HexToNibbleUrl(char c)
+    {
+        if (c >= '0' && c <= '9')
+        {
+            return c - '0';
+        }
+        if (c >= 'a' && c <= 'f')
+        {
+            return 10 + (c - 'a');
+        }
+        if (c >= 'A' && c <= 'F')
+        {
+            return 10 + (c - 'A');
+        }
+        return -1;
+    }
+
+    static std::string DecodePercentAndOptionalPlus(const std::string& text, bool plusToSpace)
+    {
+        if (text.empty())
+        {
+            return std::string();
+        }
+
+        const bool hasPercent = (text.find('%') != std::string::npos);
+        const bool hasPlus = plusToSpace && (text.find('+') != std::string::npos);
+        if (!hasPercent && !hasPlus)
+        {
+            return text;
+        }
+
+        std::string result;
+        result.reserve(text.size());
+
+        for (size_t i = 0; i < text.size(); i++)
+        {
+            const char c = text[i];
+
+            if (plusToSpace && c == '+')
+            {
+                result.push_back(' ');
+                continue;
+            }
+
+            if (c == '%' && i + 2 < text.size())
+            {
+                const int hi = HexToNibbleUrl(text[i + 1]);
+                const int lo = HexToNibbleUrl(text[i + 2]);
+                if (hi >= 0 && lo >= 0)
+                {
+                    const char decoded = static_cast<char>((hi << 4) | lo);
+                    result.push_back(decoded);
+                    i += 2;
+                    continue;
+                }
+            }
+
+            result.push_back(c);
+        }
+
+        return result;
+    }
+
     static std::string UrlEncodeInternal(const std::string& textUtf8, GB_UrlOperator::UrlEncodingMode mode)
     {
         std::string result;
-        result.reserve(textUtf8.size() * 3);
+        if (textUtf8.size() < (std::numeric_limits<size_t>::max() / 3))
+        {
+            result.reserve(textUtf8.size() * 3);
+        }
+        else
+        {
+            result.reserve(textUtf8.size());
+        }
 
         auto AppendPercent = [&](unsigned char byteValue)
             {
@@ -4655,38 +4725,8 @@ namespace
 
     static std::string UrlDecodeInternal(const std::string& text, GB_UrlOperator::UrlEncodingMode mode)
     {
-        if (text.empty())
-        {
-            return std::string();
-        }
-
-        const bool hasPercent = (text.find('%') != std::string::npos);
-        if (mode != GB_UrlOperator::UrlEncodingMode::FormUrlEncoded)
-        {
-            return hasPercent ? PercentDecode(text) : text;
-        }
-
-        const bool hasPlus = (text.find('+') != std::string::npos);
-        if (!hasPercent && !hasPlus)
-        {
-            return text;
-        }
-
-        if (!hasPlus)
-        {
-            return PercentDecode(text);
-        }
-
-        std::string replaced = text;
-        for (size_t i = 0; i < replaced.size(); i++)
-        {
-            if (replaced[i] == '+')
-            {
-                replaced[i] = ' ';
-            }
-        }
-
-        return hasPercent ? PercentDecode(replaced) : replaced;
+        const bool plusToSpace = (mode == GB_UrlOperator::UrlEncodingMode::FormUrlEncoded);
+        return DecodePercentAndOptionalPlus(text, plusToSpace);
     }
 
     struct GbQueryItemInternal
@@ -4759,21 +4799,29 @@ namespace
 
             if (end > begin)
             {
-                const std::string token = queryString.substr(begin, end - begin);
-
                 GbQueryItemInternal item;
-                const size_t eqPos = token.find('=');
+                size_t eqPos = std::string::npos;
+                for (size_t j = begin; j < end; j++)
+                {
+                    if (queryString[j] == '=')
+                    {
+                        eqPos = j;
+                        break;
+                    }
+                }
+
                 if (eqPos == std::string::npos)
                 {
                     item.hasEquals = false;
-                    item.keyUtf8 = decode ? UrlDecodeInternal(token, decodeMode) : token;
+                    const std::string rawKey = queryString.substr(begin, end - begin);
+                    item.keyUtf8 = decode ? UrlDecodeInternal(rawKey, decodeMode) : rawKey;
                     item.valueUtf8.clear();
                 }
                 else
                 {
                     item.hasEquals = true;
-                    const std::string keyPart = token.substr(0, eqPos);
-                    const std::string valuePart = token.substr(eqPos + 1);
+                    const std::string keyPart = queryString.substr(begin, eqPos - begin);
+                    const std::string valuePart = queryString.substr(eqPos + 1, end - (eqPos + 1));
 
                     item.keyUtf8 = decode ? UrlDecodeInternal(keyPart, decodeMode) : keyPart;
                     item.valueUtf8 = decode ? UrlDecodeInternal(valuePart, decodeMode) : valuePart;
@@ -4814,23 +4862,30 @@ namespace
 
             if (end > begin)
             {
-                const std::string token = queryString.substr(begin, end - begin);
-
                 GbQueryItemRaw item;
                 item.separator = nextSeparator;
 
-                const size_t eqPos = token.find('=');
+                size_t eqPos = std::string::npos;
+                for (size_t j = begin; j < end; j++)
+                {
+                    if (queryString[j] == '=')
+                    {
+                        eqPos = j;
+                        break;
+                    }
+                }
+
                 if (eqPos == std::string::npos)
                 {
                     item.hasEquals = false;
-                    item.rawKey = token;
+                    item.rawKey = queryString.substr(begin, end - begin);
                     item.rawValue.clear();
                 }
                 else
                 {
                     item.hasEquals = true;
-                    item.rawKey = token.substr(0, eqPos);
-                    item.rawValue = token.substr(eqPos + 1);
+                    item.rawKey = queryString.substr(begin, eqPos - begin);
+                    item.rawValue = queryString.substr(eqPos + 1, end - (eqPos + 1));
                 }
 
                 item.decodedKey = UrlDecodeInternal(item.rawKey, decodeMode);
@@ -4854,6 +4909,25 @@ namespace
     static std::string BuildQueryStringRaw(const std::vector<GbQueryItemRaw>& items)
     {
         std::string result;
+
+        size_t totalReserve = 0;
+        if (!items.empty())
+        {
+            totalReserve += (items.size() - 1);
+        }
+
+        for (size_t i = 0; i < items.size(); i++)
+        {
+            const GbQueryItemRaw& item = items[i];
+            totalReserve += item.rawKey.size();
+            if (!item.hasEquals && item.rawValue.empty())
+            {
+                continue;
+            }
+            totalReserve += 1;
+            totalReserve += item.rawValue.size();
+        }
+        result.reserve(totalReserve);
 
         for (size_t i = 0; i < items.size(); i++)
         {
@@ -5043,6 +5117,10 @@ namespace
             }
 
             outHostUtf8 = hostPort.substr(1, closePos - 1);
+            if (outHostUtf8.empty())
+            {
+                return false;
+            }
 
             if (closePos + 1 == hostPort.size())
             {
