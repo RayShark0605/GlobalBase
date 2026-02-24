@@ -4565,3 +4565,941 @@ GB_NetworkDownloadedFileToPath GB_DownloadFileToPath(const std::string& urlUtf8,
 
     return DownloadFileToPathSingleThread(urlUtf8, filePathUtf8, options, progress);
 }
+
+namespace
+{
+    static inline bool IsUrlAlpha(char c)
+    {
+        return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z');
+    }
+
+    static inline bool IsUrlSchemeChar(char c)
+    {
+        if ((c >= '0' && c <= '9') || IsUrlAlpha(c))
+        {
+            return true;
+        }
+        return (c == '+' || c == '-' || c == '.');
+    }
+
+    static bool IsValidUrlScheme(const std::string& scheme)
+    {
+        if (scheme.empty())
+        {
+            return false;
+        }
+        if (!IsUrlAlpha(scheme.front()))
+        {
+            return false;
+        }
+        for (size_t i = 1; i < scheme.size(); i++)
+        {
+            if (!IsUrlSchemeChar(scheme[i]))
+            {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    static inline bool IsUrlUnreservedByte(unsigned char c)
+    {
+        if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9'))
+        {
+            return true;
+        }
+        return (c == '-' || c == '.' || c == '_' || c == '~');
+    }
+
+    static std::string UrlEncodeInternal(const std::string& textUtf8, GB_UrlOperator::UrlEncodingMode mode)
+    {
+        std::string result;
+        result.reserve(textUtf8.size() * 3);
+
+        auto AppendPercent = [&](unsigned char byteValue)
+            {
+                static const char kHex[] = "0123456789ABCDEF";
+                result.push_back('%');
+                result.push_back(kHex[(byteValue >> 4) & 0x0F]);
+                result.push_back(kHex[(byteValue) & 0x0F]);
+            };
+
+        for (size_t i = 0; i < textUtf8.size(); i++)
+        {
+            const unsigned char c = static_cast<unsigned char>(textUtf8[i]);
+
+            if (mode == GB_UrlOperator::UrlEncodingMode::FormUrlEncoded && c == ' ')
+            {
+                result.push_back('+');
+                continue;
+            }
+
+            if (IsUrlUnreservedByte(c))
+            {
+                result.push_back(static_cast<char>(c));
+                continue;
+            }
+
+            AppendPercent(c);
+        }
+
+        return result;
+    }
+
+    static std::string UrlDecodeInternal(const std::string& text, GB_UrlOperator::UrlEncodingMode mode)
+    {
+        if (mode != GB_UrlOperator::UrlEncodingMode::FormUrlEncoded)
+        {
+            return PercentDecode(text);
+        }
+
+        std::string replaced = text;
+        for (size_t i = 0; i < replaced.size(); i++)
+        {
+            if (replaced[i] == '+')
+            {
+                replaced[i] = ' ';
+            }
+        }
+        return PercentDecode(replaced);
+    }
+
+    struct GbQueryItemInternal
+    {
+        std::string keyUtf8;
+        std::string valueUtf8;
+        bool hasEquals = false;
+    };
+
+    struct GbQueryItemRaw
+    {
+        // 原始（未解码）的 key/value 子串（不含 '=' 与 '&'）
+        std::string rawKey;
+        std::string rawValue;
+        bool hasEquals = false;
+
+        // 解码后的 key/value（用于匹配/读取）
+        std::string decodedKey;
+        std::string decodedValue;
+
+        // 本项前的分隔符（'&' 或 ';'）。首项忽略该字段。
+        char separator = '&';
+    };
+
+    static void SplitUrlQueryAndFragment(const std::string& urlUtf8,
+        size_t& outPrefixEnd,
+        bool& outHasQuery,
+        size_t& outQueryBegin,
+        size_t& outQueryEnd,
+        bool& outHasFragment,
+        size_t& outFragmentBegin)
+    {
+        outPrefixEnd = urlUtf8.size();
+        outHasQuery = false;
+        outQueryBegin = std::string::npos;
+        outQueryEnd = std::string::npos;
+        outHasFragment = false;
+        outFragmentBegin = std::string::npos;
+
+        const size_t fragmentPos = urlUtf8.find('#');
+        if (fragmentPos != std::string::npos)
+        {
+            outHasFragment = true;
+            outFragmentBegin = fragmentPos + 1;
+            outPrefixEnd = fragmentPos;
+        }
+
+        const size_t queryPos = urlUtf8.find('?');
+        if (queryPos != std::string::npos && queryPos < outPrefixEnd)
+        {
+            outHasQuery = true;
+            outQueryBegin = queryPos + 1;
+            outQueryEnd = outPrefixEnd;
+            outPrefixEnd = queryPos;
+        }
+    }
+
+    static std::vector<GbQueryItemInternal> ParseQueryStringInternal(const std::string& queryString, bool decode, GB_UrlOperator::UrlEncodingMode decodeMode)
+    {
+        std::vector<GbQueryItemInternal> items;
+
+        size_t begin = 0;
+        while (begin <= queryString.size())
+        {
+            size_t end = queryString.find_first_of("&;", begin);
+            if (end == std::string::npos)
+            {
+                end = queryString.size();
+            }
+
+            if (end > begin)
+            {
+                const std::string token = queryString.substr(begin, end - begin);
+
+                GbQueryItemInternal item;
+                const size_t eqPos = token.find('=');
+                if (eqPos == std::string::npos)
+                {
+                    item.hasEquals = false;
+                    item.keyUtf8 = decode ? UrlDecodeInternal(token, decodeMode) : token;
+                    item.valueUtf8.clear();
+                }
+                else
+                {
+                    item.hasEquals = true;
+                    const std::string keyPart = token.substr(0, eqPos);
+                    const std::string valuePart = token.substr(eqPos + 1);
+
+                    item.keyUtf8 = decode ? UrlDecodeInternal(keyPart, decodeMode) : keyPart;
+                    item.valueUtf8 = decode ? UrlDecodeInternal(valuePart, decodeMode) : valuePart;
+                }
+
+                items.push_back(item);
+            }
+
+            if (end == queryString.size())
+            {
+                break;
+            }
+            begin = end + 1;
+        }
+
+        return items;
+    }
+
+    static std::vector<GbQueryItemRaw> ParseQueryStringRaw(const std::string& queryString, GB_UrlOperator::UrlEncodingMode decodeMode)
+    {
+        std::vector<GbQueryItemRaw> items;
+
+        size_t begin = 0;
+        char nextSeparator = '&';
+
+        while (begin <= queryString.size())
+        {
+            size_t end = queryString.find_first_of("&;", begin);
+            char delimiter = '\0';
+            if (end == std::string::npos)
+            {
+                end = queryString.size();
+            }
+            else
+            {
+                delimiter = queryString[end];
+            }
+
+            if (end > begin)
+            {
+                const std::string token = queryString.substr(begin, end - begin);
+
+                GbQueryItemRaw item;
+                item.separator = nextSeparator;
+
+                const size_t eqPos = token.find('=');
+                if (eqPos == std::string::npos)
+                {
+                    item.hasEquals = false;
+                    item.rawKey = token;
+                    item.rawValue.clear();
+                }
+                else
+                {
+                    item.hasEquals = true;
+                    item.rawKey = token.substr(0, eqPos);
+                    item.rawValue = token.substr(eqPos + 1);
+                }
+
+                item.decodedKey = UrlDecodeInternal(item.rawKey, decodeMode);
+                item.decodedValue = UrlDecodeInternal(item.rawValue, decodeMode);
+
+                items.push_back(item);
+            }
+
+            if (end == queryString.size())
+            {
+                break;
+            }
+
+            nextSeparator = (delimiter == ';') ? ';' : '&';
+            begin = end + 1;
+        }
+
+        return items;
+    }
+
+    static std::string BuildQueryStringRaw(const std::vector<GbQueryItemRaw>& items)
+    {
+        std::string result;
+
+        for (size_t i = 0; i < items.size(); i++)
+        {
+            const GbQueryItemRaw& item = items[i];
+
+            if (i > 0)
+            {
+                result.push_back((item.separator == ';') ? ';' : '&');
+            }
+
+            result += item.rawKey;
+
+            if (!item.hasEquals && item.rawValue.empty())
+            {
+                continue;
+            }
+
+            result.push_back('=');
+            result += item.rawValue;
+        }
+
+        return result;
+    }
+
+    static bool TryGetUrlPathRange(const std::string& urlUtf8, size_t& outPathBegin, size_t& outPathEndBeforeQueryAndFragment)
+    {
+        outPathBegin = 0;
+        outPathEndBeforeQueryAndFragment = urlUtf8.size();
+
+        size_t prefixEnd = 0;
+        bool hasQuery = false;
+        size_t queryBegin = 0;
+        size_t queryEnd = 0;
+        bool hasFragment = false;
+        size_t fragmentBegin = 0;
+        SplitUrlQueryAndFragment(urlUtf8, prefixEnd, hasQuery, queryBegin, queryEnd, hasFragment, fragmentBegin);
+
+        outPathEndBeforeQueryAndFragment = prefixEnd;
+
+        size_t posAfterScheme = 0;
+        bool hasScheme = false;
+
+        const size_t firstDelim = urlUtf8.find_first_of("/?#");
+        const size_t schemeLimit = (firstDelim == std::string::npos) ? urlUtf8.size() : firstDelim;
+
+        const size_t colonPos = urlUtf8.find(':');
+        if (colonPos != std::string::npos && colonPos < schemeLimit)
+        {
+            const std::string scheme = urlUtf8.substr(0, colonPos);
+            if (IsValidUrlScheme(scheme))
+            {
+                hasScheme = true;
+                posAfterScheme = colonPos + 1;
+            }
+        }
+
+        bool hasAuthority = false;
+        size_t authorityBegin = std::string::npos;
+        size_t authorityEnd = std::string::npos;
+
+        if (hasScheme && posAfterScheme + 1 < urlUtf8.size() && urlUtf8.compare(posAfterScheme, 2, "//") == 0)
+        {
+            hasAuthority = true;
+            authorityBegin = posAfterScheme + 2;
+        }
+        else if (!hasScheme && urlUtf8.size() >= 2 && urlUtf8.compare(0, 2, "//") == 0)
+        {
+            hasAuthority = true;
+            authorityBegin = 2;
+        }
+
+        if (hasAuthority)
+        {
+            authorityEnd = urlUtf8.find_first_of("/?#", authorityBegin);
+            if (authorityEnd == std::string::npos)
+            {
+                authorityEnd = urlUtf8.size();
+            }
+            if (authorityEnd > outPathEndBeforeQueryAndFragment)
+            {
+                authorityEnd = outPathEndBeforeQueryAndFragment;
+            }
+
+            outPathBegin = authorityEnd;
+        }
+        else
+        {
+            outPathBegin = hasScheme ? posAfterScheme : 0;
+        }
+
+        if (outPathBegin > outPathEndBeforeQueryAndFragment)
+        {
+            outPathBegin = outPathEndBeforeQueryAndFragment;
+        }
+
+        return true;
+    }
+
+    static void ReplaceAllInplace(std::string& text, const std::string& oldValue, const std::string& newValue)
+    {
+        if (oldValue.empty())
+        {
+            return;
+        }
+
+        size_t pos = 0;
+        while (true)
+        {
+            pos = text.find(oldValue, pos);
+            if (pos == std::string::npos)
+            {
+                break;
+            }
+
+            text.replace(pos, oldValue.size(), newValue);
+            pos += newValue.size();
+        }
+    }
+
+    static std::string ReplaceColonStyleParam(const std::string& path, const std::string& keyUtf8, const std::string& replacementUtf8)
+    {
+        if (keyUtf8.empty())
+        {
+            return path;
+        }
+
+        std::string result;
+        result.reserve(path.size() + replacementUtf8.size());
+
+        size_t i = 0;
+        while (i < path.size())
+        {
+            if (path[i] == ':' && (i == 0 || path[i - 1] == '/'))
+            {
+                if (i + 1 + keyUtf8.size() <= path.size() && path.compare(i + 1, keyUtf8.size(), keyUtf8) == 0)
+                {
+                    const size_t after = i + 1 + keyUtf8.size();
+                    if (after == path.size() || path[after] == '/')
+                    {
+                        result += replacementUtf8;
+                        i = after;
+                        continue;
+                    }
+                }
+            }
+
+            result.push_back(path[i]);
+            i++;
+        }
+
+        return result;
+    }
+
+    static bool ParseAuthority(const std::string& authorityUtf8, std::string& outUserInfoUtf8, std::string& outHostUtf8, unsigned short& outPort, bool& outHasPort)
+    {
+        outUserInfoUtf8.clear();
+        outHostUtf8.clear();
+        outPort = 0;
+        outHasPort = false;
+
+        if (authorityUtf8.empty())
+        {
+            // 允许空 authority（例如 file:///path），此时 host 为空。
+            return true;
+        }
+
+        std::string hostPort = authorityUtf8;
+        const size_t atPos = authorityUtf8.rfind('@');
+        if (atPos != std::string::npos)
+        {
+            outUserInfoUtf8 = authorityUtf8.substr(0, atPos);
+            hostPort = (atPos + 1 < authorityUtf8.size()) ? authorityUtf8.substr(atPos + 1) : std::string();
+        }
+
+        if (hostPort.empty())
+        {
+            return true;
+        }
+
+        // IPv6 literal: [2001:db8::1]:8080
+        if (hostPort.front() == '[')
+        {
+            const size_t closePos = hostPort.find(']');
+            if (closePos == std::string::npos)
+            {
+                return false;
+            }
+
+            outHostUtf8 = hostPort.substr(1, closePos - 1);
+
+            if (closePos + 1 < hostPort.size() && hostPort[closePos + 1] == ':')
+            {
+                const std::string portText = hostPort.substr(closePos + 2);
+                if (!portText.empty())
+                {
+                    try
+                    {
+                        const unsigned long portUl = std::stoul(portText);
+                        if (portUl <= 65535UL)
+                        {
+                            outPort = static_cast<unsigned short>(portUl);
+                            outHasPort = true;
+                        }
+                    }
+                    catch (...)
+                    {
+                        // ignore
+                    }
+                }
+            }
+
+            return true;
+        }
+
+        // reg-name / IPv4: example.com:80
+        const size_t lastColon = hostPort.rfind(':');
+        if (lastColon != std::string::npos && lastColon + 1 < hostPort.size())
+        {
+            const std::string portText = hostPort.substr(lastColon + 1);
+
+            bool allDigits = true;
+            for (size_t i = 0; i < portText.size(); i++)
+            {
+                if (portText[i] < '0' || portText[i] > '9')
+                {
+                    allDigits = false;
+                    break;
+                }
+            }
+
+            if (allDigits)
+            {
+                outHostUtf8 = hostPort.substr(0, lastColon);
+
+                try
+                {
+                    const unsigned long portUl = std::stoul(portText);
+                    if (portUl <= 65535UL)
+                    {
+                        outPort = static_cast<unsigned short>(portUl);
+                        outHasPort = true;
+                    }
+                }
+                catch (...)
+                {
+                    // ignore
+                }
+
+                return true;
+            }
+        }
+
+        outHostUtf8 = hostPort;
+        return true;
+    }
+} // namespace
+
+
+bool GB_UrlOperator::TryParseUrl(const std::string& urlUtf8, GB_UrlOperator::UrlComponents& outComponents)
+{
+    outComponents = GB_UrlOperator::UrlComponents();
+
+    if (urlUtf8.empty())
+    {
+        return false;
+    }
+
+    size_t prefixEnd = 0;
+    bool hasQuery = false;
+    size_t queryBegin = 0;
+    size_t queryEnd = 0;
+    bool hasFragment = false;
+    size_t fragmentBegin = 0;
+    SplitUrlQueryAndFragment(urlUtf8, prefixEnd, hasQuery, queryBegin, queryEnd, hasFragment, fragmentBegin);
+
+    if (hasQuery && queryBegin <= urlUtf8.size() && queryEnd <= urlUtf8.size() && queryEnd >= queryBegin)
+    {
+        outComponents.queryUtf8 = urlUtf8.substr(queryBegin, queryEnd - queryBegin);
+    }
+
+    if (hasFragment && fragmentBegin <= urlUtf8.size())
+    {
+        outComponents.fragmentUtf8 = urlUtf8.substr(fragmentBegin);
+    }
+
+    size_t posAfterScheme = 0;
+    bool hasScheme = false;
+
+    const size_t firstDelim = urlUtf8.find_first_of("/?#");
+    const size_t schemeLimit = (firstDelim == std::string::npos) ? urlUtf8.size() : firstDelim;
+
+    const size_t colonPos = urlUtf8.find(':');
+    if (colonPos != std::string::npos && colonPos < schemeLimit)
+    {
+        const std::string scheme = urlUtf8.substr(0, colonPos);
+        if (IsValidUrlScheme(scheme))
+        {
+            outComponents.schemeLower = ToLowerCopy(scheme);
+            hasScheme = true;
+            posAfterScheme = colonPos + 1;
+        }
+    }
+
+    bool hasAuthority = false;
+    size_t authorityBegin = std::string::npos;
+    size_t authorityEnd = std::string::npos;
+
+    if (hasScheme && posAfterScheme + 1 < urlUtf8.size() && urlUtf8.compare(posAfterScheme, 2, "//") == 0)
+    {
+        hasAuthority = true;
+        authorityBegin = posAfterScheme + 2;
+    }
+    else if (!hasScheme && urlUtf8.size() >= 2 && urlUtf8.compare(0, 2, "//") == 0)
+    {
+        hasAuthority = true;
+        authorityBegin = 2;
+    }
+
+    if (hasAuthority)
+    {
+        authorityEnd = urlUtf8.find_first_of("/?#", authorityBegin);
+        if (authorityEnd == std::string::npos)
+        {
+            authorityEnd = urlUtf8.size();
+        }
+
+        outComponents.hasAuthority = true;
+
+        const std::string authority = urlUtf8.substr(authorityBegin, authorityEnd - authorityBegin);
+        if (!ParseAuthority(authority, outComponents.userInfoUtf8, outComponents.hostUtf8, outComponents.port, outComponents.hasPort))
+        {
+            return false;
+        }
+    }
+
+    size_t pathBegin = 0;
+    if (hasAuthority)
+    {
+        pathBegin = authorityEnd;
+    }
+    else
+    {
+        pathBegin = hasScheme ? posAfterScheme : 0;
+    }
+
+    if (pathBegin > prefixEnd)
+    {
+        pathBegin = prefixEnd;
+    }
+
+    if (prefixEnd >= pathBegin)
+    {
+        outComponents.pathUtf8 = urlUtf8.substr(pathBegin, prefixEnd - pathBegin);
+    }
+
+    return true;
+}
+
+
+std::string GB_UrlOperator::GetUrlBase(const std::string& urlUtf8)
+{
+    if (urlUtf8.empty())
+    {
+        return std::string();
+    }
+
+    const size_t qPos = urlUtf8.find('?');
+    const size_t hPos = urlUtf8.find('#');
+
+    size_t endPos = urlUtf8.size();
+    if (qPos != std::string::npos)
+    {
+        endPos = qPos;
+    }
+    if (hPos != std::string::npos)
+    {
+        endPos = std::min(endPos, hPos);
+    }
+
+    return urlUtf8.substr(0, endPos);
+}
+
+
+std::string GB_UrlOperator::GetUrlHost(const std::string& urlUtf8)
+{
+    GB_UrlOperator::UrlComponents components;
+    if (!GB_UrlOperator::TryParseUrl(urlUtf8, components))
+    {
+        return std::string();
+    }
+    return components.hostUtf8;
+}
+
+
+std::string GB_UrlOperator::UrlEncode(const std::string& textUtf8, GB_UrlOperator::UrlEncodingMode mode)
+{
+    return UrlEncodeInternal(textUtf8, mode);
+}
+
+
+std::string GB_UrlOperator::UrlDecode(const std::string& text, GB_UrlOperator::UrlEncodingMode mode)
+{
+    return UrlDecodeInternal(text, mode);
+}
+
+
+std::vector<GB_UrlOperator::UrlKeyValue> GB_UrlOperator::ParseUrlQueryKvp(const std::string& urlUtf8, bool decode, GB_UrlOperator::UrlEncodingMode decodeMode)
+{
+    size_t prefixEnd = 0;
+    bool hasQuery = false;
+    size_t queryBegin = 0;
+    size_t queryEnd = 0;
+    bool hasFragment = false;
+    size_t fragmentBegin = 0;
+    SplitUrlQueryAndFragment(urlUtf8, prefixEnd, hasQuery, queryBegin, queryEnd, hasFragment, fragmentBegin);
+
+    if (!hasQuery || queryBegin > queryEnd || queryEnd > urlUtf8.size())
+    {
+        return {};
+    }
+
+    const std::string queryString = urlUtf8.substr(queryBegin, queryEnd - queryBegin);
+    const std::vector<GbQueryItemInternal> items = ParseQueryStringInternal(queryString, decode, decodeMode);
+
+    std::vector<GB_UrlOperator::UrlKeyValue> result;
+    result.reserve(items.size());
+
+    for (size_t i = 0; i < items.size(); i++)
+    {
+        GB_UrlOperator::UrlKeyValue kvp;
+        kvp.keyUtf8 = items[i].keyUtf8;
+        kvp.valueUtf8 = items[i].valueUtf8;
+        result.push_back(kvp);
+    }
+
+    return result;
+}
+
+
+std::vector<std::string> GB_UrlOperator::GetUrlQueryValues(const std::string& urlUtf8, const std::string& keyUtf8, bool decode, GB_UrlOperator::UrlEncodingMode decodeMode)
+{
+    if (keyUtf8.empty())
+    {
+        return {};
+    }
+
+    const std::vector<GB_UrlOperator::UrlKeyValue> kvps = GB_UrlOperator::ParseUrlQueryKvp(urlUtf8, decode, decodeMode);
+
+    std::vector<std::string> values;
+    for (size_t i = 0; i < kvps.size(); i++)
+    {
+        if (kvps[i].keyUtf8 == keyUtf8)
+        {
+            values.push_back(kvps[i].valueUtf8);
+        }
+    }
+
+    return values;
+}
+
+
+bool GB_UrlOperator::TryGetUrlQueryValue(const std::string& urlUtf8, const std::string& keyUtf8, std::string& outValueUtf8, bool decode, GB_UrlOperator::UrlEncodingMode decodeMode)
+{
+    outValueUtf8.clear();
+
+    if (keyUtf8.empty())
+    {
+        return false;
+    }
+
+    const std::vector<GB_UrlOperator::UrlKeyValue> kvps = GB_UrlOperator::ParseUrlQueryKvp(urlUtf8, decode, decodeMode);
+    for (size_t i = 0; i < kvps.size(); i++)
+    {
+        if (kvps[i].keyUtf8 == keyUtf8)
+        {
+            outValueUtf8 = kvps[i].valueUtf8;
+            return true;
+        }
+    }
+
+    return false;
+}
+
+
+std::string GB_UrlOperator::SetUrlQueryValue(const std::string& urlUtf8, const std::string& keyUtf8, const std::string& valueUtf8, GB_UrlOperator::UrlQuerySetMode setMode, GB_UrlOperator::UrlEncodingMode encodeMode)
+{
+    if (urlUtf8.empty())
+    {
+        return std::string();
+    }
+
+    if (keyUtf8.empty())
+    {
+        return urlUtf8;
+    }
+
+    size_t prefixEnd = 0;
+    bool hasQuery = false;
+    size_t queryBegin = 0;
+    size_t queryEnd = 0;
+    bool hasFragment = false;
+    size_t fragmentBegin = 0;
+    SplitUrlQueryAndFragment(urlUtf8, prefixEnd, hasQuery, queryBegin, queryEnd, hasFragment, fragmentBegin);
+
+    const std::string prefix = urlUtf8.substr(0, prefixEnd);
+    const std::string fragment = hasFragment ? urlUtf8.substr(fragmentBegin) : std::string();
+    const std::string queryString = hasQuery ? urlUtf8.substr(queryBegin, queryEnd - queryBegin) : std::string();
+
+    std::vector<GbQueryItemRaw> items = ParseQueryStringRaw(queryString, encodeMode);
+
+    const std::string newRawKey = UrlEncodeInternal(keyUtf8, encodeMode);
+    const std::string newRawValue = UrlEncodeInternal(valueUtf8, encodeMode);
+
+    bool foundAny = false;
+
+    if (setMode != GB_UrlOperator::UrlQuerySetMode::Append)
+    {
+        for (size_t i = 0; i < items.size(); i++)
+        {
+            if (items[i].decodedKey == keyUtf8)
+            {
+                foundAny = true;
+
+                if (setMode == GB_UrlOperator::UrlQuerySetMode::AddIfAbsent)
+                {
+                    break;
+                }
+
+                items[i].rawValue = newRawValue;
+                items[i].decodedValue = valueUtf8;
+                items[i].hasEquals = true;
+
+                if (setMode == GB_UrlOperator::UrlQuerySetMode::ReplaceFirst)
+                {
+                    break;
+                }
+            }
+        }
+    }
+
+    if (setMode == GB_UrlOperator::UrlQuerySetMode::Append || !foundAny)
+    {
+        GbQueryItemRaw newItem;
+        newItem.separator = '&';
+        newItem.rawKey = newRawKey;
+        newItem.rawValue = newRawValue;
+        newItem.decodedKey = keyUtf8;
+        newItem.decodedValue = valueUtf8;
+        newItem.hasEquals = true;
+
+        if (setMode == GB_UrlOperator::UrlQuerySetMode::AddIfAbsent && foundAny)
+        {
+            // no-op
+        }
+        else
+        {
+            items.push_back(newItem);
+        }
+    }
+
+    const std::string newQuery = BuildQueryStringRaw(items);
+
+    std::string result = prefix;
+    if (!newQuery.empty())
+    {
+        result.push_back('?');
+        result += newQuery;
+    }
+    if (!fragment.empty())
+    {
+        result.push_back('#');
+        result += fragment;
+    }
+
+    return result;
+}
+
+
+std::string GB_UrlOperator::RemoveUrlQueryKey(const std::string& urlUtf8, const std::string& keyUtf8, bool decode, GB_UrlOperator::UrlEncodingMode decodeMode)
+{
+    if (urlUtf8.empty() || keyUtf8.empty())
+    {
+        return urlUtf8;
+    }
+
+    size_t prefixEnd = 0;
+    bool hasQuery = false;
+    size_t queryBegin = 0;
+    size_t queryEnd = 0;
+    bool hasFragment = false;
+    size_t fragmentBegin = 0;
+    SplitUrlQueryAndFragment(urlUtf8, prefixEnd, hasQuery, queryBegin, queryEnd, hasFragment, fragmentBegin);
+
+    if (!hasQuery)
+    {
+        return urlUtf8;
+    }
+
+    const std::string prefix = urlUtf8.substr(0, prefixEnd);
+    const std::string fragment = hasFragment ? urlUtf8.substr(fragmentBegin) : std::string();
+    const std::string queryString = urlUtf8.substr(queryBegin, queryEnd - queryBegin);
+
+    std::vector<GbQueryItemRaw> items = ParseQueryStringRaw(queryString, decodeMode);
+
+    std::vector<GbQueryItemRaw> kept;
+    kept.reserve(items.size());
+
+    for (size_t i = 0; i < items.size(); i++)
+    {
+        const std::string& candidateKey = decode ? items[i].decodedKey : items[i].rawKey;
+        if (candidateKey != keyUtf8)
+        {
+            kept.push_back(items[i]);
+        }
+    }
+
+    const std::string newQuery = BuildQueryStringRaw(kept);
+
+    std::string result = prefix;
+    if (!newQuery.empty())
+    {
+        result.push_back('?');
+        result += newQuery;
+    }
+    if (!fragment.empty())
+    {
+        result.push_back('#');
+        result += fragment;
+    }
+
+    return result;
+}
+
+
+std::string GB_UrlOperator::ReplaceUrlPathParams(const std::string& urlUtf8, const std::vector<GB_UrlOperator::UrlKeyValue>& params, bool encodeValue)
+{
+    if (urlUtf8.empty() || params.empty())
+    {
+        return urlUtf8;
+    }
+
+    size_t pathBegin = 0;
+    size_t pathEnd = 0;
+    if (!TryGetUrlPathRange(urlUtf8, pathBegin, pathEnd))
+    {
+        return urlUtf8;
+    }
+
+    const std::string prefix = urlUtf8.substr(0, pathBegin);
+    const std::string path = urlUtf8.substr(pathBegin, pathEnd - pathBegin);
+    const std::string suffix = urlUtf8.substr(pathEnd);
+
+    std::string newPath = path;
+
+    for (size_t i = 0; i < params.size(); i++)
+    {
+        const GB_UrlOperator::UrlKeyValue& p = params[i];
+        if (p.keyUtf8.empty())
+        {
+            continue;
+        }
+
+        const std::string replacement = encodeValue ? UrlEncodeInternal(p.valueUtf8, GB_UrlOperator::UrlEncodingMode::Rfc3986) : p.valueUtf8;
+
+        // "{id}" 风格
+        const std::string braceToken = "{" + p.keyUtf8 + "}";
+        ReplaceAllInplace(newPath, braceToken, replacement);
+
+        // ":id" 风格（路径段开头）
+        newPath = ReplaceColonStyleParam(newPath, p.keyUtf8, replacement);
+    }
+
+    return prefix + newPath + suffix;
+}

@@ -242,4 +242,144 @@ GLOBALBASE_PORT GB_NetworkDownloadedFile GB_DownloadFile(const std::string& urlU
  */
 GLOBALBASE_PORT GB_NetworkDownloadedFileToPath GB_DownloadFileToPath(const std::string& urlUtf8, const std::string& filePathUtf8, const GB_NetworkRequestOptions& options = GB_NetworkRequestOptions(), GB_DownloadFileStrategy strategy = GB_DownloadFileStrategy::MultiCurl, void* totalSizeAtomicPtr = nullptr, void* downloadedSizeAtomicPtr = nullptr);
 
+class GLOBALBASE_PORT GB_UrlOperator
+{
+public:
+
+    /**
+     * @brief URL 的主要组成部分（RFC 3986：scheme/authority/path/query/fragment）。
+     *
+     * @remarks
+     * - schemeLower / hostUtf8 在语义上是大小写不敏感的；这里将 schemeLower 统一为小写，hostUtf8 保持原样（仅提取）。
+     * - pathUtf8/queryUtf8/fragmentUtf8 为“未解码”的原始子串（不包含分隔符）。
+     * - 对于相对 URL（无 scheme/authority），hasAuthority=false，hostUtf8 可能为空。
+     */
+    struct UrlComponents
+    {
+        std::string schemeLower = "";
+        std::string userInfoUtf8 = "";
+        std::string hostUtf8 = "";
+        unsigned short port = 0;
+        bool hasPort = false;
+
+        std::string pathUtf8 = "";
+        std::string queryUtf8 = "";
+        std::string fragmentUtf8 = "";
+
+        bool hasAuthority = false;
+    };
+
+    /**
+     * @brief 尝试解析 URL 的主要组成部分（不会进行网络访问）。
+     *
+     * @param urlUtf8 URL（UTF-8）。
+     * @param outComponents 输出的组成部分。
+     * @return 解析成功返回 true；否则返回 false（通常是极端不完整/不合法的 authority，比如 IPv6 方括号不匹配等）。
+     */
+    static bool TryParseUrl(const std::string& urlUtf8, UrlComponents& outComponents);
+
+    /**
+     * @brief 获取 URL 的“基础部分”（不包含 query 与 fragment）。
+     *
+     * @remarks
+     * 例如：
+     * - "https://a.com/p?q=1#x" -> "https://a.com/p"
+     * - "/p?q=1" -> "/p"
+     */
+    static std::string GetUrlBase(const std::string& urlUtf8);
+
+    /**
+     * @brief 提取 URL 的域名（host，不包含端口，不包含方括号）。
+     *
+     * @remarks
+     * - "https://user:pass@example.com:8443/p" -> "example.com"
+     * - "http://[2001:db8::1]:8080/p" -> "2001:db8::1"
+     */
+    static std::string GetUrlHost(const std::string& urlUtf8);
+
+    // URL 编码/解码模式
+    enum class UrlEncodingMode
+    {
+        Rfc3986,        // 按 RFC 3986 的 percent-encoding 规则编码；空格编码为 "%20"
+        FormUrlEncoded  // 用于 application/x-www-form-urlencoded（常见于 query / 表单），空格编码为 '+'。
+    };
+    
+    // 将文本按指定模式进行 URL 编码（percent-encoding）
+    static std::string UrlEncode(const std::string& textUtf8, UrlEncodingMode mode = UrlEncodingMode::Rfc3986);
+
+    // 将文本进行 URL 解码（percent-decoding）。mode=FormUrlEncoded 时会将 '+' 视为空格再解码。
+    static std::string UrlDecode(const std::string& text, UrlEncodingMode mode = UrlEncodingMode::Rfc3986);
+
+    struct UrlKeyValue
+    {
+        std::string keyUtf8 = "";
+        std::string valueUtf8 = "";
+    };
+
+    /**
+     * @brief 提取 URL 中 query 的所有键值对（保持原顺序，允许重复 key）。
+     *
+     * @param urlUtf8 URL（UTF-8）。
+     * @param decode 是否对 key/value 做解码（percent-decoding）。
+     * @param decodeMode 解码模式（仅 decode=true 时生效）。
+     */
+    static std::vector<UrlKeyValue> ParseUrlQueryKvp(const std::string& urlUtf8, bool decode = true, UrlEncodingMode decodeMode = UrlEncodingMode::FormUrlEncoded);
+
+    /**
+     * @brief 获取 URL query 中指定 key 的所有 value（允许重复 key）。
+     */
+    static std::vector<std::string> GetUrlQueryValues(const std::string& urlUtf8, const std::string& keyUtf8, bool decode = true, UrlEncodingMode decodeMode = UrlEncodingMode::FormUrlEncoded);
+
+    /**
+     * @brief 获取 URL query 中指定 key 的第一个 value。
+     *
+     * @return 找到返回 true；否则返回 false。
+     */
+    static bool TryGetUrlQueryValue(const std::string& urlUtf8, const std::string& keyUtf8, std::string& outValueUtf8, bool decode = true, UrlEncodingMode decodeMode = UrlEncodingMode::FormUrlEncoded);
+
+    /**
+     * @brief URL Query 设置策略。
+     */
+    enum class UrlQuerySetMode
+    {
+        Append,         // 始终追加一个新的 key=value
+        AddIfAbsent,    // 仅当 key 不存在时追加
+        ReplaceFirst,   // 替换第一个匹配的 key；若不存在则追加
+        ReplaceAll      // 替换所有匹配的 key；若不存在则追加
+    };
+
+    /**
+     * @brief 增加/删除/修改 URL query 中的 key=value，并返回新的 URL。
+     *
+     * @remarks
+     * - 该函数会保留原 URL 的 fragment（#...）。
+     * - 会对 valueUtf8 按 encodeMode 进行编码后写回 URL。
+     */
+    static std::string SetUrlQueryValue(const std::string& urlUtf8, const std::string& keyUtf8, const std::string& valueUtf8, UrlQuerySetMode setMode = UrlQuerySetMode::ReplaceAll, UrlEncodingMode encodeMode = UrlEncodingMode::FormUrlEncoded);
+
+    /**
+     * @brief 删除 URL query 中指定 key 的所有项，并返回新的 URL。
+     *
+     * @remarks
+     * - 保留 fragment。
+     * - 若删除后 query 为空，会移除 '?' 分隔符。
+     */
+    static std::string RemoveUrlQueryKey(const std::string& urlUtf8, const std::string& keyUtf8, bool decode = true, UrlEncodingMode decodeMode = UrlEncodingMode::FormUrlEncoded);
+
+    /**
+     * @brief 将 REST 风格的路径参数替换为指定值，并返回新的 URL。
+     *
+     * @remarks
+     * 支持两种占位符写法（仅对 path 部分生效）：
+     * - "{id}"：花括号风格
+     * - ":id"：冒号风格（要求位于路径段开头，例如 "/users/:id/profile"）
+     *
+     * @param urlUtf8 URL（UTF-8）。
+     * @param params 待替换的参数列表。
+     * @param encodeValue 是否对替换值做 URL 编码（建议 true）。
+     * @return 替换后的 URL（保留 query 与 fragment）。
+     */
+    static std::string ReplaceUrlPathParams(const std::string& urlUtf8, const std::vector<UrlKeyValue>& params, bool encodeValue = true);
+};
+
 #endif
