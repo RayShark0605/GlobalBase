@@ -1191,8 +1191,15 @@ namespace
 
     static std::string PercentDecode(const std::string& text)
     {
+        const size_t firstPercent = text.find('%');
+        if (firstPercent == std::string::npos)
+        {
+            return text;
+        }
+
         std::string result;
         result.reserve(text.size());
+        result.append(text, 0, firstPercent);
 
         auto HexToNibble = [](char c) -> int {
             if (c >= '0' && c <= '9') return c - '0';
@@ -1201,7 +1208,7 @@ namespace
             return -1;
             };
 
-        for (size_t i = 0; i < text.size(); i++)
+        for (size_t i = firstPercent; i < text.size(); i++)
         {
             const char c = text[i];
             if (c == '%' && i + 2 < text.size())
@@ -4648,7 +4655,24 @@ namespace
 
     static std::string UrlDecodeInternal(const std::string& text, GB_UrlOperator::UrlEncodingMode mode)
     {
+        if (text.empty())
+        {
+            return std::string();
+        }
+
+        const bool hasPercent = (text.find('%') != std::string::npos);
         if (mode != GB_UrlOperator::UrlEncodingMode::FormUrlEncoded)
+        {
+            return hasPercent ? PercentDecode(text) : text;
+        }
+
+        const bool hasPlus = (text.find('+') != std::string::npos);
+        if (!hasPercent && !hasPlus)
+        {
+            return text;
+        }
+
+        if (!hasPlus)
         {
             return PercentDecode(text);
         }
@@ -4661,7 +4685,8 @@ namespace
                 replaced[i] = ' ';
             }
         }
-        return PercentDecode(replaced);
+
+        return hasPercent ? PercentDecode(replaced) : replaced;
     }
 
     struct GbQueryItemInternal
@@ -5019,25 +5044,48 @@ namespace
 
             outHostUtf8 = hostPort.substr(1, closePos - 1);
 
-            if (closePos + 1 < hostPort.size() && hostPort[closePos + 1] == ':')
+            if (closePos + 1 == hostPort.size())
             {
-                const std::string portText = hostPort.substr(closePos + 2);
-                if (!portText.empty())
+                return true;
+            }
+
+            if (hostPort[closePos + 1] != ':')
+            {
+                return false;
+            }
+
+            if (closePos + 2 >= hostPort.size())
+            {
+                return false;
+            }
+
+            const std::string portText = hostPort.substr(closePos + 2);
+            if (portText.empty())
+            {
+                return false;
+            }
+
+            for (size_t i = 0; i < portText.size(); i++)
+            {
+                if (portText[i] < '0' || portText[i] > '9')
                 {
-                    try
-                    {
-                        const unsigned long portUl = std::stoul(portText);
-                        if (portUl <= 65535UL)
-                        {
-                            outPort = static_cast<unsigned short>(portUl);
-                            outHasPort = true;
-                        }
-                    }
-                    catch (...)
-                    {
-                        // ignore
-                    }
+                    return false;
                 }
+            }
+
+            try
+            {
+                const unsigned long portUl = std::stoul(portText);
+                if (portUl > 65535UL)
+                {
+                    return false;
+                }
+                outPort = static_cast<unsigned short>(portUl);
+                outHasPort = true;
+            }
+            catch (...)
+            {
+                return false;
             }
 
             return true;
@@ -5045,39 +5093,45 @@ namespace
 
         // reg-name / IPv4: example.com:80
         const size_t lastColon = hostPort.rfind(':');
-        if (lastColon != std::string::npos && lastColon + 1 < hostPort.size())
+        if (lastColon != std::string::npos)
         {
+            // authority 中（非 IPv6 literal）出现 ':'，应当解释为端口分隔符。
+            if (lastColon == hostPort.size() - 1)
+            {
+                return false;
+            }
+
+            const std::string hostPart = hostPort.substr(0, lastColon);
             const std::string portText = hostPort.substr(lastColon + 1);
 
-            bool allDigits = true;
+            if (hostPart.empty() || portText.empty())
+            {
+                return false;
+            }
+
             for (size_t i = 0; i < portText.size(); i++)
             {
                 if (portText[i] < '0' || portText[i] > '9')
                 {
-                    allDigits = false;
-                    break;
+                    return false;
                 }
             }
 
-            if (allDigits)
+            try
             {
-                outHostUtf8 = hostPort.substr(0, lastColon);
-
-                try
+                const unsigned long portUl = std::stoul(portText);
+                if (portUl > 65535UL)
                 {
-                    const unsigned long portUl = std::stoul(portText);
-                    if (portUl <= 65535UL)
-                    {
-                        outPort = static_cast<unsigned short>(portUl);
-                        outHasPort = true;
-                    }
+                    return false;
                 }
-                catch (...)
-                {
-                    // ignore
-                }
-
+                outHostUtf8 = hostPart;
+                outPort = static_cast<unsigned short>(portUl);
+                outHasPort = true;
                 return true;
+            }
+            catch (...)
+            {
+                return false;
             }
         }
 
@@ -5371,22 +5425,25 @@ std::string GB_UrlOperator::SetUrlQueryValue(const std::string& urlUtf8, const s
 
     if (setMode == GB_UrlOperator::UrlQuerySetMode::Append || !foundAny)
     {
+        char joinSeparator = '&';
+        if (queryString.find('&') == std::string::npos && queryString.find(';') != std::string::npos)
+        {
+            joinSeparator = ';';
+        }
+        if (!items.empty() && items.back().separator == ';')
+        {
+            joinSeparator = ';';
+        }
+
         GbQueryItemRaw newItem;
-        newItem.separator = '&';
+        newItem.separator = joinSeparator;
         newItem.rawKey = newRawKey;
         newItem.rawValue = newRawValue;
         newItem.decodedKey = keyUtf8;
         newItem.decodedValue = valueUtf8;
         newItem.hasEquals = true;
 
-        if (setMode == GB_UrlOperator::UrlQuerySetMode::AddIfAbsent && foundAny)
-        {
-            // no-op
-        }
-        else
-        {
-            items.push_back(newItem);
-        }
+        items.push_back(newItem);
     }
 
     const std::string newQuery = BuildQueryStringRaw(items);
