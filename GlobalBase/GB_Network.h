@@ -269,8 +269,8 @@ public:
      */
     enum class UrlQuerySetMode
     {
-        ReplaceAll,     ///< 替换所有匹配 key 的项。
-        ReplaceFirst,   ///< 仅替换第一个匹配 key 的项。
+        ReplaceAll,     ///< 对齐 URLSearchParams.set：替换第一个匹配 key 的项，并删除后续重复项（最终只保留一个 key）。
+        ReplaceFirst,   ///< 仅替换第一个匹配 key 的项，保留后续重复项。
         Append,         ///< 始终追加一项（允许重复 key）。
         AddIfAbsent     ///< 若 key 已存在则不改动，否则追加。
     };

@@ -5579,12 +5579,20 @@ std::string GB_UrlOperator::SetUrlQueryValue(const std::string& urlUtf8, const s
 
     bool foundAny = false;
 
-    if (setMode != GB_UrlOperator::UrlQuerySetMode::Append)
+    // ReplaceAll 的语义是“URLSearchParams.set”：替换第一个匹配项并移除后续重复项。
+    // 原实现使用 erase 循环会退化为 O(n^2)；这里改为一次线性扫描构建新数组。
+    if (setMode != GB_UrlOperator::UrlQuerySetMode::Append && !items.empty())
     {
+        std::vector<GbQueryItemRaw> newItems;
+        newItems.reserve(items.size());
+
+        bool replacedFirst = false;
         for (size_t i = 0; i < items.size(); i++)
         {
-            if (items[i].decodedKey != keyUtf8)
+            GbQueryItemRaw item = items[i];
+            if (item.decodedKey != keyUtf8)
             {
+                newItems.push_back(item);
                 continue;
             }
 
@@ -5592,35 +5600,29 @@ std::string GB_UrlOperator::SetUrlQueryValue(const std::string& urlUtf8, const s
 
             if (setMode == GB_UrlOperator::UrlQuerySetMode::AddIfAbsent)
             {
-                break;
+                newItems.push_back(item);
+                continue;
             }
 
-            if (setMode == GB_UrlOperator::UrlQuerySetMode::ReplaceAll)
+            if (!replacedFirst)
             {
-                // 行为对齐 URLSearchParams.set：修改第一个命中的项，并删除后续重复项。
-                items[i].rawValue = newRawValue;
-                items[i].decodedValue = valueUtf8;
-                items[i].hasEquals = true;
-
-                size_t j = i + 1;
-                while (j < items.size())
-                {
-                    if (items[j].decodedKey == keyUtf8)
-                    {
-                        items.erase(items.begin() + static_cast<std::vector<GbQueryItemRaw>::difference_type>(j));
-                        continue;
-                    }
-                    j++;
-                }
-                break;
+                item.rawValue = newRawValue;
+                item.decodedValue = valueUtf8;
+                item.hasEquals = true;
+                replacedFirst = true;
+                newItems.push_back(item);
+                continue;
             }
 
-            // ReplaceFirst
-            items[i].rawValue = newRawValue;
-            items[i].decodedValue = valueUtf8;
-            items[i].hasEquals = true;
-            break;
+            if (setMode == GB_UrlOperator::UrlQuerySetMode::ReplaceFirst)
+            {
+                // ReplaceFirst：后续重复项保持不变
+                newItems.push_back(item);
+            }
+            // ReplaceAll：跳过后续重复项
         }
+
+        items.swap(newItems);
     }
 
     if (setMode == GB_UrlOperator::UrlQuerySetMode::Append || !foundAny)
@@ -5654,7 +5656,7 @@ std::string GB_UrlOperator::SetUrlQueryValue(const std::string& urlUtf8, const s
         result.push_back('?');
         result += newQuery;
     }
-    if (!fragment.empty())
+    if (hasFragment)
     {
         result.push_back('#');
         result += fragment;
@@ -5687,6 +5689,12 @@ std::string GB_UrlOperator::RemoveUrlQueryKey(const std::string& urlUtf8, const 
     const std::string fragment = hasFragment ? urlUtf8.substr(fragmentBegin) : std::string();
     const std::string queryString = urlUtf8.substr(queryBegin, queryEnd - queryBegin);
 
+    // 保持幂等：如果原本 query 为空，移除任意 key 都应返回原字符串（包含 '?'）。
+    if (queryString.empty())
+    {
+        return urlUtf8;
+    }
+
     std::vector<GbQueryItemRaw> items = ParseQueryStringRaw(queryString, decodeMode);
 
     std::vector<GbQueryItemRaw> kept;
@@ -5701,6 +5709,12 @@ std::string GB_UrlOperator::RemoveUrlQueryKey(const std::string& urlUtf8, const 
         }
     }
 
+    // 如果没有删除任何项，直接返回原 URL，避免无意义的重建导致细微格式变化。
+    if (kept.size() == items.size())
+    {
+        return urlUtf8;
+    }
+
     const std::string newQuery = BuildQueryStringRaw(kept);
 
     std::string result = prefix;
@@ -5709,7 +5723,7 @@ std::string GB_UrlOperator::RemoveUrlQueryKey(const std::string& urlUtf8, const 
         result.push_back('?');
         result += newQuery;
     }
-    if (!fragment.empty())
+    if (hasFragment)
     {
         result.push_back('#');
         result += fragment;
