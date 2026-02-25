@@ -2292,3 +2292,79 @@ string GB_Utf8Replace(const string& utf8Str, const string& oldValue, const strin
     return internal::ReplaceAllBytesKmp(utf8Str, oldValue, newValue, caseSensitive);
 }
 
+string GB_Utf8VFormat(const char* format, va_list args)
+{
+    if (!format)
+    {
+        throw runtime_error("GB_Utf8VFormat: format is null.");
+    }
+
+#if defined(_WIN32)
+    va_list argsCopy;
+    va_copy(argsCopy, args);
+    const int required = _vscprintf(format, argsCopy);
+    va_end(argsCopy);
+
+    if (required < 0)
+    {
+        throw runtime_error("GB_Utf8VFormat: _vscprintf failed.");
+    }
+
+    const size_t bufferSize = static_cast<size_t>(required) + 1;
+    vector<char> buffer(bufferSize, '\0');
+
+    const int written = vsnprintf(buffer.data(), buffer.size(), format, args);
+    if (written < 0)
+    {
+        throw runtime_error("GB_Utf8VFormat: vsnprintf failed.");
+    }
+
+    return string(buffer.data(), static_cast<size_t>(written));
+#else
+    va_list argsCopy;
+    va_copy(argsCopy, args);
+    const int required = vsnprintf(nullptr, 0, format, argsCopy);
+    va_end(argsCopy);
+
+    if (required < 0)
+    {
+        throw runtime_error("GB_Utf8VFormat: vsnprintf(size query) failed.");
+    }
+
+    const size_t bufferSize = static_cast<size_t>(required) + 1;
+    vector<char> buffer(bufferSize, '\0');
+
+    const int written = vsnprintf(buffer.data(), buffer.size(), format, args);
+    if (written < 0)
+    {
+        throw runtime_error("GB_Utf8VFormat: vsnprintf failed.");
+    }
+
+    return string(buffer.data(), static_cast<size_t>(written));
+#endif
+}
+
+string GB_Utf8Format(const char* format, ...)
+{
+    if (!format)
+    {
+        throw runtime_error("GB_Utf8Format: format is null.");
+    }
+
+    va_list args;
+    va_start(args, format);
+
+    string out;
+    try
+    {
+        out = GB_Utf8VFormat(format, args);
+    }
+    catch (...)
+    {
+        va_end(args);
+        throw;
+    }
+
+    va_end(args);
+    return out;
+}

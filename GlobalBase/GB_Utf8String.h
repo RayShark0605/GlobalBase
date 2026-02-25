@@ -104,6 +104,14 @@ GLOBALBASE_PORT std::string GB_Utf8TrimRight(const std::string& utf8Str, const s
 // 替换 UTF-8 字符串中的子串（可选大小写敏感）
 GLOBALBASE_PORT std::string GB_Utf8Replace(const std::string& utf8Str, const std::string& oldValue, const std::string& newValue, bool caseSensitive = true);
 
+// printf 风格格式化生成 UTF-8 字符串
+// 注意：
+// - format 必须是 UTF-8 字节序列；
+// - %s 对应参数也假定为 UTF-8 字节序列；
+// - 本函数不做编码转换，只按 C 运行库规则格式化并拼接字节。
+// 发生格式化错误时会抛出 std::runtime_error。
+GLOBALBASE_PORT std::string GB_Utf8VFormat(const char* format, va_list args);
 
+GLOBALBASE_PORT std::string GB_Utf8Format(const char* format, ...);
 
 #endif
