@@ -3,6 +3,8 @@
 #include <stdexcept>
 #include <climits>
 #include <mutex>
+#include <cstdarg>
+#include <cstdio>
 
 #if defined(_WIN32)
 #include <windows.h>
@@ -2292,7 +2294,7 @@ string GB_Utf8Replace(const string& utf8Str, const string& oldValue, const strin
     return internal::ReplaceAllBytesKmp(utf8Str, oldValue, newValue, caseSensitive);
 }
 
-string GB_Utf8VFormat(const char* format, va_list args)
+string GB_Utf8VFormat(const char* format, std::va_list args)
 {
     if (!format)
     {
@@ -2300,7 +2302,7 @@ string GB_Utf8VFormat(const char* format, va_list args)
     }
 
 #if defined(_WIN32)
-    va_list argsCopy;
+    std::va_list argsCopy;
     va_copy(argsCopy, args);
     const int required = _vscprintf(format, argsCopy);
     va_end(argsCopy);
@@ -2321,7 +2323,7 @@ string GB_Utf8VFormat(const char* format, va_list args)
 
     return string(buffer.data(), static_cast<size_t>(written));
 #else
-    va_list argsCopy;
+    std::va_list argsCopy;
     va_copy(argsCopy, args);
     const int required = vsnprintf(nullptr, 0, format, argsCopy);
     va_end(argsCopy);
@@ -2351,7 +2353,7 @@ string GB_Utf8Format(const char* format, ...)
         throw runtime_error("GB_Utf8Format: format is null.");
     }
 
-    va_list args;
+    std::va_list args;
     va_start(args, format);
 
     string out;
