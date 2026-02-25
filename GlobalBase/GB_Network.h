@@ -341,31 +341,35 @@ public:
 
     /**
      * @brief 获取 URL query 中指定 key 的所有 value。
+     * @param keyCaseSensitive key 是否大小写敏感（仅对 ASCII 字母进行不敏感比较）。默认 false。
      */
-    static std::vector<std::string> GetUrlQueryValues(const std::string& urlUtf8, const std::string& keyUtf8, bool decode = true, UrlEncodingMode decodeMode = UrlEncodingMode::Rfc3986);
+    static std::vector<std::string> GetUrlQueryValues(const std::string& urlUtf8, const std::string& keyUtf8, bool decode = true, UrlEncodingMode decodeMode = UrlEncodingMode::Rfc3986, bool keyCaseSensitive = false);
 
     /**
      * @brief 获取 URL query 中指定 key 的第一个 value。
+     * @param keyCaseSensitive key 是否大小写敏感（仅对 ASCII 字母进行不敏感比较）。默认 false。
      */
-    static bool TryGetUrlQueryValue(const std::string& urlUtf8, const std::string& keyUtf8, std::string& outValueUtf8, bool decode = true, UrlEncodingMode decodeMode = UrlEncodingMode::Rfc3986);
+    static bool TryGetUrlQueryValue(const std::string& urlUtf8, const std::string& keyUtf8, std::string& outValueUtf8, bool decode = true, UrlEncodingMode decodeMode = UrlEncodingMode::Rfc3986, bool keyCaseSensitive = false);
 
     /**
      * @brief 设置/追加 query 参数。
+     * @param keyCaseSensitive key 是否大小写敏感（仅对 ASCII 字母进行不敏感比较）。默认 false。
      *
      * @remarks
      * - keyUtf8 / valueUtf8 视为“未编码”的原始文本（UTF-8）。
      * - encodeMode 决定新增/替换值的编码方式，同时也用于解码已有 query 以进行 key 匹配。
      */
-    static std::string SetUrlQueryValue(const std::string& urlUtf8, const std::string& keyUtf8, const std::string& valueUtf8, UrlQuerySetMode setMode = UrlQuerySetMode::ReplaceAll, UrlEncodingMode encodeMode = UrlEncodingMode::Rfc3986);
+    static std::string SetUrlQueryValue(const std::string& urlUtf8, const std::string& keyUtf8, const std::string& valueUtf8, UrlQuerySetMode setMode = UrlQuerySetMode::ReplaceAll, UrlEncodingMode encodeMode = UrlEncodingMode::Rfc3986, bool keyCaseSensitive = false);
 
     /**
      * @brief 从 URL 中移除 query 中匹配 key 的项。
+     * @param keyCaseSensitive key 是否大小写敏感（仅对 ASCII 字母进行不敏感比较）。默认 false。
      *
      * @param decode 若为 true，则对已有 query 的 key 先解码后再与 keyUtf8 比较。
      *               若为 false，则以“原始（未解码）key 子串”与 keyUtf8 比较。
      * @param decodeMode 解码模式（decode=true 时有效）。
      */
-    static std::string RemoveUrlQueryKey(const std::string& urlUtf8, const std::string& keyUtf8, bool decode = true, UrlEncodingMode decodeMode = UrlEncodingMode::Rfc3986);
+    static std::string RemoveUrlQueryKey(const std::string& urlUtf8, const std::string& keyUtf8, bool decode = true, UrlEncodingMode decodeMode = UrlEncodingMode::Rfc3986, bool keyCaseSensitive = false);
 
     /**
      * @brief 替换 URL path 中的占位符参数。

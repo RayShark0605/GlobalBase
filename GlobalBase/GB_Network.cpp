@@ -4787,6 +4787,43 @@ namespace
         char separator = '&';
     };
 
+
+    static inline char ToLowerAsciiChar(char c)
+    {
+        if (c >= 'A' && c <= 'Z')
+        {
+            return static_cast<char>(c - 'A' + 'a');
+        }
+        return c;
+    }
+
+    // URL key 的大小写不敏感比较：仅对 ASCII 字母做折叠（A-Z -> a-z）。
+    // 说明：
+    // - 这是“字节级”的比较，不做 Unicode 大小写折叠。
+    // - 对于 raw key，可同时兼容 %2F 与 %2f 这类十六进制字符大小写差异。
+    static bool AreUrlKeysEqual(const std::string& a, const std::string& b, bool keyCaseSensitive)
+    {
+        if (keyCaseSensitive)
+        {
+            return a == b;
+        }
+
+        if (a.size() != b.size())
+        {
+            return false;
+        }
+
+        for (size_t i = 0; i < a.size(); i++)
+        {
+            if (ToLowerAsciiChar(a[i]) != ToLowerAsciiChar(b[i]))
+            {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
     static void SplitUrlQueryAndFragment(const std::string& urlUtf8,
         size_t& outPrefixEnd,
         bool& outHasQuery,
@@ -5503,7 +5540,7 @@ std::vector<GB_UrlOperator::UrlKeyValue> GB_UrlOperator::ParseUrlQueryKvp(const 
 }
 
 
-std::vector<std::string> GB_UrlOperator::GetUrlQueryValues(const std::string& urlUtf8, const std::string& keyUtf8, bool decode, GB_UrlOperator::UrlEncodingMode decodeMode)
+std::vector<std::string> GB_UrlOperator::GetUrlQueryValues(const std::string& urlUtf8, const std::string& keyUtf8, bool decode, GB_UrlOperator::UrlEncodingMode decodeMode, bool keyCaseSensitive)
 {
     if (keyUtf8.empty())
     {
@@ -5515,7 +5552,7 @@ std::vector<std::string> GB_UrlOperator::GetUrlQueryValues(const std::string& ur
     std::vector<std::string> values;
     for (size_t i = 0; i < kvps.size(); i++)
     {
-        if (kvps[i].keyUtf8 == keyUtf8)
+        if (AreUrlKeysEqual(kvps[i].keyUtf8, keyUtf8, keyCaseSensitive))
         {
             values.push_back(kvps[i].valueUtf8);
         }
@@ -5525,7 +5562,7 @@ std::vector<std::string> GB_UrlOperator::GetUrlQueryValues(const std::string& ur
 }
 
 
-bool GB_UrlOperator::TryGetUrlQueryValue(const std::string& urlUtf8, const std::string& keyUtf8, std::string& outValueUtf8, bool decode, GB_UrlOperator::UrlEncodingMode decodeMode)
+bool GB_UrlOperator::TryGetUrlQueryValue(const std::string& urlUtf8, const std::string& keyUtf8, std::string& outValueUtf8, bool decode, GB_UrlOperator::UrlEncodingMode decodeMode, bool keyCaseSensitive)
 {
     outValueUtf8.clear();
 
@@ -5537,7 +5574,7 @@ bool GB_UrlOperator::TryGetUrlQueryValue(const std::string& urlUtf8, const std::
     const std::vector<GB_UrlOperator::UrlKeyValue> kvps = GB_UrlOperator::ParseUrlQueryKvp(urlUtf8, decode, decodeMode);
     for (size_t i = 0; i < kvps.size(); i++)
     {
-        if (kvps[i].keyUtf8 == keyUtf8)
+        if (AreUrlKeysEqual(kvps[i].keyUtf8, keyUtf8, keyCaseSensitive))
         {
             outValueUtf8 = kvps[i].valueUtf8;
             return true;
@@ -5548,7 +5585,7 @@ bool GB_UrlOperator::TryGetUrlQueryValue(const std::string& urlUtf8, const std::
 }
 
 
-std::string GB_UrlOperator::SetUrlQueryValue(const std::string& urlUtf8, const std::string& keyUtf8, const std::string& valueUtf8, GB_UrlOperator::UrlQuerySetMode setMode, GB_UrlOperator::UrlEncodingMode encodeMode)
+std::string GB_UrlOperator::SetUrlQueryValue(const std::string& urlUtf8, const std::string& keyUtf8, const std::string& valueUtf8, GB_UrlOperator::UrlQuerySetMode setMode, GB_UrlOperator::UrlEncodingMode encodeMode, bool keyCaseSensitive)
 {
     if (urlUtf8.empty())
     {
@@ -5590,7 +5627,7 @@ std::string GB_UrlOperator::SetUrlQueryValue(const std::string& urlUtf8, const s
         for (size_t i = 0; i < items.size(); i++)
         {
             GbQueryItemRaw item = items[i];
-            if (item.decodedKey != keyUtf8)
+            if (!AreUrlKeysEqual(item.decodedKey, keyUtf8, keyCaseSensitive))
             {
                 newItems.push_back(item);
                 continue;
@@ -5665,7 +5702,7 @@ std::string GB_UrlOperator::SetUrlQueryValue(const std::string& urlUtf8, const s
     return result;
 }
 
-std::string GB_UrlOperator::RemoveUrlQueryKey(const std::string& urlUtf8, const std::string& keyUtf8, bool decode, GB_UrlOperator::UrlEncodingMode decodeMode)
+std::string GB_UrlOperator::RemoveUrlQueryKey(const std::string& urlUtf8, const std::string& keyUtf8, bool decode, GB_UrlOperator::UrlEncodingMode decodeMode, bool keyCaseSensitive)
 {
     if (urlUtf8.empty() || keyUtf8.empty())
     {
@@ -5703,7 +5740,7 @@ std::string GB_UrlOperator::RemoveUrlQueryKey(const std::string& urlUtf8, const 
     for (size_t i = 0; i < items.size(); i++)
     {
         const std::string& candidateKey = decode ? items[i].decodedKey : items[i].rawKey;
-        if (candidateKey != keyUtf8)
+        if (!AreUrlKeysEqual(candidateKey, keyUtf8, keyCaseSensitive))
         {
             kept.push_back(items[i]);
         }
