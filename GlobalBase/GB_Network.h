@@ -86,6 +86,8 @@ struct GB_NetworkRequestOptions
     std::string caPathUtf8 = "";                      // 自定义 CA 证书目录（PEM）。为空则使用 libcurl 默认策略
 
     bool includeResponseHeaders = false;              // 是否收集响应头原始行（遇到重定向可能包含多段）
+
+    GLOBALBASE_PORT GB_NetworkRequestOptions();
 };
 
 /**

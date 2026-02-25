@@ -4169,6 +4169,16 @@ bool GB_CanConnectToInternet(unsigned int timeoutMs)
     return false;
 }
 
+GB_NetworkRequestOptions::GB_NetworkRequestOptions()
+{
+	const static std::string exeDirUtf8 = GB_GetExeDirectory();
+    const static std::string testCertPath = exeDirUtf8 + GB_STR("cacert.pem");
+    if (GB_IsFileExists(testCertPath))
+    {
+        caBundlePathUtf8 = testCertPath;
+    }
+}
+
 GB_NetworkResponse GB_RequestUrlData(const std::string& urlUtf8, const GB_NetworkRequestOptions& options)
 {
     GB_NetworkResponse response;
