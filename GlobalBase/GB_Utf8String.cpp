@@ -1859,6 +1859,40 @@ vector<string> GB_Utf8Split(const string& textUtf8, char32_t delimiter)
     return parts;
 }
 
+bool GB_Utf8Equals(const std::string& text1Utf8, const std::string& text2Utf8, bool caseSensitive)
+{
+    if (text1Utf8.size() != text2Utf8.size())
+    {
+        return false;
+    }
+
+    if (caseSensitive)
+    {
+        return text1Utf8 == text2Utf8;
+	}
+
+    for (size_t i = 0; i < text1Utf8.size(); i++)
+    {
+        unsigned char b1 = static_cast<unsigned char>(text1Utf8[i]);
+        unsigned char b2 = static_cast<unsigned char>(text2Utf8[i]);
+        if (b1 < 0x80 && b2 < 0x80)
+        {
+            if (internal::ToLowerAsciiChar(static_cast<char>(b1)) != internal::ToLowerAsciiChar(static_cast<char>(b2)))
+            {
+                return false;
+            }
+        }
+        else
+        {
+            if (b1 != b2)
+            {
+                return false;
+            }
+        }
+    }
+	return true;
+}
+
 bool GB_Utf8StartsWith(const string& textUtf8, const string& targetUtf8, bool caseSensitive)
 {
     // 与 string::rfind("",0)==0 的语义一致：空目标串恒为 true
