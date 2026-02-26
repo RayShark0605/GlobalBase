@@ -5,6 +5,7 @@
 #include <mutex>
 #include <cstdarg>
 #include <cstdio>
+#include <array>
 
 #if defined(_WIN32)
 #include <windows.h>
@@ -20,14 +21,12 @@
 #define GB_DISABLE_POSIX_SETLOCALE_AUTO_INIT 0
 #endif
 
-
 using std::string;
 using std::wstring;
 using std::vector;
 using std::unordered_set;
 using std::runtime_error;
 using std::range_error;
-
 
 namespace internal
 {
@@ -1869,29 +1868,20 @@ bool GB_Utf8Equals(const std::string& text1Utf8, const std::string& text2Utf8, b
     if (caseSensitive)
     {
         return text1Utf8 == text2Utf8;
-	}
+    }
 
     for (size_t i = 0; i < text1Utf8.size(); i++)
     {
-        unsigned char b1 = static_cast<unsigned char>(text1Utf8[i]);
-        unsigned char b2 = static_cast<unsigned char>(text2Utf8[i]);
-        if (b1 < 0x80 && b2 < 0x80)
+        const unsigned char b1 = internal::NormalizeAsciiCaseByte(static_cast<unsigned char>(text1Utf8[i]), false);
+        const unsigned char b2 = internal::NormalizeAsciiCaseByte(static_cast<unsigned char>(text2Utf8[i]), false);
+        if (b1 != b2)
         {
-            if (internal::ToLowerAsciiChar(static_cast<char>(b1)) != internal::ToLowerAsciiChar(static_cast<char>(b2)))
-            {
-                return false;
-            }
-        }
-        else
-        {
-            if (b1 != b2)
-            {
-                return false;
-            }
+            return false;
         }
     }
-	return true;
+    return true;
 }
+
 
 bool GB_Utf8StartsWith(const string& textUtf8, const string& targetUtf8, bool caseSensitive)
 {
@@ -1911,7 +1901,7 @@ bool GB_Utf8StartsWith(const string& textUtf8, const string& targetUtf8, bool ca
             }
         }
         return true;
-    };
+        };
     if (caseSensitive && isAllAscii(textUtf8) && isAllAscii(targetUtf8))
     {
         if (textUtf8.size() < targetUtf8.size())
@@ -2335,49 +2325,67 @@ string GB_Utf8VFormat(const char* format, std::va_list args)
         throw runtime_error("GB_Utf8VFormat: format is null.");
     }
 
+    // 常见场景下，格式化后的字符串往往很短。先用栈缓冲区尝试一次，避免每次都进行堆分配。
+    std::array<char, 1024> smallBuffer{};
+
+    std::va_list argsCopy;
+    va_copy(argsCopy, args);
+    const int smallWritten = std::vsnprintf(smallBuffer.data(), smallBuffer.size(), format, argsCopy);
+    va_end(argsCopy);
+
+    if (smallWritten >= 0 && static_cast<size_t>(smallWritten) < smallBuffer.size())
+    {
+        return string(smallBuffer.data(), static_cast<size_t>(smallWritten));
+    }
+
+    size_t required = 0;
+    if (smallWritten >= 0)
+    {
+        required = static_cast<size_t>(smallWritten);
+    }
 #if defined(_WIN32)
-    std::va_list argsCopy;
-    va_copy(argsCopy, args);
-    const int required = _vscprintf(format, argsCopy);
-    va_end(argsCopy);
-
-    if (required < 0)
+    else
     {
-        throw runtime_error("GB_Utf8VFormat: _vscprintf failed.");
+        // 兼容极少数旧 CRT：vsnprintf 在截断时可能返回 -1，这里退回到 _vscprintf 计算所需长度。
+        va_copy(argsCopy, args);
+        const int requiredInt = _vscprintf(format, argsCopy);
+        va_end(argsCopy);
+
+        if (requiredInt < 0)
+        {
+            throw runtime_error("GB_Utf8VFormat: _vscprintf failed.");
+        }
+        required = static_cast<size_t>(requiredInt);
     }
-
-    const size_t bufferSize = static_cast<size_t>(required) + 1;
-    vector<char> buffer(bufferSize, '\0');
-
-    const int written = vsnprintf(buffer.data(), buffer.size(), format, args);
-    if (written < 0)
-    {
-        throw runtime_error("GB_Utf8VFormat: vsnprintf failed.");
-    }
-
-    return string(buffer.data(), static_cast<size_t>(written));
 #else
-    std::va_list argsCopy;
-    va_copy(argsCopy, args);
-    const int required = vsnprintf(nullptr, 0, format, argsCopy);
-    va_end(argsCopy);
-
-    if (required < 0)
+    else
     {
-        throw runtime_error("GB_Utf8VFormat: vsnprintf(size query) failed.");
+        throw runtime_error("GB_Utf8VFormat: vsnprintf failed.");
+    }
+#endif
+
+    if (required > (std::numeric_limits<size_t>::max)() - 1)
+    {
+        throw runtime_error("GB_Utf8VFormat: formatted string too large.");
     }
 
-    const size_t bufferSize = static_cast<size_t>(required) + 1;
-    vector<char> buffer(bufferSize, '\0');
+    const size_t bufferSize = required + 1;
+    vector<char> buffer(bufferSize);
 
-    const int written = vsnprintf(buffer.data(), buffer.size(), format, args);
+    va_copy(argsCopy, args);
+    const int written = std::vsnprintf(buffer.data(), buffer.size(), format, argsCopy);
+    va_end(argsCopy);
+
     if (written < 0)
     {
         throw runtime_error("GB_Utf8VFormat: vsnprintf failed.");
     }
+    if (static_cast<size_t>(written) >= buffer.size())
+    {
+        throw runtime_error("GB_Utf8VFormat: vsnprintf truncated unexpectedly.");
+    }
 
     return string(buffer.data(), static_cast<size_t>(written));
-#endif
 }
 
 string GB_Utf8Format(const char* format, ...)
@@ -2390,17 +2398,21 @@ string GB_Utf8Format(const char* format, ...)
     std::va_list args;
     va_start(args, format);
 
-    string out;
-    try
+    struct VaListGuard
     {
-        out = GB_Utf8VFormat(format, args);
-    }
-    catch (...)
-    {
-        va_end(args);
-        throw;
-    }
+        std::va_list& args;
+        explicit VaListGuard(std::va_list& a)
+            : args(a)
+        {
+        }
+        ~VaListGuard()
+        {
+            va_end(args);
+        }
 
-    va_end(args);
-    return out;
+        VaListGuard(const VaListGuard&) = delete;
+        VaListGuard& operator=(const VaListGuard&) = delete;
+    } guard(args);
+
+    return GB_Utf8VFormat(format, args);
 }

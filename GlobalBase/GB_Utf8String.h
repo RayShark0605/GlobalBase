@@ -3,6 +3,7 @@
 
 #include "GlobalBasePort.h"
 #include <cstdint>
+#include <cstdarg>
 #include <limits>
 #include <string>
 #include <vector>
@@ -84,6 +85,11 @@ GLOBALBASE_PORT std::string GB_Utf8ToUpper(const std::string& utf8Str);
 // 按“单个 Unicode 码点”分割
 GLOBALBASE_PORT std::vector<std::string> GB_Utf8Split(const std::string& textUtf8, char32_t delimiter);
 
+// 比较两个 UTF-8 字符串是否相等。
+// - 当 caseSensitive=true：按字节精确比较。
+// - 当 caseSensitive=false：仅对 ASCII 字母做大小写不敏感比较（A-Z 与 a-z 视为相同），
+//   其他非 ASCII 字节仍按原值精确比较（不做 Unicode 大小写折叠/规范化）。
+// 说明：本函数不校验 UTF-8 合法性，也不做任何编码转换；复杂度 O(N)，不分配额外内存。
 GLOBALBASE_PORT bool GB_Utf8Equals(const std::string& text1Utf8, const std::string& text2Utf8, bool caseSensitive = true);
 
 // 检查 UTF-8 字符串是否以指定的 UTF-8 字符串开头（可选大小写敏感）
@@ -114,6 +120,12 @@ GLOBALBASE_PORT std::string GB_Utf8Replace(const std::string& utf8Str, const std
 // 发生格式化错误时会抛出 std::runtime_error。
 GLOBALBASE_PORT std::string GB_Utf8VFormat(const char* format, va_list args);
 
+// printf 风格格式化生成 UTF-8 字符串（可变参数版本）。
+// 注意：
+// - format 必须是 UTF-8 字节序列；
+// - %s 对应参数也假定为 UTF-8 字节序列；
+// - 本函数不做编码转换，只按 C 运行库规则格式化并拼接字节。
+// 发生格式化错误时会抛出 std::runtime_error。
 GLOBALBASE_PORT std::string GB_Utf8Format(const char* format, ...);
 
 #endif
