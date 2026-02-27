@@ -52,11 +52,11 @@ class GLOBALBASE_PORT GB_Logger
 public:
     static GB_Logger& GetInstance();
 
-    // 完整检查（包含读取配置的级别过滤），并写入队列。
+    // 完整检查（包含读取级别过滤缓存；缓存由后台线程轮询更新），并写入队列。
     // fileUtf8 要求已经是 UTF-8，且路径分隔符建议使用 '/'
     void Log(GB_LogLevel level, const std::string& msgUtf8, const std::string& fileUtf8, int line);
 
-    // 已通过 GB_CheckLogLevel(level) 的日志写入（避免重复读取配置）。
+    // 已通过 GB_CheckLogLevel(level) 的日志写入（避免重复读取配置/缓存）。
     // file 使用 __FILE__ 传入的窄字符串，内部会尽可能转换/规范化为 UTF-8。
     void LogChecked(GB_LogLevel level, const std::string& msgUtf8, const char* file, int line);
 
@@ -87,6 +87,8 @@ private:
     ~GB_Logger();
     GB_Logger(const GB_Logger&) = delete;
     GB_Logger& operator=(const GB_Logger&) = delete;
+
+    bool EnqueueLogItem(GB_LogItem&& logItem);
 
     void LogThreadFunc(); // 日志处理线程函数
 };

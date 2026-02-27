@@ -326,6 +326,241 @@ namespace internal
 	}
 	static const size_t kMaxPendingLogItems = 200000; // 保护内存：队列最多积压的条目数
 	static std::atomic<uint64_t> gDroppedLogCount{ 0 };
+
+	// -------- 日志配置缓存（无锁读取 + 后台轮询刷新）--------
+	// 目标：
+	// 1) GB_CheckLogLevel / GB_IsLogToConsole / GB_IsLogEnabled 等热路径只做 atomic 读，避免每条日志都查配置。
+	// 2) 支持外部动态修改配置：后台线程每 500ms 轮询同步一次。
+	class LogConfigCache
+	{
+	public:
+		static LogConfigCache& Get();
+
+		bool IsLogEnabled() const;
+		bool IsLogToConsole() const;
+		GB_LogLevel GetFilterLevel() const;
+
+		// 供 Set* 接口调用：写入配置后立即刷新一次，避免等待轮询周期。
+		void ForceRefresh();
+
+		// 可重复调用；用于进程退出/特殊生命周期（如 DLL 卸载/单测）回收后台线程。
+		void Shutdown();
+
+	private:
+		LogConfigCache();
+		LogConfigCache(const LogConfigCache&) = delete;
+		LogConfigCache& operator=(const LogConfigCache&) = delete;
+
+		void PollThreadFunc();
+		void RefreshOnce();
+
+		static GB_LogLevel ParseLogLevel(const std::string& valueRaw);
+
+		std::atomic_bool isLogEnabled{ false };
+		std::atomic_bool isLogToConsole{ false };
+		std::atomic<int> filterLevelInt{ static_cast<int>(GB_LogLevel::GBLOGLEVEL_DISABLELOG) };
+
+		std::atomic_bool stop{ false };
+		std::atomic_bool hasShutdown{ false };
+
+		std::mutex waitMtx;
+		std::condition_variable waitCv;
+		std::thread pollThread;
+	};
+
+	static std::atomic<LogConfigCache*> gLogConfigCacheInstance{ nullptr };
+
+	static void ShutdownLogConfigCacheAtExit()
+	{
+		LogConfigCache* cache = gLogConfigCacheInstance.load(std::memory_order_acquire);
+		if (cache)
+		{
+			cache->Shutdown();
+		}
+	}
+
+	LogConfigCache& LogConfigCache::Get()
+	{
+		static std::once_flag once;
+		std::call_once(once, []()
+			{
+				LogConfigCache* cache = new LogConfigCache();
+				gLogConfigCacheInstance.store(cache, std::memory_order_release);
+				std::atexit(&ShutdownLogConfigCacheAtExit);
+			});
+		LogConfigCache* cache = gLogConfigCacheInstance.load(std::memory_order_acquire);
+		return *cache;
+	}
+
+	LogConfigCache::LogConfigCache()
+	{
+		RefreshOnce();
+		pollThread = std::thread(&LogConfigCache::PollThreadFunc, this);
+	}
+
+	void LogConfigCache::Shutdown()
+	{
+		if (hasShutdown.exchange(true, std::memory_order_acq_rel))
+		{
+			return;
+		}
+
+		stop.store(true, std::memory_order_release);
+		waitCv.notify_all();
+
+		if (pollThread.joinable())
+		{
+			pollThread.join();
+		}
+	}
+
+	void LogConfigCache::ForceRefresh()
+	{
+		RefreshOnce();
+	}
+
+	bool LogConfigCache::IsLogEnabled() const
+	{
+		return isLogEnabled.load(std::memory_order_relaxed);
+	}
+
+	bool LogConfigCache::IsLogToConsole() const
+	{
+		return isLogToConsole.load(std::memory_order_relaxed);
+	}
+
+	GB_LogLevel LogConfigCache::GetFilterLevel() const
+	{
+		const int value = filterLevelInt.load(std::memory_order_relaxed);
+		return static_cast<GB_LogLevel>(value);
+	}
+
+	static std::string NormalizeLevelString(const std::string& input)
+	{
+		std::string result;
+		result.reserve(input.size());
+		for (size_t i = 0; i < input.size(); i++)
+		{
+			const unsigned char ch = static_cast<unsigned char>(input[i]);
+			if (ch == ' ' || ch == '\t' || ch == '\r' || ch == '\n')
+			{
+				continue;
+			}
+			if (ch >= 'a' && ch <= 'z')
+			{
+				result.push_back(static_cast<char>(ch - 'a' + 'A'));
+			}
+			else
+			{
+				result.push_back(static_cast<char>(ch));
+			}
+		}
+		return result;
+	}
+
+	GB_LogLevel LogConfigCache::ParseLogLevel(const std::string& valueRaw)
+	{
+		const std::string value = NormalizeLevelString(valueRaw);
+
+		if (value == GB_STR("TRACE") || value == GB_STR("0"))
+		{
+			return GB_LogLevel::GBLOGLEVEL_TRACE;
+		}
+		if (value == GB_STR("DEBUG") || value == GB_STR("1"))
+		{
+			return GB_LogLevel::GBLOGLEVEL_DEBUG;
+		}
+		if (value == GB_STR("INFO") || value == GB_STR("2"))
+		{
+			return GB_LogLevel::GBLOGLEVEL_INFO;
+		}
+		if (value == GB_STR("WARNING") || value == GB_STR("WARN") || value == GB_STR("3"))
+		{
+			return GB_LogLevel::GBLOGLEVEL_WARNING;
+		}
+		if (value == GB_STR("ERROR") || value == GB_STR("4"))
+		{
+			return GB_LogLevel::GBLOGLEVEL_ERROR;
+		}
+		if (value == GB_STR("FATAL") || value == GB_STR("5"))
+		{
+			return GB_LogLevel::GBLOGLEVEL_FATAL;
+		}
+		if (value == GB_STR("DISABLELOG") || value == GB_STR("DISABLE") || value == GB_STR("OFF") || value == GB_STR("6"))
+		{
+			return GB_LogLevel::GBLOGLEVEL_DISABLELOG;
+		}
+
+		// 未知值：按最保守的策略回退到 TRACE，避免“误关日志”导致排障困难。
+		return GB_LogLevel::GBLOGLEVEL_TRACE;
+	}
+
+	void LogConfigCache::RefreshOnce()
+	{
+		// 1) Enable
+		bool enable = false;
+		{
+			const std::string enableKey = GB_STR("GB_EnableLog");
+			if (GB_IsExistsGbConfig(enableKey))
+			{
+				std::string value;
+				enable = (GB_GetGbConfig(enableKey, value) && value == GB_STR("1"));
+			}
+		}
+		isLogEnabled.store(enable, std::memory_order_relaxed);
+
+		// 2) Console
+		bool toConsole = false;
+		{
+			const std::string consoleKey = GB_STR("GB_IsLogToConsole");
+			if (GB_IsExistsGbConfig(consoleKey))
+			{
+				std::string value;
+				toConsole = (GB_GetGbConfig(consoleKey, value) && value == GB_STR("1"));
+			}
+		}
+		isLogToConsole.store(toConsole, std::memory_order_relaxed);
+
+		// 3) FilterLevel
+		GB_LogLevel filterLevel = GB_LogLevel::GBLOGLEVEL_DISABLELOG;
+		if (enable)
+		{
+			const std::string levelKey = GB_STR("GB_LogLevel");
+			if (!GB_IsExistsGbConfig(levelKey))
+			{
+				filterLevel = GB_LogLevel::GBLOGLEVEL_TRACE;
+			}
+			else
+			{
+				std::string value;
+				if (!GB_GetGbConfig(levelKey, value))
+				{
+					filterLevel = GB_LogLevel::GBLOGLEVEL_TRACE;
+				}
+				else
+				{
+					filterLevel = ParseLogLevel(value);
+				}
+			}
+		}
+		filterLevelInt.store(static_cast<int>(filterLevel), std::memory_order_relaxed);
+	}
+
+	void LogConfigCache::PollThreadFunc()
+	{
+		std::unique_lock<std::mutex> lock(waitMtx);
+		while (!stop.load(std::memory_order_acquire))
+		{
+			lock.unlock();
+			RefreshOnce();
+			lock.lock();
+
+			waitCv.wait_for(lock, std::chrono::milliseconds(500), [this]()
+				{
+					return stop.load(std::memory_order_acquire);
+				});
+		}
+	}
 }
 
 
@@ -438,6 +673,40 @@ GB_Logger& GB_Logger::GetInstance()
 	return *gLoggerInstance;
 }
 
+bool GB_Logger::EnqueueLogItem(GB_LogItem&& logItem)
+{
+	std::lock_guard<std::mutex> lock(logQueueMtx);
+
+	if (isStop.load(std::memory_order_acquire))
+	{
+		return false;
+	}
+
+	// 防止日志写入端过快导致队列无限膨胀（OOM）。
+	// - 对于 ERROR/FATAL：尽量保留新日志，必要时丢弃最旧的日志；
+	// - 对于更低级别：当队列已满时直接丢弃。
+	if (logQueue.size() >= internal::kMaxPendingLogItems)
+	{
+		if (logItem.level >= GB_LogLevel::GBLOGLEVEL_ERROR)
+		{
+			while (logQueue.size() >= internal::kMaxPendingLogItems)
+			{
+				logQueue.pop();
+				internal::gDroppedLogCount.fetch_add(1, std::memory_order_relaxed);
+			}
+		}
+		else
+		{
+			internal::gDroppedLogCount.fetch_add(1, std::memory_order_relaxed);
+			return false;
+		}
+	}
+
+	logQueue.push(std::move(logItem));
+	return true;
+}
+
+
 void GB_Logger::Log(GB_LogLevel level, const std::string& msgUtf8, const std::string& fileUtf8, int line)
 {
 	if (isStop.load(std::memory_order_acquire))
@@ -458,38 +727,12 @@ void GB_Logger::Log(GB_LogLevel level, const std::string& msgUtf8, const std::st
 	logItem.file = GB_Utf8Replace(fileUtf8, GB_STR("\\"), GB_STR("/"));
 	logItem.line = line;
 
+	if (EnqueueLogItem(std::move(logItem)))
 	{
-		std::lock_guard<std::mutex> lock(logQueueMtx);
-
-		if (isStop.load(std::memory_order_acquire))
-		{
-			return;
-		}
-
-		// 防止日志写入端过快导致队列无限膨胀（OOM）。
-		// - 对于 ERROR/FATAL：尽量保留新日志，必要时丢弃最旧的低价值日志；
-		// - 对于更低级别：当队列已满时直接丢弃。
-		if (logQueue.size() >= internal::kMaxPendingLogItems)
-		{
-			if (level >= GB_LogLevel::GBLOGLEVEL_ERROR)
-			{
-				while (logQueue.size() >= internal::kMaxPendingLogItems)
-				{
-					logQueue.pop();
-					internal::gDroppedLogCount.fetch_add(1, std::memory_order_relaxed);
-				}
-			}
-			else
-			{
-				internal::gDroppedLogCount.fetch_add(1, std::memory_order_relaxed);
-				return;
-			}
-		}
-
-		logQueue.push(std::move(logItem));
+		logQueueCv.notify_one();
 	}
-	logQueueCv.notify_one();
 }
+
 
 void GB_Logger::LogChecked(GB_LogLevel level, const std::string& msgUtf8, const char* file, int line)
 {
@@ -506,38 +749,12 @@ void GB_Logger::LogChecked(GB_LogLevel level, const std::string& msgUtf8, const 
 	logItem.file = internal::NormalizeFilePathUtf8(file);
 	logItem.line = line;
 
+	if (EnqueueLogItem(std::move(logItem)))
 	{
-		std::lock_guard<std::mutex> lock(logQueueMtx);
-
-		if (isStop.load(std::memory_order_acquire))
-		{
-			return;
-		}
-
-		// 防止日志写入端过快导致队列无限膨胀（OOM）。
-		// - 对于 ERROR/FATAL：尽量保留新日志，必要时丢弃最旧的低价值日志；
-		// - 对于更低级别：当队列已满时直接丢弃。
-		if (logQueue.size() >= internal::kMaxPendingLogItems)
-		{
-			if (level >= GB_LogLevel::GBLOGLEVEL_ERROR)
-			{
-				while (logQueue.size() >= internal::kMaxPendingLogItems)
-				{
-					logQueue.pop();
-					internal::gDroppedLogCount.fetch_add(1, std::memory_order_relaxed);
-				}
-			}
-			else
-			{
-				internal::gDroppedLogCount.fetch_add(1, std::memory_order_relaxed);
-				return;
-			}
-		}
-
-		logQueue.push(std::move(logItem));
+		logQueueCv.notify_one();
 	}
-	logQueueCv.notify_one();
 }
+
 
 void GB_Logger::LogTrace(const std::string& msgUtf8, const char* file, int line)
 {
@@ -643,6 +860,14 @@ void GB_Logger::Shutdown()
 		std::queue<GB_LogItem> emptyQueue;
 		std::swap(logQueue, emptyQueue);
 	}
+
+	// 若日志模块被主动回收（例如 DLL 卸载/单元测试），则同时停止配置轮询线程，避免残留后台线程。
+	internal::LogConfigCache* cache = internal::gLogConfigCacheInstance.load(std::memory_order_acquire);
+	if (cache)
+	{
+		cache->Shutdown();
+	}
+
 }
 
 void GB_Logger::LogThreadFunc()
@@ -661,17 +886,6 @@ void GB_Logger::LogThreadFunc()
 						return isStop.load(std::memory_order_acquire) || !logQueue.empty();
 					});
 
-				// 小批量日志时，短暂等待以提高批处理效率，减少频繁落盘
-				static const size_t batchHintSize = 256;
-				static const int batchWaitMs = 10;
-
-				if (!isStop.load(std::memory_order_acquire) && logQueue.size() < batchHintSize)
-				{
-					logQueueCv.wait_for(lock, std::chrono::milliseconds(batchWaitMs), [this]
-						{
-							return isStop.load(std::memory_order_acquire) || logQueue.size() >= batchHintSize;
-						});
-				}
 
 				if (logQueue.empty() && isStop.load(std::memory_order_acquire))
 				{
@@ -693,6 +907,22 @@ void GB_Logger::LogThreadFunc()
 			std::string outputBatchUtf8;
 			allBatchUtf8.reserve(itemCount * 192);
 			outputBatchUtf8.reserve(itemCount * 160);
+
+			static const size_t kFlushThresholdBytes = 4 * 1024 * 1024; // 单次写入过大时分块落盘，避免一次性拼接造成巨大内存峰值
+
+			auto FlushBatches = [&]()
+				{
+					if (!allBatchUtf8.empty())
+					{
+						(void)GB_WriteUtf8ToFile(internal::GetAllLogFilePath(), allBatchUtf8);
+						allBatchUtf8.clear();
+					}
+					if (!outputBatchUtf8.empty())
+					{
+						(void)GB_WriteUtf8ToFile(internal::GetOutputLogFilePath(), outputBatchUtf8);
+						outputBatchUtf8.clear();
+					}
+				};
 
 			const uint64_t droppedLogCount = internal::gDroppedLogCount.exchange(0, std::memory_order_relaxed);
 			if (droppedLogCount > 0)
@@ -739,16 +969,13 @@ void GB_Logger::LogThreadFunc()
 				{
 					internal::ConsoleWriteColoredUtf8(plainTextUtf8, logItem.level);
 				}
+				if (allBatchUtf8.size() >= kFlushThresholdBytes || outputBatchUtf8.size() >= kFlushThresholdBytes)
+				{
+					FlushBatches();
+				}
 			}
 
-			if (!allBatchUtf8.empty())
-			{
-				(void)GB_WriteUtf8ToFile(internal::GetAllLogFilePath(), allBatchUtf8);
-			}
-			if (!outputBatchUtf8.empty())
-			{
-				(void)GB_WriteUtf8ToFile(internal::GetOutputLogFilePath(), outputBatchUtf8);
-			}
+			FlushBatches();
 		}
 	}
 	catch (const std::exception& e)
@@ -776,97 +1003,70 @@ void GB_Logger::LogThreadFunc()
 
 bool GB_IsLogEnabled()
 {
-	const static std::string targetKey = GB_STR("GB_EnableLog");
-
-	if (!GB_IsExistsGbConfig(targetKey))
+	internal::LogConfigCache* cache = internal::gLogConfigCacheInstance.load(std::memory_order_acquire);
+	if (!cache)
 	{
-		return false;
+		cache = &internal::LogConfigCache::Get();
 	}
-
-	std::string value;
-	return (GB_GetGbConfig(targetKey, value) && "1" == value);
+	return cache->IsLogEnabled();
 }
 
 bool GB_SetLogEnabled(bool enable)
 {
 	const static std::string targetKey = GB_STR("GB_EnableLog");
 	const std::string value = enable ? GB_STR("1") : GB_STR("0");
-	return GB_SetGbConfig(targetKey, value);
+
+	const bool success = GB_SetGbConfig(targetKey, value);
+	if (success)
+	{
+		internal::LogConfigCache::Get().ForceRefresh();
+	}
+	return success;
 }
 
 bool GB_IsLogToConsole()
 {
-	const static std::string targetKey = GB_STR("GB_IsLogToConsole");
-
-	if (!GB_IsExistsGbConfig(targetKey))
+	internal::LogConfigCache* cache = internal::gLogConfigCacheInstance.load(std::memory_order_acquire);
+	if (!cache)
 	{
-		return false;
+		cache = &internal::LogConfigCache::Get();
 	}
-
-	std::string value;
-	return (GB_GetGbConfig(targetKey, value) && "1" == value);
+	return cache->IsLogToConsole();
 }
 
 bool GB_SetLogToConsole(bool enable)
 {
 	const static std::string targetKey = GB_STR("GB_IsLogToConsole");
 	const std::string value = enable ? GB_STR("1") : GB_STR("0");
-	return GB_SetGbConfig(targetKey, value);
+
+	const bool success = GB_SetGbConfig(targetKey, value);
+	if (success)
+	{
+		internal::LogConfigCache::Get().ForceRefresh();
+	}
+	return success;
 }
 
 GB_LogLevel GB_GetLogFilterLevel()
 {
-	const static std::string targetKey = GB_STR("GB_LogLevel");
-
-	if (!GB_IsLogEnabled())
+	internal::LogConfigCache* cache = internal::gLogConfigCacheInstance.load(std::memory_order_acquire);
+	if (!cache)
 	{
-		return GB_LogLevel::GBLOGLEVEL_DISABLELOG;
+		cache = &internal::LogConfigCache::Get();
 	}
-
-	if (!GB_IsExistsGbConfig(targetKey))
-	{
-		return GB_LogLevel::GBLOGLEVEL_TRACE;
-	}
-	std::string value;
-	if (!GB_GetGbConfig(targetKey, value))
-	{
-		return GB_LogLevel::GBLOGLEVEL_TRACE;
-	}
-	if (value == GB_STR("TRACE") || value == GB_STR("0"))
-	{
-		return GB_LogLevel::GBLOGLEVEL_TRACE;
-	}
-	else if (value == GB_STR("DEBUG") || value == GB_STR("1"))
-	{
-		return GB_LogLevel::GBLOGLEVEL_DEBUG;
-	}
-	else if (value == GB_STR("INFO") || value == GB_STR("2"))
-	{
-		return GB_LogLevel::GBLOGLEVEL_INFO;
-	}
-	else if (value == GB_STR("WARNING") || value == GB_STR("3"))
-	{
-		return GB_LogLevel::GBLOGLEVEL_WARNING;
-	}
-	else if (value == GB_STR("ERROR") || value == GB_STR("4"))
-	{
-		return GB_LogLevel::GBLOGLEVEL_ERROR;
-	}
-	else if (value == GB_STR("FATAL") || value == GB_STR("5"))
-	{
-		return GB_LogLevel::GBLOGLEVEL_FATAL;
-	}
-	else if (value == GB_STR("DISABLELOG") || value == GB_STR("6"))
-	{
-		return GB_LogLevel::GBLOGLEVEL_DISABLELOG;
-	}
-	return GB_LogLevel::GBLOGLEVEL_TRACE;
+	return cache->GetFilterLevel();
 }
 
 bool GB_CheckLogLevel(GB_LogLevel level)
 {
-	const GB_LogLevel filterLevel = GB_GetLogFilterLevel();
-	return (level >= filterLevel && filterLevel != GB_LogLevel::GBLOGLEVEL_DISABLELOG);
+	internal::LogConfigCache* cache = internal::gLogConfigCacheInstance.load(std::memory_order_acquire);
+	if (!cache)
+	{
+		cache = &internal::LogConfigCache::Get();
+	}
+
+	const GB_LogLevel filterLevel = cache->GetFilterLevel();
+	return (filterLevel != GB_LogLevel::GBLOGLEVEL_DISABLELOG) && (level >= filterLevel);
 }
 
 namespace crashlog
@@ -1001,6 +1201,10 @@ namespace crashlog
 		const std::string path = dir + GB_STR("GB_Crash.log");
 		// UTF-8 -> UTF-16
 		int wlen = MultiByteToWideChar(CP_UTF8, 0, path.c_str(), (int)path.size(), NULL, 0);
+		if (wlen <= 0)
+		{
+			return;
+		}
 		std::wstring wpath((size_t)wlen, L'\0');
 		if (wlen > 0)
 		{
@@ -1048,12 +1252,14 @@ void GB_InstallCrashHandlers()
 	crashlog::sigBackupCount = 0;
 #endif
 
-	// 层 1：未捕获 C++ 异常
+		// 层 1：未捕获 C++ 异常（尽量避免在 terminate 环境里走“异步日志队列”，以免死锁）
 	crashlog::oldTerminateHandler = std::set_terminate([]()
 		{
+			crashlog::OpenCrashFileOnce();
+
+			const char* reason = "unknown";
 			try
 			{
-				// 尽量取异常信息；此处仍在正常环境，可调用你的异步日志
 				if (auto ep = std::current_exception())
 				{
 					try
@@ -1062,32 +1268,49 @@ void GB_InstallCrashHandlers()
 					}
 					catch (const std::exception& e)
 					{
-						GB_Logger::GetInstance().LogFatal(std::string("std::terminate: ") + e.what(), __FILE__, __LINE__);
+						reason = e.what();
 					}
 					catch (...)
 					{
-						GB_Logger::GetInstance().LogFatal("std::terminate: non-std exception", __FILE__, __LINE__);
+						reason = "non-std exception";
 					}
 				}
 				else
 				{
-					GB_Logger::GetInstance().LogFatal("std::terminate: no current_exception", __FILE__, __LINE__);
+					reason = "no current_exception";
 				}
 			}
 			catch (...)
 			{
-				/* 避免再抛 */
+				reason = "failed to extract exception";
 			}
 
-			// 保险：在崩溃环境外也直写一份
-			char buf[256]; size_t p = 0;
-			p += crashlog::AppendStr(buf + p, sizeof(buf) - p, "FATAL: std::terminate at ");
+			char buf[512];
+			size_t p = 0;
+			p += crashlog::AppendStr(buf + p, sizeof(buf) - p, "FATAL: std::terminate: ");
+			p += crashlog::AppendStr(buf + p, sizeof(buf) - p, reason);
+
+#if defined(_WIN32)
+			p += crashlog::AppendStr(buf + p, sizeof(buf) - p, " tid=");
+			p += crashlog::AppendDec(buf + p, sizeof(buf) - p, (uint64_t)GetCurrentThreadId());
+#else
+			p += crashlog::AppendStr(buf + p, sizeof(buf) - p, " pid=");
+			p += crashlog::AppendDec(buf + p, sizeof(buf) - p, (uint64_t)getpid());
+#endif
+
+			p += crashlog::AppendStr(buf + p, sizeof(buf) - p, " ts=");
 			p += crashlog::AppendDec(buf + p, sizeof(buf) - p, (uint64_t)time(nullptr));
+
+#if defined(_WIN32)
+			p += crashlog::AppendStr(buf + p, sizeof(buf) - p, "\r\n");
+#else
 			p += crashlog::AppendStr(buf + p, sizeof(buf) - p, "\n");
+#endif
 			crashlog::EmergencyWrite(buf, p);
 
 			std::abort(); // 维持标准行为
 		});
+
 
 #if defined(_WIN32)
 	// 层 3：未处理 SEH 异常
