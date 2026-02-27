@@ -90,6 +90,22 @@ namespace internal
 		return threadIdUtf8;
 	}
 
+	static std::string NormalizeFilePathUtf8(const char* file)
+	{
+		if (!file)
+		{
+			return std::string();
+		}
+
+#if defined(_WIN32)
+		std::string fileStrUtf8 = GB_AnsiToUtf8(file);
+#else
+		std::string fileStrUtf8 = file;
+#endif
+		fileStrUtf8 = GB_Utf8Replace(fileStrUtf8, GB_STR("\\"), GB_STR("/"));
+		return fileStrUtf8;
+	}
+
 #if defined(_WIN32)
 	struct WinConsoleState
 	{
@@ -316,6 +332,11 @@ void GB_Logger::Log(GB_LogLevel level, const std::string& msgUtf8, const std::st
 		return;
 	}
 
+	if (isStop.load(std::memory_order_acquire))
+	{
+		return;
+	}
+
 	GB_LogItem logItem;
 	logItem.timestamp = GetLocalTimeStr();
 	logItem.level = level;
@@ -333,113 +354,56 @@ void GB_Logger::Log(GB_LogLevel level, const std::string& msgUtf8, const std::st
 
 void GB_Logger::LogTrace(const std::string& msgUtf8, const char* file, int line)
 {
-	if (!file)
-	{
-		Log(GB_LogLevel::GBLOGLEVEL_TRACE, msgUtf8, "", line);
-		return;
-	}
-
-#if defined(_WIN32)
-	std::string fileStrUtf8 = GB_AnsiToUtf8(file);
-#else
-	std::string fileStrUtf8 = file;
-#endif
-	fileStrUtf8 = GB_Utf8Replace(fileStrUtf8, GB_STR("\\"), GB_STR("/"));
+	const std::string fileStrUtf8 = internal::NormalizeFilePathUtf8(file);
 	Log(GB_LogLevel::GBLOGLEVEL_TRACE, msgUtf8, fileStrUtf8, line);
 }
 
+
 void GB_Logger::LogDebug(const std::string& msgUtf8, const char* file, int line)
 {
-	if (!file)
-	{
-		Log(GB_LogLevel::GBLOGLEVEL_DEBUG, msgUtf8, "", line);
-		return;
-	}
-
-#if defined(_WIN32)
-	std::string fileStrUtf8 = GB_AnsiToUtf8(file);
-#else
-	std::string fileStrUtf8 = file;
-#endif
-	fileStrUtf8 = GB_Utf8Replace(fileStrUtf8, GB_STR("\\"), GB_STR("/"));
+	const std::string fileStrUtf8 = internal::NormalizeFilePathUtf8(file);
 	Log(GB_LogLevel::GBLOGLEVEL_DEBUG, msgUtf8, fileStrUtf8, line);
 }
 
+
 void GB_Logger::LogInfo(const std::string& msgUtf8, const char* file, int line)
 {
-	if (!file)
-	{
-		Log(GB_LogLevel::GBLOGLEVEL_INFO, msgUtf8, "", line);
-		return;
-	}
-
-#if defined(_WIN32)
-	std::string fileStrUtf8 = GB_AnsiToUtf8(file);
-#else
-	std::string fileStrUtf8 = file;
-#endif
-	fileStrUtf8 = GB_Utf8Replace(fileStrUtf8, GB_STR("\\"), GB_STR("/"));
+	const std::string fileStrUtf8 = internal::NormalizeFilePathUtf8(file);
 	Log(GB_LogLevel::GBLOGLEVEL_INFO, msgUtf8, fileStrUtf8, line);
 }
 
+
 void GB_Logger::LogWarning(const std::string& msgUtf8, const char* file, int line)
 {
-	if (!file)
-	{
-		Log(GB_LogLevel::GBLOGLEVEL_WARNING, msgUtf8, "", line);
-		return;
-	}
-
-#if defined(_WIN32)
-	std::string fileStrUtf8 = GB_AnsiToUtf8(file);
-#else
-	std::string fileStrUtf8 = file;
-#endif
-	fileStrUtf8 = GB_Utf8Replace(fileStrUtf8, GB_STR("\\"), GB_STR("/"));
+	const std::string fileStrUtf8 = internal::NormalizeFilePathUtf8(file);
 	Log(GB_LogLevel::GBLOGLEVEL_WARNING, msgUtf8, fileStrUtf8, line);
 }
 
+
 void GB_Logger::LogError(const std::string& msgUtf8, const char* file, int line)
 {
-	if (!file)
-	{
-		Log(GB_LogLevel::GBLOGLEVEL_ERROR, msgUtf8, "", line);
-		return;
-	}
-
-#if defined(_WIN32)
-	std::string fileStrUtf8 = GB_AnsiToUtf8(file);
-#else
-	std::string fileStrUtf8 = file;
-#endif
-	fileStrUtf8 = GB_Utf8Replace(fileStrUtf8, GB_STR("\\"), GB_STR("/"));
+	const std::string fileStrUtf8 = internal::NormalizeFilePathUtf8(file);
 	Log(GB_LogLevel::GBLOGLEVEL_ERROR, msgUtf8, fileStrUtf8, line);
 }
 
+
 void GB_Logger::LogFatal(const std::string& msgUtf8, const char* file, int line)
 {
-	if (!file)
-	{
-		Log(GB_LogLevel::GBLOGLEVEL_FATAL, msgUtf8, "", line);
-		return;
-	}
-
-#if defined(_WIN32)
-	std::string fileStrUtf8 = GB_AnsiToUtf8(file);
-#else
-	std::string fileStrUtf8 = file;
-#endif
-	fileStrUtf8 = GB_Utf8Replace(fileStrUtf8, GB_STR("\\"), GB_STR("/"));
+	const std::string fileStrUtf8 = internal::NormalizeFilePathUtf8(file);
 	Log(GB_LogLevel::GBLOGLEVEL_FATAL, msgUtf8, fileStrUtf8, line);
 }
 
 
+
 bool GB_Logger::ClearLogFiles() const
 {
-	const bool success1 = GB_CreateFileRecursive(internal::GetAllLogFilePath());
-	const bool success2 = GB_CreateFileRecursive(internal::GetOutputLogFilePath());
+	internal::EnsureLogFilesCreated();
+
+	const bool success1 = GB_WriteUtf8ToFile(internal::GetAllLogFilePath(), std::string(), false);
+	const bool success2 = GB_WriteUtf8ToFile(internal::GetOutputLogFilePath(), std::string(), false);
 	return success1 && success2;
 }
+
 
 GB_Logger::GB_Logger()
 {
@@ -464,74 +428,101 @@ GB_Logger::~GB_Logger()
 
 void GB_Logger::LogThreadFunc()
 {
-	internal::EnsureLogFilesCreated();
-
-	for (;;)
+	try
 	{
-		std::queue<GB_LogItem> localQueue;
-		{
-			std::unique_lock<std::mutex> lock(logQueueMtx);
-			logQueueCv.wait(lock, [this] {
-				return isStop.load(std::memory_order_acquire) || !logQueue.empty();
-				});
+		internal::EnsureLogFilesCreated();
 
-			if (logQueue.empty() && isStop.load(std::memory_order_acquire))
+		for (;;)
+		{
+			std::queue<GB_LogItem> localQueue;
 			{
-				break;
+				std::unique_lock<std::mutex> lock(logQueueMtx);
+				logQueueCv.wait(lock, [this] {
+					return isStop.load(std::memory_order_acquire) || !logQueue.empty();
+					});
+
+				if (logQueue.empty() && isStop.load(std::memory_order_acquire))
+				{
+					break;
+				}
+
+				std::swap(localQueue, logQueue);
 			}
 
-			std::swap(localQueue, logQueue);
-		}
-
-		if (localQueue.empty())
-		{
-			continue;
-		}
-
-		if (!GB_IsLogEnabled())
-		{
-			continue;
-		}
-
-		const GB_LogLevel filterLevel = GB_GetLogFilterLevel();
-		const bool logToConsole = GB_IsLogToConsole();
-
-		std::string allBatchUtf8;
-		std::string outputBatchUtf8;
-
-		while (!localQueue.empty())
-		{
-			GB_LogItem logItem = std::move(localQueue.front());
-			localQueue.pop();
-
-			const std::string logJsonUtf8 = logItem.ToJsonString();
-			allBatchUtf8 += logJsonUtf8;
-
-			const bool passFilter = (filterLevel != GB_LogLevel::GBLOGLEVEL_DISABLELOG && logItem.level >= filterLevel);
-			if (!passFilter)
+			if (localQueue.empty())
 			{
 				continue;
 			}
 
-			outputBatchUtf8 += logJsonUtf8;
-
-			if (logToConsole)
+			if (!GB_IsLogEnabled())
 			{
-				const std::string logTextUtf8 = logItem.ToPlainTextString();
-				internal::ConsoleWriteColoredUtf8(logTextUtf8, logItem.level);
+				continue;
+			}
+
+			const GB_LogLevel filterLevel = GB_GetLogFilterLevel();
+			const bool logToConsole = GB_IsLogToConsole();
+
+			const size_t itemCount = localQueue.size();
+			std::string allBatchUtf8;
+			std::string outputBatchUtf8;
+			allBatchUtf8.reserve(itemCount * 192);
+			outputBatchUtf8.reserve(itemCount * 160);
+
+			while (!localQueue.empty())
+			{
+				GB_LogItem logItem = std::move(localQueue.front());
+				localQueue.pop();
+
+				const std::string logJsonUtf8 = logItem.ToJsonString();
+				allBatchUtf8 += logJsonUtf8;
+
+				const bool passFilter = (filterLevel != GB_LogLevel::GBLOGLEVEL_DISABLELOG && logItem.level >= filterLevel);
+				if (!passFilter)
+				{
+					continue;
+				}
+
+				outputBatchUtf8 += logJsonUtf8;
+
+				if (logToConsole)
+				{
+					const std::string logTextUtf8 = logItem.ToPlainTextString();
+					internal::ConsoleWriteColoredUtf8(logTextUtf8, logItem.level);
+				}
+			}
+
+			if (!allBatchUtf8.empty())
+			{
+				(void)GB_WriteUtf8ToFile(internal::GetAllLogFilePath(), allBatchUtf8);
+			}
+			if (!outputBatchUtf8.empty())
+			{
+				(void)GB_WriteUtf8ToFile(internal::GetOutputLogFilePath(), outputBatchUtf8);
 			}
 		}
-
-		if (!allBatchUtf8.empty())
+	}
+	catch (const std::exception& e)
+	{
+		try
 		{
-			(void)GB_WriteUtf8ToFile(internal::GetAllLogFilePath(), allBatchUtf8);
+			std::cerr << "GB_Logger thread exception: " << e.what() << std::endl;
 		}
-		if (!outputBatchUtf8.empty())
+		catch (...)
 		{
-			(void)GB_WriteUtf8ToFile(internal::GetOutputLogFilePath(), outputBatchUtf8);
+		}
+	}
+	catch (...)
+	{
+		try
+		{
+			std::cerr << "GB_Logger thread exception: unknown" << std::endl;
+		}
+		catch (...)
+		{
 		}
 	}
 }
+
 
 bool GB_IsLogEnabled()
 {

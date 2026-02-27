@@ -55,7 +55,7 @@ public:
     void LogError(const std::string& msgUtf8, const char* file, int line);
     void LogFatal(const std::string& msgUtf8, const char* file, int line);
 
-    bool ClearLogFiles() const;
+    bool ClearLogFiles() const; // 清空日志文件（将 GB_AllLog.log 和 GB_OutputLog.log 截断为 0 字节）
 
 private:
     std::queue<GB_LogItem> logQueue; // 日志队列
