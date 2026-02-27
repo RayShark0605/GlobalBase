@@ -1,15 +1,16 @@
-﻿#ifndef GLOBALBASE_LOGGER_H_H
-#define GLOBALBASE_LOGGER_H_H
+﻿#ifndef GLOBALBASE_LOGGER_H
+#define GLOBALBASE_LOGGER_H
 
 #include "GB_Utility.h"
 #include "GB_Utf8String.h"
 #include "GlobalBasePort.h"
-#include <mutex>
-#include <condition_variable>
+
 #include <atomic>
+#include <condition_variable>
+#include <mutex>
 #include <queue>
-#include <thread>
 #include <string>
+#include <thread>
 
 // 可自愈或已回退=WARNING；关键业务事件=INFO；实现细节=DEBUG；逐步跟踪=TRACE
 enum class GB_LogLevel : int
@@ -32,6 +33,9 @@ struct GB_LogItem
     std::string file; // 文件名
     int line; // 行号
 
+    void AppendJsonTo(std::string& out) const;
+    void AppendPlainTextTo(std::string& out) const;
+
     std::string ToJsonString() const;
     std::string ToPlainTextString() const;
 };
@@ -42,12 +46,20 @@ std::string LogLevelToString(GB_LogLevel level);
 #  pragma warning(push)
 #  pragma warning(disable: 4251)
 #endif
+
 class GLOBALBASE_PORT GB_Logger
 {
 public:
     static GB_Logger& GetInstance();
 
+    // 完整检查（包含读取配置的级别过滤），并写入队列。
+    // fileUtf8 要求已经是 UTF-8，且路径分隔符建议使用 '/'
     void Log(GB_LogLevel level, const std::string& msgUtf8, const std::string& fileUtf8, int line);
+
+    // 已通过 GB_CheckLogLevel(level) 的日志写入（避免重复读取配置）。
+    // file 使用 __FILE__ 传入的窄字符串，内部会尽可能转换/规范化为 UTF-8。
+    void LogChecked(GB_LogLevel level, const std::string& msgUtf8, const char* file, int line);
+
     void LogTrace(const std::string& msgUtf8, const char* file, int line);
     void LogDebug(const std::string& msgUtf8, const char* file, int line);
     void LogInfo(const std::string& msgUtf8, const char* file, int line);
@@ -57,12 +69,18 @@ public:
 
     bool ClearLogFiles() const; // 清空日志文件（将 GB_AllLog.log 和 GB_OutputLog.log 截断为 0 字节）
 
+    // 主动停止后台线程并清理队列。可重复调用，线程安全。
+    // - 正常情况下无需手动调用：内部会在进程退出时自动调用一次；
+    // - 若你需要在 DLL 卸载、单元测试或特殊生命周期下提前回收资源，可显式调用。
+    void Shutdown();
+
 private:
     std::queue<GB_LogItem> logQueue; // 日志队列
     std::mutex logQueueMtx;
     std::condition_variable logQueueCv;
 
     std::atomic_bool isStop{ false };
+    std::atomic_bool hasShutdown{ false };
     std::thread logThread;
 
     GB_Logger();
@@ -72,16 +90,17 @@ private:
 
     void LogThreadFunc(); // 日志处理线程函数
 };
+
 #ifdef _MSC_VER
 #  pragma warning(pop)
 #endif
 
-#define GBLOG_TRACE(msg) do { GB_Logger::GetInstance().LogTrace(msg, __FILE__, __LINE__); } while (0)
-#define GBLOG_DEBUG(msg) do { GB_Logger::GetInstance().LogDebug(msg, __FILE__, __LINE__); } while (0)
-#define GBLOG_INFO(msg) do { GB_Logger::GetInstance().LogInfo(msg, __FILE__, __LINE__); } while (0)
-#define GBLOG_WARNING(msg) do { GB_Logger::GetInstance().LogWarning(msg, __FILE__, __LINE__); } while (0)
-#define GBLOG_ERROR(msg) do { GB_Logger::GetInstance().LogError(msg, __FILE__, __LINE__); } while (0)
-#define GBLOG_FATAL(msg) do { GB_Logger::GetInstance().LogFatal(msg, __FILE__, __LINE__); } while (0)
+#define GBLOG_TRACE(msg)   do { if (GB_CheckLogLevel(GB_LogLevel::GBLOGLEVEL_TRACE))   { GB_Logger::GetInstance().LogChecked(GB_LogLevel::GBLOGLEVEL_TRACE,   (msg), __FILE__, __LINE__); } } while (0)
+#define GBLOG_DEBUG(msg)   do { if (GB_CheckLogLevel(GB_LogLevel::GBLOGLEVEL_DEBUG))   { GB_Logger::GetInstance().LogChecked(GB_LogLevel::GBLOGLEVEL_DEBUG,   (msg), __FILE__, __LINE__); } } while (0)
+#define GBLOG_INFO(msg)    do { if (GB_CheckLogLevel(GB_LogLevel::GBLOGLEVEL_INFO))    { GB_Logger::GetInstance().LogChecked(GB_LogLevel::GBLOGLEVEL_INFO,    (msg), __FILE__, __LINE__); } } while (0)
+#define GBLOG_WARNING(msg) do { if (GB_CheckLogLevel(GB_LogLevel::GBLOGLEVEL_WARNING)) { GB_Logger::GetInstance().LogChecked(GB_LogLevel::GBLOGLEVEL_WARNING, (msg), __FILE__, __LINE__); } } while (0)
+#define GBLOG_ERROR(msg)   do { if (GB_CheckLogLevel(GB_LogLevel::GBLOGLEVEL_ERROR))   { GB_Logger::GetInstance().LogChecked(GB_LogLevel::GBLOGLEVEL_ERROR,   (msg), __FILE__, __LINE__); } } while (0)
+#define GBLOG_FATAL(msg)   do { if (GB_CheckLogLevel(GB_LogLevel::GBLOGLEVEL_FATAL))   { GB_Logger::GetInstance().LogChecked(GB_LogLevel::GBLOGLEVEL_FATAL,   (msg), __FILE__, __LINE__); } } while (0)
 
 GLOBALBASE_PORT bool GB_IsLogEnabled();
 GLOBALBASE_PORT bool GB_SetLogEnabled(bool enable);
