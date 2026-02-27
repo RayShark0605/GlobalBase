@@ -1828,7 +1828,7 @@ string GB_Utf8ToUpper(const string& utf8Str)
     return out;
 }
 
-vector<string> GB_Utf8Split(const string& textUtf8, char32_t delimiter)
+vector<string> GB_Utf8Split(const string& textUtf8, char32_t delimiter, bool removeEmptySections)
 {
     vector<string> parts;
 
@@ -1855,6 +1855,12 @@ vector<string> GB_Utf8Split(const string& textUtf8, char32_t delimiter)
     }
 
     parts.emplace_back(textUtf8.substr(tokenStart));
+
+    if (removeEmptySections)
+    {
+        parts.erase(std::remove_if(parts.begin(), parts.end(), [](const string& s) { return s.empty(); }), parts.end());
+    }
+
     return parts;
 }
 

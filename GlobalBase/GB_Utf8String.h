@@ -83,7 +83,7 @@ GLOBALBASE_PORT std::string GB_Utf8ToLower(const std::string& utf8Str);
 GLOBALBASE_PORT std::string GB_Utf8ToUpper(const std::string& utf8Str);
 
 // 按“单个 Unicode 码点”分割
-GLOBALBASE_PORT std::vector<std::string> GB_Utf8Split(const std::string& textUtf8, char32_t delimiter);
+GLOBALBASE_PORT std::vector<std::string> GB_Utf8Split(const std::string& textUtf8, char32_t delimiter, bool removeEmptySections = true);
 
 // 比较两个 UTF-8 字符串是否相等。
 // - 当 caseSensitive=true：按字节精确比较。
