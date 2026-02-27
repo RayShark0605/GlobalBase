@@ -6,6 +6,13 @@
 #include "GB_Timer.h"
 
 #include <cstring>
+#include <ctime>
+#include <sstream>
+#include <utility>
+#include <iostream>
+#include <exception>
+#include <cstdlib>
+#include <cstdint>
 
 #if defined(_WIN32)
 #  include <windows.h>
@@ -17,9 +24,6 @@
 #  include <signal.h>
 #  include <execinfo.h>
 #endif
-
-using namespace std;
-
 namespace internal
 {
 	static void AppendJsonEscaped(std::string& out, const std::string& s)
@@ -72,6 +76,18 @@ namespace internal
 	static std::ostream& SelectStream(GB_LogLevel level)
 	{
 		return (level >= GB_LogLevel::GBLOGLEVEL_ERROR) ? std::cerr : std::cout;
+	}
+
+	static const std::string& GetThreadIdString()
+	{
+		thread_local std::string threadIdUtf8;
+		if (threadIdUtf8.empty())
+		{
+			std::ostringstream oss;
+			oss << std::this_thread::get_id();
+			threadIdUtf8 = oss.str();
+		}
+		return threadIdUtf8;
 	}
 
 #if defined(_WIN32)
@@ -146,6 +162,9 @@ namespace internal
 	// 如果 Windows 支持 VT：发 VT 转义 + UTF-8 文本；否则回退 SetConsoleTextAttribute 着色后直接输出 UTF-8 文本。
 	static void ConsoleWriteColoredUtf8(const std::string& textUtf8, GB_LogLevel level)
 	{
+		static std::mutex consoleMtx;
+		std::lock_guard<std::mutex> lock(consoleMtx);
+
 		unsigned int originCodePage = 0;
 		GB_GetConsoleEncodingCode(originCodePage);
 		if (originCodePage != 65001)
@@ -170,14 +189,14 @@ namespace internal
 		{
 			const WORD oldAttr = toErr ? st.defaultAttrErr : st.defaultAttrOut;
 			const WORD newAttr = GetWinAttrByLevel(level);
-			if (h) SetConsoleTextAttribute(h, newAttr); // 仅改变颜色属性，不影响编码。:contentReference[oaicite:3]{index=3}
+			if (h) SetConsoleTextAttribute(h, newAttr); // 仅改变颜色属性，不影响编码。
 			os << textUtf8;
 			os.flush();
 			if (h) SetConsoleTextAttribute(h, oldAttr);
 		}
 #else
 		std::ostream& os = SelectStream(level);
-		os << GetAnsiColorByLevel(level) << textUtf8 << "\x1b[0m"; // ANSI/ECMA-48 转义序列（着色），正文仍是 UTF-8。:contentReference[oaicite:4]{index=4}
+		os << GetAnsiColorByLevel(level) << textUtf8 << "\x1b[0m"; // ANSI/ECMA-48 转义序列（着色），正文仍是 UTF-8。
 		os.flush();
 #endif
 
@@ -186,10 +205,27 @@ namespace internal
 			GB_SetConsoleEncoding(originCodePage);
 		}
 	}
+	static const std::string& GetAllLogFilePath()
+	{
+		static const std::string filePathUtf8 = GB_GetExeDirectory() + GB_STR("GB_Logs/GB_AllLog.log");
+		return filePathUtf8;
+	}
+
+	static const std::string& GetOutputLogFilePath()
+	{
+		static const std::string filePathUtf8 = GB_GetExeDirectory() + GB_STR("GB_Logs/GB_OutputLog.log");
+		return filePathUtf8;
+	}
+
+	static void EnsureLogFilesCreated()
+	{
+		(void)GB_CreateFileRecursive(GetAllLogFilePath());
+		(void)GB_CreateFileRecursive(GetOutputLogFilePath());
+	}
 }
 
 
-string LogLevelToString(GB_LogLevel level)
+std::string LogLevelToString(GB_LogLevel level)
 {
 	switch (level)
 	{
@@ -204,9 +240,9 @@ string LogLevelToString(GB_LogLevel level)
 	}
 }
 
-string GB_LogItem::ToJsonString() const
+std::string GB_LogItem::ToJsonString() const
 {
-	string out;
+	std::string out;
 	const size_t reserveGuess = 64 + message.size() + threadId.size() + file.size();
 	out.reserve(reserveGuess);
 
@@ -230,11 +266,7 @@ string GB_LogItem::ToJsonString() const
 	out += GB_STR("\"");
 
 	out += GB_STR(",\"line\":");
-	{
-		std::ostringstream oss;
-		oss << line;
-		out += oss.str();
-	}
+	out += std::to_string(line);
 
 	out += GB_STR(",\"msg\":\"");
 	internal::AppendJsonEscaped(out, message);
@@ -244,9 +276,9 @@ string GB_LogItem::ToJsonString() const
 	return out;
 }
 
-string GB_LogItem::ToPlainTextString() const
+std::string GB_LogItem::ToPlainTextString() const
 {
-	string out;
+	std::string out;
 	const size_t reserveGuess = 64 + message.size() + threadId.size() + file.size();
 	out.reserve(reserveGuess);
 
@@ -262,11 +294,7 @@ string GB_LogItem::ToPlainTextString() const
 
 	out += file;
 	out += GB_STR(":");
-	{
-		std::ostringstream oss;
-		oss << line;
-		out += oss.str();
-	}
+	out += std::to_string(line);
 
 	out += GB_STR("] ");
 	out += message;
@@ -281,22 +309,24 @@ GB_Logger& GB_Logger::GetInstance()
 	return instance;
 }
 
-void GB_Logger::Log(GB_LogLevel level, const string& msgUtf8, const string& fileUtf8, int line)
+void GB_Logger::Log(GB_LogLevel level, const std::string& msgUtf8, const std::string& fileUtf8, int line)
 {
+	if (!GB_IsLogEnabled())
+	{
+		return;
+	}
+
 	GB_LogItem logItem;
 	logItem.timestamp = GetLocalTimeStr();
 	logItem.level = level;
 	logItem.message = msgUtf8;
-	{
-		std::ostringstream oss;
-		oss << std::this_thread::get_id();
-		logItem.threadId = oss.str();
-	}
+	logItem.threadId = internal::GetThreadIdString();
 	logItem.file = fileUtf8;
 	logItem.line = line;
+
 	{
 		std::lock_guard<std::mutex> lock(logQueueMtx);
-		logQueue.push(logItem);
+		logQueue.push(std::move(logItem));
 	}
 	logQueueCv.notify_one();
 }
@@ -310,9 +340,9 @@ void GB_Logger::LogTrace(const std::string& msgUtf8, const char* file, int line)
 	}
 
 #if defined(_WIN32)
-	string fileStrUtf8 = GB_AnsiToUtf8(file);
+	std::string fileStrUtf8 = GB_AnsiToUtf8(file);
 #else
-	string fileStrUtf8 = file;
+	std::string fileStrUtf8 = file;
 #endif
 	fileStrUtf8 = GB_Utf8Replace(fileStrUtf8, GB_STR("\\"), GB_STR("/"));
 	Log(GB_LogLevel::GBLOGLEVEL_TRACE, msgUtf8, fileStrUtf8, line);
@@ -327,9 +357,9 @@ void GB_Logger::LogDebug(const std::string& msgUtf8, const char* file, int line)
 	}
 
 #if defined(_WIN32)
-	string fileStrUtf8 = GB_AnsiToUtf8(file);
+	std::string fileStrUtf8 = GB_AnsiToUtf8(file);
 #else
-	string fileStrUtf8 = file;
+	std::string fileStrUtf8 = file;
 #endif
 	fileStrUtf8 = GB_Utf8Replace(fileStrUtf8, GB_STR("\\"), GB_STR("/"));
 	Log(GB_LogLevel::GBLOGLEVEL_DEBUG, msgUtf8, fileStrUtf8, line);
@@ -344,9 +374,9 @@ void GB_Logger::LogInfo(const std::string& msgUtf8, const char* file, int line)
 	}
 
 #if defined(_WIN32)
-	string fileStrUtf8 = GB_AnsiToUtf8(file);
+	std::string fileStrUtf8 = GB_AnsiToUtf8(file);
 #else
-	string fileStrUtf8 = file;
+	std::string fileStrUtf8 = file;
 #endif
 	fileStrUtf8 = GB_Utf8Replace(fileStrUtf8, GB_STR("\\"), GB_STR("/"));
 	Log(GB_LogLevel::GBLOGLEVEL_INFO, msgUtf8, fileStrUtf8, line);
@@ -361,9 +391,9 @@ void GB_Logger::LogWarning(const std::string& msgUtf8, const char* file, int lin
 	}
 
 #if defined(_WIN32)
-	string fileStrUtf8 = GB_AnsiToUtf8(file);
+	std::string fileStrUtf8 = GB_AnsiToUtf8(file);
 #else
-	string fileStrUtf8 = file;
+	std::string fileStrUtf8 = file;
 #endif
 	fileStrUtf8 = GB_Utf8Replace(fileStrUtf8, GB_STR("\\"), GB_STR("/"));
 	Log(GB_LogLevel::GBLOGLEVEL_WARNING, msgUtf8, fileStrUtf8, line);
@@ -378,9 +408,9 @@ void GB_Logger::LogError(const std::string& msgUtf8, const char* file, int line)
 	}
 
 #if defined(_WIN32)
-	string fileStrUtf8 = GB_AnsiToUtf8(file);
+	std::string fileStrUtf8 = GB_AnsiToUtf8(file);
 #else
-	string fileStrUtf8 = file;
+	std::string fileStrUtf8 = file;
 #endif
 	fileStrUtf8 = GB_Utf8Replace(fileStrUtf8, GB_STR("\\"), GB_STR("/"));
 	Log(GB_LogLevel::GBLOGLEVEL_ERROR, msgUtf8, fileStrUtf8, line);
@@ -395,21 +425,19 @@ void GB_Logger::LogFatal(const std::string& msgUtf8, const char* file, int line)
 	}
 
 #if defined(_WIN32)
-	string fileStrUtf8 = GB_AnsiToUtf8(file);
+	std::string fileStrUtf8 = GB_AnsiToUtf8(file);
 #else
-	string fileStrUtf8 = file;
+	std::string fileStrUtf8 = file;
 #endif
 	fileStrUtf8 = GB_Utf8Replace(fileStrUtf8, GB_STR("\\"), GB_STR("/"));
 	Log(GB_LogLevel::GBLOGLEVEL_FATAL, msgUtf8, fileStrUtf8, line);
 }
 
-const static string allLogFilePath = GB_GetExeDirectory() + GB_STR("GB_Logs/GB_AllLog.log");
-const static string outputLogFilePath = GB_GetExeDirectory() + GB_STR("GB_Logs/GB_OutputLog.log");
 
 bool GB_Logger::ClearLogFiles() const
 {
-	const bool success1 = GB_CreateFileRecursive(allLogFilePath);
-	const bool success2 = GB_CreateFileRecursive(outputLogFilePath);
+	const bool success1 = GB_CreateFileRecursive(internal::GetAllLogFilePath());
+	const bool success2 = GB_CreateFileRecursive(internal::GetOutputLogFilePath());
 	return success1 && success2;
 }
 
@@ -418,7 +446,6 @@ GB_Logger::GB_Logger()
 	isStop.store(false, std::memory_order_release);
 
 	logThread = std::thread(&GB_Logger::LogThreadFunc, this);
-	logThread.detach();
 }
 
 GB_Logger::~GB_Logger()
@@ -437,22 +464,23 @@ GB_Logger::~GB_Logger()
 
 void GB_Logger::LogThreadFunc()
 {
-	while (!isStop.load(std::memory_order_acquire))
+	internal::EnsureLogFilesCreated();
+
+	for (;;)
 	{
 		std::queue<GB_LogItem> localQueue;
 		{
 			std::unique_lock<std::mutex> lock(logQueueMtx);
 			logQueueCv.wait(lock, [this] {
-				return !logQueue.empty() || isStop.load(std::memory_order_acquire); });
-			if (isStop.load(std::memory_order_acquire))
+				return isStop.load(std::memory_order_acquire) || !logQueue.empty();
+				});
+
+			if (logQueue.empty() && isStop.load(std::memory_order_acquire))
 			{
-				return;
+				break;
 			}
-			while (!logQueue.empty())
-			{
-				localQueue.push(logQueue.front());
-				logQueue.pop();
-			}
+
+			std::swap(localQueue, logQueue);
 		}
 
 		if (localQueue.empty())
@@ -460,80 +488,94 @@ void GB_Logger::LogThreadFunc()
 			continue;
 		}
 
+		if (!GB_IsLogEnabled())
+		{
+			continue;
+		}
+
+		const GB_LogLevel filterLevel = GB_GetLogFilterLevel();
+		const bool logToConsole = GB_IsLogToConsole();
+
+		std::string allBatchUtf8;
+		std::string outputBatchUtf8;
+
 		while (!localQueue.empty())
 		{
-			const GB_LogItem logItem = localQueue.front();
+			GB_LogItem logItem = std::move(localQueue.front());
 			localQueue.pop();
 
-			if (isStop)
-			{
-				return;
-			}
+			const std::string logJsonUtf8 = logItem.ToJsonString();
+			allBatchUtf8 += logJsonUtf8;
 
-			if (!GB_IsLogEnabled())
+			const bool passFilter = (filterLevel != GB_LogLevel::GBLOGLEVEL_DISABLELOG && logItem.level >= filterLevel);
+			if (!passFilter)
 			{
 				continue;
 			}
 
-			const string logJsonUtf8 = logItem.ToJsonString();
-			GB_WriteUtf8ToFile(allLogFilePath, logJsonUtf8);
+			outputBatchUtf8 += logJsonUtf8;
 
-			if (GB_CheckLogLevel(logItem.level))
+			if (logToConsole)
 			{
-				GB_WriteUtf8ToFile(outputLogFilePath, logJsonUtf8);
-				if (GB_IsLogToConsole())
-				{
-					const string logTextUtf8 = logItem.ToPlainTextString();
-					internal::ConsoleWriteColoredUtf8(logTextUtf8, logItem.level);
-				}
+				const std::string logTextUtf8 = logItem.ToPlainTextString();
+				internal::ConsoleWriteColoredUtf8(logTextUtf8, logItem.level);
 			}
+		}
+
+		if (!allBatchUtf8.empty())
+		{
+			(void)GB_WriteUtf8ToFile(internal::GetAllLogFilePath(), allBatchUtf8);
+		}
+		if (!outputBatchUtf8.empty())
+		{
+			(void)GB_WriteUtf8ToFile(internal::GetOutputLogFilePath(), outputBatchUtf8);
 		}
 	}
 }
 
 bool GB_IsLogEnabled()
 {
-	const static string targetKey = GB_STR("GB_EnableLog");
+	const static std::string targetKey = GB_STR("GB_EnableLog");
 
 	if (!GB_IsExistsGbConfig(targetKey))
 	{
 		return false;
 	}
 
-	string value;
+	std::string value;
 	return (GB_GetGbConfig(targetKey, value) && "1" == value);
 }
 
 bool GB_SetLogEnabled(bool enable)
 {
-	const static string targetKey = GB_STR("GB_EnableLog");
-	const string value = enable ? GB_STR("1") : GB_STR("0");
+	const static std::string targetKey = GB_STR("GB_EnableLog");
+	const std::string value = enable ? GB_STR("1") : GB_STR("0");
 	return GB_SetGbConfig(targetKey, value);
 }
 
 bool GB_IsLogToConsole()
 {
-	const static string targetKey = GB_STR("GB_IsLogToConsole");
+	const static std::string targetKey = GB_STR("GB_IsLogToConsole");
 
 	if (!GB_IsExistsGbConfig(targetKey))
 	{
 		return false;
 	}
 
-	string value;
+	std::string value;
 	return (GB_GetGbConfig(targetKey, value) && "1" == value);
 }
 
 bool GB_SetLogToConsole(bool enable)
 {
-	const static string targetKey = GB_STR("GB_IsLogToConsole");
-	const string value = enable ? GB_STR("1") : GB_STR("0");
+	const static std::string targetKey = GB_STR("GB_IsLogToConsole");
+	const std::string value = enable ? GB_STR("1") : GB_STR("0");
 	return GB_SetGbConfig(targetKey, value);
 }
 
 GB_LogLevel GB_GetLogFilterLevel()
 {
-	const static string targetKey = GB_STR("GB_LogLevel");
+	const static std::string targetKey = GB_STR("GB_LogLevel");
 
 	if (!GB_IsLogEnabled())
 	{
@@ -544,7 +586,7 @@ GB_LogLevel GB_GetLogFilterLevel()
 	{
 		return GB_LogLevel::GBLOGLEVEL_TRACE;
 	}
-	string value;
+	std::string value;
 	if (!GB_GetGbConfig(targetKey, value))
 	{
 		return GB_LogLevel::GBLOGLEVEL_TRACE;
@@ -595,6 +637,20 @@ namespace crashlog
 #endif
 	static std::atomic<bool> installed{ false };
 
+	static std::terminate_handler oldTerminateHandler = nullptr;
+#if defined(_WIN32)
+	static LPTOP_LEVEL_EXCEPTION_FILTER oldSehFilter = nullptr;
+#else
+	struct SigActionBackup
+	{
+		int sig = 0;
+		struct sigaction oldAction;
+		bool hasOld = false;
+	};
+	static SigActionBackup sigBackups[8];
+	static size_t sigBackupCount = 0;
+#endif
+
 	// 十进制/十六进制安全拼接（无malloc）
 	static size_t AppendStr(char* buf, size_t cap, const char* s)
 	{
@@ -612,6 +668,29 @@ namespace crashlog
 		do { tmp[p++] = char('0' + (v % 10)); v /= 10; } while (v && p < sizeof(tmp));
 		size_t w = 0;
 		while (p && w < cap) buf[w++] = tmp[--p];
+		return w;
+	}
+
+	static size_t AppendHexU64(char* buf, size_t cap, uint64_t v, bool withPrefix)
+	{
+		static const char* hex = "0123456789ABCDEF";
+		size_t w = 0;
+		if (withPrefix && cap >= 2)
+		{
+			buf[w++] = '0';
+			buf[w++] = 'x';
+		}
+
+		bool started = false;
+		for (int i = (int)(sizeof(v) * 2 - 1); i >= 0 && w < cap; --i)
+		{
+			const unsigned nib = (unsigned)((v >> (i * 4)) & 0xFULL);
+			if (nib || started || i == 0)
+			{
+				started = true;
+				buf[w++] = hex[nib];
+			}
+		}
 		return w;
 	}
 
@@ -670,7 +749,9 @@ namespace crashlog
 			return;
 		}
 
-		const std::string path = GB_GetExeDirectory() + GB_STR("GB_Logs/GB_Crash.log");
+		const std::string dir = GB_GetExeDirectory() + GB_STR("GB_Logs/");
+		GB_CreateDirectory(dir);
+		const std::string path = dir + GB_STR("GB_Crash.log");
 		// UTF-8 -> UTF-16
 		int wlen = MultiByteToWideChar(CP_UTF8, 0, path.c_str(), (int)path.size(), NULL, 0);
 		std::wstring wpath((size_t)wlen, L'\0');
@@ -692,8 +773,8 @@ namespace crashlog
 #if !defined(_WIN32)
 	static void LogBacktraceLinux()
 	{
-		// 注意：backtrace() 在 glibc 上不保证 AS-safe，但实践中常用于崩溃处理；
-		// backtrace_symbols_fd() 文档标注为 AS-safe，会直接写到 fd。:contentReference[oaicite:7]{index=7}
+		// 注意：在信号处理函数里调用 backtrace/backtrace_symbols_fd 的可用性与 async-signal-safe 属性依赖 libc 实现；
+		// 本实现尽量将输出落到 backtrace_symbols_fd（直接写 fd）并避免 malloc/stdio。
 		void* frames[64];
 		int n = ::backtrace(frames, 64);
 		if (n > 0 && crashFd >= 0)
@@ -713,8 +794,15 @@ void GB_InstallCrashHandlers()
 	}
 	crashlog::OpenCrashFileOnce();
 
+	crashlog::oldTerminateHandler = nullptr;
+#if defined(_WIN32)
+	crashlog::oldSehFilter = nullptr;
+#else
+	crashlog::sigBackupCount = 0;
+#endif
+
 	// 层 1：未捕获 C++ 异常
-	std::set_terminate([]()
+	crashlog::oldTerminateHandler = std::set_terminate([]()
 		{
 			try
 			{
@@ -756,11 +844,11 @@ void GB_InstallCrashHandlers()
 
 #if defined(_WIN32)
 	// 层 3：未处理 SEH 异常
-	SetUnhandledExceptionFilter([](EXCEPTION_POINTERS* ex) -> LONG
+	crashlog::oldSehFilter = SetUnhandledExceptionFilter([](EXCEPTION_POINTERS* ex) -> LONG
 		{
 			char head[256]; size_t p = 0;
 			p += crashlog::AppendStr(head + p, sizeof(head) - p, "FATAL: Unhandled SEH, code=0x");
-			p += crashlog::AppendDec(head + p, sizeof(head) - p, (uint64_t)ex->ExceptionRecord->ExceptionCode);
+			p += crashlog::AppendHexU64(head + p, sizeof(head) - p, (uint64_t)ex->ExceptionRecord->ExceptionCode, false);
 			p += crashlog::AppendStr(head + p, sizeof(head) - p, " at ");
 			p += crashlog::AppendHexPtr(head + p, sizeof(head) - p, ex->ExceptionRecord->ExceptionAddress);
 			p += crashlog::AppendStr(head + p, sizeof(head) - p, " t=");
@@ -804,7 +892,7 @@ void GB_InstallCrashHandlers()
 					p += crashlog::AppendDec(head + p, sizeof(head) - p, (uint64_t)s);
 					p += crashlog::AppendStr(head + p, sizeof(head) - p, " addr=");
 					p += crashlog::AppendHexPtr(head + p, sizeof(head) - p, info ? info->si_addr : nullptr);
-					p += crashlog::AppendStr(head + p, sizeof(head) - p, " t=");
+					p += crashlog::AppendStr(head + p, sizeof(head) - p, " pid=");
 					p += crashlog::AppendDec(head + p, sizeof(head) - p, (uint64_t)getpid());
 					p += crashlog::AppendStr(head + p, sizeof(head) - p, " ts=");
 					p += crashlog::AppendDec(head + p, sizeof(head) - p, (uint64_t)time(nullptr));
@@ -819,7 +907,17 @@ void GB_InstallCrashHandlers()
 				};
 			sigemptyset(&sa.sa_mask);
 			sa.sa_flags = SA_SIGINFO;
-			sigaction(sig, &sa, nullptr); // 参考 signal-safety & sigaction
+			struct sigaction oldSa;
+			if (sigaction(sig, &sa, &oldSa) == 0)
+			{
+				if (crashlog::sigBackupCount < (sizeof(crashlog::sigBackups) / sizeof(crashlog::sigBackups[0])))
+				{
+					crashlog::sigBackups[crashlog::sigBackupCount].sig = sig;
+					crashlog::sigBackups[crashlog::sigBackupCount].oldAction = oldSa;
+					crashlog::sigBackups[crashlog::sigBackupCount].hasOld = true;
+					crashlog::sigBackupCount++;
+				}
+			}
 		};
 
 	install(SIGSEGV);
@@ -835,6 +933,43 @@ void GB_InstallCrashHandlers()
 
 void GB_RemoveCrashHandlers()
 {
-	// 轻实现：当前仅用于关闭重复安装；详细还原可按平台补充
-	crashlog::installed.store(false);
+	if (!crashlog::installed.exchange(false))
+	{
+		return;
+	}
+
+	if (crashlog::oldTerminateHandler)
+	{
+		std::set_terminate(crashlog::oldTerminateHandler);
+		crashlog::oldTerminateHandler = nullptr;
+	}
+
+#if defined(_WIN32)
+	if (crashlog::oldSehFilter)
+	{
+		SetUnhandledExceptionFilter(crashlog::oldSehFilter);
+		crashlog::oldSehFilter = nullptr;
+	}
+
+	if (crashlog::crashFile != INVALID_HANDLE_VALUE)
+	{
+		CloseHandle(crashlog::crashFile);
+		crashlog::crashFile = INVALID_HANDLE_VALUE;
+	}
+#else
+	for (size_t i = 0; i < crashlog::sigBackupCount; i++)
+	{
+		if (crashlog::sigBackups[i].hasOld)
+		{
+			sigaction(crashlog::sigBackups[i].sig, &crashlog::sigBackups[i].oldAction, nullptr);
+		}
+	}
+	crashlog::sigBackupCount = 0;
+
+	if (crashlog::crashFd >= 0)
+	{
+		(void)::close(crashlog::crashFd);
+		crashlog::crashFd = -1;
+	}
+#endif
 }

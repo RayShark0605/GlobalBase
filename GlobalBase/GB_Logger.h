@@ -7,6 +7,9 @@
 #include <mutex>
 #include <condition_variable>
 #include <atomic>
+#include <queue>
+#include <thread>
+#include <string>
 
 // 可自愈或已回退=WARNING；关键业务事件=INFO；实现细节=DEBUG；逐步跟踪=TRACE
 enum class GB_LogLevel : int
@@ -64,10 +67,10 @@ private:
 
     GB_Logger();
     ~GB_Logger();
-	GB_Logger(const GB_Logger&) = delete;
+    GB_Logger(const GB_Logger&) = delete;
     GB_Logger& operator=(const GB_Logger&) = delete;
 
-	void LogThreadFunc(); // 日志处理线程函数
+    void LogThreadFunc(); // 日志处理线程函数
 };
 #ifdef _MSC_VER
 #  pragma warning(pop)
