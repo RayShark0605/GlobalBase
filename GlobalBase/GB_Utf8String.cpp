@@ -314,6 +314,45 @@ namespace internal
         return true;
     }
 
+
+    // 与 Qt6 的 QChar::isSpace(char32_t) 保持一致的“空白”判定。
+    // 规则（来自 Qt 的实现）：
+    // - ASCII: U+0020 或 [U+0009..U+000D]（\t \n \v \f \r）
+    // - 额外的 C0/C1 控制: U+0085
+    // - 不换行空格: U+00A0
+    // - 以及 Unicode Separator 类别中的空白：U+1680、U+2000..U+200A、U+2028、U+2029、U+202F、U+205F、U+3000
+    static bool IsQtSpace(char32_t ucs4)
+    {
+        if (ucs4 == 0x20 || (ucs4 >= 0x09 && ucs4 <= 0x0D))
+        {
+            return true;
+        }
+
+        // 注意：Qt 对 0x85 / 0xA0 做了显式特判（它们不属于 Separator_* 类别）
+        if (ucs4 == 0x85 || ucs4 == 0xA0)
+        {
+            return true;
+        }
+
+        if (ucs4 == 0x1680 ||
+            (ucs4 >= 0x2000 && ucs4 <= 0x200A) ||
+            ucs4 == 0x2028 ||
+            ucs4 == 0x2029 ||
+            ucs4 == 0x202F ||
+            ucs4 == 0x205F ||
+            ucs4 == 0x3000)
+        {
+            return true;
+        }
+
+        return false;
+    }
+
+    static bool IsQtSpaceByte(unsigned char ch)
+    {
+        return ch == 0x20 || (ch >= 0x09 && ch <= 0x0D);
+    }
+
     static bool HasUtf8Bom(const string& text)
     {
         if (text.size() < 3)
@@ -2305,6 +2344,95 @@ string GB_Utf8TrimRight(const string& utf8Str, const string& trimChars)
 
     const unordered_set<char32_t> trimSet = internal::BuildTrimSet(trimChars);
     return internal::TrimRightImpl(utf8Str, trimSet);
+}
+
+
+string GB_Utf8Simplified(const string& utf8Str)
+{
+    if (utf8Str.empty())
+    {
+        return {};
+    }
+
+    // ASCII 快速路径（无需 UTF-8 解码）
+    if (internal::IsAllAscii(utf8Str))
+    {
+        string out;
+        out.reserve(utf8Str.size());
+
+        bool hasPendingSpace = false;
+        for (size_t i = 0; i < utf8Str.size(); i++)
+        {
+            const unsigned char ch = static_cast<unsigned char>(utf8Str[i]);
+            if (internal::IsQtSpaceByte(ch))
+            {
+                // 仅在已经输出过内容时，才可能需要在后续插入一个空格
+                if (!out.empty())
+                {
+                    hasPendingSpace = true;
+                }
+                continue;
+            }
+
+            if (hasPendingSpace)
+            {
+                out.push_back(' ');
+                hasPendingSpace = false;
+            }
+
+            out.push_back(static_cast<char>(ch));
+        }
+
+        return out;
+    }
+
+    // 通用路径：按码点扫描并折叠空白
+    string out;
+    out.reserve(utf8Str.size()); // 上界：折叠后只会更短
+
+    bool hasPendingSpace = false;
+
+    size_t pos = 0;
+    while (pos < utf8Str.size())
+    {
+        char32_t cp = 0;
+        size_t nextPos = pos;
+
+        const bool ok = internal::DecodeOne(utf8Str, pos, cp, nextPos);
+        if (!ok)
+        {
+            // 输入非合法 UTF-8：按字节原样透传（不参与空白折叠）
+            if (hasPendingSpace)
+            {
+                out.push_back(' ');
+                hasPendingSpace = false;
+            }
+            out.push_back(utf8Str[pos]);
+            pos = pos + 1;
+            continue;
+        }
+
+        if (internal::IsQtSpace(cp))
+        {
+            if (!out.empty())
+            {
+                hasPendingSpace = true;
+            }
+        }
+        else
+        {
+            if (hasPendingSpace)
+            {
+                out.push_back(' ');
+                hasPendingSpace = false;
+            }
+            out.append(utf8Str, pos, nextPos - pos);
+        }
+
+        pos = nextPos;
+    }
+
+    return out;
 }
 
 string GB_Utf8Replace(const string& utf8Str, const string& oldValue, const string& newValue, bool caseSensitive)

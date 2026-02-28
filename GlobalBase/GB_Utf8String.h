@@ -109,6 +109,11 @@ GLOBALBASE_PORT std::string GB_Utf8Trim(const std::string& utf8Str, const std::s
 GLOBALBASE_PORT std::string GB_Utf8TrimLeft(const std::string& utf8Str, const std::string& trimChars = " \t\r\n");
 GLOBALBASE_PORT std::string GB_Utf8TrimRight(const std::string& utf8Str, const std::string& trimChars = " \t\r\n");
 
+// 规范化 UTF-8 字符串中的空白字符
+// - 移除两端空白；
+// - 将内部连续空白折叠为单个 ASCII 空格（' '）。
+GLOBALBASE_PORT std::string GB_Utf8Simplified(const std::string& utf8Str);
+
 // 替换 UTF-8 字符串中的子串（可选大小写敏感）
 GLOBALBASE_PORT std::string GB_Utf8Replace(const std::string& utf8Str, const std::string& oldValue, const std::string& newValue, bool caseSensitive = true);
 

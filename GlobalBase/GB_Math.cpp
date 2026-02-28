@@ -341,54 +341,69 @@ namespace
 	}
 }
 
-int GB_ToInt(const std::string& str, int defaultValue)
+int GB_ToInt(const std::string& str, int defaultValue, bool* isOk)
 {
 	int parsedValue = 0;
-	if (!TryParseSignedDecimal<int>(str, parsedValue))
+	const bool success = TryParseSignedDecimal<int>(str, parsedValue);
+
+	if (isOk)
 	{
-		return defaultValue;
+		*isOk = success;
 	}
-	return parsedValue;
+
+	return success ? parsedValue : defaultValue;
 }
 
-unsigned int GB_ToUInt(const std::string& str, unsigned int defaultValue)
+unsigned int GB_ToUInt(const std::string& str, unsigned int defaultValue, bool* isOk)
 {
 	unsigned int parsedValue = 0;
-	if (!TryParseUnsignedDecimal<unsigned int>(str, parsedValue))
+	const bool success = TryParseUnsignedDecimal<unsigned int>(str, parsedValue);
+
+	if (isOk)
 	{
-		return defaultValue;
+		*isOk = success;
 	}
-	return parsedValue;
+
+	return success ? parsedValue : defaultValue;
 }
 
-long long GB_ToLongLong(const std::string& str, long long defaultValue)
+long long GB_ToLongLong(const std::string& str, long long defaultValue, bool* isOk)
 {
 	long long parsedValue = 0;
-	if (!TryParseSignedDecimal<long long>(str, parsedValue))
+	const bool success = TryParseSignedDecimal<long long>(str, parsedValue);
+
+	if (isOk)
 	{
-		return defaultValue;
+		*isOk = success;
 	}
-	return parsedValue;
+
+	return success ? parsedValue : defaultValue;
 }
 
-unsigned long long GB_ToULongLong(const std::string& str, unsigned long long defaultValue)
+unsigned long long GB_ToULongLong(const std::string& str, unsigned long long defaultValue, bool* isOk)
 {
 	unsigned long long parsedValue = 0;
-	if (!TryParseUnsignedDecimal<unsigned long long>(str, parsedValue))
+	const bool success = TryParseUnsignedDecimal<unsigned long long>(str, parsedValue);
+
+	if (isOk)
 	{
-		return defaultValue;
+		*isOk = success;
 	}
-	return parsedValue;
+
+	return success ? parsedValue : defaultValue;
 }
 
-double GB_ToDouble(const std::string& str, double defaultValue)
+double GB_ToDouble(const std::string& str, double defaultValue, bool* isOk)
 {
 	double parsedValue = 0.0;
-	if (!TryParseDouble(str, parsedValue))
+	const bool success = TryParseDouble(str, parsedValue);
+
+	if (isOk)
 	{
-		return defaultValue;
+		*isOk = success;
 	}
-	return parsedValue;
+
+	return success ? parsedValue : defaultValue;
 }
 
 

@@ -210,42 +210,47 @@ GLOBALBASE_PORT std::string GB_RandomString(size_t length);
  * @brief 将字符串按十进制解析为 int。
  * @param str 输入字符串（允许首尾空白；仅识别 ASCII 数字与可选正负号）。
  * @param defaultValue 解析失败或越界时返回的默认值。
+ * @param isOk 输出参数：若非空，转换成功设为 true，转换失败设为 false。
  * @return 解析成功返回转换结果；否则返回 defaultValue。
  * @note 本函数保证不抛出异常；要求除首尾空白外，字符串必须完全匹配一个十进制整数。
  */
-GLOBALBASE_PORT int GB_ToInt(const std::string& str, int defaultValue = 0);
+GLOBALBASE_PORT int GB_ToInt(const std::string& str, int defaultValue = 0, bool* isOk = nullptr);
 
 /**
  * @brief 将字符串按十进制解析为 unsigned int。
  * @param str 输入字符串（允许首尾空白；仅识别 ASCII 数字与可选前导 '+' 号）。
  * @param defaultValue 解析失败或越界时返回的默认值。
+ * @param isOk 输出参数：若非空，转换成功设为 true，转换失败设为 false。
  * @return 解析成功返回转换结果；否则返回 defaultValue。
  * @note 本函数保证不抛出异常；若包含负号或出现非数字字符（除首尾空白外），视为失败。
  */
-GLOBALBASE_PORT unsigned int GB_ToUInt(const std::string& str, unsigned int defaultValue = 0);
+GLOBALBASE_PORT unsigned int GB_ToUInt(const std::string& str, unsigned int defaultValue = 0, bool* isOk = nullptr);
 
 /**
  * @brief 将字符串按十进制解析为 long long。
  * @param str 输入字符串（允许首尾空白；仅识别 ASCII 数字与可选正负号）。
  * @param defaultValue 解析失败或越界时返回的默认值。
+ * @param isOk 输出参数：若非空，转换成功设为 true，转换失败设为 false。
  * @return 解析成功返回转换结果；否则返回 defaultValue。
  * @note 本函数保证不抛出异常；要求除首尾空白外，字符串必须完全匹配一个十进制整数。
  */
-GLOBALBASE_PORT long long GB_ToLongLong(const std::string& str, long long defaultValue = 0);
+GLOBALBASE_PORT long long GB_ToLongLong(const std::string& str, long long defaultValue = 0, bool* isOk = nullptr);
 
 /**
  * @brief 将字符串按十进制解析为 unsigned long long。
  * @param str 输入字符串（允许首尾空白；仅识别 ASCII 数字与可选前导 '+' 号）。
  * @param defaultValue 解析失败或越界时返回的默认值。
+ * @param isOk 输出参数：若非空，转换成功设为 true，转换失败设为 false。
  * @return 解析成功返回转换结果；否则返回 defaultValue。
  * @note 本函数保证不抛出异常；若包含负号或出现非数字字符（除首尾空白外），视为失败。
  */
-GLOBALBASE_PORT unsigned long long GB_ToULongLong(const std::string& str, unsigned long long defaultValue = 0);
+GLOBALBASE_PORT unsigned long long GB_ToULongLong(const std::string& str, unsigned long long defaultValue = 0, bool* isOk = nullptr);
 
 /**
  * @brief 将字符串解析为 double。
  * @param str 输入字符串（允许首尾空白）。
  * @param defaultValue 解析失败或溢出时返回的默认值。
+ * @param isOk 输出参数：若非空，转换成功设为 true，转换失败设为 false。
  * @return 解析成功返回转换结果；否则返回 defaultValue。
  * @note 本函数保证不抛出异常；要求除首尾空白外，字符串必须完全匹配一个合法浮点数。
  *       支持科学计数法（如 1.23e-4）。
@@ -253,7 +258,7 @@ GLOBALBASE_PORT unsigned long long GB_ToULongLong(const std::string& str, unsign
  *       若平台不支持 locale 专用版本，则退化为使用标准库 strtod。
  *       另外，本函数不接受 NaN/Inf 等非有限值（解析到非有限值会视为失败）。
  */
-GLOBALBASE_PORT double GB_ToDouble(const std::string& str, double defaultValue = 0);
+GLOBALBASE_PORT double GB_ToDouble(const std::string& str, double defaultValue = 0, bool* isOk = nullptr);
 
 
 #endif
