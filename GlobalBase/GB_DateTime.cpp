@@ -2193,11 +2193,7 @@ namespace
 		return true;
 	}
 
-	inline bool ParseIsoDateTimeSpan(
-		const char* data,
-		size_t length,
-		GB_DateTime& outDateTime,
-		GB_DateTimeSpec defaultSpec)
+	inline bool ParseIsoDateTimeSpan(const char* data, size_t length, GB_DateTime& outDateTime, GB_DateTimeSpec defaultSpec)
 	{
 		if (data == nullptr)
 		{
