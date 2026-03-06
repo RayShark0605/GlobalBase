@@ -39,6 +39,13 @@ GLOBALBASE_PORT std::string GB_Utf8ToAnsi(const std::string& utf8Str);
 // ANSI 编码字符串转 UTF-8
 GLOBALBASE_PORT std::string GB_AnsiToUtf8(const std::string& ansiStr);
 
+// 将指定编码的原始字节流转换为 UTF-8。
+// - rawBytes：原始字节流（可包含 \0）。
+// - encodingName：源编码名称，例如 "utf8"、"utf-8"、"GBK"、"GB18030"、"ISO-8859-6"、"ISO-8859-1"、"windows-1252"、"cp1252" 等。
+// - 返回值：转换后的 UTF-8 字节串。
+// - 失败时抛出 std::runtime_error（例如编码名不支持、输入字节不符合指定编码等）。
+GLOBALBASE_PORT std::string GB_BytesToUtf8(const std::string& rawBytes, const std::string& encodingName);
+
 // 是否是“合法的 UTF-8 字节序列”
 // 注意：返回 true 仅表示按 UTF-8 解码不会出错（字节序列是 well-formed）。
 // 它并不能证明这段数据的“真实编码”一定是 UTF-8（例如：纯 ASCII 同时也是合法 UTF-8 / 多种 ANSI 代码页内容）。

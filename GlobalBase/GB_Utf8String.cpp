@@ -21,6 +21,7 @@
 #include <locale>
 #include <codecvt>
 #include <langinfo.h>
+#include <iconv.h>
 #endif
 #ifndef GB_DISABLE_POSIX_SETLOCALE_AUTO_INIT
 #define GB_DISABLE_POSIX_SETLOCALE_AUTO_INIT 0
@@ -1280,6 +1281,581 @@ namespace internal
     }
 }
 
+
+namespace internal
+{
+    static string NormalizeEncodingName(const string& encodingName)
+    {
+        string normalized;
+        normalized.reserve(encodingName.size());
+
+        for (size_t i = 0; i < encodingName.size(); i++)
+        {
+            const unsigned char ch = static_cast<unsigned char>(encodingName[i]);
+            if ((ch >= static_cast<unsigned char>('0') && ch <= static_cast<unsigned char>('9')) ||
+                (ch >= static_cast<unsigned char>('A') && ch <= static_cast<unsigned char>('Z')) ||
+                (ch >= static_cast<unsigned char>('a') && ch <= static_cast<unsigned char>('z')))
+            {
+                normalized.push_back(internal::ToLowerAsciiChar(static_cast<char>(ch)));
+            }
+        }
+
+        return normalized;
+    }
+
+    static bool TryParseUnsignedInteger(const string& text, unsigned int& value)
+    {
+        if (text.empty())
+        {
+            return false;
+        }
+
+        unsigned long long result = 0;
+        for (size_t i = 0; i < text.size(); i++)
+        {
+            const unsigned char ch = static_cast<unsigned char>(text[i]);
+            if (ch < static_cast<unsigned char>('0') || ch > static_cast<unsigned char>('9'))
+            {
+                return false;
+            }
+
+            result = result * 10ull + static_cast<unsigned long long>(ch - static_cast<unsigned char>('0'));
+            if (result > static_cast<unsigned long long>(UINT_MAX))
+            {
+                return false;
+            }
+        }
+
+        value = static_cast<unsigned int>(result);
+        return true;
+    }
+
+    static bool IsUtf8EncodingName(const string& normalizedEncodingName)
+    {
+        return normalizedEncodingName == "utf8" || normalizedEncodingName == "utf-8";
+    }
+
+    static bool IsAsciiEncodingName(const string& normalizedEncodingName)
+    {
+        return normalizedEncodingName == "ascii" ||
+            normalizedEncodingName == "usascii" ||
+            normalizedEncodingName == "ansix341968";
+    }
+
+    static bool IsLatin1EncodingName(const string& normalizedEncodingName)
+    {
+        return normalizedEncodingName == "latin1" ||
+            normalizedEncodingName == "latin" ||
+            normalizedEncodingName == "iso88591";
+    }
+
+    static string Latin1ToUtf8(const string& rawBytes)
+    {
+        string utf8;
+        utf8.reserve(rawBytes.size() * 2);
+
+        for (size_t i = 0; i < rawBytes.size(); i++)
+        {
+            const unsigned char byteValue = static_cast<unsigned char>(rawBytes[i]);
+            if (byteValue < 0x80u)
+            {
+                utf8.push_back(static_cast<char>(byteValue));
+            }
+            else
+            {
+                utf8.push_back(static_cast<char>(0xC0u | (byteValue >> 6)));
+                utf8.push_back(static_cast<char>(0x80u | (byteValue & 0x3Fu)));
+            }
+        }
+
+        return utf8;
+    }
+
+#if defined(_WIN32)
+    static UINT ResolveIso8859WindowsCodePage(const string& normalizedEncodingName)
+    {
+        if (normalizedEncodingName.size() <= 7 || normalizedEncodingName.compare(0, 7, "iso8859") != 0)
+        {
+            return 0u;
+        }
+
+        const string suffix = normalizedEncodingName.substr(7);
+        unsigned int isoPart = 0;
+        if (!TryParseUnsignedInteger(suffix, isoPart))
+        {
+            return 0u;
+        }
+
+        switch (isoPart)
+        {
+        case 1u: return 28591u;
+        case 2u: return 28592u;
+        case 3u: return 28593u;
+        case 4u: return 28594u;
+        case 5u: return 28595u;
+        case 6u: return 28596u;
+        case 7u: return 28597u;
+        case 8u: return 28598u;
+        case 9u: return 28599u;
+        case 13u: return 28603u;
+        case 15u: return 28605u;
+        default:
+            return 0u;
+        }
+    }
+
+    static UINT ResolveEncodingNameToWindowsCodePage(const string& encodingName)
+    {
+        const string normalizedEncodingName = NormalizeEncodingName(encodingName);
+        if (normalizedEncodingName.empty())
+        {
+            throw runtime_error("Encoding name is empty.");
+        }
+
+        if (IsUtf8EncodingName(normalizedEncodingName))
+        {
+            return CP_UTF8;
+        }
+        if (IsAsciiEncodingName(normalizedEncodingName))
+        {
+            return 20127u;
+        }
+        if (normalizedEncodingName == "utf16")
+        {
+            return 1200u;
+        }
+        if (normalizedEncodingName == "utf16le")
+        {
+            return 1200u;
+        }
+        if (normalizedEncodingName == "utf16be")
+        {
+            return 1201u;
+        }
+        if (normalizedEncodingName == "utf32")
+        {
+            return 12000u;
+        }
+        if (normalizedEncodingName == "utf32le")
+        {
+            return 12000u;
+        }
+        if (normalizedEncodingName == "utf32be")
+        {
+            return 12001u;
+        }
+        if (normalizedEncodingName == "gbk")
+        {
+            return 936u;
+        }
+        if (normalizedEncodingName == "gb2312" || normalizedEncodingName == "euccn")
+        {
+            return 20936u;
+        }
+        if (normalizedEncodingName == "gb18030")
+        {
+            return 54936u;
+        }
+        if (normalizedEncodingName == "big5")
+        {
+            return 950u;
+        }
+        if (normalizedEncodingName == "big5hkscs")
+        {
+            return 950u;
+        }
+        if (normalizedEncodingName == "shiftjis" || normalizedEncodingName == "sjis" ||
+            normalizedEncodingName == "windows31j" || normalizedEncodingName == "mskanji")
+        {
+            return 932u;
+        }
+        if (normalizedEncodingName == "euckr" || normalizedEncodingName == "ksc5601" ||
+            normalizedEncodingName == "ksx1001" || normalizedEncodingName == "uhc")
+        {
+            return 949u;
+        }
+        if (normalizedEncodingName == "koi8r")
+        {
+            return 20866u;
+        }
+        if (normalizedEncodingName == "koi8u")
+        {
+            return 21866u;
+        }
+
+        const UINT isoCodePage = ResolveIso8859WindowsCodePage(normalizedEncodingName);
+        if (isoCodePage != 0u)
+        {
+            return isoCodePage;
+        }
+
+        unsigned int parsedCodePage = 0;
+        if (TryParseUnsignedInteger(normalizedEncodingName, parsedCodePage))
+        {
+            return static_cast<UINT>(parsedCodePage);
+        }
+        if (normalizedEncodingName.size() > 2 && normalizedEncodingName.compare(0, 2, "cp") == 0 &&
+            TryParseUnsignedInteger(normalizedEncodingName.substr(2), parsedCodePage))
+        {
+            return static_cast<UINT>(parsedCodePage);
+        }
+        if (normalizedEncodingName.size() > 7 && normalizedEncodingName.compare(0, 7, "windows") == 0 &&
+            TryParseUnsignedInteger(normalizedEncodingName.substr(7), parsedCodePage))
+        {
+            return static_cast<UINT>(parsedCodePage);
+        }
+        if (normalizedEncodingName.size() > 2 && normalizedEncodingName.compare(0, 2, "ms") == 0 &&
+            TryParseUnsignedInteger(normalizedEncodingName.substr(2), parsedCodePage))
+        {
+            return static_cast<UINT>(parsedCodePage);
+        }
+        if (normalizedEncodingName.size() > 3 && normalizedEncodingName.compare(0, 3, "ibm") == 0 &&
+            TryParseUnsignedInteger(normalizedEncodingName.substr(3), parsedCodePage))
+        {
+            return static_cast<UINT>(parsedCodePage);
+        }
+
+        throw runtime_error("Unsupported encoding name: " + encodingName);
+    }
+
+    static wstring ConvertBytesToWideStringByCodePage(const string& rawBytes, UINT codePage)
+    {
+        if (rawBytes.empty())
+        {
+            return {};
+        }
+
+        DWORD flags = MB_ERR_INVALID_CHARS;
+        int wideLength = ::MultiByteToWideChar(
+            codePage,
+            flags,
+            rawBytes.data(),
+            internal::ToWinApiLengthChecked(rawBytes.size()),
+            nullptr,
+            0
+        );
+
+        if (wideLength <= 0)
+        {
+            const DWORD lastError = ::GetLastError();
+            if (lastError == ERROR_INVALID_FLAGS)
+            {
+                flags = 0;
+                wideLength = ::MultiByteToWideChar(
+                    codePage,
+                    flags,
+                    rawBytes.data(),
+                    internal::ToWinApiLengthChecked(rawBytes.size()),
+                    nullptr,
+                    0
+                );
+            }
+        }
+
+        if (wideLength <= 0)
+        {
+            throw runtime_error("MultiByteToWideChar failed for specified source encoding.");
+        }
+
+        wstring wideString(static_cast<size_t>(wideLength), L'\0');
+        const int written = ::MultiByteToWideChar(
+            codePage,
+            flags,
+            rawBytes.data(),
+            internal::ToWinApiLengthChecked(rawBytes.size()),
+            &wideString[0],
+            wideLength
+        );
+        if (written <= 0)
+        {
+            throw runtime_error("MultiByteToWideChar failed for specified source encoding.");
+        }
+
+        return wideString;
+    }
+#else
+    static void AddUniqueEncodingCandidate(vector<string>& candidates, const string& candidate)
+    {
+        if (candidate.empty())
+        {
+            return;
+        }
+
+        if (std::find(candidates.begin(), candidates.end(), candidate) == candidates.end())
+        {
+            candidates.push_back(candidate);
+        }
+    }
+
+    static void AddWindowsCodePageCandidates(vector<string>& candidates, unsigned int codePage)
+    {
+        AddUniqueEncodingCandidate(candidates, "CP" + std::to_string(codePage));
+        AddUniqueEncodingCandidate(candidates, "WINDOWS-" + std::to_string(codePage));
+        AddUniqueEncodingCandidate(candidates, std::to_string(codePage));
+    }
+
+    static vector<string> ResolveEncodingNameToPosixCandidates(const string& encodingName)
+    {
+        const string normalizedEncodingName = NormalizeEncodingName(encodingName);
+        if (normalizedEncodingName.empty())
+        {
+            throw runtime_error("Encoding name is empty.");
+        }
+
+        vector<string> candidates;
+        candidates.reserve(4);
+
+        if (IsUtf8EncodingName(normalizedEncodingName))
+        {
+            AddUniqueEncodingCandidate(candidates, "UTF-8");
+            return candidates;
+        }
+        if (IsAsciiEncodingName(normalizedEncodingName))
+        {
+            AddUniqueEncodingCandidate(candidates, "ASCII");
+            AddUniqueEncodingCandidate(candidates, "US-ASCII");
+            return candidates;
+        }
+        if (normalizedEncodingName == "utf16")
+        {
+            AddUniqueEncodingCandidate(candidates, "UTF-16");
+            return candidates;
+        }
+        if (normalizedEncodingName == "utf16le")
+        {
+            AddUniqueEncodingCandidate(candidates, "UTF-16LE");
+            return candidates;
+        }
+        if (normalizedEncodingName == "utf16be")
+        {
+            AddUniqueEncodingCandidate(candidates, "UTF-16BE");
+            return candidates;
+        }
+        if (normalizedEncodingName == "utf32")
+        {
+            AddUniqueEncodingCandidate(candidates, "UTF-32");
+            return candidates;
+        }
+        if (normalizedEncodingName == "utf32le")
+        {
+            AddUniqueEncodingCandidate(candidates, "UTF-32LE");
+            return candidates;
+        }
+        if (normalizedEncodingName == "utf32be")
+        {
+            AddUniqueEncodingCandidate(candidates, "UTF-32BE");
+            return candidates;
+        }
+        if (normalizedEncodingName == "gbk")
+        {
+            AddUniqueEncodingCandidate(candidates, "GBK");
+            AddUniqueEncodingCandidate(candidates, "CP936");
+            return candidates;
+        }
+        if (normalizedEncodingName == "gb2312" || normalizedEncodingName == "euccn")
+        {
+            AddUniqueEncodingCandidate(candidates, "GB2312");
+            AddUniqueEncodingCandidate(candidates, "EUC-CN");
+            return candidates;
+        }
+        if (normalizedEncodingName == "gb18030")
+        {
+            AddUniqueEncodingCandidate(candidates, "GB18030");
+            return candidates;
+        }
+        if (normalizedEncodingName == "big5")
+        {
+            AddUniqueEncodingCandidate(candidates, "BIG5");
+            AddUniqueEncodingCandidate(candidates, "CP950");
+            return candidates;
+        }
+        if (normalizedEncodingName == "big5hkscs")
+        {
+            AddUniqueEncodingCandidate(candidates, "BIG5-HKSCS");
+            AddUniqueEncodingCandidate(candidates, "BIG5HKSCS");
+            AddUniqueEncodingCandidate(candidates, "BIG5");
+            return candidates;
+        }
+        if (normalizedEncodingName == "shiftjis" || normalizedEncodingName == "sjis" ||
+            normalizedEncodingName == "windows31j" || normalizedEncodingName == "mskanji")
+        {
+            AddUniqueEncodingCandidate(candidates, "SHIFT_JIS");
+            AddUniqueEncodingCandidate(candidates, "CP932");
+            AddUniqueEncodingCandidate(candidates, "WINDOWS-31J");
+            return candidates;
+        }
+        if (normalizedEncodingName == "euckr")
+        {
+            AddUniqueEncodingCandidate(candidates, "EUC-KR");
+            AddUniqueEncodingCandidate(candidates, "CP949");
+            return candidates;
+        }
+        if (normalizedEncodingName == "ksc5601" || normalizedEncodingName == "ksx1001" || normalizedEncodingName == "uhc")
+        {
+            AddUniqueEncodingCandidate(candidates, "CP949");
+            AddUniqueEncodingCandidate(candidates, "UHC");
+            AddUniqueEncodingCandidate(candidates, "EUC-KR");
+            return candidates;
+        }
+        if (normalizedEncodingName == "koi8r")
+        {
+            AddUniqueEncodingCandidate(candidates, "KOI8-R");
+            return candidates;
+        }
+        if (normalizedEncodingName == "koi8u")
+        {
+            AddUniqueEncodingCandidate(candidates, "KOI8-U");
+            return candidates;
+        }
+
+        if (normalizedEncodingName.size() > 7 && normalizedEncodingName.compare(0, 7, "iso8859") == 0)
+        {
+            const string suffix = normalizedEncodingName.substr(7);
+            unsigned int isoPart = 0;
+            if (TryParseUnsignedInteger(suffix, isoPart))
+            {
+                AddUniqueEncodingCandidate(candidates, "ISO-8859-" + std::to_string(isoPart));
+                return candidates;
+            }
+        }
+
+        unsigned int codePage = 0;
+        if (TryParseUnsignedInteger(normalizedEncodingName, codePage))
+        {
+            AddWindowsCodePageCandidates(candidates, codePage);
+            return candidates;
+        }
+        if (normalizedEncodingName.size() > 2 && normalizedEncodingName.compare(0, 2, "cp") == 0 &&
+            TryParseUnsignedInteger(normalizedEncodingName.substr(2), codePage))
+        {
+            AddWindowsCodePageCandidates(candidates, codePage);
+            return candidates;
+        }
+        if (normalizedEncodingName.size() > 7 && normalizedEncodingName.compare(0, 7, "windows") == 0 &&
+            TryParseUnsignedInteger(normalizedEncodingName.substr(7), codePage))
+        {
+            AddWindowsCodePageCandidates(candidates, codePage);
+            return candidates;
+        }
+        if (normalizedEncodingName.size() > 2 && normalizedEncodingName.compare(0, 2, "ms") == 0 &&
+            TryParseUnsignedInteger(normalizedEncodingName.substr(2), codePage))
+        {
+            AddWindowsCodePageCandidates(candidates, codePage);
+            return candidates;
+        }
+        if (normalizedEncodingName.size() > 3 && normalizedEncodingName.compare(0, 3, "ibm") == 0 &&
+            TryParseUnsignedInteger(normalizedEncodingName.substr(3), codePage))
+        {
+            AddUniqueEncodingCandidate(candidates, "IBM" + std::to_string(codePage));
+            AddWindowsCodePageCandidates(candidates, codePage);
+            return candidates;
+        }
+
+        throw runtime_error("Unsupported encoding name: " + encodingName);
+    }
+
+    class IconvHandle
+    {
+    public:
+        explicit IconvHandle(iconv_t handleValue)
+            : handle(handleValue)
+        {
+        }
+
+        ~IconvHandle()
+        {
+            if (handle != reinterpret_cast<iconv_t>(-1))
+            {
+                iconv_close(handle);
+            }
+        }
+
+        iconv_t Get() const
+        {
+            return handle;
+        }
+
+        IconvHandle(const IconvHandle&) = delete;
+        IconvHandle& operator=(const IconvHandle&) = delete;
+
+    private:
+        iconv_t handle = reinterpret_cast<iconv_t>(-1);
+    };
+
+    static string ConvertBytesToUtf8ByIconv(const string& rawBytes, const string& fromEncoding)
+    {
+        iconv_t iconvDescriptor = iconv_open("UTF-8", fromEncoding.c_str());
+        if (iconvDescriptor == reinterpret_cast<iconv_t>(-1))
+        {
+            throw runtime_error("iconv_open failed for source encoding: " + fromEncoding);
+        }
+
+        IconvHandle iconvHandle(iconvDescriptor);
+
+        size_t outputCapacity = rawBytes.empty() ? static_cast<size_t>(32) : (rawBytes.size() * 4 + 32);
+        string output(outputCapacity, '\0');
+
+        char* inputPtr = const_cast<char*>(rawBytes.data());
+        size_t inputBytesLeft = rawBytes.size();
+        char* outputPtr = &output[0];
+        size_t outputBytesLeft = output.size();
+
+        while (true)
+        {
+            errno = 0;
+            const size_t result = iconv(iconvHandle.Get(), &inputPtr, &inputBytesLeft, &outputPtr, &outputBytesLeft);
+            if (result != static_cast<size_t>(-1))
+            {
+                break;
+            }
+
+            if (errno == E2BIG)
+            {
+                const size_t usedSize = output.size() - outputBytesLeft;
+                output.resize(output.size() * 2 + 32);
+                outputPtr = &output[0] + usedSize;
+                outputBytesLeft = output.size() - usedSize;
+                continue;
+            }
+            if (errno == EILSEQ)
+            {
+                throw runtime_error("Invalid byte sequence for source encoding: " + fromEncoding);
+            }
+            if (errno == EINVAL)
+            {
+                throw runtime_error("Incomplete multibyte sequence for source encoding: " + fromEncoding);
+            }
+
+            throw runtime_error("iconv conversion failed for source encoding: " + fromEncoding);
+        }
+
+        while (true)
+        {
+            errno = 0;
+            const size_t result = iconv(iconvHandle.Get(), nullptr, nullptr, &outputPtr, &outputBytesLeft);
+            if (result != static_cast<size_t>(-1))
+            {
+                break;
+            }
+
+            if (errno == E2BIG)
+            {
+                const size_t usedSize = output.size() - outputBytesLeft;
+                output.resize(output.size() * 2 + 32);
+                outputPtr = &output[0] + usedSize;
+                outputBytesLeft = output.size() - usedSize;
+                continue;
+            }
+
+            throw runtime_error("iconv flush failed for source encoding: " + fromEncoding);
+        }
+
+        output.resize(output.size() - outputBytesLeft);
+        return output;
+    }
+#endif
+}
+
 string GB_MakeUtf8String(const char* s)
 {
     if (!s)
@@ -1498,6 +2074,76 @@ string GB_AnsiToUtf8(const string& ansiStr)
     }
 #endif
 }
+
+
+string GB_BytesToUtf8(const string& rawBytes, const string& encodingName)
+{
+    if (rawBytes.empty())
+    {
+        return {};
+    }
+
+    const string normalizedEncodingName = internal::NormalizeEncodingName(encodingName);
+    if (normalizedEncodingName.empty())
+    {
+        throw runtime_error("Encoding name is empty.");
+    }
+
+    if (internal::IsUtf8EncodingName(normalizedEncodingName))
+    {
+        if (!GB_IsUtf8(rawBytes))
+        {
+            throw runtime_error("Input bytes are not valid UTF-8.");
+        }
+        return rawBytes;
+    }
+
+    if (internal::IsAsciiEncodingName(normalizedEncodingName))
+    {
+        if (!internal::IsAllAscii(rawBytes))
+        {
+            throw runtime_error("Input bytes are not valid ASCII.");
+        }
+        return rawBytes;
+    }
+
+    if (internal::IsLatin1EncodingName(normalizedEncodingName))
+    {
+        return internal::Latin1ToUtf8(rawBytes);
+    }
+
+#if defined(_WIN32)
+    const UINT codePage = internal::ResolveEncodingNameToWindowsCodePage(encodingName);
+    if (codePage != CP_UTF8 && !::IsValidCodePage(codePage))
+    {
+        throw runtime_error("Unsupported Windows code page for encoding: " + encodingName);
+    }
+
+    const wstring wideString = internal::ConvertBytesToWideStringByCodePage(rawBytes, codePage);
+    return GB_WStringToUtf8(wideString);
+#else
+    const vector<string> candidates = internal::ResolveEncodingNameToPosixCandidates(encodingName);
+    for (size_t i = 0; i < candidates.size(); i++)
+    {
+        try
+        {
+            return internal::ConvertBytesToUtf8ByIconv(rawBytes, candidates[i]);
+        }
+        catch (const runtime_error& ex)
+        {
+            const string errorMessage = ex.what();
+            if (errorMessage.find("iconv_open failed") != string::npos)
+            {
+                continue;
+            }
+            throw;
+        }
+    }
+
+    throw runtime_error("Unsupported encoding name on current POSIX iconv implementation: " + encodingName);
+#endif
+}
+
 
 bool GB_IsUtf8(const string& text)
 {
