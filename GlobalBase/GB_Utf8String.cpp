@@ -1,5 +1,6 @@
 ﻿#include "GB_Utf8String.h"
 #include <unordered_set>
+#include <algorithm>
 #include <stdexcept>
 #include <climits>
 #include <mutex>
@@ -9,6 +10,10 @@
 
 #if defined(_WIN32)
 #include <windows.h>
+#include <shlwapi.h>
+#if defined(_MSC_VER)
+#pragma comment(lib, "Shlwapi.lib")
+#endif
 #else
 #include <clocale>
 #include <cwchar>
@@ -1142,6 +1147,137 @@ namespace internal
         }
         return 0;
     }
+
+    static int NormalizeCompareResult(int compareResult)
+    {
+        if (compareResult < 0)
+        {
+            return -1;
+        }
+        if (compareResult > 0)
+        {
+            return 1;
+        }
+        return 0;
+    }
+
+    static bool IsAsciiDigitCodePoint(char32_t codePoint)
+    {
+        return codePoint >= U'0' && codePoint <= U'9';
+    }
+
+    static size_t FindAsciiDigitRunEnd(const string& text, size_t startPos)
+    {
+        size_t pos = startPos;
+        while (pos < text.size())
+        {
+            char32_t codePoint = 0;
+            size_t nextPos = pos;
+            internal::DecodeOneOrReplacement(text, pos, codePoint, nextPos);
+            if (nextPos != pos + 1 || !IsAsciiDigitCodePoint(codePoint))
+            {
+                break;
+            }
+            pos = nextPos;
+        }
+        return pos;
+    }
+
+    static int CompareAsciiDigitRuns(const string& leftText, size_t leftBegin, size_t leftEnd, const string& rightText, size_t rightBegin, size_t rightEnd)
+    {
+        size_t leftSignificantBegin = leftBegin;
+        while (leftSignificantBegin < leftEnd && leftText[leftSignificantBegin] == '0')
+        {
+            leftSignificantBegin++;
+        }
+
+        size_t rightSignificantBegin = rightBegin;
+        while (rightSignificantBegin < rightEnd && rightText[rightSignificantBegin] == '0')
+        {
+            rightSignificantBegin++;
+        }
+
+        const size_t leftSignificantLength = leftEnd - leftSignificantBegin;
+        const size_t rightSignificantLength = rightEnd - rightSignificantBegin;
+        if (leftSignificantLength != rightSignificantLength)
+        {
+            return (leftSignificantLength < rightSignificantLength) ? -1 : 1;
+        }
+
+        if (leftSignificantLength > 0)
+        {
+            const int contentCompare = std::char_traits<char>::compare(
+                leftText.data() + leftSignificantBegin,
+                rightText.data() + rightSignificantBegin,
+                leftSignificantLength
+            );
+            if (contentCompare != 0)
+            {
+                return NormalizeCompareResult(contentCompare);
+            }
+        }
+
+        const size_t leftTotalLength = leftEnd - leftBegin;
+        const size_t rightTotalLength = rightEnd - rightBegin;
+        if (leftTotalLength != rightTotalLength)
+        {
+            return (leftTotalLength > rightTotalLength) ? -1 : 1;
+        }
+
+        return 0;
+    }
+
+    static int CompareLogicalUtf8Fallback(const string& text1Utf8, const string& text2Utf8)
+    {
+        size_t pos1 = 0;
+        size_t pos2 = 0;
+
+        while (pos1 < text1Utf8.size() && pos2 < text2Utf8.size())
+        {
+            char32_t codePoint1 = 0;
+            char32_t codePoint2 = 0;
+            size_t nextPos1 = pos1;
+            size_t nextPos2 = pos2;
+            internal::DecodeOneOrReplacement(text1Utf8, pos1, codePoint1, nextPos1);
+            internal::DecodeOneOrReplacement(text2Utf8, pos2, codePoint2, nextPos2);
+
+            if (nextPos1 == pos1 + 1 && nextPos2 == pos2 + 1 &&
+                IsAsciiDigitCodePoint(codePoint1) && IsAsciiDigitCodePoint(codePoint2))
+            {
+                const size_t digitRunEnd1 = FindAsciiDigitRunEnd(text1Utf8, pos1);
+                const size_t digitRunEnd2 = FindAsciiDigitRunEnd(text2Utf8, pos2);
+                const int numberCompare = CompareAsciiDigitRuns(text1Utf8, pos1, digitRunEnd1, text2Utf8, pos2, digitRunEnd2);
+                if (numberCompare != 0)
+                {
+                    return numberCompare;
+                }
+
+                pos1 = digitRunEnd1;
+                pos2 = digitRunEnd2;
+                continue;
+            }
+
+            const char32_t normalizedCodePoint1 = internal::ToLowerAscii(codePoint1);
+            const char32_t normalizedCodePoint2 = internal::ToLowerAscii(codePoint2);
+            if (normalizedCodePoint1 != normalizedCodePoint2)
+            {
+                return (normalizedCodePoint1 < normalizedCodePoint2) ? -1 : 1;
+            }
+
+            pos1 = nextPos1;
+            pos2 = nextPos2;
+        }
+
+        if (pos1 < text1Utf8.size())
+        {
+            return 1;
+        }
+        if (pos2 < text2Utf8.size())
+        {
+            return -1;
+        }
+        return 0;
+    }
 }
 
 string GB_MakeUtf8String(const char* s)
@@ -1925,6 +2061,24 @@ bool GB_Utf8Equals(const std::string& text1Utf8, const std::string& text2Utf8, b
         }
     }
     return true;
+}
+
+int GB_Utf8CompareLogical(const std::string& text1Utf8, const std::string& text2Utf8)
+{
+#if defined(_WIN32)
+    try
+    {
+        const std::wstring text1Wide = GB_Utf8ToWString(text1Utf8);
+        const std::wstring text2Wide = GB_Utf8ToWString(text2Utf8);
+        return internal::NormalizeCompareResult(::StrCmpLogicalW(text1Wide.c_str(), text2Wide.c_str()));
+    }
+    catch (const std::exception&)
+    {
+        return internal::CompareLogicalUtf8Fallback(text1Utf8, text2Utf8);
+    }
+#else
+    return internal::CompareLogicalUtf8Fallback(text1Utf8, text2Utf8);
+#endif
 }
 
 

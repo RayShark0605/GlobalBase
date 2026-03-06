@@ -92,6 +92,12 @@ GLOBALBASE_PORT std::vector<std::string> GB_Utf8Split(const std::string& textUtf
 // 说明：本函数不校验 UTF-8 合法性，也不做任何编码转换；复杂度 O(N)，不分配额外内存。
 GLOBALBASE_PORT bool GB_Utf8Equals(const std::string& text1Utf8, const std::string& text2Utf8, bool caseSensitive = true);
 
+// 按 Windows 文件名排序方式（logical compare / natural compare）比较两个 UTF-8 字符串。
+// - Windows：对合法 UTF-8 输入，直接调用 StrCmpLogicalW，行为与 Windows 文件资源管理器中的文件名排序保持一致。
+// - 非 Windows，或输入不是合法 UTF-8：退化为库内兼容实现（数字按数值比较、ASCII 大小写不敏感）。
+// 返回值：< 0 表示 text1Utf8 < text2Utf8；0 表示等价；> 0 表示 text1Utf8 > text2Utf8。
+GLOBALBASE_PORT int GB_Utf8CompareLogical(const std::string& text1Utf8, const std::string& text2Utf8);
+
 // 检查 UTF-8 字符串是否以指定的 UTF-8 字符串开头（可选大小写敏感）
 GLOBALBASE_PORT bool GB_Utf8StartsWith(const std::string& textUtf8, const std::string& targetUtf8, bool caseSensitive = true);
 

@@ -5,7 +5,7 @@
 #include "GB_BaseTypes.h"
 #include <string>
 
-GLOBALBASE_PORT bool GB_WriteUtf8ToFile(const std::string& filePathUtf8, const std::string& utf8Content, bool appendMode = true, bool addBomIfNewFile = false);
+GLOBALBASE_PORT bool GB_WriteUtf8ToFile(const std::string& filePathUtf8, const std::string& utf8Content, bool appendMode = false, bool addBomIfNewFile = true);
 
 GLOBALBASE_PORT GB_ByteBuffer GB_ReadFileToBinary(const std::string& filePathUtf8);
 
