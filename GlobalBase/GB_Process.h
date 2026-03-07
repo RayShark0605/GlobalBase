@@ -27,6 +27,22 @@ GLOBALBASE_PORT bool GB_IsRunningAsAdmin();
 GLOBALBASE_PORT bool GB_EnsureRunningAsAdmin();
 
 /**
+ * @brief 立即结束当前进程（自我关闭）。
+ *
+ * @param exitCode 进程退出码。
+ *
+ * @remarks
+ * - 这是一个底层“直接退出当前进程”的接口；调用成功后当前进程不会继续执行。
+ * - 为了尽量统一跨平台语义，本接口采用“立即终止当前进程”的策略：
+ *   - Windows：调用 ExitProcess。
+ *   - Linux：调用 _exit。
+ * - 因此它不会进行当前调用栈的 C++ 自动对象析构/栈展开；
+ *   若业务层需要保存数据、刷新日志、释放关键资源，请在调用前先自行完成。
+ * - 退出码在不同平台上的可观察范围可能存在差异：例如 POSIX 父进程通常只能观察到低 8 位。
+ */
+GLOBALBASE_PORT void GB_ExitCurrentProcess(int exitCode = 0);
+
+/**
  * @brief 进程信息。
  *
  * @remarks
@@ -183,12 +199,5 @@ GLOBALBASE_PORT std::vector<std::string> GB_GetExportedFunctionSignatures(const 
  * @return 外部函数列表。
  */
 GLOBALBASE_PORT std::vector<std::string> GB_GetImportedFunctionSignatures(const std::string& filePathUtf8, bool onlyFunctionNames = true);
-
-
-
-
-
-
-
 
 #endif

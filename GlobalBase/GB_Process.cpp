@@ -1382,6 +1382,15 @@ bool GB_EnsureRunningAsAdmin()
 #endif
 }
 
+void GB_ExitCurrentProcess(int exitCode)
+{
+#ifdef _WIN32
+    ::ExitProcess(static_cast<UINT>(exitCode));
+#else
+    ::_exit(exitCode);
+#endif
+}
+
 std::vector<GB_ProcessInfo> GB_GetAllProcessesInfo()
 {
     std::vector<GB_ProcessInfo> processesInfo;
