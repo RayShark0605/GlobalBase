@@ -1,4 +1,5 @@
 ﻿#include "GB_DateTime.h"
+#include "GB_Network.h"
 
 #include <algorithm>
 #include <chrono>
@@ -590,6 +591,415 @@ namespace
 #endif
 		outTm = temp;
 		return true;
+	}
+
+
+	inline char ToLowerAscii(char ch)
+	{
+		if (ch >= 'A' && ch <= 'Z')
+		{
+			return static_cast<char>(ch - 'A' + 'a');
+		}
+		return ch;
+	}
+
+	inline bool EqualsAsciiIgnoreCase(const char* leftData, size_t leftLength, const char* rightData, size_t rightLength)
+	{
+		if (leftData == nullptr || rightData == nullptr)
+		{
+			return false;
+		}
+		if (leftLength != rightLength)
+		{
+			return false;
+		}
+
+		for (size_t i = 0; i < leftLength; i++)
+		{
+			if (ToLowerAscii(leftData[i]) != ToLowerAscii(rightData[i]))
+			{
+				return false;
+			}
+		}
+		return true;
+	}
+
+	inline bool EqualsAsciiIgnoreCase(const std::string& left, const char* rightLiteral)
+	{
+		if (rightLiteral == nullptr)
+		{
+			return false;
+		}
+		return EqualsAsciiIgnoreCase(left.data(), left.size(), rightLiteral, std::strlen(rightLiteral));
+	}
+
+	inline int ParseHttpMonth(const char* data, size_t length)
+	{
+		if (data == nullptr || length != 3)
+		{
+			return 0;
+		}
+
+		static const char* const monthNames[12] =
+		{
+			"Jan", "Feb", "Mar", "Apr", "May", "Jun",
+			"Jul", "Aug", "Sep", "Oct", "Nov", "Dec"
+		};
+
+		for (int i = 0; i < 12; i++)
+		{
+			if (EqualsAsciiIgnoreCase(data, length, monthNames[i], 3))
+			{
+				return i + 1;
+			}
+		}
+
+		return 0;
+	}
+
+	inline int ExpandHttpRfc850Year(int twoDigitYear)
+	{
+		if (twoDigitYear < 0 || twoDigitYear > 99)
+		{
+			return -1;
+		}
+
+		const std::time_t nowTime = std::time(nullptr);
+		std::tm nowUtcTm = {};
+		int currentYear = 2000;
+		if (nowTime != static_cast<std::time_t>(-1) && GetGmTm(nowTime, nowUtcTm))
+		{
+			currentYear = nowUtcTm.tm_year + 1900;
+		}
+
+		int expandedYear = (currentYear / 100) * 100 + twoDigitYear;
+		if (expandedYear > currentYear + 50)
+		{
+			expandedYear -= 100;
+		}
+		return expandedYear;
+	}
+
+	inline bool TryConvertUtcCivilToUnixSeconds(
+		int year,
+		int month,
+		int day,
+		int hour,
+		int minute,
+		int second,
+		long long& outUnixSeconds)
+	{
+		if (month < 1 || month > 12 || day < 1 || day > 31 || hour < 0 || hour > 23 || minute < 0 || minute > 59 || second < 0 || second > 60)
+		{
+			return false;
+		}
+
+		const GB_Date date(year, month, day);
+		if (!date.IsValid())
+		{
+			return false;
+		}
+
+		const bool hasLeapSecond = (second == 60);
+		const int normalizedSecond = hasLeapSecond ? 59 : second;
+
+		std::tm utcTm = {};
+		utcTm.tm_year = year - 1900;
+		utcTm.tm_mon = month - 1;
+		utcTm.tm_mday = day;
+		utcTm.tm_hour = hour;
+		utcTm.tm_min = minute;
+		utcTm.tm_sec = normalizedSecond;
+		utcTm.tm_isdst = 0;
+
+#if defined(_WIN32)
+		const std::time_t timeValue = _mkgmtime(&utcTm);
+#else
+		const std::time_t timeValue = timegm(&utcTm);
+#endif
+
+		std::tm roundTripUtcTm = {};
+		if (!GetGmTm(timeValue, roundTripUtcTm))
+		{
+			return false;
+		}
+		if (roundTripUtcTm.tm_year != (year - 1900)
+			|| roundTripUtcTm.tm_mon != (month - 1)
+			|| roundTripUtcTm.tm_mday != day
+			|| roundTripUtcTm.tm_hour != hour
+			|| roundTripUtcTm.tm_min != minute
+			|| roundTripUtcTm.tm_sec != normalizedSecond)
+		{
+			return false;
+		}
+
+		long long unixSeconds = static_cast<long long>(timeValue);
+		if (hasLeapSecond)
+		{
+			if (unixSeconds == std::numeric_limits<long long>::max())
+			{
+				return false;
+			}
+			unixSeconds += 1;
+		}
+
+		outUnixSeconds = unixSeconds;
+		return true;
+	}
+
+	inline bool TryParseHttpImfFixdate(const std::string& httpDate, long long& outUnixSeconds)
+	{
+		const size_t length = httpDate.size();
+		if (length != 29)
+		{
+			return false;
+		}
+		const char* data = httpDate.data();
+		if (data[3] != ',' || data[4] != ' ' || data[7] != ' ' || data[11] != ' ' || data[16] != ' ' || data[19] != ':' || data[22] != ':' || data[25] != ' ')
+		{
+			return false;
+		}
+		if (!EqualsAsciiIgnoreCase(data + 26, 3, "GMT", 3))
+		{
+			return false;
+		}
+
+		int day = 0;
+		int year = 0;
+		int hour = 0;
+		int minute = 0;
+		int second = 0;
+		if (!ParseFixedDigits(data, length, 5, 2, day)
+			|| !ParseFixedDigits(data, length, 12, 4, year)
+			|| !ParseFixedDigits(data, length, 17, 2, hour)
+			|| !ParseFixedDigits(data, length, 20, 2, minute)
+			|| !ParseFixedDigits(data, length, 23, 2, second))
+		{
+			return false;
+		}
+
+		const int month = ParseHttpMonth(data + 8, 3);
+		if (month == 0)
+		{
+			return false;
+		}
+
+		return TryConvertUtcCivilToUnixSeconds(year, month, day, hour, minute, second, outUnixSeconds);
+	}
+
+	inline bool TryParseHttpRfc850Date(const std::string& httpDate, long long& outUnixSeconds)
+	{
+		const std::string::size_type commaPos = httpDate.find(',');
+		if (commaPos == std::string::npos)
+		{
+			return false;
+		}
+		if (commaPos + 2 >= httpDate.size() || httpDate[commaPos + 1] != ' ')
+		{
+			return false;
+		}
+
+		const size_t datePos = commaPos + 2;
+		if (datePos + 18 > httpDate.size())
+		{
+			return false;
+		}
+		const char* data = httpDate.data();
+		if (data[datePos + 2] != '-' || data[datePos + 6] != '-' || data[datePos + 9] != ' ' || data[datePos + 12] != ':' || data[datePos + 15] != ':' || data[datePos + 18] != ' ')
+		{
+			return false;
+		}
+
+		const size_t gmtPos = datePos + 19;
+		if (gmtPos + 3 != httpDate.size())
+		{
+			return false;
+		}
+		if (!EqualsAsciiIgnoreCase(data + gmtPos, 3, "GMT", 3))
+		{
+			return false;
+		}
+
+		int day = 0;
+		int twoDigitYear = 0;
+		int hour = 0;
+		int minute = 0;
+		int second = 0;
+		if (!ParseFixedDigits(data, httpDate.size(), datePos + 0, 2, day)
+			|| !ParseFixedDigits(data, httpDate.size(), datePos + 7, 2, twoDigitYear)
+			|| !ParseFixedDigits(data, httpDate.size(), datePos + 10, 2, hour)
+			|| !ParseFixedDigits(data, httpDate.size(), datePos + 13, 2, minute)
+			|| !ParseFixedDigits(data, httpDate.size(), datePos + 16, 2, second))
+		{
+			return false;
+		}
+
+		const int month = ParseHttpMonth(data + datePos + 3, 3);
+		if (month == 0)
+		{
+			return false;
+		}
+
+		const int year = ExpandHttpRfc850Year(twoDigitYear);
+		if (year < 0)
+		{
+			return false;
+		}
+
+		return TryConvertUtcCivilToUnixSeconds(year, month, day, hour, minute, second, outUnixSeconds);
+	}
+
+	inline bool TryParseHttpAsctimeDate(const std::string& httpDate, long long& outUnixSeconds)
+	{
+		if (httpDate.size() != 24)
+		{
+			return false;
+		}
+
+		const char* data = httpDate.data();
+		if (data[3] != ' ' || data[7] != ' ' || data[10] != ' ' || data[13] != ':' || data[16] != ':' || data[19] != ' ')
+		{
+			return false;
+		}
+
+		const int month = ParseHttpMonth(data + 4, 3);
+		if (month == 0)
+		{
+			return false;
+		}
+
+		int day = 0;
+		if (data[8] == ' ')
+		{
+			if (data[9] < '0' || data[9] > '9')
+			{
+				return false;
+			}
+			day = data[9] - '0';
+		}
+		else
+		{
+			if (!ParseFixedDigits(data, httpDate.size(), 8, 2, day))
+			{
+				return false;
+			}
+		}
+
+		int year = 0;
+		int hour = 0;
+		int minute = 0;
+		int second = 0;
+		if (!ParseFixedDigits(data, httpDate.size(), 20, 4, year)
+			|| !ParseFixedDigits(data, httpDate.size(), 11, 2, hour)
+			|| !ParseFixedDigits(data, httpDate.size(), 14, 2, minute)
+			|| !ParseFixedDigits(data, httpDate.size(), 17, 2, second))
+		{
+			return false;
+		}
+
+		return TryConvertUtcCivilToUnixSeconds(year, month, day, hour, minute, second, outUnixSeconds);
+	}
+
+	inline bool TryParseHttpDateToUnixSeconds(const std::string& headerValueUtf8, long long& outUnixSeconds)
+	{
+		size_t start = 0;
+		size_t end = 0;
+		GetTrimmedAsciiRange(headerValueUtf8, start, end);
+		if (start >= end)
+		{
+			return false;
+		}
+
+		const std::string trimmed = headerValueUtf8.substr(start, end - start);
+		return TryParseHttpImfFixdate(trimmed, outUnixSeconds)
+			|| TryParseHttpRfc850Date(trimmed, outUnixSeconds)
+			|| TryParseHttpAsctimeDate(trimmed, outUnixSeconds);
+	}
+
+	inline bool TryExtractHttpDateHeader(const std::vector<std::string>& responseHeadersUtf8, std::string& outDateHeaderUtf8)
+	{
+		for (std::vector<std::string>::const_reverse_iterator it = responseHeadersUtf8.rbegin(); it != responseHeadersUtf8.rend(); ++it)
+		{
+			size_t lineStart = 0;
+			size_t lineEnd = 0;
+			GetTrimmedAsciiRange(*it, lineStart, lineEnd);
+			if (lineStart >= lineEnd)
+			{
+				continue;
+			}
+
+			const std::string line = it->substr(lineStart, lineEnd - lineStart);
+			const std::string::size_type colonPos = line.find(':');
+			if (colonPos == std::string::npos)
+			{
+				continue;
+			}
+
+			size_t keyStart = 0;
+			size_t keyEnd = colonPos;
+			GetTrimmedAsciiRange(line.data(), colonPos, keyStart, keyEnd);
+			if (keyStart >= keyEnd)
+			{
+				continue;
+			}
+
+			if (!EqualsAsciiIgnoreCase(line.data() + keyStart, keyEnd - keyStart, "Date", 4))
+			{
+				continue;
+			}
+
+			size_t valueStart = colonPos + 1;
+			size_t valueEnd = line.size();
+			GetTrimmedAsciiRange(line.data() + valueStart, line.size() - valueStart, valueStart, valueEnd);
+			outDateHeaderUtf8 = line.substr(colonPos + 1);
+			size_t finalStart = 0;
+			size_t finalEnd = 0;
+			GetTrimmedAsciiRange(outDateHeaderUtf8, finalStart, finalEnd);
+			outDateHeaderUtf8 = outDateHeaderUtf8.substr(finalStart, finalEnd - finalStart);
+			return !outDateHeaderUtf8.empty();
+		}
+
+		return false;
+	}
+
+	inline GB_DateTime TryRequestNetworkUtcNowFromUrl(const std::string& urlUtf8)
+	{
+		GB_NetworkRequestOptions options;
+		options.includeResponseHeaders = true;
+		options.followRedirects = true;
+		options.maxRedirects = 5;
+		options.connectTimeoutMs = 3000;
+		options.totalTimeoutMs = 5000;
+		options.headersUtf8.push_back("Cache-Control: no-cache");
+		options.headersUtf8.push_back("Pragma: no-cache");
+		options.headersUtf8.push_back("Accept: */*");
+
+		const long long nonceValue = static_cast<long long>(std::chrono::steady_clock::now().time_since_epoch().count());
+		const std::string requestUrlUtf8 = GB_UrlOperator::SetUrlQueryValue(
+			urlUtf8,
+			"_gbts",
+			std::to_string(nonceValue),
+			GB_UrlOperator::UrlQuerySetMode::Append);
+
+		const GB_NetworkResponse response = GB_RequestUrlData(requestUrlUtf8, options);
+		if (response.curlErrorCode != 0 || response.responseHeadersUtf8.empty())
+		{
+			return GB_DateTime::Invalid;
+		}
+
+		std::string dateHeaderUtf8;
+		if (!TryExtractHttpDateHeader(response.responseHeadersUtf8, dateHeaderUtf8))
+		{
+			return GB_DateTime::Invalid;
+		}
+
+		long long unixSeconds = 0;
+		if (!TryParseHttpDateToUnixSeconds(dateHeaderUtf8, unixSeconds))
+		{
+			return GB_DateTime::Invalid;
+		}
+
+		return GB_DateTime::CreateFromUnixSeconds(unixSeconds, GB_DateTimeSpec::UtcTime, 0);
 	}
 
 	constexpr uint32_t kTimeBinaryVersion = 1;
@@ -3089,6 +3499,32 @@ GB_DateTime GB_DateTime::UtcNow()
 	return CreateFromUnixMilliseconds(static_cast<long long>(ms), GB_DateTimeSpec::UtcTime, 0);
 }
 
+
+GB_DateTime GB_DateTime::GetUtcTimeFromNetwork()
+{
+	static const std::vector<std::string> candidateUrls =
+	{
+		"https://www.baidu.com/",
+		"https://www.qq.com/",
+		"https://www.aliyun.com/",
+		"https://www.cloudflare.com/",
+		"https://www.microsoft.com/",
+		"https://www.apple.com/",
+		"https://www.bing.com/"
+	};
+
+	for (size_t i = 0; i < candidateUrls.size(); i++)
+	{
+		const GB_DateTime networkUtcNow = TryRequestNetworkUtcNowFromUrl(candidateUrls[i]);
+		if (networkUtcNow.IsValid())
+		{
+			return networkUtcNow;
+		}
+	}
+
+	return GB_DateTime::Invalid;
+}
+
 GB_DateTime GB_DateTime::ToUtc() const
 {
 	if (!valid)
@@ -4135,6 +4571,45 @@ namespace
 		outMilliseconds = total;
 		return true;
 	}
+
+	inline GB_TimeDuration CreateFixedDurationFromMilliseconds(int64_t milliseconds)
+	{
+		GB_TimeDuration duration;
+		if (milliseconds == 0)
+		{
+			return duration;
+		}
+
+		const bool isNegative = (milliseconds < 0);
+		uint64_t absoluteMilliseconds = 0;
+		if (isNegative)
+		{
+			absoluteMilliseconds = static_cast<uint64_t>(-(milliseconds + 1)) + 1ULL;
+		}
+		else
+		{
+			absoluteMilliseconds = static_cast<uint64_t>(milliseconds);
+		}
+
+		const uint64_t millisecondsPerHour = 60ULL * 60ULL * 1000ULL;
+		const uint64_t millisecondsPerMinute = 60ULL * 1000ULL;
+
+		const uint64_t absoluteHours = absoluteMilliseconds / millisecondsPerHour;
+		absoluteMilliseconds %= millisecondsPerHour;
+
+		const uint64_t absoluteMinutes = absoluteMilliseconds / millisecondsPerMinute;
+		absoluteMilliseconds %= millisecondsPerMinute;
+
+		const uint64_t absoluteWholeSeconds = absoluteMilliseconds / 1000ULL;
+		const uint64_t absoluteMillisecondRemainder = absoluteMilliseconds % 1000ULL;
+
+		const int signedFactor = isNegative ? -1 : 1;
+		duration.hours = static_cast<int>(absoluteHours) * signedFactor;
+		duration.minutes = static_cast<int>(absoluteMinutes) * signedFactor;
+		duration.seconds = (static_cast<double>(absoluteWholeSeconds)
+			+ static_cast<double>(absoluteMillisecondRemainder) / 1000.0) * static_cast<double>(signedFactor);
+		return duration;
+	}
 }
 
 GB_TimeDuration GB_TimeDuration::CreateFromSeconds(double seconds)
@@ -4694,4 +5169,15 @@ GB_DateTime GB_DateTime::operator+(const GB_TimeDuration& duration) const
 GB_DateTime GB_DateTime::operator-(const GB_TimeDuration& duration) const
 {
 	return (-duration).AddToDateTime(*this);
+}
+
+GB_TimeDuration GB_DateTime::operator-(const GB_DateTime& other) const
+{
+	if (!IsValid() || !other.IsValid())
+	{
+		return GB_TimeDuration();
+	}
+
+	const int64_t deltaMilliseconds = other.MsecsTo(*this);
+	return CreateFixedDurationFromMilliseconds(deltaMilliseconds);
 }

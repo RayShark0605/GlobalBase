@@ -321,6 +321,10 @@ public:
 	static GB_DateTime Now();
 	static GB_DateTime UtcNow();
 
+	// 从网络响应头 Date 获取当前 UTC 时间；失败返回 Invalid。
+	// 注意：HTTP Date 通常仅精确到秒，因此返回值的毫秒部分为 0。
+	static GB_DateTime GetUtcTimeFromNetwork();
+
 	// 仅改变 Spec（同一时间点，不改变 unixMilliseconds）。
 	GB_DateTime ToUtc() const;
 	GB_DateTime ToLocal() const;
@@ -357,6 +361,11 @@ public:
 	GB_DateTime operator+(const GB_TimeDuration& duration) const;
 
 	GB_DateTime operator-(const GB_TimeDuration& duration) const;
+
+	// 两个时间点之差：this - other。
+	// 返回固定时长分量（仅使用 hours/minutes/seconds，不包含 years/months/weeks/days）。
+	// 若任一对象无效，则返回零时长。
+	GB_TimeDuration operator-(const GB_DateTime& other) const;
 
 	struct GB_DateTimeHash
 	{
