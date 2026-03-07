@@ -112,15 +112,6 @@ namespace internal
         return true;
     }
 
-    static bool DecodeSingleChar(const string& s, char32_t& codePoint)
-    {
-        size_t nextPos = 0;
-        if (!DecodeOne(s, 0, codePoint, nextPos))
-        {
-            return false;
-        }
-        return nextPos == s.size(); // 必须恰好一个码点
-    }
 
     static char32_t ToLowerAscii(char32_t cp)
     {
@@ -193,8 +184,54 @@ namespace internal
         return lps;
     }
 
+    static string ReplaceAllBytesExactFind(const string& text, const string& oldValue, const string& newValue)
+    {
+        if (text.empty() || oldValue.empty())
+        {
+            return text;
+        }
+        if (oldValue.size() > text.size())
+        {
+            return text;
+        }
+
+        string out;
+        out.reserve(text.size());
+
+        size_t searchPos = 0;
+        size_t matchPos = text.find(oldValue, searchPos);
+        if (matchPos == string::npos)
+        {
+            return text;
+        }
+
+        do
+        {
+            if (matchPos > searchPos)
+            {
+                out.append(text, searchPos, matchPos - searchPos);
+            }
+            out += newValue;
+
+            searchPos = matchPos + oldValue.size();
+            matchPos = text.find(oldValue, searchPos);
+        } while (matchPos != string::npos);
+
+        if (searchPos < text.size())
+        {
+            out.append(text, searchPos, text.size() - searchPos);
+        }
+
+        return out;
+    }
+
     static string ReplaceAllBytesKmp(const string& text, const string& oldValue, const string& newValue, bool caseSensitive)
     {
+        if (caseSensitive)
+        {
+            return ReplaceAllBytesExactFind(text, oldValue, newValue);
+        }
+
         if (text.empty() || oldValue.empty())
         {
             return text;
@@ -295,17 +332,6 @@ namespace internal
 #endif
     }
 
-    static wstring Utf8ToWString_Posix(const string& utf8Str)
-    {
-        std::wstring_convert<std::codecvt_utf8<wchar_t>> c8; // C++11 可用
-        return c8.from_bytes(utf8Str);
-    }
-
-    static string WStringToUtf8_Posix(const wstring& ws)
-    {
-        std::wstring_convert<std::codecvt_utf8<wchar_t>> c8;
-        return c8.to_bytes(ws);
-    }
 #endif // !_WIN32
 
     static bool IsAllAscii(const string& s)
@@ -564,163 +590,8 @@ namespace internal
         return 1;
     }
 
-    static int ComputeQualityScoreFromUtf8AssumingValid(const string& utf8Text)
-    {
-        size_t pos = 0;
-        bool isFirstCodePoint = true;
-        int score = 0;
 
-        while (pos < utf8Text.size())
-        {
-            char32_t codePoint = 0;
-            size_t nextPos = pos;
-            if (!internal::DecodeOne(utf8Text, pos, codePoint, nextPos))
-            {
-                // 理论上不应发生（调用方应确保 utf8Text 为合法 UTF-8）
-                return INT_MIN;
-            }
 
-            score += internal::ScoreCodePoint(codePoint, isFirstCodePoint);
-            isFirstCodePoint = false;
-            pos = nextPos;
-        }
-
-        return score;
-    }
-
-    static int ComputeQualityScoreFromWideString(const wstring& wideString)
-    {
-        bool isFirstCodePoint = true;
-        int score = 0;
-
-#if defined(_WIN32)
-        for (size_t i = 0; i < wideString.size(); i++)
-        {
-            const wchar_t w = wideString[i];
-            char32_t codePoint = static_cast<char32_t>(w);
-
-            // 处理 UTF-16 代理项对
-            if (w >= 0xD800 && w <= 0xDBFF)
-            {
-                if (i + 1 < wideString.size())
-                {
-                    const wchar_t w2 = wideString[i + 1];
-                    if (w2 >= 0xDC00 && w2 <= 0xDFFF)
-                    {
-                        const uint32_t high = static_cast<uint32_t>(w - 0xD800);
-                        const uint32_t low = static_cast<uint32_t>(w2 - 0xDC00);
-                        codePoint = static_cast<char32_t>(0x10000u + ((high << 10) | low));
-                        i++;
-                    }
-                    else
-                    {
-                        // 孤立高代理项
-                        codePoint = 0xFFFDu;
-                    }
-                }
-                else
-                {
-                    codePoint = 0xFFFDu;
-                }
-            }
-            else if (w >= 0xDC00 && w <= 0xDFFF)
-            {
-                // 孤立低代理项
-                codePoint = 0xFFFDu;
-            }
-
-            score += internal::ScoreCodePoint(codePoint, isFirstCodePoint);
-            isFirstCodePoint = false;
-        }
-#else
-        for (size_t i = 0; i < wideString.size(); i++)
-        {
-            const char32_t codePoint = static_cast<char32_t>(wideString[i]);
-            score += internal::ScoreCodePoint(codePoint, isFirstCodePoint);
-            isFirstCodePoint = false;
-        }
-#endif
-        return score;
-    }
-
-    static int ComputeQualityScoreFromAnsiBytes(const string& ansiBytes, bool& decodedOk)
-    {
-        decodedOk = false;
-
-        if (ansiBytes.empty())
-        {
-            decodedOk = true;
-            return 0;
-        }
-
-#if defined(_WIN32)
-        const UINT codePage = CP_ACP;
-
-        int wideLength = ::MultiByteToWideChar(
-            codePage,
-            MB_ERR_INVALID_CHARS,
-            ansiBytes.data(),
-            internal::ToWinApiLengthChecked(ansiBytes.size()),
-            nullptr,
-            0
-        );
-        if (wideLength <= 0)
-        {
-            decodedOk = false;
-            return INT_MIN;
-        }
-
-        wstring wideString(static_cast<size_t>(wideLength), L'\0');
-        const int written = ::MultiByteToWideChar(
-            codePage,
-            MB_ERR_INVALID_CHARS,
-            ansiBytes.data(),
-            internal::ToWinApiLengthChecked(ansiBytes.size()),
-            &wideString[0],
-            wideLength
-        );
-        if (written <= 0)
-        {
-            decodedOk = false;
-            return INT_MIN;
-        }
-
-        decodedOk = true;
-        return internal::ComputeQualityScoreFromWideString(wideString);
-
-#else
-        internal::EnsureLocaleInitialized();
-
-        const char* src = ansiBytes.c_str();
-        mbstate_t state = mbstate_t{};
-        errno = 0;
-        const size_t wideLength = mbsrtowcs(nullptr, &src, 0, &state);
-        if (wideLength == static_cast<size_t>(-1))
-        {
-            decodedOk = false;
-            return INT_MIN;
-        }
-
-        wstring wideString(wideLength, L'\0');
-        src = ansiBytes.c_str();
-        state = mbstate_t{};
-        errno = 0;
-        const size_t written = mbsrtowcs(&wideString[0], &src, wideLength, &state);
-        if (written == static_cast<size_t>(-1))
-        {
-            decodedOk = false;
-            return INT_MIN;
-        }
-
-        if (written < wideString.size())
-        {
-            wideString.resize(written);
-        }
-
-        decodedOk = true;
-        return internal::ComputeQualityScoreFromWideString(wideString);
-#endif
-    }
     static unordered_set<char32_t> BuildTrimSet(const string& trimCharsUtf8)
     {
         unordered_set<char32_t> st;
@@ -1228,6 +1099,34 @@ namespace internal
         return 0;
     }
 
+    static bool FindUtf8ByteOffsetByCharIndex(const string& text, int64_t targetCharIndex, size_t& byteOffset)
+    {
+        if (targetCharIndex < 0)
+        {
+            return false;
+        }
+
+        size_t textBytePos = 0;
+        int64_t textCharIndex = 0;
+
+        while (textBytePos < text.size() && textCharIndex < targetCharIndex)
+        {
+            char32_t codePoint = 0;
+            size_t nextPos = textBytePos;
+            internal::DecodeOneOrReplacement(text, textBytePos, codePoint, nextPos);
+            textBytePos = nextPos;
+            textCharIndex++;
+        }
+
+        if (textCharIndex != targetCharIndex)
+        {
+            return false;
+        }
+
+        byteOffset = textBytePos;
+        return true;
+    }
+
     static int CompareLogicalUtf8Fallback(const string& text1Utf8, const string& text2Utf8)
     {
         size_t pos1 = 0;
@@ -1332,21 +1231,277 @@ namespace internal
 
     static bool IsUtf8EncodingName(const string& normalizedEncodingName)
     {
-        return normalizedEncodingName == "utf8" || normalizedEncodingName == "utf-8";
+        return normalizedEncodingName == "utf8" ||
+            normalizedEncodingName == "cp65001";
     }
+
+    static bool IsUtf8BomEncodingName(const string& normalizedEncodingName)
+    {
+        return normalizedEncodingName == "utf8sig" ||
+            normalizedEncodingName == "utf8bom" ||
+            normalizedEncodingName == "utf8withbom" ||
+            normalizedEncodingName == "utf8signature";
+    }
+
+    static bool IsAnsiEncodingName(const string& normalizedEncodingName)
+    {
+        return normalizedEncodingName == "ansi" ||
+            normalizedEncodingName == "acp" ||
+            normalizedEncodingName == "system" ||
+            normalizedEncodingName == "default" ||
+            normalizedEncodingName == "current" ||
+            normalizedEncodingName == "native" ||
+            normalizedEncodingName == "locale";
+    }
+
+    static bool IsOemEncodingName(const string& normalizedEncodingName)
+    {
+        return normalizedEncodingName == "oem" ||
+            normalizedEncodingName == "oemcp";
+    }
+
+#if defined(_WIN32)
+    static bool ContainsNullCharacter(const string& text)
+    {
+        return text.find('\0') != string::npos;
+    }
+#endif
 
     static bool IsAsciiEncodingName(const string& normalizedEncodingName)
     {
         return normalizedEncodingName == "ascii" ||
             normalizedEncodingName == "usascii" ||
-            normalizedEncodingName == "ansix341968";
+            normalizedEncodingName == "ansix341968" ||
+            normalizedEncodingName == "iso646us";
     }
 
     static bool IsLatin1EncodingName(const string& normalizedEncodingName)
     {
         return normalizedEncodingName == "latin1" ||
             normalizedEncodingName == "latin" ||
-            normalizedEncodingName == "iso88591";
+            normalizedEncodingName == "iso88591" ||
+            normalizedEncodingName == "cp819" ||
+            normalizedEncodingName == "ibm819";
+    }
+
+    static bool IsUtf16EncodingName(const string& normalizedEncodingName)
+    {
+        return normalizedEncodingName == "utf16";
+    }
+
+    static bool IsUtf16LeEncodingName(const string& normalizedEncodingName)
+    {
+        return normalizedEncodingName == "utf16le";
+    }
+
+    static bool IsUtf16BeEncodingName(const string& normalizedEncodingName)
+    {
+        return normalizedEncodingName == "utf16be";
+    }
+
+    static bool IsUtf32EncodingName(const string& normalizedEncodingName)
+    {
+        return normalizedEncodingName == "utf32";
+    }
+
+    static bool IsUtf32LeEncodingName(const string& normalizedEncodingName)
+    {
+        return normalizedEncodingName == "utf32le";
+    }
+
+    static bool IsUtf32BeEncodingName(const string& normalizedEncodingName)
+    {
+        return normalizedEncodingName == "utf32be";
+    }
+
+    static void AppendUtf8CodePoint(string& utf8Text, uint32_t codePoint)
+    {
+        if (!internal::IsValidUnicode(codePoint))
+        {
+            throw runtime_error("Invalid Unicode code point.");
+        }
+
+        if (codePoint <= 0x7Fu)
+        {
+            utf8Text.push_back(static_cast<char>(codePoint));
+            return;
+        }
+
+        if (codePoint <= 0x7FFu)
+        {
+            utf8Text.push_back(static_cast<char>(0xC0u | (codePoint >> 6)));
+            utf8Text.push_back(static_cast<char>(0x80u | (codePoint & 0x3Fu)));
+            return;
+        }
+
+        if (codePoint <= 0xFFFFu)
+        {
+            utf8Text.push_back(static_cast<char>(0xE0u | (codePoint >> 12)));
+            utf8Text.push_back(static_cast<char>(0x80u | ((codePoint >> 6) & 0x3Fu)));
+            utf8Text.push_back(static_cast<char>(0x80u | (codePoint & 0x3Fu)));
+            return;
+        }
+
+        utf8Text.push_back(static_cast<char>(0xF0u | (codePoint >> 18)));
+        utf8Text.push_back(static_cast<char>(0x80u | ((codePoint >> 12) & 0x3Fu)));
+        utf8Text.push_back(static_cast<char>(0x80u | ((codePoint >> 6) & 0x3Fu)));
+        utf8Text.push_back(static_cast<char>(0x80u | (codePoint & 0x3Fu)));
+    }
+
+    static uint16_t ReadUint16(const string& rawBytes, size_t offset, bool littleEndian)
+    {
+        const unsigned char byte0 = static_cast<unsigned char>(rawBytes[offset]);
+        const unsigned char byte1 = static_cast<unsigned char>(rawBytes[offset + 1]);
+
+        if (littleEndian)
+        {
+            return static_cast<uint16_t>(byte0 | (static_cast<uint16_t>(byte1) << 8));
+        }
+
+        return static_cast<uint16_t>((static_cast<uint16_t>(byte0) << 8) | byte1);
+    }
+
+    static uint32_t ReadUint32(const string& rawBytes, size_t offset, bool littleEndian)
+    {
+        const unsigned char byte0 = static_cast<unsigned char>(rawBytes[offset]);
+        const unsigned char byte1 = static_cast<unsigned char>(rawBytes[offset + 1]);
+        const unsigned char byte2 = static_cast<unsigned char>(rawBytes[offset + 2]);
+        const unsigned char byte3 = static_cast<unsigned char>(rawBytes[offset + 3]);
+
+        if (littleEndian)
+        {
+            return static_cast<uint32_t>(byte0) |
+                (static_cast<uint32_t>(byte1) << 8) |
+                (static_cast<uint32_t>(byte2) << 16) |
+                (static_cast<uint32_t>(byte3) << 24);
+        }
+
+        return (static_cast<uint32_t>(byte0) << 24) |
+            (static_cast<uint32_t>(byte1) << 16) |
+            (static_cast<uint32_t>(byte2) << 8) |
+            static_cast<uint32_t>(byte3);
+    }
+
+    static string Utf16BytesToUtf8(const string& rawBytes, bool littleEndian, bool requireBom, const string& encodingName)
+    {
+        if ((rawBytes.size() % 2) != 0)
+        {
+            throw runtime_error("UTF-16 byte count must be even for encoding: " + encodingName);
+        }
+
+        size_t offset = 0;
+        bool actualLittleEndian = littleEndian;
+
+        if (rawBytes.size() >= 2)
+        {
+            const unsigned char byte0 = static_cast<unsigned char>(rawBytes[0]);
+            const unsigned char byte1 = static_cast<unsigned char>(rawBytes[1]);
+            if (byte0 == 0xFFu && byte1 == 0xFEu)
+            {
+                actualLittleEndian = true;
+                offset = 2;
+            }
+            else if (byte0 == 0xFEu && byte1 == 0xFFu)
+            {
+                actualLittleEndian = false;
+                offset = 2;
+            }
+            else if (requireBom)
+            {
+                throw runtime_error("UTF-16 input without BOM is ambiguous for encoding: " + encodingName);
+            }
+        }
+        else if (requireBom)
+        {
+            throw runtime_error("UTF-16 input requires a BOM when encoding name is UTF-16.");
+        }
+
+        string utf8Text;
+        utf8Text.reserve(rawBytes.size() * 2);
+
+        while (offset < rawBytes.size())
+        {
+            const uint16_t firstWord = ReadUint16(rawBytes, offset, actualLittleEndian);
+            offset += 2;
+
+            uint32_t codePoint = firstWord;
+            if (firstWord >= 0xD800u && firstWord <= 0xDBFFu)
+            {
+                if (offset >= rawBytes.size())
+                {
+                    throw runtime_error("Incomplete UTF-16 surrogate pair for encoding: " + encodingName);
+                }
+
+                const uint16_t secondWord = ReadUint16(rawBytes, offset, actualLittleEndian);
+                if (secondWord < 0xDC00u || secondWord > 0xDFFFu)
+                {
+                    throw runtime_error("Invalid UTF-16 surrogate pair for encoding: " + encodingName);
+                }
+
+                offset += 2;
+                codePoint = 0x10000u +
+                    ((static_cast<uint32_t>(firstWord - 0xD800u) << 10) |
+                        static_cast<uint32_t>(secondWord - 0xDC00u));
+            }
+            else if (firstWord >= 0xDC00u && firstWord <= 0xDFFFu)
+            {
+                throw runtime_error("Unpaired UTF-16 low surrogate for encoding: " + encodingName);
+            }
+
+            AppendUtf8CodePoint(utf8Text, codePoint);
+        }
+
+        return utf8Text;
+    }
+
+    static string Utf32BytesToUtf8(const string& rawBytes, bool littleEndian, bool requireBom, const string& encodingName)
+    {
+        if ((rawBytes.size() % 4) != 0)
+        {
+            throw runtime_error("UTF-32 byte count must be divisible by 4 for encoding: " + encodingName);
+        }
+
+        size_t offset = 0;
+        bool actualLittleEndian = littleEndian;
+
+        if (rawBytes.size() >= 4)
+        {
+            const unsigned char byte0 = static_cast<unsigned char>(rawBytes[0]);
+            const unsigned char byte1 = static_cast<unsigned char>(rawBytes[1]);
+            const unsigned char byte2 = static_cast<unsigned char>(rawBytes[2]);
+            const unsigned char byte3 = static_cast<unsigned char>(rawBytes[3]);
+
+            if (byte0 == 0xFFu && byte1 == 0xFEu && byte2 == 0x00u && byte3 == 0x00u)
+            {
+                actualLittleEndian = true;
+                offset = 4;
+            }
+            else if (byte0 == 0x00u && byte1 == 0x00u && byte2 == 0xFEu && byte3 == 0xFFu)
+            {
+                actualLittleEndian = false;
+                offset = 4;
+            }
+            else if (requireBom)
+            {
+                throw runtime_error("UTF-32 input without BOM is ambiguous for encoding: " + encodingName);
+            }
+        }
+        else if (requireBom)
+        {
+            throw runtime_error("UTF-32 input requires a BOM when encoding name is UTF-32.");
+        }
+
+        string utf8Text;
+        utf8Text.reserve(rawBytes.size());
+
+        while (offset < rawBytes.size())
+        {
+            const uint32_t codePoint = ReadUint32(rawBytes, offset, actualLittleEndian);
+            offset += 4;
+            AppendUtf8CodePoint(utf8Text, codePoint);
+        }
+
+        return utf8Text;
     }
 
     static string Latin1ToUtf8(const string& rawBytes)
@@ -1444,15 +1599,17 @@ namespace internal
         {
             return 12001u;
         }
-        if (normalizedEncodingName == "gbk")
+        if (normalizedEncodingName == "gbk" || normalizedEncodingName == "xgbk")
         {
             return 936u;
         }
-        if (normalizedEncodingName == "gb2312" || normalizedEncodingName == "euccn")
+        if (normalizedEncodingName == "gb2312" || normalizedEncodingName == "euccn" ||
+            normalizedEncodingName == "gb231280" || normalizedEncodingName == "gb23121980")
         {
-            return 20936u;
+            return 936u;
         }
-        if (normalizedEncodingName == "gb18030")
+        if (normalizedEncodingName == "gb18030" || normalizedEncodingName == "gb180302000" ||
+            normalizedEncodingName == "gb180302005")
         {
             return 54936u;
         }
@@ -1460,7 +1617,7 @@ namespace internal
         {
             return 950u;
         }
-        if (normalizedEncodingName == "big5hkscs")
+        if (normalizedEncodingName == "big5hkscs" || normalizedEncodingName == "bigfivehkscs")
         {
             return 950u;
         }
@@ -1468,6 +1625,10 @@ namespace internal
             normalizedEncodingName == "windows31j" || normalizedEncodingName == "mskanji")
         {
             return 932u;
+        }
+        if (normalizedEncodingName == "eucjp")
+        {
+            return 51932u;
         }
         if (normalizedEncodingName == "euckr" || normalizedEncodingName == "ksc5601" ||
             normalizedEncodingName == "ksx1001" || normalizedEncodingName == "uhc")
@@ -1574,6 +1735,44 @@ namespace internal
         return wideString;
     }
 #else
+    static string TrimAsciiWhitespace(const string& text)
+    {
+        size_t first = 0;
+        while (first < text.size())
+        {
+            const unsigned char ch = static_cast<unsigned char>(text[first]);
+            if (ch != ' ' && ch != '\t' && ch != '\r' && ch != '\n' && ch != '\f' && ch != '\v')
+            {
+                break;
+            }
+            first++;
+        }
+
+        size_t last = text.size();
+        while (last > first)
+        {
+            const unsigned char ch = static_cast<unsigned char>(text[last - 1]);
+            if (ch != ' ' && ch != '\t' && ch != '\r' && ch != '\n' && ch != '\f' && ch != '\v')
+            {
+                break;
+            }
+            last--;
+        }
+
+        return text.substr(first, last - first);
+    }
+
+    static string ToUpperAsciiString(const string& text)
+    {
+        string result = text;
+        for (size_t i = 0; i < result.size(); i++)
+        {
+            const char ch = result[i];
+            result[i] = (ch >= 'a' && ch <= 'z') ? static_cast<char>(ch - 'a' + 'A') : ch;
+        }
+        return result;
+    }
+
     static void AddUniqueEncodingCandidate(vector<string>& candidates, const string& candidate)
     {
         if (candidate.empty())
@@ -1596,14 +1795,18 @@ namespace internal
 
     static vector<string> ResolveEncodingNameToPosixCandidates(const string& encodingName)
     {
-        const string normalizedEncodingName = NormalizeEncodingName(encodingName);
+        const string trimmedEncodingName = TrimAsciiWhitespace(encodingName);
+        const string normalizedEncodingName = NormalizeEncodingName(trimmedEncodingName);
         if (normalizedEncodingName.empty())
         {
             throw runtime_error("Encoding name is empty.");
         }
 
         vector<string> candidates;
-        candidates.reserve(4);
+        candidates.reserve(8);
+
+        AddUniqueEncodingCandidate(candidates, trimmedEncodingName);
+        AddUniqueEncodingCandidate(candidates, ToUpperAsciiString(trimmedEncodingName));
 
         if (IsUtf8EncodingName(normalizedEncodingName))
         {
@@ -1646,19 +1849,22 @@ namespace internal
             AddUniqueEncodingCandidate(candidates, "UTF-32BE");
             return candidates;
         }
-        if (normalizedEncodingName == "gbk")
+        if (normalizedEncodingName == "gbk" || normalizedEncodingName == "xgbk")
         {
             AddUniqueEncodingCandidate(candidates, "GBK");
             AddUniqueEncodingCandidate(candidates, "CP936");
             return candidates;
         }
-        if (normalizedEncodingName == "gb2312" || normalizedEncodingName == "euccn")
+        if (normalizedEncodingName == "gb2312" || normalizedEncodingName == "euccn" ||
+            normalizedEncodingName == "gb231280" || normalizedEncodingName == "gb23121980")
         {
             AddUniqueEncodingCandidate(candidates, "GB2312");
             AddUniqueEncodingCandidate(candidates, "EUC-CN");
+            AddUniqueEncodingCandidate(candidates, "CP936");
             return candidates;
         }
-        if (normalizedEncodingName == "gb18030")
+        if (normalizedEncodingName == "gb18030" || normalizedEncodingName == "gb180302000" ||
+            normalizedEncodingName == "gb180302005")
         {
             AddUniqueEncodingCandidate(candidates, "GB18030");
             return candidates;
@@ -1669,7 +1875,7 @@ namespace internal
             AddUniqueEncodingCandidate(candidates, "CP950");
             return candidates;
         }
-        if (normalizedEncodingName == "big5hkscs")
+        if (normalizedEncodingName == "big5hkscs" || normalizedEncodingName == "bigfivehkscs")
         {
             AddUniqueEncodingCandidate(candidates, "BIG5-HKSCS");
             AddUniqueEncodingCandidate(candidates, "BIG5HKSCS");
@@ -1682,6 +1888,13 @@ namespace internal
             AddUniqueEncodingCandidate(candidates, "SHIFT_JIS");
             AddUniqueEncodingCandidate(candidates, "CP932");
             AddUniqueEncodingCandidate(candidates, "WINDOWS-31J");
+            return candidates;
+        }
+        if (normalizedEncodingName == "eucjp")
+        {
+            AddUniqueEncodingCandidate(candidates, "EUC-JP");
+            AddUniqueEncodingCandidate(candidates, "EUCJP");
+            AddUniqueEncodingCandidate(candidates, "CP51932");
             return candidates;
         }
         if (normalizedEncodingName == "euckr")
@@ -1751,7 +1964,78 @@ namespace internal
             return candidates;
         }
 
-        throw runtime_error("Unsupported encoding name: " + encodingName);
+        return candidates;
+    }
+
+
+    static vector<string> ResolveCurrentLocaleEncodingCandidates()
+    {
+        EnsureLocaleInitialized();
+
+        const char* codeset = nl_langinfo(CODESET);
+        if (codeset == nullptr || *codeset == '\0')
+        {
+            throw runtime_error("Cannot determine current locale character encoding.");
+        }
+
+        vector<string> candidates;
+        candidates.reserve(6);
+
+        const string localeEncoding(codeset);
+        AddUniqueEncodingCandidate(candidates, localeEncoding);
+        AddUniqueEncodingCandidate(candidates, ToUpperAsciiString(localeEncoding));
+
+        const string normalizedEncodingName = NormalizeEncodingName(localeEncoding);
+        if (IsUtf8EncodingName(normalizedEncodingName))
+        {
+            AddUniqueEncodingCandidate(candidates, "UTF-8");
+        }
+        else if (normalizedEncodingName == "gbk" || normalizedEncodingName == "xgbk")
+        {
+            AddUniqueEncodingCandidate(candidates, "GBK");
+            AddUniqueEncodingCandidate(candidates, "CP936");
+        }
+        else if (normalizedEncodingName == "gb18030")
+        {
+            AddUniqueEncodingCandidate(candidates, "GB18030");
+        }
+        else if (normalizedEncodingName == "gb2312" || normalizedEncodingName == "euccn")
+        {
+            AddUniqueEncodingCandidate(candidates, "GB2312");
+            AddUniqueEncodingCandidate(candidates, "EUC-CN");
+            AddUniqueEncodingCandidate(candidates, "CP936");
+        }
+        else if (normalizedEncodingName == "big5")
+        {
+            AddUniqueEncodingCandidate(candidates, "BIG5");
+            AddUniqueEncodingCandidate(candidates, "CP950");
+        }
+        else if (normalizedEncodingName == "big5hkscs")
+        {
+            AddUniqueEncodingCandidate(candidates, "BIG5-HKSCS");
+            AddUniqueEncodingCandidate(candidates, "BIG5");
+        }
+        else if (normalizedEncodingName == "shiftjis" || normalizedEncodingName == "sjis" ||
+            normalizedEncodingName == "windows31j" || normalizedEncodingName == "mskanji")
+        {
+            AddUniqueEncodingCandidate(candidates, "SHIFT_JIS");
+            AddUniqueEncodingCandidate(candidates, "WINDOWS-31J");
+            AddUniqueEncodingCandidate(candidates, "CP932");
+        }
+        else if (normalizedEncodingName == "eucjp")
+        {
+            AddUniqueEncodingCandidate(candidates, "EUC-JP");
+            AddUniqueEncodingCandidate(candidates, "CP51932");
+        }
+        else if (normalizedEncodingName == "euckr" || normalizedEncodingName == "ksc5601" ||
+            normalizedEncodingName == "ksx1001" || normalizedEncodingName == "uhc")
+        {
+            AddUniqueEncodingCandidate(candidates, "EUC-KR");
+            AddUniqueEncodingCandidate(candidates, "CP949");
+            AddUniqueEncodingCandidate(candidates, "UHC");
+        }
+
+        return candidates;
     }
 
     class IconvHandle
@@ -1782,21 +2066,21 @@ namespace internal
         iconv_t handle = reinterpret_cast<iconv_t>(-1);
     };
 
-    static string ConvertBytesToUtf8ByIconv(const string& rawBytes, const string& fromEncoding)
+    static string ConvertBytesByIconv(const string& inputBytes, const string& fromEncoding, const string& toEncoding)
     {
-        iconv_t iconvDescriptor = iconv_open("UTF-8", fromEncoding.c_str());
+        iconv_t iconvDescriptor = iconv_open(toEncoding.c_str(), fromEncoding.c_str());
         if (iconvDescriptor == reinterpret_cast<iconv_t>(-1))
         {
-            throw runtime_error("iconv_open failed for source encoding: " + fromEncoding);
+            throw runtime_error("iconv_open failed for conversion: " + fromEncoding + " -> " + toEncoding);
         }
 
         IconvHandle iconvHandle(iconvDescriptor);
 
-        size_t outputCapacity = rawBytes.empty() ? static_cast<size_t>(32) : (rawBytes.size() * 4 + 32);
+        size_t outputCapacity = inputBytes.empty() ? static_cast<size_t>(32) : (inputBytes.size() * 4 + 32);
         string output(outputCapacity, '\0');
 
-        char* inputPtr = const_cast<char*>(rawBytes.data());
-        size_t inputBytesLeft = rawBytes.size();
+        char* inputPtr = const_cast<char*>(inputBytes.data());
+        size_t inputBytesLeft = inputBytes.size();
         char* outputPtr = &output[0];
         size_t outputBytesLeft = output.size();
 
@@ -1819,14 +2103,14 @@ namespace internal
             }
             if (errno == EILSEQ)
             {
-                throw runtime_error("Invalid byte sequence for source encoding: " + fromEncoding);
+                throw runtime_error("Invalid byte sequence for conversion: " + fromEncoding + " -> " + toEncoding);
             }
             if (errno == EINVAL)
             {
-                throw runtime_error("Incomplete multibyte sequence for source encoding: " + fromEncoding);
+                throw runtime_error("Incomplete multibyte sequence for conversion: " + fromEncoding + " -> " + toEncoding);
             }
 
-            throw runtime_error("iconv conversion failed for source encoding: " + fromEncoding);
+            throw runtime_error("iconv conversion failed for conversion: " + fromEncoding + " -> " + toEncoding);
         }
 
         while (true)
@@ -1847,11 +2131,96 @@ namespace internal
                 continue;
             }
 
-            throw runtime_error("iconv flush failed for source encoding: " + fromEncoding);
+            throw runtime_error("iconv flush failed for conversion: " + fromEncoding + " -> " + toEncoding);
         }
 
         output.resize(output.size() - outputBytesLeft);
         return output;
+    }
+
+    static string ConvertBytesToUtf8ByIconv(const string& rawBytes, const string& fromEncoding)
+    {
+        return ConvertBytesByIconv(rawBytes, fromEncoding, "UTF-8");
+    }
+
+    static string ConvertUtf8ToBytesByIconv(const string& utf8Bytes, const string& toEncoding)
+    {
+        return ConvertBytesByIconv(utf8Bytes, "UTF-8", toEncoding);
+    }
+
+    static string ConvertCurrentAnsiBytesToUtf8_Posix(const string& ansiBytes)
+    {
+        const vector<string> candidates = ResolveCurrentLocaleEncodingCandidates();
+        for (size_t i = 0; i < candidates.size(); i++)
+        {
+            try
+            {
+                return ConvertBytesToUtf8ByIconv(ansiBytes, candidates[i]);
+            }
+            catch (const runtime_error& ex)
+            {
+                const string errorMessage = ex.what();
+                if (errorMessage.find("iconv_open failed") != string::npos)
+                {
+                    continue;
+                }
+                throw;
+            }
+        }
+
+        throw runtime_error("Current locale character encoding is not supported by iconv.");
+    }
+
+    static string ConvertUtf8ToCurrentAnsiBytes_Posix(const string& utf8Bytes)
+    {
+        const vector<string> candidates = ResolveCurrentLocaleEncodingCandidates();
+        for (size_t i = 0; i < candidates.size(); i++)
+        {
+            try
+            {
+                return ConvertUtf8ToBytesByIconv(utf8Bytes, candidates[i]);
+            }
+            catch (const runtime_error& ex)
+            {
+                const string errorMessage = ex.what();
+                if (errorMessage.find("iconv_open failed") != string::npos)
+                {
+                    continue;
+                }
+                throw;
+            }
+        }
+
+        throw runtime_error("Current locale character encoding is not supported by iconv.");
+    }
+
+    static bool CanDecodeAsCurrentAnsi_Posix(const string& text)
+    {
+        const vector<string> candidates = ResolveCurrentLocaleEncodingCandidates();
+
+        for (size_t i = 0; i < candidates.size(); i++)
+        {
+            try
+            {
+                ConvertBytesToUtf8ByIconv(text, candidates[i]);
+                return true;
+            }
+            catch (const runtime_error& ex)
+            {
+                const string errorMessage = ex.what();
+                if (errorMessage.find("iconv_open failed") != string::npos)
+                {
+                    continue;
+                }
+                if (errorMessage.find("Invalid byte sequence") != string::npos ||
+                    errorMessage.find("Incomplete multibyte sequence") != string::npos)
+                {
+                    return false;
+                }
+            }
+        }
+
+        return false;
     }
 #endif
 }
@@ -1929,6 +2298,7 @@ string GB_Utf8ToAnsi(const string& utf8Str)
     {
         throw runtime_error("WideCharToMultiByte(CP_ACP) failed (size).");
     }
+
     string ansi(static_cast<size_t>(alen), '\0');
     BOOL usedDefaultChar = FALSE;
     const int awritten = ::WideCharToMultiByte(CP_ACP, WC_NO_BEST_FIT_CHARS, ws.data(), static_cast<int>(ws.size()), &ansi[0], alen, nullptr, &usedDefaultChar);
@@ -1936,58 +2306,23 @@ string GB_Utf8ToAnsi(const string& utf8Str)
     {
         throw runtime_error("WideCharToMultiByte(CP_ACP) failed (convert).");
     }
-    // 这里不把 usedDefaultChar 当作错误抛出；如需“严格模式”可改为检测后抛异常。
+    if (usedDefaultChar == TRUE)
+    {
+        throw runtime_error("WideCharToMultiByte(CP_ACP) would lose information for one or more characters.");
+    }
     return ansi;
 
 #else
-    if (utf8Str.empty())
+    if (internal::IsCurrentAnsiUtf8())
     {
-        return {};
+        if (!GB_IsUtf8(utf8Str))
+        {
+            throw runtime_error("Input bytes are not valid UTF-8.");
+        }
+        return utf8Str;
     }
 
-    internal::EnsureLocaleInitialized();
-
-    // UTF-8 -> wstring
-    wstring ws;
-    try
-    {
-        ws = internal::Utf8ToWString_Posix(utf8Str);
-    }
-    catch (const range_error&)
-    {
-        throw runtime_error("UTF-8 decoding failed.");
-    }
-
-    // wstring -> 本地多字节（依赖 LC_CTYPE）
-    const wchar_t* src = ws.c_str();
-    mbstate_t st = mbstate_t{};
-    // 1) 预计算所需字节数（不含终止 '\0'）
-    errno = 0;
-    size_t need = wcsrtombs(nullptr, &src, 0, &st);
-    if (need == static_cast<size_t>(-1))
-    {
-        throw runtime_error("Local multibyte encoding failed (wstring -> bytes).");
-    }
-
-    if (need == 0)
-    {
-        return {};
-    }
-
-    string out(need, '\0');
-    src = ws.c_str();
-    st = mbstate_t{};
-    errno = 0;
-    size_t written = wcsrtombs(&out[0], &src, need, &st);
-    if (written == static_cast<size_t>(-1))
-    {
-        throw runtime_error("Local multibyte encoding failed (wstring -> bytes).");
-    }
-    if (written < out.size())
-    {
-        out.resize(written);
-    }
-    return out;
+    return internal::ConvertUtf8ToCurrentAnsiBytes_Posix(utf8Str);
 #endif
 }
 
@@ -1998,80 +2333,19 @@ string GB_AnsiToUtf8(const string& ansiStr)
         return {};
     }
 #if defined(_WIN32)
-    // ANSI(ACP) -> UTF-16
-    const int wlen = ::MultiByteToWideChar(CP_ACP, 0, ansiStr.data(), internal::ToWinApiLengthChecked(ansiStr.size()), nullptr, 0);
-    if (wlen <= 0)
-    {
-        throw runtime_error("MultiByteToWideChar(CP_ACP) failed (size).");
-    }
-    wstring ws(static_cast<size_t>(wlen), L'\0');
-    const int wwritten = ::MultiByteToWideChar(CP_ACP, 0, ansiStr.data(), internal::ToWinApiLengthChecked(ansiStr.size()), &ws[0], wlen);
-    if (wwritten <= 0)
-    {
-        throw runtime_error("MultiByteToWideChar(CP_ACP) failed (convert).");
-    }
-
-    // UTF-16 -> UTF-8
-    const int u8len = ::WideCharToMultiByte(CP_UTF8, 0, ws.data(), static_cast<int>(ws.size()), nullptr, 0, nullptr, nullptr);
-    if (u8len <= 0)
-    {
-        throw runtime_error("WideCharToMultiByte(CP_UTF8) failed (size).");
-    }
-    string utf8(static_cast<size_t>(u8len), '\0');
-    const int u8written = ::WideCharToMultiByte(CP_UTF8, 0, ws.data(), static_cast<int>(ws.size()), &utf8[0], u8len, nullptr, nullptr);
-    if (u8written <= 0)
-    {
-        throw runtime_error("WideCharToMultiByte(CP_UTF8) failed (convert).");
-    }
-    return utf8;
-
+    const wstring ws = internal::ConvertBytesToWideStringByCodePage(ansiStr, CP_ACP);
+    return GB_WStringToUtf8(ws);
 #else
-    if (ansiStr.empty())
+    if (internal::IsCurrentAnsiUtf8())
     {
-        return {};
+        if (!GB_IsUtf8(ansiStr))
+        {
+            throw runtime_error("Input bytes are not valid UTF-8.");
+        }
+        return ansiStr;
     }
 
-    internal::EnsureLocaleInitialized();
-
-    // 本地多字节 -> wstring（依赖 LC_CTYPE）
-    const char* src = ansiStr.c_str();
-    mbstate_t st = mbstate_t{};
-    errno = 0;
-    // 1) 计算需要的 wchar_t 数量（不含终止 L'\0'）
-    size_t wlen = mbsrtowcs(nullptr, &src, 0, &st);
-    if (wlen == static_cast<size_t>(-1))
-    {
-        throw runtime_error("Local multibyte decoding failed (bytes -> wstring).");
-    }
-
-    if (wlen == 0)
-    {
-        return {};
-    }
-
-    wstring ws(wlen, L'\0');
-    src = ansiStr.c_str();
-    st = mbstate_t{};
-    errno = 0;
-    size_t wwritten = mbsrtowcs(&ws[0], &src, wlen, &st);
-    if (wwritten == static_cast<size_t>(-1))
-    {
-        throw runtime_error("Local multibyte decoding failed (bytes -> wstring).");
-    }
-    if (wwritten < ws.size())
-    {
-        ws.resize(wwritten);
-    }
-
-    // wstring -> UTF-8
-    try
-    {
-        return internal::WStringToUtf8_Posix(ws);
-    }
-    catch (const range_error&)
-    {
-        throw runtime_error("UTF-8 encoding failed.");
-    }
+    return internal::ConvertCurrentAnsiBytesToUtf8_Posix(ansiStr);
 #endif
 }
 
@@ -2098,6 +2372,38 @@ string GB_BytesToUtf8(const string& rawBytes, const string& encodingName)
         return rawBytes;
     }
 
+    if (internal::IsUtf8BomEncodingName(normalizedEncodingName))
+    {
+        if (!GB_IsUtf8(rawBytes))
+        {
+            throw runtime_error("Input bytes are not valid UTF-8.");
+        }
+        if (internal::HasUtf8Bom(rawBytes))
+        {
+            return rawBytes.substr(3);
+        }
+        return rawBytes;
+    }
+
+    if (internal::IsAnsiEncodingName(normalizedEncodingName))
+    {
+#if defined(_WIN32)
+        const wstring wideString = internal::ConvertBytesToWideStringByCodePage(rawBytes, CP_ACP);
+        return GB_WStringToUtf8(wideString);
+#else
+        if (internal::IsCurrentAnsiUtf8())
+        {
+            if (!GB_IsUtf8(rawBytes))
+            {
+                throw runtime_error("Input bytes are not valid UTF-8.");
+            }
+            return rawBytes;
+        }
+
+        return internal::ConvertCurrentAnsiBytesToUtf8_Posix(rawBytes);
+#endif
+    }
+
     if (internal::IsAsciiEncodingName(normalizedEncodingName))
     {
         if (!internal::IsAllAscii(rawBytes))
@@ -2110,6 +2416,49 @@ string GB_BytesToUtf8(const string& rawBytes, const string& encodingName)
     if (internal::IsLatin1EncodingName(normalizedEncodingName))
     {
         return internal::Latin1ToUtf8(rawBytes);
+    }
+
+#if defined(_WIN32)
+    if (internal::IsOemEncodingName(normalizedEncodingName))
+    {
+        const std::wstring wideString = internal::ConvertBytesToWideStringByCodePage(rawBytes, CP_OEMCP);
+        return GB_WStringToUtf8(wideString);
+    }
+#else
+    if (internal::IsOemEncodingName(normalizedEncodingName))
+    {
+        throw runtime_error("OEM code page conversion is only supported on Windows.");
+    }
+#endif
+
+    if (internal::IsUtf16EncodingName(normalizedEncodingName))
+    {
+        return internal::Utf16BytesToUtf8(rawBytes, true, true, encodingName);
+    }
+
+    if (internal::IsUtf16LeEncodingName(normalizedEncodingName))
+    {
+        return internal::Utf16BytesToUtf8(rawBytes, true, false, encodingName);
+    }
+
+    if (internal::IsUtf16BeEncodingName(normalizedEncodingName))
+    {
+        return internal::Utf16BytesToUtf8(rawBytes, false, false, encodingName);
+    }
+
+    if (internal::IsUtf32EncodingName(normalizedEncodingName))
+    {
+        return internal::Utf32BytesToUtf8(rawBytes, true, true, encodingName);
+    }
+
+    if (internal::IsUtf32LeEncodingName(normalizedEncodingName))
+    {
+        return internal::Utf32BytesToUtf8(rawBytes, true, false, encodingName);
+    }
+
+    if (internal::IsUtf32BeEncodingName(normalizedEncodingName))
+    {
+        return internal::Utf32BytesToUtf8(rawBytes, false, false, encodingName);
     }
 
 #if defined(_WIN32)
@@ -2178,7 +2527,7 @@ bool GB_IsAnsi(const string& text)
 #if defined(_WIN32)
     const UINT codePage = CP_ACP;
 
-    int wideLength = ::MultiByteToWideChar(codePage, MB_ERR_INVALID_CHARS, text.data(), static_cast<int>(text.size()), nullptr, 0);
+    int wideLength = ::MultiByteToWideChar(codePage, MB_ERR_INVALID_CHARS, text.data(), internal::ToWinApiLengthChecked(text.size()), nullptr, 0);
 
     if (wideLength > 0)
     {
@@ -2189,21 +2538,14 @@ bool GB_IsAnsi(const string& text)
     if (lastError == ERROR_INVALID_FLAGS)
     {
         // 个别环境下可能不支持 MB_ERR_INVALID_CHARS，退化为“能否转换”
-        wideLength = ::MultiByteToWideChar(codePage, 0, text.data(), static_cast<int>(text.size()), nullptr, 0);
+        wideLength = ::MultiByteToWideChar(codePage, 0, text.data(), internal::ToWinApiLengthChecked(text.size()), nullptr, 0);
         return wideLength > 0;
     }
 
     return false;
 
 #else
-    internal::EnsureLocaleInitialized();
-
-    const char* src = text.c_str();
-    mbstate_t state = mbstate_t{};
-    errno = 0;
-
-    const size_t wideLength = mbsrtowcs(nullptr, &src, 0, &state);
-    return wideLength != static_cast<size_t>(-1);
+    return internal::CanDecodeAsCurrentAnsi_Posix(text);
 #endif
 }
 
@@ -2711,7 +3053,27 @@ bool GB_Utf8Equals(const std::string& text1Utf8, const std::string& text2Utf8, b
 
 int GB_Utf8CompareLogical(const std::string& text1Utf8, const std::string& text2Utf8)
 {
+    if (text1Utf8 == text2Utf8)
+    {
+        return 0;
+    }
+
+    if (internal::IsAllAscii(text1Utf8) && internal::IsAllAscii(text2Utf8))
+    {
+        return internal::CompareLogicalUtf8Fallback(text1Utf8, text2Utf8);
+    }
+
 #if defined(_WIN32)
+    if (internal::ContainsNullCharacter(text1Utf8) || internal::ContainsNullCharacter(text2Utf8))
+    {
+        return internal::CompareLogicalUtf8Fallback(text1Utf8, text2Utf8);
+    }
+
+    if (!GB_IsUtf8(text1Utf8) || !GB_IsUtf8(text2Utf8))
+    {
+        return internal::CompareLogicalUtf8Fallback(text1Utf8, text2Utf8);
+    }
+
     try
     {
         const std::wstring text1Wide = GB_Utf8ToWString(text1Utf8);
@@ -2886,47 +3248,75 @@ bool GB_Utf8EndsWith(const string& textUtf8, const string& targetUtf8, bool case
     return true;
 }
 
-int64_t GB_Utf8Find(const string& text, const string& needle, bool caseSensitive)
+int64_t GB_Utf8Find(const string& text, const string& needle, bool caseSensitive, int64_t startPos)
 {
+    if (startPos < 0)
+    {
+        return -1;
+    }
+
+    size_t startBytePos = 0;
+    if (!internal::FindUtf8ByteOffsetByCharIndex(text, startPos, startBytePos))
+    {
+        return -1;
+    }
+
+    if (needle.empty())
+    {
+        return startPos;
+    }
+
+    // —— ASCII + 大小写敏感：字节级快速路径（ASCII 下“字节偏移 == 码点偏移”）—— //
+    if (caseSensitive && internal::IsAllAscii(text) && internal::IsAllAscii(needle))
+    {
+        const size_t matchPos = text.find(needle, startBytePos);
+        if (matchPos == string::npos)
+        {
+            return -1;
+        }
+        return static_cast<int64_t>(matchPos);
+    }
+
     // 1) 预解码模式串到码点数组（并可选 ASCII 折叠）
     vector<char32_t> pat;
     {
         size_t pos = 0;
         while (pos < needle.size())
         {
-            char32_t cp = 0;
+            char32_t codePoint = 0;
             size_t nextPos = pos;
-            internal::DecodeOneOrReplacement(needle, pos, cp, nextPos);
+            internal::DecodeOneOrReplacement(needle, pos, codePoint, nextPos);
             if (!caseSensitive)
             {
-                cp = internal::ToLowerAscii(cp);
+                codePoint = internal::ToLowerAscii(codePoint);
             }
-            pat.push_back(cp);
+            pat.push_back(codePoint);
             pos = nextPos;
         }
     }
 
-    const size_t m = pat.size();
-    if (m == 0)
+    const size_t patLength = pat.size();
+    if (patLength == 0)
     {
-        return 0; // 与 string::find("") 一致
+        return startPos;
     }
+
     // 2) 计算 KMP 的前缀函数（LPS）
-    vector<size_t> lps(m, 0);
+    vector<size_t> lps(patLength, 0);
     {
-        size_t len = 0;
+        size_t matchedLength = 0;
         size_t i = 1;
-        while (i < m)
+        while (i < patLength)
         {
-            if (pat[i] == pat[len])
+            if (pat[i] == pat[matchedLength])
             {
-                len++;
-                lps[i] = len;
+                matchedLength++;
+                lps[i] = matchedLength;
                 i++;
             }
-            else if (len != 0)
+            else if (matchedLength != 0)
             {
-                len = lps[len - 1];
+                matchedLength = lps[matchedLength - 1];
             }
             else
             {
@@ -2936,32 +3326,31 @@ int64_t GB_Utf8Find(const string& text, const string& needle, bool caseSensitive
         }
     }
 
-    // 3) 流式解码 text 并进行 KMP 匹配（无需整串展开为码点向量）
-    size_t j = 0;                // 已匹配 pat[0..j-1]
-    size_t textBytePos = 0;      // 字节位置
-    int64_t textCharIndex = 0;   // 已读码点数量（也就是当前码点索引）
+    // 3) 从 startPos 开始流式解码 text 并进行 KMP 匹配（无需整串展开为码点向量）
+    size_t matchedLength = 0;     // 已匹配 pat[0..matchedLength-1]
+    size_t textBytePos = startBytePos;
+    int64_t textCharIndex = startPos;
 
     while (textBytePos < text.size())
     {
-        char32_t cp = 0;
+        char32_t codePoint = 0;
         size_t nextPos = textBytePos;
-        internal::DecodeOneOrReplacement(text, textBytePos, cp, nextPos);
+        internal::DecodeOneOrReplacement(text, textBytePos, codePoint, nextPos);
         if (!caseSensitive)
         {
-            cp = internal::ToLowerAscii(cp);
+            codePoint = internal::ToLowerAscii(codePoint);
         }
 
-        while (j > 0 && cp != pat[j])
+        while (matchedLength > 0 && codePoint != pat[matchedLength])
         {
-            j = lps[j - 1];
+            matchedLength = lps[matchedLength - 1];
         }
-        if (cp == pat[j])
+        if (codePoint == pat[matchedLength])
         {
-            j++;
-            if (j == m)
+            matchedLength++;
+            if (matchedLength == patLength)
             {
-                // 命中：起始“码点偏移” = 当前码点索引 - m + 1
-                return textCharIndex - static_cast<int64_t>(m) + 1;
+                return textCharIndex - static_cast<int64_t>(patLength) + 1;
             }
         }
 

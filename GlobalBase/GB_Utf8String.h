@@ -39,11 +39,17 @@ GLOBALBASE_PORT std::string GB_Utf8ToAnsi(const std::string& utf8Str);
 // ANSI 编码字符串转 UTF-8
 GLOBALBASE_PORT std::string GB_AnsiToUtf8(const std::string& ansiStr);
 
-// 将指定编码的原始字节流转换为 UTF-8。
+// 将指定编码的原始字节流严格转换为 UTF-8。
 // - rawBytes：原始字节流（可包含 \0）。
-// - encodingName：源编码名称，例如 "utf8"、"utf-8"、"GBK"、"GB18030"、"ISO-8859-6"、"ISO-8859-1"、"windows-1252"、"cp1252" 等。
+// - encodingName：源编码名称；比较时不区分大小写，并忽略常见分隔符（如 '-'、'_'、空格）。
+//   例如 "utf8"、"utf-8"、"utf-8-sig"、"utf8signature"、"GBK"、"GB18030"、"GB2312"、"Big5"、"Shift-JIS"、"EUC-JP"、
+//   "EUC-KR"、"ISO-8859-6"、"ISO-8859-1"、"windows-1252"、"cp1252"、"utf16le"、"utf-16be"、"utf32"、"ansi"、"locale"、"system"、"oem" 等。
+// - 对于 UTF-16/UTF-32：
+//   - "utf16" / "utf32" 需要 BOM；
+//   - "utf16le" / "utf16be" / "utf32le" / "utf32be" 在输入开头存在 BOM 时，会优先以 BOM 为准并跳过该 BOM。
+// - 对于 "utf-8-sig" / "utf8bom"：若输入以 UTF-8 BOM 开头，会自动移除 BOM。
 // - 返回值：转换后的 UTF-8 字节串。
-// - 失败时抛出 std::runtime_error（例如编码名不支持、输入字节不符合指定编码等）。
+// - 失败时抛出 std::runtime_error（例如编码名不支持、输入字节不符合指定编码、UTF-16/UTF-32 数据不完整或代理项非法等）。
 GLOBALBASE_PORT std::string GB_BytesToUtf8(const std::string& rawBytes, const std::string& encodingName);
 
 // 是否是“合法的 UTF-8 字节序列”
@@ -99,9 +105,13 @@ GLOBALBASE_PORT std::vector<std::string> GB_Utf8Split(const std::string& textUtf
 // 说明：本函数不校验 UTF-8 合法性，也不做任何编码转换；复杂度 O(N)，不分配额外内存。
 GLOBALBASE_PORT bool GB_Utf8Equals(const std::string& text1Utf8, const std::string& text2Utf8, bool caseSensitive = true);
 
-// 按 Windows 文件名排序方式（logical compare / natural compare）比较两个 UTF-8 字符串。
-// - Windows：对合法 UTF-8 输入，直接调用 StrCmpLogicalW，行为与 Windows 文件资源管理器中的文件名排序保持一致。
-// - 非 Windows，或输入不是合法 UTF-8：退化为库内兼容实现（数字按数值比较、ASCII 大小写不敏感）。
+// 按“自然排序 / logical compare”比较两个 UTF-8 字符串。
+// - Windows：
+//   - 对纯 ASCII 输入，直接走库内快速路径；
+//   - 对合法 UTF-8 的非 ASCII 输入，调用 StrCmpLogicalW，尽量贴近 Windows 资源管理器的文件名排序；
+//   - 若输入不是合法 UTF-8，或任一输入包含嵌入式 '\0'，则退化为库内兼容实现。
+//   - 注意：StrCmpLogicalW 的排序结果带有平台/版本依赖性，不适合作为需要长期稳定性的“规范排序”规则。
+// - 非 Windows：始终使用库内兼容实现（数字按数值比较、ASCII 大小写不敏感）。
 // 返回值：< 0 表示 text1Utf8 < text2Utf8；0 表示等价；> 0 表示 text1Utf8 > text2Utf8。
 GLOBALBASE_PORT int GB_Utf8CompareLogical(const std::string& text1Utf8, const std::string& text2Utf8);
 
@@ -112,7 +122,8 @@ GLOBALBASE_PORT bool GB_Utf8StartsWith(const std::string& textUtf8, const std::s
 GLOBALBASE_PORT bool GB_Utf8EndsWith(const std::string& textUtf8, const std::string& targetUtf8, bool caseSensitive = true);
 
 // 查找子串：返回第一个匹配的起始位置（UTF-8 字符偏移），未找到返回 -1
-GLOBALBASE_PORT int64_t GB_Utf8Find(const std::string& text, const std::string& needle, bool caseSensitive = true);
+// - startPos：查找起始位置（UTF-8 字符偏移，按码点计，不是字节偏移）
+GLOBALBASE_PORT int64_t GB_Utf8Find(const std::string& text, const std::string& needle, bool caseSensitive = true, int64_t startPos = 0);
 
 // 查找子串：返回最后一个匹配的起始位置（UTF-8 字符偏移），未找到返回 -1
 GLOBALBASE_PORT int64_t GB_Utf8FindLast(const std::string& text, const std::string& needle, bool caseSensitive = true);
