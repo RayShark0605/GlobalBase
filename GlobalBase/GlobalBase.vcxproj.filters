@@ -96,6 +96,9 @@
     <ClInclude Include="GB_DateTime.h">
       <Filter>头文件</Filter>
     </ClInclude>
+    <ClInclude Include="Geometry\GB_Polygon.h">
+      <Filter>头文件\Geometry</Filter>
+    </ClInclude>
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="GB_Utf8String.cpp">
@@ -163,6 +166,9 @@
     </ClCompile>
     <ClCompile Include="GB_DateTime.cpp">
       <Filter>源文件</Filter>
+    </ClCompile>
+    <ClCompile Include="Geometry\GB_Polygon.cpp">
+      <Filter>源文件\Geometry</Filter>
     </ClCompile>
   </ItemGroup>
 </Project>

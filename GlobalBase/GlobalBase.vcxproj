@@ -40,6 +40,7 @@
     <ClInclude Include="Geometry\GB_GeometryInterface.h" />
     <ClInclude Include="Geometry\GB_Matrix3x3.h" />
     <ClInclude Include="Geometry\GB_Point2d.h" />
+    <ClInclude Include="Geometry\GB_Polygon.h" />
     <ClInclude Include="Geometry\GB_Rectangle.h" />
     <ClInclude Include="Geometry\GB_Vector2d.h" />
     <ClInclude Include="GB_BaseTypes.h" />
@@ -66,6 +67,7 @@
     <ClCompile Include="Geometry\GB_GeometryInterface.cpp" />
     <ClCompile Include="Geometry\GB_Matrix3x3.cpp" />
     <ClCompile Include="Geometry\GB_Point2d.cpp" />
+    <ClCompile Include="Geometry\GB_Polygon.cpp" />
     <ClCompile Include="Geometry\GB_Rectangle.cpp" />
     <ClCompile Include="Geometry\GB_Vector2d.cpp" />
   </ItemGroup>
@@ -122,11 +124,11 @@
   </ImportGroup>
   <PropertyGroup Label="UserMacros" />
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
-    <IncludePath>../3rdParty/libcurl_8.18.0/include;$(IncludePath)</IncludePath>
+    <IncludePath>../3rdParty/libcurl_8.18.0/include;../3rdParty/CGAL-6.1.1/include;../3rdParty/boost_1_90_0;$(IncludePath)</IncludePath>
     <LibraryPath>../3rdParty/libcurl_8.18.0/lib/Debug;$(LibraryPath)</LibraryPath>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
-    <IncludePath>../3rdParty/libcurl_8.18.0/include;$(IncludePath)</IncludePath>
+    <IncludePath>../3rdParty/libcurl_8.18.0/include;../3rdParty/CGAL-6.1.1/include;../3rdParty/boost_1_90_0;$(IncludePath)</IncludePath>
     <LibraryPath>../3rdParty/libcurl_8.18.0/lib/Release;$(LibraryPath)</LibraryPath>
   </PropertyGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">
@@ -165,13 +167,12 @@
     <ClCompile>
       <WarningLevel>Level3</WarningLevel>
       <SDLCheck>true</SDLCheck>
-      <PreprocessorDefinitions>_DEBUG;GLOBALBASE_EXPORTS;_WINDOWS;_USRDLL;%(PreprocessorDefinitions);GLOBALBASE_API</PreprocessorDefinitions>
+      <PreprocessorDefinitions>_DEBUG;GLOBALBASE_EXPORTS;CGAL_DISABLE_GMP;_WINDOWS;_USRDLL;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <ConformanceMode>true</ConformanceMode>
       <PrecompiledHeader>NotUsing</PrecompiledHeader>
       <PrecompiledHeaderFile>
       </PrecompiledHeaderFile>
-      <LanguageStandard>
-      </LanguageStandard>
+      <LanguageStandard>stdcpp17</LanguageStandard>
       <OpenMPSupport>true</OpenMPSupport>
       <MultiProcessorCompilation>true</MultiProcessorCompilation>
     </ClCompile>
@@ -189,13 +190,12 @@
       <FunctionLevelLinking>true</FunctionLevelLinking>
       <IntrinsicFunctions>true</IntrinsicFunctions>
       <SDLCheck>true</SDLCheck>
-      <PreprocessorDefinitions>NDEBUG;GLOBALBASE_EXPORTS;_WINDOWS;_USRDLL;%(PreprocessorDefinitions);GLOBALBASE_API</PreprocessorDefinitions>
+      <PreprocessorDefinitions>NDEBUG;GLOBALBASE_EXPORTS;CGAL_DISABLE_GMP;_WINDOWS;_USRDLL;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <ConformanceMode>true</ConformanceMode>
       <PrecompiledHeader>NotUsing</PrecompiledHeader>
       <PrecompiledHeaderFile>
       </PrecompiledHeaderFile>
-      <LanguageStandard>
-      </LanguageStandard>
+      <LanguageStandard>stdcpp17</LanguageStandard>
       <OpenMPSupport>true</OpenMPSupport>
       <MultiProcessorCompilation>true</MultiProcessorCompilation>
       <FavorSizeOrSpeed>Speed</FavorSizeOrSpeed>
