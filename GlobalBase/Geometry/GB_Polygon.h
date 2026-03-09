@@ -83,6 +83,9 @@ public:
     bool UsesExactStringCoordinates() const;
 
     bool IsEmpty() const;
+
+    // 当前类将“至少 2 个顶点的隐式闭合折线环”视为有效；
+    // 这比传统简单多边形（通常要求至少 3 个点）更宽松，便于表达退化闭合边界。
     bool IsValid() const;
 
     // 本类总是按“隐式首尾相连”解释顶点序列；当对象有效且至少有 2 个点时，视为有闭合边界。
@@ -103,6 +106,7 @@ public:
     bool TryGetVertexAsDouble(size_t index, GB_Point2d& outVertex) const;
     bool TryGetVertexExactStrings(size_t index, std::string& outXText, std::string& outYText) const;
 
+    // 返回 double 轴对齐包围盒；若 ExactString 模式下某个坐标无法安全转换为有限 double，则返回无效矩形。
     GB_Rectangle GetBoundingBox() const;
     bool TryGetBoundingBoxExactStrings(std::string& outMinXText, std::string& outMinYText, std::string& outMaxXText, std::string& outMaxYText) const;
 
@@ -114,8 +118,8 @@ public:
     // 简单多边形判定：不允许非相邻边相交，也不允许边重叠/退化为破坏简单性的情况。
     bool IsSimple() const;
 
-    // 这里的“自相交/非简单”按广义边界非简单理解；
-    // 因此相邻重复点、重叠边等导致的 non-simple 情况也会返回 true。
+    // 这里的“自相交/非简单”按广义边界 non-simple 理解；
+    // 因此相邻重复点、重叠边、顶点数不足 3 但仍形成退化重叠边界等情况，也会返回 true。
     bool HasSelfIntersections() const;
 
     Orientation GetOrientation() const;
