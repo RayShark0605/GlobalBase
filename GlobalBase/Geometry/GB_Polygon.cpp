@@ -35,7 +35,6 @@
 #include <iomanip>
 #include <iterator>
 #include <limits>
-#include <list>
 #include <memory>
 #include <locale>
 #include <sstream>
@@ -1106,6 +1105,24 @@ namespace
         return normalizedPoints;
     }
 
+    static bool HasDuplicateAdjacentVerticesInClosedRing(const std::vector<ExactPoint>& points)
+    {
+        if (points.size() < 2)
+        {
+            return false;
+        }
+
+        for (size_t i = 0; i < points.size(); i++)
+        {
+            if (points[i] == points[(i + 1) % points.size()])
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
     static bool IsAxisAlignedNonZeroSegment(const ExactPoint& startPoint, const ExactPoint& endPoint)
     {
         if (startPoint == endPoint)
@@ -1267,22 +1284,27 @@ namespace
     {
         outPolygon.clear();
 
-        std::vector<ExactPoint> points = NormalizeExactRing(inputPoints);
-        if (points.size() < 3)
+        if (inputPoints.size() < 3)
         {
             return false;
         }
 
-        if (AreAllPointsCollinear(points))
+        if (HasDuplicateAdjacentVerticesInClosedRing(inputPoints))
         {
             return false;
         }
 
-        if (!IsSimpleRing(points))
+        if (AreAllPointsCollinear(inputPoints))
         {
             return false;
         }
 
+        if (!IsSimpleRing(inputPoints))
+        {
+            return false;
+        }
+
+        std::vector<ExactPoint> points = inputPoints;
         const ExactNumber signedAreaTwice = ComputeSignedDoubleAreaTwice(points);
         if (signedAreaTwice == ExactNumber(0))
         {
@@ -1312,6 +1334,14 @@ namespace
         }
 
         return GB_Polygon(exactStringVertices);
+    }
+
+    static void EnsurePolygonOrientation(GB_Polygon& ioPolygon, GB_Polygon::Orientation expectedOrientation)
+    {
+        if (ioPolygon.GetOrientation() != expectedOrientation)
+        {
+            ioPolygon.Reverse();
+        }
     }
 
     static bool TryExecutePolygonBooleanOperation(const std::vector<ExactPoint>& firstInputPoints,
@@ -1348,19 +1378,23 @@ namespace
             return false;
         }
 
-        std::list<CgalPolygonWithHoles2> polygonWithHolesList;
+        std::vector<CgalPolygonWithHoles2> polygonWithHolesList;
         polygonSet.polygons_with_holes(std::back_inserter(polygonWithHolesList));
 
         outOuterBoundaries.reserve(polygonWithHolesList.size());
         outHoleBoundaries.reserve(polygonWithHolesList.size());
-        for (std::list<CgalPolygonWithHoles2>::const_iterator pwhIt = polygonWithHolesList.begin(); pwhIt != polygonWithHolesList.end(); ++pwhIt)
+        for (std::vector<CgalPolygonWithHoles2>::const_iterator pwhIt = polygonWithHolesList.begin(); pwhIt != polygonWithHolesList.end(); ++pwhIt)
         {
-            outOuterBoundaries.push_back(BuildPolygonFromCgalRing(pwhIt->outer_boundary()));
+            GB_Polygon outerBoundary = BuildPolygonFromCgalRing(pwhIt->outer_boundary());
+            EnsurePolygonOrientation(outerBoundary, GB_Polygon::Orientation::CounterClockwise);
+            outOuterBoundaries.push_back(std::move(outerBoundary));
 
             std::vector<GB_Polygon> holeBoundaries;
             for (CgalPolygonWithHoles2::Hole_const_iterator holeIt = pwhIt->holes_begin(); holeIt != pwhIt->holes_end(); ++holeIt)
             {
-                holeBoundaries.push_back(BuildPolygonFromCgalRing(*holeIt));
+                GB_Polygon holeBoundary = BuildPolygonFromCgalRing(*holeIt);
+                EnsurePolygonOrientation(holeBoundary, GB_Polygon::Orientation::Clockwise);
+                holeBoundaries.push_back(std::move(holeBoundary));
             }
             outHoleBoundaries.push_back(std::move(holeBoundaries));
         }
@@ -1519,7 +1553,10 @@ GB_Polygon::GB_Polygon(GB_Polygon&& other) noexcept
         std::atomic_store_explicit(&exactCache, otherCache, std::memory_order_release);
     }
 
-    other.Clear();
+    other.storageMode = CoordinateStorageMode::Double;
+    other.vertices.clear();
+    other.exactStringVertices.clear();
+    other.InvalidateCaches();
 }
 
 GB_Polygon& GB_Polygon::operator=(const GB_Polygon& other)
@@ -1571,7 +1608,10 @@ GB_Polygon& GB_Polygon::operator=(GB_Polygon&& other) noexcept
         std::atomic_store_explicit(&exactCache, std::shared_ptr<const ExactCacheData>(), std::memory_order_release);
     }
 
-    other.Clear();
+    other.storageMode = CoordinateStorageMode::Double;
+    other.vertices.clear();
+    other.exactStringVertices.clear();
+    other.InvalidateCaches();
     return *this;
 }
 

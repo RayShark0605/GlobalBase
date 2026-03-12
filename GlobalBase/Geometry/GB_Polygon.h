@@ -406,7 +406,7 @@ public:
      * @param outOuterBoundaries 输出结果中的外环集合，每个外环均为 CCW。
      * @param outHoleBoundaries 输出结果中的洞环集合；其大小与 outOuterBoundaries 相同，
      *        outHoleBoundaries[i] 对应 outOuterBoundaries[i] 的所有洞，每个洞环均为 CW。
-     * @return 成功返回 true。若输入不满足 CGAL 规则化布尔运算要求（例如非 simple、面积为 0、CGAL 不可用），返回 false。
+     * @return 成功返回 true。若输入不满足 CGAL 规则化布尔运算要求（例如非 simple、面积为 0、存在相邻重复顶点/显式闭合重复点、CGAL 不可用），返回 false。
      */
     bool ComputeIntersection(const GB_Polygon& other, std::vector<GB_Polygon>& outOuterBoundaries, std::vector<std::vector<GB_Polygon>>& outHoleBoundaries) const;
 
