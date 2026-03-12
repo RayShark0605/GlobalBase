@@ -1,24 +1,42 @@
 ﻿#include "GB_Polygon.h"
+#include "GB_Rectangle.h"
 
 #ifdef _MSC_VER
 #  pragma warning(push)
 #  pragma warning(disable: 4819)
 #endif
 
-#include <CGAL/Cartesian.h>
-#include <CGAL/Polygon_2_algorithms.h>
-#include <CGAL/boost_mp.h>
+#if defined(__has_include)
+#  if __has_include(<CGAL/Boolean_set_operations_2.h>) && __has_include(<CGAL/Cartesian.h>) && __has_include(<CGAL/Polygon_2.h>) && __has_include(<CGAL/Polygon_2_algorithms.h>) && __has_include(<CGAL/Polygon_set_2.h>) && __has_include(<CGAL/Polygon_with_holes_2.h>) && __has_include(<CGAL/boost_mp.h>)
+#    define GB_POLYGON_HAS_CGAL 1
+#    include <CGAL/Boolean_set_operations_2.h>
+#    include <CGAL/Cartesian.h>
+#    include <CGAL/Polygon_2.h>
+#    include <CGAL/Polygon_2_algorithms.h>
+#    include <CGAL/Polygon_set_2.h>
+#    include <CGAL/Polygon_with_holes_2.h>
+#    include <CGAL/boost_mp.h>
+#  else
+#    define GB_POLYGON_HAS_CGAL 0
+#  endif
+#else
+#  define GB_POLYGON_HAS_CGAL 0
+#endif
 
 #include <boost/multiprecision/cpp_int.hpp>
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cctype>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <iomanip>
+#include <iterator>
 #include <limits>
+#include <list>
+#include <memory>
 #include <locale>
 #include <sstream>
 #include <stdexcept>
@@ -30,8 +48,32 @@ namespace
 {
     using ExactNumber = boost::multiprecision::cpp_rational;
     using ExactInteger = boost::multiprecision::cpp_int;
-    using ExactKernel = CGAL::Cartesian<ExactNumber>;
-    using ExactPoint = ExactKernel::Point_2;
+
+    struct ExactPoint
+    {
+        ExactNumber x = ExactNumber(0);
+        ExactNumber y = ExactNumber(0);
+
+        ExactPoint()
+        {
+        }
+
+        ExactPoint(const ExactNumber& xValue, const ExactNumber& yValue)
+            : x(xValue)
+            , y(yValue)
+        {
+        }
+
+        bool operator==(const ExactPoint& other) const
+        {
+            return x == other.x && y == other.y;
+        }
+
+        bool operator!=(const ExactPoint& other) const
+        {
+            return !(*this == other);
+        }
+    };
 
     static inline std::string TrimAscii(const std::string& text)
     {
@@ -561,55 +603,40 @@ namespace
         return oss.str();
     }
 
-    static bool TryBuildExactPoints(const GB_Polygon& polygon, std::vector<ExactPoint>& outPoints)
+
+    static bool TrySetDoubleVerticesFromDeserialization(GB_Polygon& polygon, std::vector<GB_Point2d>&& parsedVertices)
     {
-        outPoints.clear();
-        const size_t numVertices = polygon.GetNumVertices();
-        outPoints.reserve(numVertices);
-
-        if (polygon.GetCoordinateStorageMode() == GB_Polygon::CoordinateStorageMode::Double)
+        const size_t numVertices = parsedVertices.size();
+        if (polygon.SetVertices(std::move(parsedVertices)))
         {
-            const std::vector<GB_Point2d>& vertices = polygon.GetDoubleVertices();
-            if (vertices.size() != numVertices)
-            {
-                return false;
-            }
-
-            for (const GB_Point2d& vertex : vertices)
-            {
-                ExactNumber x = ExactNumber(0);
-                ExactNumber y = ExactNumber(0);
-                if (!TryConvertDoubleToExactNumber(vertex.x, x) || !TryConvertDoubleToExactNumber(vertex.y, y))
-                {
-                    outPoints.clear();
-                    return false;
-                }
-                outPoints.emplace_back(x, y);
-            }
             return true;
         }
 
-        const std::vector<GB_Polygon::ExactStringVertex>& exactVertices = polygon.GetExactStringVertices();
-        if (exactVertices.size() != numVertices)
+        if (numVertices < 2 && polygon.GetCoordinateStorageMode() == GB_Polygon::CoordinateStorageMode::Double && polygon.GetNumVertices() == numVertices)
         {
-            return false;
+            return true;
         }
 
-        for (const GB_Polygon::ExactStringVertex& vertex : exactVertices)
-        {
-            ExactNumber x = ExactNumber(0);
-            ExactNumber y = ExactNumber(0);
-            if (!TryParseExactNumber(vertex.first, x) || !TryParseExactNumber(vertex.second, y))
-            {
-                outPoints.clear();
-                return false;
-            }
-            outPoints.emplace_back(x, y);
-        }
-
-        return true;
+        polygon.Clear();
+        return false;
     }
 
+    static bool TrySetExactStringVerticesFromDeserialization(GB_Polygon& polygon, std::vector<GB_Polygon::ExactStringVertex>&& parsedVertices)
+    {
+        const size_t numVertices = parsedVertices.size();
+        if (polygon.SetVertices(std::move(parsedVertices)))
+        {
+            return true;
+        }
+
+        if (numVertices < 2 && polygon.GetCoordinateStorageMode() == GB_Polygon::CoordinateStorageMode::ExactString && polygon.GetNumVertices() == numVertices)
+        {
+            return true;
+        }
+
+        polygon.Clear();
+        return false;
+    }
     static bool TryBuildExactPoint(const GB_Point2d& point, ExactPoint& outPoint)
     {
         ExactNumber x = ExactNumber(0);
@@ -634,115 +661,13 @@ namespace
         return true;
     }
 
-    static bool TryGetExactPointAt(const GB_Polygon& polygon, size_t index, ExactPoint& outPoint)
-    {
-        if (index >= polygon.GetNumVertices())
-        {
-            return false;
-        }
-
-        if (polygon.GetCoordinateStorageMode() == GB_Polygon::CoordinateStorageMode::Double)
-        {
-            const std::vector<GB_Point2d>& doubleVertices = polygon.GetDoubleVertices();
-            if (doubleVertices.size() != polygon.GetNumVertices())
-            {
-                return false;
-            }
-
-            return TryBuildExactPoint(doubleVertices[index], outPoint);
-        }
-
-        const std::vector<GB_Polygon::ExactStringVertex>& exactVertices = polygon.GetExactStringVertices();
-        if (exactVertices.size() != polygon.GetNumVertices())
-        {
-            return false;
-        }
-
-        return TryBuildExactPoint(exactVertices[index].first, exactVertices[index].second, outPoint);
-    }
-
-    static bool TryGetDoublePointAt(const GB_Polygon& polygon, size_t index, GB_Point2d& outPoint)
-    {
-        outPoint = GB_Point2d();
-        if (index >= polygon.GetNumVertices())
-        {
-            return false;
-        }
-
-        if (polygon.GetCoordinateStorageMode() == GB_Polygon::CoordinateStorageMode::Double)
-        {
-            const std::vector<GB_Point2d>& doubleVertices = polygon.GetDoubleVertices();
-            if (doubleVertices.size() != polygon.GetNumVertices())
-            {
-                return false;
-            }
-
-            outPoint = doubleVertices[index];
-            return outPoint.IsValid();
-        }
-
-        const std::vector<GB_Polygon::ExactStringVertex>& exactVertices = polygon.GetExactStringVertices();
-        if (exactVertices.size() != polygon.GetNumVertices())
-        {
-            return false;
-        }
-
-        ExactNumber x = ExactNumber(0);
-        ExactNumber y = ExactNumber(0);
-        double xDouble = GB_QuietNan;
-        double yDouble = GB_QuietNan;
-        if (!TryParseExactNumber(exactVertices[index].first, x)
-            || !TryParseExactNumber(exactVertices[index].second, y)
-            || !TryConvertExactNumberToDouble(x, xDouble)
-            || !TryConvertExactNumberToDouble(y, yDouble))
-        {
-            return false;
-        }
-
-        outPoint = GB_Point2d(xDouble, yDouble);
-        return true;
-    }
-
-    static bool TryComputeSignedDoubleAreaTwice(const GB_Polygon& polygon, ExactNumber& outAreaTwice)
-    {
-        outAreaTwice = ExactNumber(0);
-
-        const size_t numVertices = polygon.GetNumVertices();
-        if (numVertices < 2)
-        {
-            return true;
-        }
-
-        ExactPoint firstPoint;
-        ExactPoint prevPoint;
-        if (!TryGetExactPointAt(polygon, 0, firstPoint))
-        {
-            return false;
-        }
-
-        prevPoint = firstPoint;
-        for (size_t i = 1; i < numVertices; i++)
-        {
-            ExactPoint curPoint;
-            if (!TryGetExactPointAt(polygon, i, curPoint))
-            {
-                return false;
-            }
-
-            outAreaTwice += prevPoint.x() * curPoint.y() - curPoint.x() * prevPoint.y();
-            prevPoint = curPoint;
-        }
-
-        outAreaTwice += prevPoint.x() * firstPoint.y() - firstPoint.x() * prevPoint.y();
-        return true;
-    }
 
     static inline ExactNumber Cross(const ExactPoint& origin, const ExactPoint& a, const ExactPoint& b)
     {
-        const ExactNumber ax = a.x() - origin.x();
-        const ExactNumber ay = a.y() - origin.y();
-        const ExactNumber bx = b.x() - origin.x();
-        const ExactNumber by = b.y() - origin.y();
+        const ExactNumber ax = a.x - origin.x;
+        const ExactNumber ay = a.y - origin.y;
+        const ExactNumber bx = b.x - origin.x;
+        const ExactNumber by = b.y - origin.y;
         return ax * by - ay * bx;
     }
 
@@ -753,11 +678,11 @@ namespace
             return false;
         }
 
-        const ExactNumber minX = std::min(a.x(), b.x());
-        const ExactNumber maxX = std::max(a.x(), b.x());
-        const ExactNumber minY = std::min(a.y(), b.y());
-        const ExactNumber maxY = std::max(a.y(), b.y());
-        return point.x() >= minX && point.x() <= maxX && point.y() >= minY && point.y() <= maxY;
+        const ExactNumber minX = std::min(a.x, b.x);
+        const ExactNumber maxX = std::max(a.x, b.x);
+        const ExactNumber minY = std::min(a.y, b.y);
+        const ExactNumber maxY = std::max(a.y, b.y);
+        return point.x >= minX && point.x <= maxX && point.y >= minY && point.y <= maxY;
     }
 
     static ExactNumber ComputeSignedDoubleAreaTwice(const std::vector<ExactPoint>& points)
@@ -772,7 +697,7 @@ namespace
         for (size_t i = 0; i < numVertices; i++)
         {
             const size_t nextIndex = (i + 1) % numVertices;
-            areaTwice += points[i].x() * points[nextIndex].y() - points[nextIndex].x() * points[i].y();
+            areaTwice += points[i].x * points[nextIndex].y - points[nextIndex].x * points[i].y;
         }
         return areaTwice;
     }
@@ -808,24 +733,171 @@ namespace
         return true;
     }
 
-    static std::vector<std::string> SplitByChar(const std::string& text, char delimiter)
+    static int GetSign(const ExactNumber& value)
     {
-        std::vector<std::string> tokens;
-        std::string currentToken;
-        for (char ch : text)
+        if (value > ExactNumber(0))
         {
-            if (ch == delimiter)
+            return 1;
+        }
+        if (value < ExactNumber(0))
+        {
+            return -1;
+        }
+        return 0;
+    }
+
+    static bool DoBoxesOverlap(const ExactPoint& a, const ExactPoint& b, const ExactPoint& c, const ExactPoint& d)
+    {
+        const ExactNumber abMinX = std::min(a.x, b.x);
+        const ExactNumber abMaxX = std::max(a.x, b.x);
+        const ExactNumber abMinY = std::min(a.y, b.y);
+        const ExactNumber abMaxY = std::max(a.y, b.y);
+        const ExactNumber cdMinX = std::min(c.x, d.x);
+        const ExactNumber cdMaxX = std::max(c.x, d.x);
+        const ExactNumber cdMinY = std::min(c.y, d.y);
+        const ExactNumber cdMaxY = std::max(c.y, d.y);
+        return !(abMaxX < cdMinX || cdMaxX < abMinX || abMaxY < cdMinY || cdMaxY < abMinY);
+    }
+
+    static bool DoSegmentsIntersect(const ExactPoint& a, const ExactPoint& b, const ExactPoint& c, const ExactPoint& d)
+    {
+        if (!DoBoxesOverlap(a, b, c, d))
+        {
+            return false;
+        }
+
+        const ExactNumber cross1 = Cross(a, b, c);
+        const ExactNumber cross2 = Cross(a, b, d);
+        const ExactNumber cross3 = Cross(c, d, a);
+        const ExactNumber cross4 = Cross(c, d, b);
+
+        const int sign1 = GetSign(cross1);
+        const int sign2 = GetSign(cross2);
+        const int sign3 = GetSign(cross3);
+        const int sign4 = GetSign(cross4);
+
+        if (sign1 == 0 && IsPointOnSegment(c, a, b))
+        {
+            return true;
+        }
+        if (sign2 == 0 && IsPointOnSegment(d, a, b))
+        {
+            return true;
+        }
+        if (sign3 == 0 && IsPointOnSegment(a, c, d))
+        {
+            return true;
+        }
+        if (sign4 == 0 && IsPointOnSegment(b, c, d))
+        {
+            return true;
+        }
+
+        return sign1 * sign2 < 0 && sign3 * sign4 < 0;
+    }
+
+    static bool AreEdgeIndicesAdjacent(size_t edgeIndexA, size_t edgeIndexB, size_t numPoints)
+    {
+        if (edgeIndexA == edgeIndexB)
+        {
+            return true;
+        }
+
+        if ((edgeIndexA + 1) % numPoints == edgeIndexB)
+        {
+            return true;
+        }
+
+        if ((edgeIndexB + 1) % numPoints == edgeIndexA)
+        {
+            return true;
+        }
+
+        return false;
+    }
+
+    static bool IsSimpleRingQuadratic(const std::vector<ExactPoint>& points)
+    {
+        const size_t numPoints = points.size();
+        if (numPoints < 3)
+        {
+            return false;
+        }
+
+        for (size_t edgeIndexA = 0; edgeIndexA < numPoints; edgeIndexA++)
+        {
+            const ExactPoint& a0 = points[edgeIndexA];
+            const ExactPoint& a1 = points[(edgeIndexA + 1) % numPoints];
+
+            for (size_t edgeIndexB = edgeIndexA + 1; edgeIndexB < numPoints; edgeIndexB++)
             {
-                tokens.push_back(currentToken);
-                currentToken.clear();
-            }
-            else
-            {
-                currentToken.push_back(ch);
+                if (AreEdgeIndicesAdjacent(edgeIndexA, edgeIndexB, numPoints))
+                {
+                    continue;
+                }
+
+                const ExactPoint& b0 = points[edgeIndexB];
+                const ExactPoint& b1 = points[(edgeIndexB + 1) % numPoints];
+                if (DoSegmentsIntersect(a0, a1, b0, b1))
+                {
+                    return false;
+                }
             }
         }
-        tokens.push_back(currentToken);
-        return tokens;
+
+        return true;
+    }
+
+#if GB_POLYGON_HAS_CGAL
+    static bool TryIsSimpleRingWithCgal(const std::vector<ExactPoint>& points, bool& outIsSimple)
+    {
+        using CgalExactKernel = CGAL::Cartesian<ExactNumber>;
+        using CgalExactPoint = CgalExactKernel::Point_2;
+
+        std::vector<CgalExactPoint> cgalPoints;
+        cgalPoints.reserve(points.size());
+        for (size_t i = 0; i < points.size(); i++)
+        {
+            cgalPoints.emplace_back(points[i].x, points[i].y);
+        }
+
+        outIsSimple = CGAL::is_simple_2(cgalPoints.begin(), cgalPoints.end(), CgalExactKernel());
+        return true;
+    }
+#endif
+
+    static bool IsSimpleRing(const std::vector<ExactPoint>& points)
+    {
+#if GB_POLYGON_HAS_CGAL
+        bool isSimple = false;
+        if (TryIsSimpleRingWithCgal(points, isSimple))
+        {
+            return isSimple;
+        }
+#endif
+        return IsSimpleRingQuadratic(points);
+    }
+
+
+    static bool ReadNextSerializedField(const std::string& text, size_t& ioOffset, std::string& outField)
+    {
+        if (ioOffset > text.size())
+        {
+            outField.clear();
+            return false;
+        }
+
+        const size_t delimiterPos = text.find('|', ioOffset);
+        if (delimiterPos == std::string::npos)
+        {
+            outField.assign(text.data() + ioOffset, text.size() - ioOffset);
+            ioOffset = text.size();
+            return true;
+        }
+
+        outField.assign(text.data() + ioOffset, delimiterPos - ioOffset);
+        ioOffset = delimiterPos + 1;
+        return true;
     }
 
     static void AppendUInt8(GB_ByteBuffer& buffer, std::uint8_t value)
@@ -961,18 +1033,6 @@ namespace
         return true;
     }
 
-    static bool TryComputeSerializedStringTokenCount(size_t numVertices, size_t& outTokenCount)
-    {
-        if (numVertices > (std::numeric_limits<size_t>::max() - 3) / 2)
-        {
-            outTokenCount = 0;
-            return false;
-        }
-
-        outTokenCount = 3 + numVertices * 2;
-        return true;
-    }
-
     static size_t GetBinaryReserveHint(size_t numVertices)
     {
         constexpr static size_t baseReserve = 64;
@@ -1007,52 +1067,388 @@ namespace
             return true;
         }
 
-        if (storageMode == GB_Polygon::CoordinateStorageMode::ExactString)
+        outPolygon.SetVertices(std::vector<GB_Polygon::ExactStringVertex>());
+        return true;
+    }
+
+    enum class PolygonBooleanOperation
+    {
+        Intersection = 0,
+        Union = 1,
+        Difference = 2
+    };
+
+#if GB_POLYGON_HAS_CGAL
+    using CgalExactKernel = CGAL::Cartesian<ExactNumber>;
+    using CgalExactPoint = CgalExactKernel::Point_2;
+    using CgalPolygon2 = CGAL::Polygon_2<CgalExactKernel>;
+    using CgalPolygonWithHoles2 = CGAL::Polygon_with_holes_2<CgalExactKernel>;
+    using CgalPolygonSet2 = CGAL::Polygon_set_2<CgalExactKernel>;
+#endif
+
+    static std::vector<ExactPoint> NormalizeExactRing(const std::vector<ExactPoint>& points)
+    {
+        std::vector<ExactPoint> normalizedPoints;
+        normalizedPoints.reserve(points.size());
+        for (size_t i = 0; i < points.size(); i++)
         {
-            outPolygon.SetVertices(std::vector<GB_Polygon::ExactStringVertex>());
-            return true;
+            if (normalizedPoints.empty() || points[i] != normalizedPoints.back())
+            {
+                normalizedPoints.push_back(points[i]);
+            }
         }
 
-        return false;
+        if (normalizedPoints.size() > 1 && normalizedPoints.front() == normalizedPoints.back())
+        {
+            normalizedPoints.pop_back();
+        }
+
+        return normalizedPoints;
     }
 
-    static long double HypotLongDouble(long double dx, long double dy)
+    static bool IsAxisAlignedNonZeroSegment(const ExactPoint& startPoint, const ExactPoint& endPoint)
     {
-        return std::hypot(dx, dy);
+        if (startPoint == endPoint)
+        {
+            return false;
+        }
+
+        return startPoint.x == endPoint.x || startPoint.y == endPoint.y;
     }
+
+    static void RemoveAxisAlignedCollinearVertices(std::vector<ExactPoint>& ioPoints)
+    {
+        if (ioPoints.size() < 3)
+        {
+            return;
+        }
+
+        bool isChanged = true;
+        while (isChanged && ioPoints.size() >= 3)
+        {
+            isChanged = false;
+            for (size_t i = 0; i < ioPoints.size() && ioPoints.size() >= 3; )
+            {
+                const size_t prevIndex = (i + ioPoints.size() - 1) % ioPoints.size();
+                const size_t nextIndex = (i + 1) % ioPoints.size();
+                const ExactPoint& prevPoint = ioPoints[prevIndex];
+                const ExactPoint& curPoint = ioPoints[i];
+                const ExactPoint& nextPoint = ioPoints[nextIndex];
+
+                const bool isSameVerticalLine = (prevPoint.x == curPoint.x) && (curPoint.x == nextPoint.x);
+                const bool isSameHorizontalLine = (prevPoint.y == curPoint.y) && (curPoint.y == nextPoint.y);
+                if ((isSameVerticalLine || isSameHorizontalLine) && Cross(prevPoint, curPoint, nextPoint) == ExactNumber(0))
+                {
+                    ioPoints.erase(ioPoints.begin() + static_cast<std::ptrdiff_t>(i));
+                    isChanged = true;
+                    if (i >= ioPoints.size())
+                    {
+                        i = 0;
+                    }
+                    continue;
+                }
+
+                i++;
+            }
+        }
+    }
+
+    static bool TryBuildAxisAlignedRectangleFromRing(const std::vector<ExactPoint>& inputPoints, GB_Rectangle& outRectangle)
+    {
+        outRectangle.Reset();
+
+        std::vector<ExactPoint> points = NormalizeExactRing(inputPoints);
+        if (points.size() < 4)
+        {
+            return false;
+        }
+
+        ExactNumber minX = points[0].x;
+        ExactNumber minY = points[0].y;
+        ExactNumber maxX = points[0].x;
+        ExactNumber maxY = points[0].y;
+        for (size_t i = 0; i < points.size(); i++)
+        {
+            const ExactPoint& curPoint = points[i];
+            const ExactPoint& nextPoint = points[(i + 1) % points.size()];
+            if (!IsAxisAlignedNonZeroSegment(curPoint, nextPoint))
+            {
+                return false;
+            }
+
+            if (curPoint.x < minX)
+            {
+                minX = curPoint.x;
+            }
+            if (curPoint.y < minY)
+            {
+                minY = curPoint.y;
+            }
+            if (curPoint.x > maxX)
+            {
+                maxX = curPoint.x;
+            }
+            if (curPoint.y > maxY)
+            {
+                maxY = curPoint.y;
+            }
+        }
+
+        if (minX >= maxX || minY >= maxY)
+        {
+            return false;
+        }
+
+        RemoveAxisAlignedCollinearVertices(points);
+        if (points.size() != 4)
+        {
+            return false;
+        }
+
+        const std::vector<ExactPoint> corners =
+        {
+            ExactPoint(minX, minY),
+            ExactPoint(maxX, minY),
+            ExactPoint(maxX, maxY),
+            ExactPoint(minX, maxY)
+        };
+
+        bool hasCorner[4] = { false, false, false, false };
+        for (size_t i = 0; i < points.size(); i++)
+        {
+            size_t matchedCornerIndex = static_cast<size_t>(-1);
+            for (size_t j = 0; j < corners.size(); j++)
+            {
+                if (points[i] == corners[j])
+                {
+                    matchedCornerIndex = j;
+                    break;
+                }
+            }
+
+            if (matchedCornerIndex == static_cast<size_t>(-1) || hasCorner[matchedCornerIndex])
+            {
+                return false;
+            }
+
+            hasCorner[matchedCornerIndex] = true;
+        }
+
+        ExactNumber areaTwice = ComputeSignedDoubleAreaTwice(points);
+        if (areaTwice < ExactNumber(0))
+        {
+            areaTwice = -areaTwice;
+        }
+
+        const ExactNumber expectedAreaTwice = ExactNumber(2) * (maxX - minX) * (maxY - minY);
+        if (areaTwice != expectedAreaTwice)
+        {
+            return false;
+        }
+
+        double minXDouble = GB_QuietNan;
+        double minYDouble = GB_QuietNan;
+        double maxXDouble = GB_QuietNan;
+        double maxYDouble = GB_QuietNan;
+        if (!TryConvertExactNumberToDouble(minX, minXDouble)
+            || !TryConvertExactNumberToDouble(minY, minYDouble)
+            || !TryConvertExactNumberToDouble(maxX, maxXDouble)
+            || !TryConvertExactNumberToDouble(maxY, maxYDouble))
+        {
+            return false;
+        }
+
+        outRectangle.Set(minXDouble, minYDouble, maxXDouble, maxYDouble);
+        return outRectangle.IsValid();
+    }
+
+#if GB_POLYGON_HAS_CGAL
+    static bool TryBuildCgalPolygon(const std::vector<ExactPoint>& inputPoints, CgalPolygon2& outPolygon)
+    {
+        outPolygon.clear();
+
+        std::vector<ExactPoint> points = NormalizeExactRing(inputPoints);
+        if (points.size() < 3)
+        {
+            return false;
+        }
+
+        if (AreAllPointsCollinear(points))
+        {
+            return false;
+        }
+
+        if (!IsSimpleRing(points))
+        {
+            return false;
+        }
+
+        const ExactNumber signedAreaTwice = ComputeSignedDoubleAreaTwice(points);
+        if (signedAreaTwice == ExactNumber(0))
+        {
+            return false;
+        }
+
+        if (signedAreaTwice < ExactNumber(0))
+        {
+            std::reverse(points.begin(), points.end());
+        }
+
+        for (size_t i = 0; i < points.size(); i++)
+        {
+            outPolygon.push_back(CgalExactPoint(points[i].x, points[i].y));
+        }
+
+        return true;
+    }
+
+    static GB_Polygon BuildPolygonFromCgalRing(const CgalPolygon2& polygon)
+    {
+        std::vector<GB_Polygon::ExactStringVertex> exactStringVertices;
+        exactStringVertices.reserve(static_cast<size_t>(polygon.size()));
+        for (CgalPolygon2::Vertex_const_iterator it = polygon.vertices_begin(); it != polygon.vertices_end(); ++it)
+        {
+            exactStringVertices.emplace_back(ExactNumberToString(it->x()), ExactNumberToString(it->y()));
+        }
+
+        return GB_Polygon(exactStringVertices);
+    }
+
+    static bool TryExecutePolygonBooleanOperation(const std::vector<ExactPoint>& firstInputPoints,
+        const std::vector<ExactPoint>& secondInputPoints,
+        PolygonBooleanOperation operation,
+        std::vector<GB_Polygon>& outOuterBoundaries,
+        std::vector<std::vector<GB_Polygon>>& outHoleBoundaries)
+    {
+        outOuterBoundaries.clear();
+        outHoleBoundaries.clear();
+
+        CgalPolygon2 firstPolygon;
+        CgalPolygon2 secondPolygon;
+        if (!TryBuildCgalPolygon(firstInputPoints, firstPolygon) || !TryBuildCgalPolygon(secondInputPoints, secondPolygon))
+        {
+            return false;
+        }
+
+        CgalPolygonSet2 polygonSet;
+        polygonSet.insert(firstPolygon);
+
+        switch (operation)
+        {
+        case PolygonBooleanOperation::Intersection:
+            polygonSet.intersection(secondPolygon);
+            break;
+        case PolygonBooleanOperation::Union:
+            polygonSet.join(secondPolygon);
+            break;
+        case PolygonBooleanOperation::Difference:
+            polygonSet.difference(secondPolygon);
+            break;
+        default:
+            return false;
+        }
+
+        std::list<CgalPolygonWithHoles2> polygonWithHolesList;
+        polygonSet.polygons_with_holes(std::back_inserter(polygonWithHolesList));
+
+        outOuterBoundaries.reserve(polygonWithHolesList.size());
+        outHoleBoundaries.reserve(polygonWithHolesList.size());
+        for (std::list<CgalPolygonWithHoles2>::const_iterator pwhIt = polygonWithHolesList.begin(); pwhIt != polygonWithHolesList.end(); ++pwhIt)
+        {
+            outOuterBoundaries.push_back(BuildPolygonFromCgalRing(pwhIt->outer_boundary()));
+
+            std::vector<GB_Polygon> holeBoundaries;
+            for (CgalPolygonWithHoles2::Hole_const_iterator holeIt = pwhIt->holes_begin(); holeIt != pwhIt->holes_end(); ++holeIt)
+            {
+                holeBoundaries.push_back(BuildPolygonFromCgalRing(*holeIt));
+            }
+            outHoleBoundaries.push_back(std::move(holeBoundaries));
+        }
+
+        return true;
+    }
+#endif
 
     static GB_Polygon::PointContainment ClassifyPointOddEvenImpl(const std::vector<ExactPoint>& polygonPoints, const ExactPoint& queryPoint)
     {
+        const size_t numPoints = polygonPoints.size();
+        if (numPoints < 2)
+        {
+            return GB_Polygon::PointContainment::Outside;
+        }
+
         bool isInside = false;
-        for (size_t i = 0; i < polygonPoints.size(); i++)
+
+        for (size_t i = 0; i < numPoints; i++)
         {
             const ExactPoint& a = polygonPoints[i];
-            const ExactPoint& b = polygonPoints[(i + 1) % polygonPoints.size()];
+            const ExactPoint& b = polygonPoints[(i + 1) % numPoints];
 
             if (IsPointOnSegment(queryPoint, a, b))
             {
                 return GB_Polygon::PointContainment::OnBoundary;
             }
 
-            const bool intersectsHalfOpenYRange = ((a.y() > queryPoint.y()) != (b.y() > queryPoint.y()));
-            if (!intersectsHalfOpenYRange)
+            const bool aAbove = (a.y > queryPoint.y);
+            const bool bAbove = (b.y > queryPoint.y);
+
+            if (aAbove == bAbove)
             {
                 continue;
             }
 
-            const ExactNumber lhs = (b.x() - a.x()) * (queryPoint.y() - a.y());
-            const ExactNumber rhs = (queryPoint.x() - a.x()) * (b.y() - a.y());
-            const bool isAscending = (b.y() > a.y());
-            const bool isRayCrossingRightSide = isAscending ? (lhs > rhs) : (lhs < rhs);
-            if (isRayCrossingRightSide)
+            const ExactNumber crossValue = Cross(a, b, queryPoint);
+
+            if (b.y > a.y)
             {
-                isInside = !isInside;
+                if (crossValue > ExactNumber(0))
+                {
+                    isInside = !isInside;
+                }
+            }
+            else
+            {
+                if (crossValue < ExactNumber(0))
+                {
+                    isInside = !isInside;
+                }
             }
         }
 
-        return isInside ? GB_Polygon::PointContainment::Inside : GB_Polygon::PointContainment::Outside;
+        return isInside
+            ? GB_Polygon::PointContainment::Inside
+            : GB_Polygon::PointContainment::Outside;
     }
 }
+
+struct GB_Polygon::ExactCacheData
+{
+    std::uint64_t version = 0;
+    std::vector<ExactPoint> exactPoints;
+    std::vector<GB_Point2d> doubleVertices;
+    bool hasAllFiniteDoubleVertices = true;
+
+    bool hasBoundingBoxDouble = false;
+    GB_Rectangle boundingBoxDouble;
+
+    bool hasBoundingBoxExactStrings = false;
+    std::string minXText;
+    std::string minYText;
+    std::string maxXText;
+    std::string maxYText;
+
+    ExactNumber signedAreaTwice = ExactNumber(0);
+    double signedAreaDouble = GB_QuietNan;
+    std::string signedAreaExactString;
+
+    bool hasDuplicateAdjacentVertices = false;
+    bool hasCollinearAdjacentTriples = false;
+    bool areAllVerticesCollinear = true;
+    bool isSimple = false;
+
+    bool hasPerimeter = false;
+    double perimeter = GB_QuietNan;
+};
 
 const GB_Polygon GB_Polygon::Invalid = GB_Polygon();
 
@@ -1080,14 +1476,104 @@ GB_Polygon::GB_Polygon(std::initializer_list<ExactStringVertex> exactStringVerti
     SetVertices(std::vector<ExactStringVertex>(exactStringVertices));
 }
 
+GB_Polygon::GB_Polygon(const GB_Rectangle& rectangle)
+{
+    if (!rectangle.IsValid())
+    {
+        return;
+    }
+
+    SetVertices(rectangle.GetCorners());
+}
+
 GB_Polygon::~GB_Polygon()
 {
 }
 
-GB_Polygon::GB_Polygon(const GB_Polygon& other) = default;
-GB_Polygon::GB_Polygon(GB_Polygon&& other) noexcept = default;
-GB_Polygon& GB_Polygon::operator=(const GB_Polygon& other) = default;
-GB_Polygon& GB_Polygon::operator=(GB_Polygon&& other) noexcept = default;
+GB_Polygon::GB_Polygon(const GB_Polygon& other)
+    : storageMode(other.storageMode)
+    , vertices(other.vertices)
+    , exactStringVertices(other.exactStringVertices)
+    , cacheVersion(other.GetCurrentCacheVersion())
+    , exactCache()
+{
+    const std::uint64_t otherVersion = other.GetCurrentCacheVersion();
+    const std::shared_ptr<const ExactCacheData> otherCache = std::atomic_load_explicit(&other.exactCache, std::memory_order_acquire);
+    if (otherCache && otherCache->version == otherVersion)
+    {
+        std::atomic_store_explicit(&exactCache, otherCache, std::memory_order_release);
+    }
+}
+
+GB_Polygon::GB_Polygon(GB_Polygon&& other) noexcept
+    : storageMode(other.storageMode)
+    , vertices(std::move(other.vertices))
+    , exactStringVertices(std::move(other.exactStringVertices))
+    , cacheVersion(other.GetCurrentCacheVersion())
+    , exactCache()
+{
+    const std::uint64_t otherVersion = other.GetCurrentCacheVersion();
+    const std::shared_ptr<const ExactCacheData> otherCache = std::atomic_load_explicit(&other.exactCache, std::memory_order_acquire);
+    if (otherCache && otherCache->version == otherVersion)
+    {
+        std::atomic_store_explicit(&exactCache, otherCache, std::memory_order_release);
+    }
+
+    other.Clear();
+}
+
+GB_Polygon& GB_Polygon::operator=(const GB_Polygon& other)
+{
+    if (this == &other)
+    {
+        return *this;
+    }
+
+    storageMode = other.storageMode;
+    vertices = other.vertices;
+    exactStringVertices = other.exactStringVertices;
+
+    const std::uint64_t otherVersion = other.GetCurrentCacheVersion();
+    const std::shared_ptr<const ExactCacheData> otherCache = std::atomic_load_explicit(&other.exactCache, std::memory_order_acquire);
+    cacheVersion.store(otherVersion, std::memory_order_release);
+    if (otherCache && otherCache->version == otherVersion)
+    {
+        std::atomic_store_explicit(&exactCache, otherCache, std::memory_order_release);
+    }
+    else
+    {
+        std::atomic_store_explicit(&exactCache, std::shared_ptr<const ExactCacheData>(), std::memory_order_release);
+    }
+
+    return *this;
+}
+
+GB_Polygon& GB_Polygon::operator=(GB_Polygon&& other) noexcept
+{
+    if (this == &other)
+    {
+        return *this;
+    }
+
+    storageMode = other.storageMode;
+    vertices = std::move(other.vertices);
+    exactStringVertices = std::move(other.exactStringVertices);
+
+    const std::uint64_t otherVersion = other.GetCurrentCacheVersion();
+    const std::shared_ptr<const ExactCacheData> otherCache = std::atomic_load_explicit(&other.exactCache, std::memory_order_acquire);
+    cacheVersion.store(otherVersion, std::memory_order_release);
+    if (otherCache && otherCache->version == otherVersion)
+    {
+        std::atomic_store_explicit(&exactCache, otherCache, std::memory_order_release);
+    }
+    else
+    {
+        std::atomic_store_explicit(&exactCache, std::shared_ptr<const ExactCacheData>(), std::memory_order_release);
+    }
+
+    other.Clear();
+    return *this;
+}
 
 const std::string& GB_Polygon::GetClassType() const
 {
@@ -1101,53 +1587,427 @@ uint64_t GB_Polygon::GetClassTypeId() const
     return classTypeId;
 }
 
+void GB_Polygon::InvalidateCaches()
+{
+    cacheVersion.fetch_add(1, std::memory_order_release);
+    std::atomic_store_explicit(&exactCache, std::shared_ptr<const ExactCacheData>(), std::memory_order_release);
+}
+
+std::uint64_t GB_Polygon::GetCurrentCacheVersion() const
+{
+    return cacheVersion.load(std::memory_order_acquire);
+}
+
+std::shared_ptr<const GB_Polygon::ExactCacheData> GB_Polygon::GetOrBuildExactCache() const
+{
+    const std::uint64_t currentVersion = GetCurrentCacheVersion();
+    std::shared_ptr<const ExactCacheData> cache = std::atomic_load_explicit(&exactCache, std::memory_order_acquire);
+    if (cache && cache->version == currentVersion)
+    {
+        return cache;
+    }
+
+    std::shared_ptr<ExactCacheData> newCache = std::make_shared<ExactCacheData>();
+    newCache->version = currentVersion;
+
+    const size_t numVertices = GetNumVertices();
+    newCache->exactPoints.reserve(numVertices);
+    newCache->doubleVertices.reserve(numVertices);
+
+    bool bboxExactInitialized = false;
+    ExactNumber minX = ExactNumber(0);
+    ExactNumber minY = ExactNumber(0);
+    ExactNumber maxX = ExactNumber(0);
+    ExactNumber maxY = ExactNumber(0);
+
+    bool bboxDoubleInitialized = false;
+    double minXDouble = GB_QuietNan;
+    double minYDouble = GB_QuietNan;
+    double maxXDouble = GB_QuietNan;
+    double maxYDouble = GB_QuietNan;
+
+    if (storageMode == CoordinateStorageMode::Double)
+    {
+        if (vertices.size() != numVertices)
+        {
+            return std::shared_ptr<const ExactCacheData>();
+        }
+
+        for (size_t i = 0; i < numVertices; i++)
+        {
+            const GB_Point2d& vertex = vertices[i];
+            if (!vertex.IsValid())
+            {
+                return std::shared_ptr<const ExactCacheData>();
+            }
+
+            ExactNumber x = ExactNumber(0);
+            ExactNumber y = ExactNumber(0);
+            if (!TryConvertDoubleToExactNumber(vertex.x, x) || !TryConvertDoubleToExactNumber(vertex.y, y))
+            {
+                return std::shared_ptr<const ExactCacheData>();
+            }
+
+            newCache->exactPoints.emplace_back(x, y);
+            newCache->doubleVertices.emplace_back(vertex);
+
+            if (!bboxExactInitialized)
+            {
+                minX = x;
+                minY = y;
+                maxX = x;
+                maxY = y;
+                newCache->minXText = DoubleToString(vertex.x);
+                newCache->minYText = DoubleToString(vertex.y);
+                newCache->maxXText = newCache->minXText;
+                newCache->maxYText = newCache->minYText;
+                bboxExactInitialized = true;
+
+                minXDouble = vertex.x;
+                minYDouble = vertex.y;
+                maxXDouble = vertex.x;
+                maxYDouble = vertex.y;
+                bboxDoubleInitialized = true;
+            }
+            else
+            {
+                if (x < minX)
+                {
+                    minX = x;
+                    newCache->minXText = DoubleToString(vertex.x);
+                }
+                if (y < minY)
+                {
+                    minY = y;
+                    newCache->minYText = DoubleToString(vertex.y);
+                }
+                if (x > maxX)
+                {
+                    maxX = x;
+                    newCache->maxXText = DoubleToString(vertex.x);
+                }
+                if (y > maxY)
+                {
+                    maxY = y;
+                    newCache->maxYText = DoubleToString(vertex.y);
+                }
+
+                if (vertex.x < minXDouble)
+                {
+                    minXDouble = vertex.x;
+                }
+                if (vertex.y < minYDouble)
+                {
+                    minYDouble = vertex.y;
+                }
+                if (vertex.x > maxXDouble)
+                {
+                    maxXDouble = vertex.x;
+                }
+                if (vertex.y > maxYDouble)
+                {
+                    maxYDouble = vertex.y;
+                }
+            }
+        }
+    }
+    else
+    {
+        if (exactStringVertices.size() != numVertices)
+        {
+            return std::shared_ptr<const ExactCacheData>();
+        }
+
+        for (size_t i = 0; i < numVertices; i++)
+        {
+            const ExactStringVertex& vertex = exactStringVertices[i];
+            ExactNumber x = ExactNumber(0);
+            ExactNumber y = ExactNumber(0);
+            if (!TryParseExactNumber(vertex.first, x) || !TryParseExactNumber(vertex.second, y))
+            {
+                return std::shared_ptr<const ExactCacheData>();
+            }
+
+            newCache->exactPoints.emplace_back(x, y);
+
+            double xDouble = GB_QuietNan;
+            double yDouble = GB_QuietNan;
+            if (TryConvertExactNumberToDouble(x, xDouble) && TryConvertExactNumberToDouble(y, yDouble))
+            {
+                newCache->doubleVertices.emplace_back(xDouble, yDouble);
+            }
+            else
+            {
+                newCache->doubleVertices.emplace_back(GB_QuietNan, GB_QuietNan);
+                newCache->hasAllFiniteDoubleVertices = false;
+            }
+
+            if (!bboxExactInitialized)
+            {
+                minX = x;
+                minY = y;
+                maxX = x;
+                maxY = y;
+                newCache->minXText = vertex.first;
+                newCache->minYText = vertex.second;
+                newCache->maxXText = vertex.first;
+                newCache->maxYText = vertex.second;
+                bboxExactInitialized = true;
+
+                if (newCache->hasAllFiniteDoubleVertices)
+                {
+                    minXDouble = xDouble;
+                    minYDouble = yDouble;
+                    maxXDouble = xDouble;
+                    maxYDouble = yDouble;
+                    bboxDoubleInitialized = true;
+                }
+            }
+            else
+            {
+                if (x < minX)
+                {
+                    minX = x;
+                    newCache->minXText = vertex.first;
+                }
+                if (y < minY)
+                {
+                    minY = y;
+                    newCache->minYText = vertex.second;
+                }
+                if (x > maxX)
+                {
+                    maxX = x;
+                    newCache->maxXText = vertex.first;
+                }
+                if (y > maxY)
+                {
+                    maxY = y;
+                    newCache->maxYText = vertex.second;
+                }
+
+                if (newCache->hasAllFiniteDoubleVertices)
+                {
+                    if (!bboxDoubleInitialized)
+                    {
+                        minXDouble = xDouble;
+                        minYDouble = yDouble;
+                        maxXDouble = xDouble;
+                        maxYDouble = yDouble;
+                        bboxDoubleInitialized = true;
+                    }
+                    else
+                    {
+                        if (xDouble < minXDouble)
+                        {
+                            minXDouble = xDouble;
+                        }
+                        if (yDouble < minYDouble)
+                        {
+                            minYDouble = yDouble;
+                        }
+                        if (xDouble > maxXDouble)
+                        {
+                            maxXDouble = xDouble;
+                        }
+                        if (yDouble > maxYDouble)
+                        {
+                            maxYDouble = yDouble;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    newCache->hasBoundingBoxExactStrings = bboxExactInitialized;
+    newCache->signedAreaTwice = ComputeSignedDoubleAreaTwice(newCache->exactPoints);
+
+    const ExactNumber signedArea = newCache->signedAreaTwice / ExactNumber(2);
+    TryConvertExactNumberToDouble(signedArea, newCache->signedAreaDouble);
+    newCache->signedAreaExactString = ExactNumberToString(signedArea);
+
+    const size_t numPoints = newCache->exactPoints.size();
+    if (numPoints >= 2)
+    {
+        const ExactPoint& firstPoint = newCache->exactPoints.front();
+        ExactPoint prevPoint = firstPoint;
+
+        long double perimeter = 0.0L;
+        const GB_Point2d* firstDoublePoint = nullptr;
+        const GB_Point2d* prevDoublePoint = nullptr;
+        if (IsValid() && newCache->hasAllFiniteDoubleVertices)
+        {
+            firstDoublePoint = &newCache->doubleVertices.front();
+            prevDoublePoint = firstDoublePoint;
+        }
+
+        for (size_t i = 1; i < numPoints; i++)
+        {
+            const ExactPoint& curPoint = newCache->exactPoints[i];
+            if (curPoint == prevPoint)
+            {
+                newCache->hasDuplicateAdjacentVertices = true;
+            }
+
+            if (prevDoublePoint)
+            {
+                const GB_Point2d& curDoublePoint = newCache->doubleVertices[i];
+                const long double dx = static_cast<long double>(curDoublePoint.x) - static_cast<long double>(prevDoublePoint->x);
+                const long double dy = static_cast<long double>(curDoublePoint.y) - static_cast<long double>(prevDoublePoint->y);
+                perimeter += std::hypot(dx, dy);
+                prevDoublePoint = &curDoublePoint;
+            }
+
+            prevPoint = curPoint;
+        }
+        if (prevPoint == firstPoint)
+        {
+            newCache->hasDuplicateAdjacentVertices = true;
+        }
+
+        if (prevDoublePoint && firstDoublePoint)
+        {
+            const long double dx = static_cast<long double>(firstDoublePoint->x) - static_cast<long double>(prevDoublePoint->x);
+            const long double dy = static_cast<long double>(firstDoublePoint->y) - static_cast<long double>(prevDoublePoint->y);
+            perimeter += std::hypot(dx, dy);
+
+            const double perimeterDouble = static_cast<double>(perimeter);
+            if (std::isfinite(perimeterDouble))
+            {
+                newCache->hasPerimeter = true;
+                newCache->perimeter = perimeterDouble;
+            }
+        }
+    }
+
+    if (numPoints >= 3)
+    {
+        for (size_t i = 0; i < numPoints; i++)
+        {
+            const ExactPoint& prevPoint = newCache->exactPoints[(i + numPoints - 1) % numPoints];
+            const ExactPoint& curPoint = newCache->exactPoints[i];
+            const ExactPoint& nextPoint = newCache->exactPoints[(i + 1) % numPoints];
+            if (Cross(prevPoint, curPoint, nextPoint) == ExactNumber(0))
+            {
+                newCache->hasCollinearAdjacentTriples = true;
+                break;
+            }
+        }
+    }
+
+    newCache->areAllVerticesCollinear = AreAllPointsCollinear(newCache->exactPoints);
+    if (numPoints < 3 || newCache->hasDuplicateAdjacentVertices || newCache->areAllVerticesCollinear)
+    {
+        newCache->isSimple = false;
+    }
+    else
+    {
+        newCache->isSimple = IsSimpleRing(newCache->exactPoints);
+    }
+
+    if (IsValid() && newCache->hasAllFiniteDoubleVertices && bboxDoubleInitialized)
+    {
+        newCache->boundingBoxDouble.Set(minXDouble, minYDouble, maxXDouble, maxYDouble);
+        newCache->hasBoundingBoxDouble = newCache->boundingBoxDouble.IsValid();
+    }
+
+    cache = std::shared_ptr<const ExactCacheData>(newCache);
+    std::atomic_store_explicit(&exactCache, cache, std::memory_order_release);
+    return cache;
+}
+
 void GB_Polygon::Clear()
 {
     storageMode = CoordinateStorageMode::Double;
     vertices.clear();
     exactStringVertices.clear();
+    InvalidateCaches();
 }
 
 bool GB_Polygon::SetVertices(const std::vector<GB_Point2d>& vertices)
 {
-    Clear();
-    storageMode = CoordinateStorageMode::Double;
-
     for (const GB_Point2d& vertex : vertices)
     {
         if (!vertex.IsValid())
         {
-            Clear();
             return false;
         }
     }
 
+    storageMode = CoordinateStorageMode::Double;
     this->vertices = vertices;
+    exactStringVertices.clear();
+    InvalidateCaches();
+    return this->vertices.size() >= 2;
+}
+
+bool GB_Polygon::SetVertices(std::vector<GB_Point2d>&& vertices)
+{
+    for (const GB_Point2d& vertex : vertices)
+    {
+        if (!vertex.IsValid())
+        {
+            return false;
+        }
+    }
+
+    storageMode = CoordinateStorageMode::Double;
+    this->vertices = std::move(vertices);
+    exactStringVertices.clear();
+    InvalidateCaches();
     return this->vertices.size() >= 2;
 }
 
 bool GB_Polygon::SetVertices(const std::vector<ExactStringVertex>& exactStringVertices)
 {
-    Clear();
-    storageMode = CoordinateStorageMode::ExactString;
-    this->exactStringVertices.reserve(exactStringVertices.size());
+    std::vector<ExactStringVertex> normalizedVertices;
+    normalizedVertices.reserve(exactStringVertices.size());
 
-    for (const ExactStringVertex& vertex : exactStringVertices)
+    for (size_t i = 0; i < exactStringVertices.size(); i++)
     {
-        const std::string xText = TrimAscii(vertex.first);
-        const std::string yText = TrimAscii(vertex.second);
+        std::string xText = TrimAscii(exactStringVertices[i].first);
+        std::string yText = TrimAscii(exactStringVertices[i].second);
 
         ExactNumber x = ExactNumber(0);
         ExactNumber y = ExactNumber(0);
         if (!TryParseExactNumber(xText, x) || !TryParseExactNumber(yText, y))
         {
-            Clear();
             return false;
         }
 
-        this->exactStringVertices.emplace_back(xText, yText);
+        normalizedVertices.emplace_back(std::move(xText), std::move(yText));
     }
 
+    storageMode = CoordinateStorageMode::ExactString;
+    vertices.clear();
+    this->exactStringVertices = std::move(normalizedVertices);
+    InvalidateCaches();
+    return this->exactStringVertices.size() >= 2;
+}
+
+bool GB_Polygon::SetVertices(std::vector<ExactStringVertex>&& exactStringVertices)
+{
+    for (size_t i = 0; i < exactStringVertices.size(); i++)
+    {
+        std::string& xText = exactStringVertices[i].first;
+        std::string& yText = exactStringVertices[i].second;
+
+        xText = TrimAscii(xText);
+        yText = TrimAscii(yText);
+
+        ExactNumber x = ExactNumber(0);
+        ExactNumber y = ExactNumber(0);
+        if (!TryParseExactNumber(xText, x) || !TryParseExactNumber(yText, y))
+        {
+            return false;
+        }
+    }
+
+    storageMode = CoordinateStorageMode::ExactString;
+    vertices.clear();
+    this->exactStringVertices = std::move(exactStringVertices);
+    InvalidateCaches();
     return this->exactStringVertices.size() >= 2;
 }
 
@@ -1178,11 +2038,7 @@ bool GB_Polygon::IsClosed() const
 
 size_t GB_Polygon::GetNumVertices() const
 {
-    if (storageMode == CoordinateStorageMode::Double)
-    {
-        return vertices.size();
-    }
-    return exactStringVertices.size();
+    return storageMode == CoordinateStorageMode::Double ? vertices.size() : exactStringVertices.size();
 }
 
 size_t GB_Polygon::GetNumEdges() const
@@ -1207,24 +2063,13 @@ std::vector<GB_Point2d> GB_Polygon::GetVerticesAsDouble() const
         return vertices;
     }
 
-    std::vector<GB_Point2d> result;
-    const size_t numVertices = GetNumVertices();
-    result.reserve(numVertices);
-
-    for (size_t i = 0; i < numVertices; i++)
+    const std::shared_ptr<const ExactCacheData> cache = GetOrBuildExactCache();
+    if (!cache)
     {
-        GB_Point2d vertexAsDouble;
-        if (TryGetDoublePointAt(*this, i, vertexAsDouble))
-        {
-            result.emplace_back(vertexAsDouble);
-        }
-        else
-        {
-            result.emplace_back(GB_QuietNan, GB_QuietNan);
-        }
+        return std::vector<GB_Point2d>();
     }
 
-    return result;
+    return cache->doubleVertices;
 }
 
 bool GB_Polygon::TryGetVertexAsDouble(size_t index, GB_Point2d& outVertex) const
@@ -1241,7 +2086,14 @@ bool GB_Polygon::TryGetVertexAsDouble(size_t index, GB_Point2d& outVertex) const
         return outVertex.IsValid();
     }
 
-    return TryGetDoublePointAt(*this, index, outVertex);
+    const std::shared_ptr<const ExactCacheData> cache = GetOrBuildExactCache();
+    if (!cache || index >= cache->doubleVertices.size())
+    {
+        return false;
+    }
+
+    outVertex = cache->doubleVertices[index];
+    return outVertex.IsValid();
 }
 
 bool GB_Polygon::TryGetVertexExactStrings(size_t index, std::string& outXText, std::string& outYText) const
@@ -1267,36 +2119,18 @@ bool GB_Polygon::TryGetVertexExactStrings(size_t index, std::string& outXText, s
 
 GB_Rectangle GB_Polygon::GetBoundingBox() const
 {
-    GB_Rectangle bounds;
     if (!IsValid())
     {
-        return bounds;
+        return GB_Rectangle();
     }
 
-    if (storageMode == CoordinateStorageMode::Double)
+    const std::shared_ptr<const ExactCacheData> cache = GetOrBuildExactCache();
+    if (!cache || !cache->hasBoundingBoxDouble)
     {
-        bounds.Expand(vertices);
-        return bounds;
+        return GB_Rectangle();
     }
 
-    for (const ExactStringVertex& vertex : exactStringVertices)
-    {
-        ExactNumber x = ExactNumber(0);
-        ExactNumber y = ExactNumber(0);
-        double xDouble = GB_QuietNan;
-        double yDouble = GB_QuietNan;
-        if (!TryParseExactNumber(vertex.first, x)
-            || !TryParseExactNumber(vertex.second, y)
-            || !TryConvertExactNumberToDouble(x, xDouble)
-            || !TryConvertExactNumberToDouble(y, yDouble))
-        {
-            return GB_Rectangle();
-        }
-
-        bounds.Expand(GB_Point2d(xDouble, yDouble));
-    }
-
-    return bounds;
+    return cache->boundingBoxDouble;
 }
 
 bool GB_Polygon::TryGetBoundingBoxExactStrings(std::string& outMinXText, std::string& outMinYText, std::string& outMaxXText, std::string& outMaxYText) const
@@ -1306,114 +2140,45 @@ bool GB_Polygon::TryGetBoundingBoxExactStrings(std::string& outMinXText, std::st
     outMaxXText.clear();
     outMaxYText.clear();
 
-    const size_t numVertices = GetNumVertices();
-    if (numVertices == 0)
+    if (!IsValid())
     {
         return false;
     }
 
-    ExactPoint point;
-    if (!TryGetExactPointAt(*this, 0, point))
+    const std::shared_ptr<const ExactCacheData> cache = GetOrBuildExactCache();
+    if (!cache || !cache->hasBoundingBoxExactStrings)
     {
         return false;
     }
 
-    ExactNumber minX = point.x();
-    ExactNumber minY = point.y();
-    ExactNumber maxX = point.x();
-    ExactNumber maxY = point.y();
-
-    if (storageMode == CoordinateStorageMode::ExactString)
-    {
-        outMinXText = exactStringVertices[0].first;
-        outMinYText = exactStringVertices[0].second;
-        outMaxXText = exactStringVertices[0].first;
-        outMaxYText = exactStringVertices[0].second;
-    }
-    else
-    {
-        outMinXText = DoubleToString(vertices[0].x);
-        outMinYText = DoubleToString(vertices[0].y);
-        outMaxXText = DoubleToString(vertices[0].x);
-        outMaxYText = DoubleToString(vertices[0].y);
-    }
-
-    for (size_t i = 1; i < numVertices; i++)
-    {
-        if (!TryGetExactPointAt(*this, i, point))
-        {
-            outMinXText.clear();
-            outMinYText.clear();
-            outMaxXText.clear();
-            outMaxYText.clear();
-            return false;
-        }
-
-        const std::string xText = (storageMode == CoordinateStorageMode::ExactString)
-            ? exactStringVertices[i].first
-            : DoubleToString(vertices[i].x);
-        const std::string yText = (storageMode == CoordinateStorageMode::ExactString)
-            ? exactStringVertices[i].second
-            : DoubleToString(vertices[i].y);
-
-        if (point.x() < minX)
-        {
-            minX = point.x();
-            outMinXText = xText;
-        }
-        if (point.y() < minY)
-        {
-            minY = point.y();
-            outMinYText = yText;
-        }
-        if (point.x() > maxX)
-        {
-            maxX = point.x();
-            outMaxXText = xText;
-        }
-        if (point.y() > maxY)
-        {
-            maxY = point.y();
-            outMaxYText = yText;
-        }
-    }
-
+    outMinXText = cache->minXText;
+    outMinYText = cache->minYText;
+    outMaxXText = cache->maxXText;
+    outMaxYText = cache->maxYText;
     return true;
+}
+
+bool GB_Polygon::TryGetAxisAlignedRectangle(GB_Rectangle& outRectangle) const
+{
+    outRectangle.Reset();
+    if (!IsValid())
+    {
+        return false;
+    }
+
+    const std::shared_ptr<const ExactCacheData> cache = GetOrBuildExactCache();
+    if (!cache)
+    {
+        return false;
+    }
+
+    return TryBuildAxisAlignedRectangleFromRing(cache->exactPoints, outRectangle);
 }
 
 bool GB_Polygon::HasDuplicateAdjacentVertices() const
 {
-    const size_t numVertices = GetNumVertices();
-    if (numVertices < 2)
-    {
-        return false;
-    }
-
-    ExactPoint firstPoint;
-    ExactPoint prevPoint;
-    if (!TryGetExactPointAt(*this, 0, firstPoint))
-    {
-        return false;
-    }
-
-    prevPoint = firstPoint;
-    for (size_t i = 1; i < numVertices; i++)
-    {
-        ExactPoint curPoint;
-        if (!TryGetExactPointAt(*this, i, curPoint))
-        {
-            return false;
-        }
-
-        if (curPoint == prevPoint)
-        {
-            return true;
-        }
-
-        prevPoint = curPoint;
-    }
-
-    return prevPoint == firstPoint;
+    const std::shared_ptr<const ExactCacheData> cache = GetOrBuildExactCache();
+    return cache ? cache->hasDuplicateAdjacentVertices : false;
 }
 
 bool GB_Polygon::HasZeroLengthEdges() const
@@ -1423,104 +2188,20 @@ bool GB_Polygon::HasZeroLengthEdges() const
 
 bool GB_Polygon::HasCollinearAdjacentTriples() const
 {
-    const size_t numVertices = GetNumVertices();
-    if (numVertices < 3)
-    {
-        return false;
-    }
-
-    ExactPoint firstPoint;
-    ExactPoint secondPoint;
-    if (!TryGetExactPointAt(*this, 0, firstPoint) || !TryGetExactPointAt(*this, 1, secondPoint))
-    {
-        return false;
-    }
-
-    ExactPoint prevPrevPoint = firstPoint;
-    ExactPoint prevPoint = secondPoint;
-    for (size_t i = 2; i < numVertices; i++)
-    {
-        ExactPoint curPoint;
-        if (!TryGetExactPointAt(*this, i, curPoint))
-        {
-            return false;
-        }
-
-        if (Cross(prevPrevPoint, prevPoint, curPoint) == ExactNumber(0))
-        {
-            return true;
-        }
-
-        prevPrevPoint = prevPoint;
-        prevPoint = curPoint;
-    }
-
-    return Cross(prevPrevPoint, prevPoint, firstPoint) == ExactNumber(0)
-        || Cross(prevPoint, firstPoint, secondPoint) == ExactNumber(0);
+    const std::shared_ptr<const ExactCacheData> cache = GetOrBuildExactCache();
+    return cache ? cache->hasCollinearAdjacentTriples : false;
 }
 
 bool GB_Polygon::AreAllVerticesCollinear() const
 {
-    const size_t numVertices = GetNumVertices();
-    if (numVertices <= 2)
-    {
-        return true;
-    }
-
-    ExactPoint firstPoint;
-    if (!TryGetExactPointAt(*this, 0, firstPoint))
-    {
-        return false;
-    }
-
-    size_t secondIndex = 1;
-    ExactPoint secondPoint;
-    while (secondIndex < numVertices)
-    {
-        if (!TryGetExactPointAt(*this, secondIndex, secondPoint))
-        {
-            return false;
-        }
-
-        if (secondPoint != firstPoint)
-        {
-            break;
-        }
-
-        secondIndex++;
-    }
-
-    if (secondIndex >= numVertices)
-    {
-        return true;
-    }
-
-    for (size_t i = secondIndex + 1; i < numVertices; i++)
-    {
-        ExactPoint curPoint;
-        if (!TryGetExactPointAt(*this, i, curPoint))
-        {
-            return false;
-        }
-
-        if (Cross(firstPoint, secondPoint, curPoint) != ExactNumber(0))
-        {
-            return false;
-        }
-    }
-
-    return true;
+    const std::shared_ptr<const ExactCacheData> cache = GetOrBuildExactCache();
+    return cache ? cache->areAllVerticesCollinear : false;
 }
 
 bool GB_Polygon::IsSimple() const
 {
-    std::vector<ExactPoint> points;
-    if (!TryBuildExactPoints(*this, points) || points.size() < 3)
-    {
-        return false;
-    }
-
-    return CGAL::is_simple_2(points.begin(), points.end(), ExactKernel());
+    const std::shared_ptr<const ExactCacheData> cache = GetOrBuildExactCache();
+    return cache ? cache->isSimple : false;
 }
 
 bool GB_Polygon::HasSelfIntersections() const
@@ -1530,17 +2211,22 @@ bool GB_Polygon::HasSelfIntersections() const
 
 GB_Polygon::Orientation GB_Polygon::GetOrientation() const
 {
-    ExactNumber areaTwice = ExactNumber(0);
-    if (!TryComputeSignedDoubleAreaTwice(*this, areaTwice) || GetNumVertices() < 2)
+    if (GetNumVertices() < 2)
     {
         return Orientation::Degenerate;
     }
 
-    if (areaTwice > ExactNumber(0))
+    const std::shared_ptr<const ExactCacheData> cache = GetOrBuildExactCache();
+    if (!cache)
+    {
+        return Orientation::Degenerate;
+    }
+
+    if (cache->signedAreaTwice > ExactNumber(0))
     {
         return Orientation::CounterClockwise;
     }
-    if (areaTwice < ExactNumber(0))
+    if (cache->signedAreaTwice < ExactNumber(0))
     {
         return Orientation::Clockwise;
     }
@@ -1559,19 +2245,13 @@ bool GB_Polygon::IsCounterClockwise() const
 
 double GB_Polygon::GetSignedArea() const
 {
-    ExactNumber areaTwice = ExactNumber(0);
-    if (!TryComputeSignedDoubleAreaTwice(*this, areaTwice))
+    if (!IsValid())
     {
         return GB_QuietNan;
     }
 
-    const ExactNumber area = areaTwice / ExactNumber(2);
-    double areaDouble = GB_QuietNan;
-    if (!TryConvertExactNumberToDouble(area, areaDouble))
-    {
-        return GB_QuietNan;
-    }
-    return areaDouble;
+    const std::shared_ptr<const ExactCacheData> cache = GetOrBuildExactCache();
+    return cache ? cache->signedAreaDouble : GB_QuietNan;
 }
 
 double GB_Polygon::GetUnsignedArea() const
@@ -1582,13 +2262,13 @@ double GB_Polygon::GetUnsignedArea() const
 
 std::string GB_Polygon::GetSignedAreaExactString() const
 {
-    ExactNumber areaTwice = ExactNumber(0);
-    if (!TryComputeSignedDoubleAreaTwice(*this, areaTwice))
+    if (!IsValid())
     {
-        return "";
+        return std::string();
     }
 
-    return ExactNumberToString(areaTwice / ExactNumber(2));
+    const std::shared_ptr<const ExactCacheData> cache = GetOrBuildExactCache();
+    return cache ? cache->signedAreaExactString : std::string();
 }
 
 double GB_Polygon::GetPerimeter() const
@@ -1598,43 +2278,13 @@ double GB_Polygon::GetPerimeter() const
         return GB_QuietNan;
     }
 
-    const size_t numVertices = GetNumVertices();
-    if (numVertices < 2)
+    const std::shared_ptr<const ExactCacheData> cache = GetOrBuildExactCache();
+    if (!cache || !cache->hasPerimeter)
     {
         return GB_QuietNan;
     }
 
-    GB_Point2d firstPoint;
-    GB_Point2d prevPoint;
-    if (!TryGetDoublePointAt(*this, 0, firstPoint))
-    {
-        return GB_QuietNan;
-    }
-
-    prevPoint = firstPoint;
-    long double perimeter = 0.0L;
-    for (size_t i = 1; i < numVertices; i++)
-    {
-        GB_Point2d curPoint;
-        if (!TryGetDoublePointAt(*this, i, curPoint))
-        {
-            return GB_QuietNan;
-        }
-
-        const long double dx = static_cast<long double>(curPoint.x) - static_cast<long double>(prevPoint.x);
-        const long double dy = static_cast<long double>(curPoint.y) - static_cast<long double>(prevPoint.y);
-        perimeter += HypotLongDouble(dx, dy);
-        prevPoint = curPoint;
-    }
-
-    {
-        const long double dx = static_cast<long double>(firstPoint.x) - static_cast<long double>(prevPoint.x);
-        const long double dy = static_cast<long double>(firstPoint.y) - static_cast<long double>(prevPoint.y);
-        perimeter += HypotLongDouble(dx, dy);
-    }
-
-    const double perimeterDouble = static_cast<double>(perimeter);
-    return std::isfinite(perimeterDouble) ? perimeterDouble : GB_QuietNan;
+    return cache->perimeter;
 }
 
 GB_Polygon::PointContainment GB_Polygon::ClassifyPointOddEven(const GB_Point2d& point) const
@@ -1644,26 +2294,26 @@ GB_Polygon::PointContainment GB_Polygon::ClassifyPointOddEven(const GB_Point2d& 
         return PointContainment::Outside;
     }
 
-    std::vector<ExactPoint> polygonPoints;
+    const std::shared_ptr<const ExactCacheData> cache = GetOrBuildExactCache();
     ExactPoint queryPoint;
-    if (!TryBuildExactPoints(*this, polygonPoints) || polygonPoints.size() < 2 || !TryBuildExactPoint(point, queryPoint))
+    if (!cache || cache->exactPoints.size() < 2 || !TryBuildExactPoint(point, queryPoint))
     {
         return PointContainment::Outside;
     }
 
-    return ClassifyPointOddEvenImpl(polygonPoints, queryPoint);
+    return ClassifyPointOddEvenImpl(cache->exactPoints, queryPoint);
 }
 
 GB_Polygon::PointContainment GB_Polygon::ClassifyPointOddEven(const std::string& xText, const std::string& yText) const
 {
-    std::vector<ExactPoint> polygonPoints;
+    const std::shared_ptr<const ExactCacheData> cache = GetOrBuildExactCache();
     ExactPoint queryPoint;
-    if (!TryBuildExactPoints(*this, polygonPoints) || polygonPoints.size() < 2 || !TryBuildExactPoint(xText, yText, queryPoint))
+    if (!cache || cache->exactPoints.size() < 2 || !TryBuildExactPoint(xText, yText, queryPoint))
     {
         return PointContainment::Outside;
     }
 
-    return ClassifyPointOddEvenImpl(polygonPoints, queryPoint);
+    return ClassifyPointOddEvenImpl(cache->exactPoints, queryPoint);
 }
 
 GB_Polygon GB_Polygon::Reversed() const
@@ -1683,6 +2333,68 @@ void GB_Polygon::Reverse()
     {
         std::reverse(exactStringVertices.begin(), exactStringVertices.end());
     }
+
+    InvalidateCaches();
+}
+
+bool GB_Polygon::ComputeIntersection(const GB_Polygon& other, std::vector<GB_Polygon>& outOuterBoundaries, std::vector<std::vector<GB_Polygon>>& outHoleBoundaries) const
+{
+    outOuterBoundaries.clear();
+    outHoleBoundaries.clear();
+
+#if GB_POLYGON_HAS_CGAL
+    const std::shared_ptr<const ExactCacheData> firstCache = GetOrBuildExactCache();
+    const std::shared_ptr<const ExactCacheData> secondCache = other.GetOrBuildExactCache();
+    if (!firstCache || !secondCache)
+    {
+        return false;
+    }
+
+    return TryExecutePolygonBooleanOperation(firstCache->exactPoints, secondCache->exactPoints, PolygonBooleanOperation::Intersection, outOuterBoundaries, outHoleBoundaries);
+#else
+    (void)other;
+    return false;
+#endif
+}
+
+bool GB_Polygon::ComputeUnion(const GB_Polygon& other, std::vector<GB_Polygon>& outOuterBoundaries, std::vector<std::vector<GB_Polygon>>& outHoleBoundaries) const
+{
+    outOuterBoundaries.clear();
+    outHoleBoundaries.clear();
+
+#if GB_POLYGON_HAS_CGAL
+    const std::shared_ptr<const ExactCacheData> firstCache = GetOrBuildExactCache();
+    const std::shared_ptr<const ExactCacheData> secondCache = other.GetOrBuildExactCache();
+    if (!firstCache || !secondCache)
+    {
+        return false;
+    }
+
+    return TryExecutePolygonBooleanOperation(firstCache->exactPoints, secondCache->exactPoints, PolygonBooleanOperation::Union, outOuterBoundaries, outHoleBoundaries);
+#else
+    (void)other;
+    return false;
+#endif
+}
+
+bool GB_Polygon::ComputeDifference(const GB_Polygon& other, std::vector<GB_Polygon>& outOuterBoundaries, std::vector<std::vector<GB_Polygon>>& outHoleBoundaries) const
+{
+    outOuterBoundaries.clear();
+    outHoleBoundaries.clear();
+
+#if GB_POLYGON_HAS_CGAL
+    const std::shared_ptr<const ExactCacheData> firstCache = GetOrBuildExactCache();
+    const std::shared_ptr<const ExactCacheData> secondCache = other.GetOrBuildExactCache();
+    if (!firstCache || !secondCache)
+    {
+        return false;
+    }
+
+    return TryExecutePolygonBooleanOperation(firstCache->exactPoints, secondCache->exactPoints, PolygonBooleanOperation::Difference, outOuterBoundaries, outHoleBoundaries);
+#else
+    (void)other;
+    return false;
+#endif
 }
 
 bool GB_Polygon::operator==(const GB_Polygon& other) const
@@ -1788,148 +2500,214 @@ bool GB_Polygon::Deserialize(const std::string& data)
 {
     Clear();
 
-    if (data.size() < 2 || data.front() != '(' || data.back() != ')')
+    const std::string trimmed = TrimAscii(data);
+    if (trimmed.size() < 2 || trimmed.front() != '(' || trimmed.back() != ')')
     {
         return false;
     }
 
-    const std::string body = data.substr(1, data.size() - 2);
-    const std::vector<std::string> tokens = SplitByChar(body, '|');
-    if (tokens.size() < 3 || tokens[0] != GetClassType())
+    const std::string body = trimmed.substr(1, trimmed.size() - 2);
+    size_t offset = 0;
+    std::string field;
+
+    if (!ReadNextSerializedField(body, offset, field) || field != GetClassType())
+    {
+        return false;
+    }
+
+    if (!ReadNextSerializedField(body, offset, field))
     {
         return false;
     }
 
     size_t storageModeValue = 0;
+    if (!TryParseSizeT(field, storageModeValue))
+    {
+        return false;
+    }
+
+    if (storageModeValue > static_cast<size_t>(CoordinateStorageMode::ExactString))
+    {
+        return false;
+    }
+
+    const CoordinateStorageMode parsedStorageMode = static_cast<CoordinateStorageMode>(storageModeValue);
+
+    if (!ReadNextSerializedField(body, offset, field))
+    {
+        return false;
+    }
+
     size_t numVertices = 0;
-    if (!TryParseSizeT(tokens[1], storageModeValue) || !TryParseSizeT(tokens[2], numVertices))
+    if (!TryParseSizeT(field, numVertices))
     {
-        Clear();
         return false;
     }
 
-    size_t expectedTokenCount = 0;
-    if (!TryComputeSerializedStringTokenCount(numVertices, expectedTokenCount) || tokens.size() != expectedTokenCount)
+    if (numVertices == 0)
     {
-        Clear();
-        return false;
+        return (offset == body.size()) && TrySetEmptyPolygon(parsedStorageMode, *this);
     }
 
-    if (storageModeValue == static_cast<size_t>(CoordinateStorageMode::Double))
+    if (parsedStorageMode == CoordinateStorageMode::Double)
     {
-        if (numVertices == 0)
-        {
-            return TrySetEmptyPolygon(CoordinateStorageMode::Double, *this);
-        }
-
         std::vector<GB_Point2d> parsedVertices;
         parsedVertices.reserve(numVertices);
+
         for (size_t i = 0; i < numVertices; i++)
         {
-            double x = GB_QuietNan;
-            double y = GB_QuietNan;
-            if (!TryParseDoubleText(tokens[3 + i * 2], x) || !TryParseDoubleText(tokens[4 + i * 2], y))
+            std::string xText;
+            std::string yText;
+            if (!ReadNextSerializedField(body, offset, xText)
+                || !ReadNextSerializedField(body, offset, yText))
             {
                 Clear();
                 return false;
             }
+
+            double x = GB_QuietNan;
+            double y = GB_QuietNan;
+            if (!TryParseDoubleText(xText, x) || !TryParseDoubleText(yText, y))
+            {
+                Clear();
+                return false;
+            }
+
             parsedVertices.emplace_back(x, y);
         }
-        return SetVertices(parsedVertices);
+
+        if (offset != body.size())
+        {
+            Clear();
+            return false;
+        }
+
+        return TrySetDoubleVerticesFromDeserialization(*this, std::move(parsedVertices));
     }
 
-    if (storageModeValue == static_cast<size_t>(CoordinateStorageMode::ExactString))
+    std::vector<ExactStringVertex> parsedVertices;
+    parsedVertices.reserve(numVertices);
+    for (size_t i = 0; i < numVertices; i++)
     {
-        if (numVertices == 0)
+        std::string xText;
+        std::string yText;
+        if (!ReadNextSerializedField(body, offset, xText)
+            || !ReadNextSerializedField(body, offset, yText))
         {
-            return TrySetEmptyPolygon(CoordinateStorageMode::ExactString, *this);
+            Clear();
+            return false;
         }
 
-        std::vector<ExactStringVertex> parsedVertices;
-        parsedVertices.reserve(numVertices);
-        for (size_t i = 0; i < numVertices; i++)
-        {
-            parsedVertices.emplace_back(tokens[3 + i * 2], tokens[4 + i * 2]);
-        }
-        return SetVertices(parsedVertices);
+        parsedVertices.emplace_back(std::move(xText), std::move(yText));
     }
 
-    Clear();
-    return false;
+    if (offset != body.size())
+    {
+        Clear();
+        return false;
+    }
+
+    return TrySetExactStringVerticesFromDeserialization(*this, std::move(parsedVertices));
 }
 
 bool GB_Polygon::Deserialize(const GB_ByteBuffer& data)
 {
-    constexpr static std::uint16_t expectedPayloadVersion = 1;
-    constexpr static size_t minSize = 4 + 8 + 2 + 2 + 1 + 1 + 2 + 8;
-
     Clear();
-    if (data.size() < minSize)
-    {
-        return false;
-    }
+
+    constexpr static std::uint16_t supportedPayloadVersion = 1;
 
     size_t offset = 0;
-    std::uint32_t magic = 0;
-    std::uint64_t typeId = 0;
+
+    std::uint32_t magicNumber = 0;
+    if (!ReadUInt32LE(data, offset, magicNumber) || magicNumber != GB_ClassMagicNumber)
+    {
+        return false;
+    }
+
+    std::uint64_t classTypeId = 0;
+    if (!ReadUInt64LE(data, offset, classTypeId) || classTypeId != GetClassTypeId())
+    {
+        return false;
+    }
+
     std::uint16_t payloadVersion = 0;
-    std::uint16_t reservedHeader = 0;
+    if (!ReadUInt16LE(data, offset, payloadVersion) || payloadVersion != supportedPayloadVersion)
+    {
+        return false;
+    }
+
+    std::uint16_t reserved16 = 0;
+    if (!ReadUInt16LE(data, offset, reserved16))
+    {
+        return false;
+    }
+
     std::uint8_t storageModeValue = 0;
-    std::uint8_t reservedByte = 0;
-    std::uint16_t reservedTail = 0;
-    std::uint64_t numVertices = 0;
-
-    if (!ReadUInt32LE(data, offset, magic)
-        || !ReadUInt64LE(data, offset, typeId)
-        || !ReadUInt16LE(data, offset, payloadVersion)
-        || !ReadUInt16LE(data, offset, reservedHeader)
-        || !ReadUInt8(data, offset, storageModeValue)
-        || !ReadUInt8(data, offset, reservedByte)
-        || !ReadUInt16LE(data, offset, reservedTail)
-        || !ReadUInt64LE(data, offset, numVertices))
+    if (!ReadUInt8(data, offset, storageModeValue))
     {
-        Clear();
         return false;
     }
 
-    if (magic != GB_ClassMagicNumber || typeId != GetClassTypeId() || payloadVersion != expectedPayloadVersion)
+    if (storageModeValue > static_cast<std::uint8_t>(CoordinateStorageMode::ExactString))
     {
-        Clear();
         return false;
     }
 
-    if (storageModeValue == static_cast<std::uint8_t>(CoordinateStorageMode::Double))
+    const CoordinateStorageMode parsedStorageMode = static_cast<CoordinateStorageMode>(storageModeValue);
+
+    std::uint8_t reserved8 = 0;
+    if (!ReadUInt8(data, offset, reserved8))
     {
-        if (numVertices == 0)
-        {
-            return offset == data.size() && TrySetEmptyPolygon(CoordinateStorageMode::Double, *this);
-        }
+        return false;
+    }
 
-        size_t numVerticesAsSizeT = 0;
-        if (!TryConvertVertexCountToSizeT(numVertices, numVerticesAsSizeT))
+    if (!ReadUInt16LE(data, offset, reserved16))
+    {
+        return false;
+    }
+
+    std::uint64_t numVertices64 = 0;
+    if (!ReadUInt64LE(data, offset, numVertices64))
+    {
+        return false;
+    }
+
+    size_t numVertices = 0;
+    if (!TryConvertVertexCountToSizeT(numVertices64, numVertices))
+    {
+        return false;
+    }
+
+    if (numVertices == 0)
+    {
+        if (offset != data.size())
         {
-            Clear();
             return false;
         }
+        return TrySetEmptyPolygon(parsedStorageMode, *this);
+    }
 
-        const size_t remainingBytes = data.size() - offset;
-        if (numVerticesAsSizeT > remainingBytes / (sizeof(double) * 2))
-        {
-            Clear();
-            return false;
-        }
-
+    if (parsedStorageMode == CoordinateStorageMode::Double)
+    {
         std::vector<GB_Point2d> parsedVertices;
-        parsedVertices.reserve(numVerticesAsSizeT);
-        for (std::uint64_t i = 0; i < numVertices; i++)
+        parsedVertices.reserve(numVertices);
+
+        for (size_t i = 0; i < numVertices; i++)
         {
             double x = GB_QuietNan;
             double y = GB_QuietNan;
-            if (!ReadDoubleLE(data, offset, x) || !ReadDoubleLE(data, offset, y) || !std::isfinite(x) || !std::isfinite(y))
+            if (!ReadDoubleLE(data, offset, x) || !ReadDoubleLE(data, offset, y))
             {
                 Clear();
                 return false;
             }
+
+            if (!std::isfinite(x) || !std::isfinite(y))
+            {
+                Clear();
+                return false;
+            }
+
             parsedVertices.emplace_back(x, y);
         }
 
@@ -1939,48 +2717,32 @@ bool GB_Polygon::Deserialize(const GB_ByteBuffer& data)
             return false;
         }
 
-        return SetVertices(parsedVertices);
+        return TrySetDoubleVerticesFromDeserialization(*this, std::move(parsedVertices));
     }
 
-    if (storageModeValue == static_cast<std::uint8_t>(CoordinateStorageMode::ExactString))
+    std::vector<ExactStringVertex> parsedVertices;
+    parsedVertices.reserve(numVertices);
+
+    for (size_t i = 0; i < numVertices; i++)
     {
-        if (numVertices == 0)
-        {
-            return offset == data.size() && TrySetEmptyPolygon(CoordinateStorageMode::ExactString, *this);
-        }
-
-        size_t numVerticesAsSizeT = 0;
-        if (!TryConvertVertexCountToSizeT(numVertices, numVerticesAsSizeT))
+        std::string xText;
+        std::string yText;
+        if (!ReadString(data, offset, xText) || !ReadString(data, offset, yText))
         {
             Clear();
             return false;
         }
 
-        std::vector<ExactStringVertex> parsedVertices;
-        parsedVertices.reserve(numVerticesAsSizeT);
-        for (std::uint64_t i = 0; i < numVertices; i++)
-        {
-            std::string xText;
-            std::string yText;
-            if (!ReadString(data, offset, xText) || !ReadString(data, offset, yText))
-            {
-                Clear();
-                return false;
-            }
-            parsedVertices.emplace_back(xText, yText);
-        }
-
-        if (offset != data.size())
-        {
-            Clear();
-            return false;
-        }
-
-        return SetVertices(parsedVertices);
+        parsedVertices.emplace_back(std::move(xText), std::move(yText));
     }
 
-    Clear();
-    return false;
+    if (offset != data.size())
+    {
+        Clear();
+        return false;
+    }
+
+    return TrySetExactStringVerticesFromDeserialization(*this, std::move(parsedVertices));
 }
 
 #ifdef _MSC_VER

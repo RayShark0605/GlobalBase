@@ -1,4 +1,5 @@
 ﻿#include "GB_Rectangle.h"
+#include "GB_Polygon.h"
 #include "GB_Vector2d.h"
 #include "GB_Matrix3x3.h"
 #include "../GB_IO.h"
@@ -53,6 +54,11 @@ GB_Rectangle::GB_Rectangle(double minX, double minY, double maxX, double maxY)
     Set(minX, minY, maxX, maxY);
 }
 
+GB_Rectangle::GB_Rectangle(const GB_Polygon& polygon)
+{
+    Set(polygon);
+}
+
 GB_Rectangle::~GB_Rectangle()
 {
 }
@@ -91,6 +97,14 @@ void GB_Rectangle::Set(double minX, double minY, double maxX, double maxY)
     this->maxY = maxY;
 
     Normalize();
+}
+
+void GB_Rectangle::Set(const GB_Polygon& polygon)
+{
+    if (!polygon.TryGetAxisAlignedRectangle(*this))
+    {
+        Reset();
+    }
 }
 
 void GB_Rectangle::SetFromPoint(const GB_Point2d& point)
@@ -297,6 +311,16 @@ std::vector<GB_Point2d> GB_Rectangle::GetCorners() const
     corners.emplace_back(maxX, maxY);
     corners.emplace_back(minX, maxY);
     return corners;
+}
+
+GB_Polygon GB_Rectangle::ToPolygon() const
+{
+    if (!IsValid())
+    {
+        return GB_Polygon();
+    }
+
+    return GB_Polygon(GetCorners());
 }
 
 GB_Rectangle GB_Rectangle::Offsetted(double deltaX, double deltaY) const

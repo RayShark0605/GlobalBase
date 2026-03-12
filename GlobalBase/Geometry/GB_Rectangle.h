@@ -10,6 +10,7 @@
 
 class GB_Vector2d;
 class GB_Matrix3x3;
+class GB_Polygon;
 
 /**
  * @brief 二维轴对齐矩形（Axis-Aligned Rectangle / AABB）。
@@ -34,6 +35,7 @@ public:
     GB_Rectangle(const GB_Point2d& corner1, const GB_Point2d& corner2);
     GB_Rectangle(const GB_Point2d& center, double width, double height);
     GB_Rectangle(double minX, double minY, double maxX, double maxY);
+    explicit GB_Rectangle(const GB_Polygon& polygon);
     virtual ~GB_Rectangle() override;
 
     virtual const std::string& GetClassType() const override;
@@ -44,6 +46,10 @@ public:
 
     // 直接设置并自动归一化（保证 min<=max）。
     void Set(double minX, double minY, double maxX, double maxY);
+
+    // 由多边形构造轴对齐矩形。
+    // 仅当 polygon 表示横平竖直的矩形边界时成功，否则设为无效矩形。
+    void Set(const GB_Polygon& polygon);
 
     // 以单点构造退化矩形（min=max=该点）。
     void SetFromPoint(const GB_Point2d& point);
@@ -76,6 +82,9 @@ public:
 
     // 四个角点：(minX,minY) -> (maxX,minY) -> (maxX,maxY) -> (minX,maxY)
     std::vector<GB_Point2d> GetCorners() const;
+
+    // 转为 GB_Polygon。无效矩形返回无效多边形。
+    GB_Polygon ToPolygon() const;
 
     // 平移。
     GB_Rectangle Offsetted(double deltaX, double deltaY) const;
