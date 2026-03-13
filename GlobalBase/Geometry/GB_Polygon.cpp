@@ -23,6 +23,19 @@
 #  define GB_POLYGON_HAS_CGAL 0
 #endif
 
+#if GB_POLYGON_HAS_CGAL && defined(__has_include)
+#  if __has_include(<CGAL/Multipolygon_with_holes_2.h>) && __has_include(<CGAL/Polygon_repair/repair.h>) && __has_include(<CGAL/Polygon_repair/Even_odd_rule.h>)
+#    define GB_POLYGON_HAS_CGAL_POLYGON_REPAIR 1
+#    include <CGAL/Multipolygon_with_holes_2.h>
+#    include <CGAL/Polygon_repair/repair.h>
+#    include <CGAL/Polygon_repair/Even_odd_rule.h>
+#  else
+#    define GB_POLYGON_HAS_CGAL_POLYGON_REPAIR 0
+#  endif
+#else
+#  define GB_POLYGON_HAS_CGAL_POLYGON_REPAIR 0
+#endif
+
 #include <boost/multiprecision/cpp_int.hpp>
 
 #include <algorithm>
@@ -1085,6 +1098,10 @@ namespace
     using CgalPolygonSet2 = CGAL::Polygon_set_2<CgalExactKernel>;
 #endif
 
+#if GB_POLYGON_HAS_CGAL_POLYGON_REPAIR
+    using CgalMultipolygonWithHoles2 = CGAL::Multipolygon_with_holes_2<CgalExactKernel>;
+#endif
+
     static std::vector<ExactPoint> NormalizeExactRing(const std::vector<ExactPoint>& points)
     {
         std::vector<ExactPoint> normalizedPoints;
@@ -1396,6 +1413,47 @@ namespace
                 EnsurePolygonOrientation(holeBoundary, GB_Polygon::Orientation::Clockwise);
                 holeBoundaries.push_back(std::move(holeBoundary));
             }
+            outHoleBoundaries.push_back(std::move(holeBoundaries));
+        }
+
+        return true;
+    }
+#endif
+
+#if GB_POLYGON_HAS_CGAL_POLYGON_REPAIR
+    static bool TryConvertCgalMultipolygonToGbPolygons(const CgalMultipolygonWithHoles2& multipolygon,
+        std::vector<GB_Polygon>& outOuterBoundaries,
+        std::vector<std::vector<GB_Polygon>>& outHoleBoundaries)
+    {
+        outOuterBoundaries.clear();
+        outHoleBoundaries.clear();
+
+        const size_t numPolygons = static_cast<size_t>(multipolygon.number_of_polygons_with_holes());
+        outOuterBoundaries.reserve(numPolygons);
+        outHoleBoundaries.reserve(numPolygons);
+
+        for (CgalMultipolygonWithHoles2::Polygon_with_holes_const_iterator polygonIt = multipolygon.polygons_with_holes_begin(); polygonIt != multipolygon.polygons_with_holes_end(); ++polygonIt)
+        {
+            if (polygonIt->is_unbounded())
+            {
+                outOuterBoundaries.clear();
+                outHoleBoundaries.clear();
+                return false;
+            }
+
+            GB_Polygon outerBoundary = BuildPolygonFromCgalRing(polygonIt->outer_boundary());
+            EnsurePolygonOrientation(outerBoundary, GB_Polygon::Orientation::CounterClockwise);
+            outOuterBoundaries.push_back(std::move(outerBoundary));
+
+            std::vector<GB_Polygon> holeBoundaries;
+            holeBoundaries.reserve(static_cast<size_t>(polygonIt->number_of_holes()));
+            for (CgalPolygonWithHoles2::Hole_const_iterator holeIt = polygonIt->holes_begin(); holeIt != polygonIt->holes_end(); ++holeIt)
+            {
+                GB_Polygon holeBoundary = BuildPolygonFromCgalRing(*holeIt);
+                EnsurePolygonOrientation(holeBoundary, GB_Polygon::Orientation::Clockwise);
+                holeBoundaries.push_back(std::move(holeBoundary));
+            }
+
             outHoleBoundaries.push_back(std::move(holeBoundaries));
         }
 
@@ -2433,6 +2491,49 @@ bool GB_Polygon::ComputeDifference(const GB_Polygon& other, std::vector<GB_Polyg
     return TryExecutePolygonBooleanOperation(firstCache->exactPoints, secondCache->exactPoints, PolygonBooleanOperation::Difference, outOuterBoundaries, outHoleBoundaries);
 #else
     (void)other;
+    return false;
+#endif
+}
+
+bool GB_Polygon::ComputeNormalizedPolygons(std::vector<GB_Polygon>& outOuterBoundaries, std::vector<std::vector<GB_Polygon>>& outHoleBoundaries) const
+{
+    outOuterBoundaries.clear();
+    outHoleBoundaries.clear();
+
+    const std::shared_ptr<const ExactCacheData> cache = GetOrBuildExactCache();
+    if (!cache)
+    {
+        return false;
+    }
+
+    const std::vector<ExactPoint> normalizedPoints = NormalizeExactRing(cache->exactPoints);
+    if (normalizedPoints.size() < 3 || AreAllPointsCollinear(normalizedPoints))
+    {
+        return false;
+    }
+
+#if GB_POLYGON_HAS_CGAL
+    CgalPolygon2 simplePolygon;
+    if (TryBuildCgalPolygon(normalizedPoints, simplePolygon))
+    {
+        GB_Polygon outerBoundary = BuildPolygonFromCgalRing(simplePolygon);
+        EnsurePolygonOrientation(outerBoundary, Orientation::CounterClockwise);
+        outOuterBoundaries.push_back(std::move(outerBoundary));
+        outHoleBoundaries.resize(1);
+        return true;
+    }
+#endif
+
+#if GB_POLYGON_HAS_CGAL_POLYGON_REPAIR
+    CgalPolygon2 inputPolygon;
+    for (size_t i = 0; i < normalizedPoints.size(); i++)
+    {
+        inputPolygon.push_back(CgalExactPoint(normalizedPoints[i].x, normalizedPoints[i].y));
+    }
+
+    const CgalMultipolygonWithHoles2 repairedMultipolygon = CGAL::Polygon_repair::repair(inputPolygon, CGAL::Polygon_repair::Even_odd_rule());
+    return TryConvertCgalMultipolygonToGbPolygons(repairedMultipolygon, outOuterBoundaries, outHoleBoundaries);
+#else
     return false;
 #endif
 }

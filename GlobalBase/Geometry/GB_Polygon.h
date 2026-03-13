@@ -420,6 +420,21 @@ public:
      */
     bool ComputeDifference(const GB_Polygon& other, std::vector<GB_Polygon>& outOuterBoundaries, std::vector<std::vector<GB_Polygon>>& outHoleBoundaries) const;
 
+    /**
+     * @brief 对当前闭合环做规则化/规范化，输出简单外环与洞环。
+     * @param outOuterBoundaries 输出结果中的外环集合，每个外环均为 CCW。
+     * @param outHoleBoundaries 输出结果中的洞环集合；其大小与 outOuterBoundaries 相同，
+     *        outHoleBoundaries[i] 对应 outOuterBoundaries[i] 的所有洞，每个洞环均为 CW。
+     * @return 成功返回 true。
+     *
+     * @details
+     * - 若当前对象本身已经是 simple ring，则会输出与其表示区域等价的简单结果；
+     * - 若当前对象存在自交、自接触等 non-simple 情况，则会尽量使用 CGAL 2D Polygon Repair 的 even-odd 规则做规则化；
+     * - 例如“8”字形自交环会被拆分为两个简单多边形；
+     * - 若 CGAL Polygon Repair 不可用、输入退化到无法形成二维区域，或内部转换失败，则返回 false。
+     */
+    bool ComputeNormalizedPolygons(std::vector<GB_Polygon>& outOuterBoundaries, std::vector<std::vector<GB_Polygon>>& outHoleBoundaries) const;
+
     bool operator==(const GB_Polygon& other) const;
     bool operator!=(const GB_Polygon& other) const;
 
