@@ -63,29 +63,29 @@ struct GB_NetworkProxySettings
  */
 struct GB_NetworkRequestOptions
 {
-    GB_NetworkProxySettings proxy;                    // 网络代理设置
+    GB_NetworkProxySettings proxy;                      // 网络代理设置
 
-    bool impersonateBrowser = true;                   // 是否尽量伪装成浏览器（补充常见请求头等）
-    std::string userAgentUtf8 = "";                   // User-Agent。为空且 impersonateBrowser=true 时会自动设置默认 UA
-    std::string refererUtf8 = "";                     // Referer。为空表示不设置
+    bool impersonateBrowser = true;                     // 是否尽量伪装成浏览器（补充常见请求头等）
+    std::string userAgentUtf8 = "";                     // User-Agent。为空且 impersonateBrowser=true 时会自动设置默认 UA
+    std::string refererUtf8 = "";                       // Referer。为空表示不设置
 
-    std::vector<std::string> headersUtf8;             // 额外的 HTTP 头（UTF-8），每项形如 "Header-Name: value"
+    std::vector<std::string> headersUtf8;               // 额外的 HTTP 头（UTF-8），每项形如 "Header-Name: value"
 
-    bool followRedirects = true;                      // 是否自动跟随重定向（3xx）
-    int maxRedirects = 10;                            // 最大重定向次数（followRedirects=true 时有效）
+    bool followRedirects = true;                        // 是否自动跟随重定向（3xx）
+    int maxRedirects = 10;                              // 最大重定向次数（followRedirects=true 时有效）
 
-    unsigned int connectTimeoutMs = 10000;            // 连接超时（毫秒）
-    unsigned int totalTimeoutMs = 0;                  // 总超时（毫秒，包含连接 + 传输），如果是下载大文件建议设置成 0
+    unsigned int connectTimeoutMs = 5000;               // 连接超时（毫秒）
+    unsigned int totalTimeoutMs = 0;                    // 总超时（毫秒，包含连接 + 传输），如果是下载大文件建议设置成 0
 
-    bool enableHttp2 = true;                          // 是否允许 libcurl 通过 ALPN 等方式协商 HTTP/2（若当前构建支持）
+    bool enableHttp2 = true;                            // 是否允许 libcurl 通过 ALPN 等方式协商 HTTP/2（若当前构建支持）
 
-    bool verifyTlsPeer = true;                        // 是否校验证书链（CURLOPT_SSL_VERIFYPEER）
-    bool verifyTlsHost = true;                        // 是否校验证书主机名（CURLOPT_SSL_VERIFYHOST）
+    bool verifyTlsPeer = true;                          // 是否校验证书链（CURLOPT_SSL_VERIFYPEER）
+    bool verifyTlsHost = true;                          // 是否校验证书主机名（CURLOPT_SSL_VERIFYHOST）
 
-    std::string caBundlePathUtf8 = "";                // 自定义 CA 证书文件（PEM）。为空则使用 libcurl 默认策略
-    std::string caPathUtf8 = "";                      // 自定义 CA 证书目录（PEM）。为空则使用 libcurl 默认策略
+    std::string caBundlePathUtf8 = "";                  // 自定义 CA 证书文件（PEM）。为空则使用 libcurl 默认策略
+    std::string caPathUtf8 = "";                        // 自定义 CA 证书目录（PEM）。为空则使用 libcurl 默认策略
 
-    bool includeResponseHeaders = false;              // 是否收集响应头原始行（遇到重定向可能包含多段）
+    bool includeResponseHeaders = false;                // 是否收集响应头原始行（遇到重定向可能包含多段）
 
     GLOBALBASE_PORT GB_NetworkRequestOptions();
 };

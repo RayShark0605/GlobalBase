@@ -93,13 +93,13 @@
     <CharacterSet>Unicode</CharacterSet>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'" Label="Configuration">
-    <ConfigurationType>DynamicLibrary</ConfigurationType>
+    <ConfigurationType>StaticLibrary</ConfigurationType>
     <UseDebugLibraries>true</UseDebugLibraries>
     <PlatformToolset>v143</PlatformToolset>
     <CharacterSet>Unicode</CharacterSet>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'" Label="Configuration">
-    <ConfigurationType>DynamicLibrary</ConfigurationType>
+    <ConfigurationType>StaticLibrary</ConfigurationType>
     <UseDebugLibraries>false</UseDebugLibraries>
     <PlatformToolset>v143</PlatformToolset>
     <WholeProgramOptimization>true</WholeProgramOptimization>
@@ -126,10 +126,12 @@
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
     <IncludePath>../3rdParty/libcurl_8.18.0/include;../3rdParty/CGAL-6.1.1/include;../3rdParty/boost_1_90_0;$(IncludePath)</IncludePath>
     <LibraryPath>../3rdParty/libcurl_8.18.0/lib/Debug;$(LibraryPath)</LibraryPath>
+    <TargetName>GlobalBased</TargetName>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
     <IncludePath>../3rdParty/libcurl_8.18.0/include;../3rdParty/CGAL-6.1.1/include;../3rdParty/boost_1_90_0;$(IncludePath)</IncludePath>
     <LibraryPath>../3rdParty/libcurl_8.18.0/lib/Release;$(LibraryPath)</LibraryPath>
+    <TargetName>GlobalBase</TargetName>
   </PropertyGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">
     <ClCompile>
@@ -167,7 +169,7 @@
     <ClCompile>
       <WarningLevel>Level3</WarningLevel>
       <SDLCheck>true</SDLCheck>
-      <PreprocessorDefinitions>_DEBUG;GLOBALBASE_EXPORTS;CGAL_DISABLE_GMP;_WINDOWS;_USRDLL;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>_DEBUG;CGAL_DISABLE_GMP;_WINDOWS;_USRDLL;CURL_STATICLIB;GLOBALBASE_STATIC;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <ConformanceMode>true</ConformanceMode>
       <PrecompiledHeader>NotUsing</PrecompiledHeader>
       <PrecompiledHeaderFile>
@@ -183,6 +185,50 @@
       <AdditionalDependencies>libcurl-d.lib;libcrypto.lib;zlibd.lib;delayimp.lib;%(AdditionalDependencies)</AdditionalDependencies>
       <AdditionalOptions>/DELAYLOAD:libcurl-d.dll /DELAYLOAD:libcrypto-3-x64.dll /DELAYLOAD:zlibd1.dll %(AdditionalOptions)</AdditionalOptions>
     </Link>
+    <PostBuildEvent>
+      <Command>@echo on
+
+if /I "$(Configuration)"=="Debug" (
+    lib /NOLOGO ^
+    /OUT:"$(OutDir)GlobalBased.merge.lib" ^
+    "$(TargetPath)" ^
+    "$(ProjectDir)..\3rdParty\libcurl_8.18.0\lib\Debug\libcrypto.lib" ^
+    "$(ProjectDir)..\3rdParty\libcurl_8.18.0\lib\Debug\libcurl-d.lib" ^
+    "$(ProjectDir)..\3rdParty\libcurl_8.18.0\lib\Debug\libssh2.lib" ^
+    "$(ProjectDir)..\3rdParty\libcurl_8.18.0\lib\Debug\libssl.lib" ^
+    "$(ProjectDir)..\3rdParty\libcurl_8.18.0\lib\Debug\nghttp2.lib" ^
+    "$(ProjectDir)..\3rdParty\libcurl_8.18.0\lib\Debug\zlibd.lib" ^
+    &amp;&amp; copy /Y "$(OutDir)GlobalBased.merge.lib" "$(OutDir)GlobalBased.lib" ^
+    &amp;&amp; del /F /Q "$(OutDir)GlobalBased.merge.lib"
+) else if /I "$(Configuration)"=="Release" (
+    lib /NOLOGO ^
+    /OUT:"$(OutDir)GlobalBase.merge.lib" ^
+    "$(TargetPath)" ^
+    "$(ProjectDir)..\3rdParty\libcurl_8.18.0\lib\Release\libcrypto.lib" ^
+    "$(ProjectDir)..\3rdParty\libcurl_8.18.0\lib\Release\libcurl.lib" ^
+    "$(ProjectDir)..\3rdParty\libcurl_8.18.0\lib\Release\libssh2.lib" ^
+    "$(ProjectDir)..\3rdParty\libcurl_8.18.0\lib\Release\libssl.lib" ^
+    "$(ProjectDir)..\3rdParty\libcurl_8.18.0\lib\Release\nghttp2.lib" ^
+    "$(ProjectDir)..\3rdParty\libcurl_8.18.0\lib\Release\zlib.lib" ^
+    &amp;&amp; copy /Y "$(OutDir)GlobalBase.merge.lib" "$(OutDir)GlobalBase.lib" ^
+    &amp;&amp; del /F /Q "$(OutDir)GlobalBase.merge.lib"
+) else (
+    echo Unsupported configuration: $(Configuration)
+    exit /b 1
+)</Command>
+    </PostBuildEvent>
+    <PreBuildEvent>
+      <Command>@echo on
+
+if /I "$(Configuration)"=="Debug" (
+    if exist "$(OutDir)GlobalBased.lib" del /F /Q "$(OutDir)GlobalBased.lib"
+) else if /I "$(Configuration)"=="Release" (
+    if exist "$(OutDir)GlobalBase.lib" del /F /Q "$(OutDir)GlobalBase.lib"
+) else (
+    echo Unsupported configuration: $(Configuration)
+    exit /b 1
+)</Command>
+    </PreBuildEvent>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
     <ClCompile>
@@ -190,7 +236,7 @@
       <FunctionLevelLinking>true</FunctionLevelLinking>
       <IntrinsicFunctions>true</IntrinsicFunctions>
       <SDLCheck>true</SDLCheck>
-      <PreprocessorDefinitions>NDEBUG;GLOBALBASE_EXPORTS;CGAL_DISABLE_GMP;_WINDOWS;_USRDLL;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>NDEBUG;CGAL_DISABLE_GMP;_WINDOWS;_USRDLL;CURL_STATICLIB;GLOBALBASE_STATIC;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <ConformanceMode>true</ConformanceMode>
       <PrecompiledHeader>NotUsing</PrecompiledHeader>
       <PrecompiledHeaderFile>
@@ -208,6 +254,50 @@
       <AdditionalOptions>/DELAYLOAD:libcurl.dll /DELAYLOAD:libcrypto-3-x64.dll /DELAYLOAD:zlib1.dll %(AdditionalOptions)</AdditionalOptions>
       <LinkTimeCodeGeneration>UseLinkTimeCodeGeneration</LinkTimeCodeGeneration>
     </Link>
+    <PostBuildEvent>
+      <Command>@echo on
+
+if /I "$(Configuration)"=="Debug" (
+    lib /NOLOGO ^
+    /OUT:"$(OutDir)GlobalBased.merge.lib" ^
+    "$(TargetPath)" ^
+    "$(ProjectDir)..\3rdParty\libcurl_8.18.0\lib\Debug\libcrypto.lib" ^
+    "$(ProjectDir)..\3rdParty\libcurl_8.18.0\lib\Debug\libcurl-d.lib" ^
+    "$(ProjectDir)..\3rdParty\libcurl_8.18.0\lib\Debug\libssh2.lib" ^
+    "$(ProjectDir)..\3rdParty\libcurl_8.18.0\lib\Debug\libssl.lib" ^
+    "$(ProjectDir)..\3rdParty\libcurl_8.18.0\lib\Debug\nghttp2.lib" ^
+    "$(ProjectDir)..\3rdParty\libcurl_8.18.0\lib\Debug\zlibd.lib" ^
+    &amp;&amp; copy /Y "$(OutDir)GlobalBased.merge.lib" "$(OutDir)GlobalBased.lib" ^
+    &amp;&amp; del /F /Q "$(OutDir)GlobalBased.merge.lib"
+) else if /I "$(Configuration)"=="Release" (
+    lib /NOLOGO ^
+    /OUT:"$(OutDir)GlobalBase.merge.lib" ^
+    "$(TargetPath)" ^
+    "$(ProjectDir)..\3rdParty\libcurl_8.18.0\lib\Release\libcrypto.lib" ^
+    "$(ProjectDir)..\3rdParty\libcurl_8.18.0\lib\Release\libcurl.lib" ^
+    "$(ProjectDir)..\3rdParty\libcurl_8.18.0\lib\Release\libssh2.lib" ^
+    "$(ProjectDir)..\3rdParty\libcurl_8.18.0\lib\Release\libssl.lib" ^
+    "$(ProjectDir)..\3rdParty\libcurl_8.18.0\lib\Release\nghttp2.lib" ^
+    "$(ProjectDir)..\3rdParty\libcurl_8.18.0\lib\Release\zlib.lib" ^
+    &amp;&amp; copy /Y "$(OutDir)GlobalBase.merge.lib" "$(OutDir)GlobalBase.lib" ^
+    &amp;&amp; del /F /Q "$(OutDir)GlobalBase.merge.lib"
+) else (
+    echo Unsupported configuration: $(Configuration)
+    exit /b 1
+)</Command>
+    </PostBuildEvent>
+    <PreBuildEvent>
+      <Command>@echo on
+
+if /I "$(Configuration)"=="Debug" (
+    if exist "$(OutDir)GlobalBased.lib" del /F /Q "$(OutDir)GlobalBased.lib"
+) else if /I "$(Configuration)"=="Release" (
+    if exist "$(OutDir)GlobalBase.lib" del /F /Q "$(OutDir)GlobalBase.lib"
+) else (
+    echo Unsupported configuration: $(Configuration)
+    exit /b 1
+)</Command>
+    </PreBuildEvent>
   </ItemDefinitionGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">
