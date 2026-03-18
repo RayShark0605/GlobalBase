@@ -21,4 +21,10 @@
 #endif
 #endif
 
+#if defined(_WIN32) && defined(_MSC_VER) && !defined(GLOBALBASE_DISABLE_MSVC_AUTOLINK)
+#pragma comment(lib, "Iphlpapi.lib")
+#pragma comment(lib, "Crypt32.lib")
+#pragma comment(lib, "Secur32.lib")
+#endif
+
 #endif
