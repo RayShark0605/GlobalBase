@@ -299,8 +299,11 @@ public:
      */
     struct UrlKeyValue
     {
-        std::string keyUtf8;
-        std::string valueUtf8;
+        std::string keyUtf8 = "";
+        std::string valueUtf8 = "";
+
+        UrlKeyValue() {};
+        UrlKeyValue(const std::string& key, const std::string& value) : keyUtf8(key), valueUtf8(value) {}
     };
 
 public:
@@ -379,8 +382,10 @@ public:
      * 支持两种风格：
      * - "{id}"：花括号占位符。
      * - ":id"：路径段开头的冒号占位符。
+     *
+     * @param keyCaseSensitive key 是否大小写敏感（仅对 ASCII 字母进行不敏感比较）。默认 false。
      */
-    static std::string ReplaceUrlPathParams(const std::string& urlUtf8, const std::vector<UrlKeyValue>& params, bool encodeValue = true);
+    static std::string ReplaceUrlPathParams(const std::string& urlUtf8, const std::vector<UrlKeyValue>& params, bool encodeValue = true, bool keyCaseSensitive = false);
 };
 
 #endif

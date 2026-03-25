@@ -4171,7 +4171,7 @@ bool GB_CanConnectToInternet(unsigned int timeoutMs)
 
 GB_NetworkRequestOptions::GB_NetworkRequestOptions()
 {
-	const static std::string exeDirUtf8 = GB_GetExeDirectory();
+    const static std::string exeDirUtf8 = GB_GetExeDirectory();
     const static std::string testCertPath = exeDirUtf8 + GB_STR("cacert.pem");
     if (GB_IsFileExists(testCertPath))
     {
@@ -5143,25 +5143,83 @@ namespace
 
         return true;
     }
-    static void ReplaceAllInplace(std::string& text, const std::string& oldValue, const std::string& newValue)
+    static bool AsciiEqualsAt(const std::string& text, size_t pos, const std::string& pattern, bool caseSensitive)
+    {
+        if (pattern.empty() || pos > text.size() || pattern.size() > text.size() - pos)
+        {
+            return false;
+        }
+
+        if (caseSensitive)
+        {
+            return text.compare(pos, pattern.size(), pattern) == 0;
+        }
+
+        for (size_t i = 0; i < pattern.size(); i++)
+        {
+            if (ToLowerAsciiChar(text[pos + i]) != ToLowerAsciiChar(pattern[i]))
+            {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    static void ReplaceAllInplace(std::string& text, const std::string& oldValue, const std::string& newValue, bool caseSensitive = true)
     {
         if (text.empty() || oldValue.empty() || oldValue == newValue)
         {
             return;
         }
 
-        const size_t firstPos = text.find(oldValue);
+        size_t firstPos = std::string::npos;
+        if (caseSensitive)
+        {
+            firstPos = text.find(oldValue);
+        }
+        else
+        {
+            for (size_t i = 0; i + oldValue.size() <= text.size(); i++)
+            {
+                if (AsciiEqualsAt(text, i, oldValue, false))
+                {
+                    firstPos = i;
+                    break;
+                }
+            }
+        }
+
         if (firstPos == std::string::npos)
         {
             return;
         }
 
         size_t count = 0;
-        size_t scanPos = firstPos;
-        while (scanPos != std::string::npos)
+        if (caseSensitive)
         {
-            count++;
-            scanPos = text.find(oldValue, scanPos + oldValue.size());
+            size_t scanPos = firstPos;
+            while (scanPos != std::string::npos)
+            {
+                count++;
+                scanPos = text.find(oldValue, scanPos + oldValue.size());
+            }
+        }
+        else
+        {
+            size_t scanPos = firstPos;
+            while (scanPos + oldValue.size() <= text.size())
+            {
+                if (AsciiEqualsAt(text, scanPos, oldValue, false))
+                {
+                    count++;
+                    scanPos += oldValue.size();
+                }
+                else
+                {
+                    scanPos++;
+                }
+            }
         }
 
         std::string result;
@@ -5176,20 +5234,41 @@ namespace
         }
 
         size_t lastPos = 0;
-        size_t pos = firstPos;
-        while (pos != std::string::npos)
+        if (caseSensitive)
         {
-            result.append(text, lastPos, pos - lastPos);
-            result += newValue;
+            size_t pos = firstPos;
+            while (pos != std::string::npos)
+            {
+                result.append(text, lastPos, pos - lastPos);
+                result += newValue;
 
-            lastPos = pos + oldValue.size();
-            pos = text.find(oldValue, lastPos);
+                lastPos = pos + oldValue.size();
+                pos = text.find(oldValue, lastPos);
+            }
+        }
+        else
+        {
+            size_t pos = firstPos;
+            while (pos + oldValue.size() <= text.size())
+            {
+                if (AsciiEqualsAt(text, pos, oldValue, false))
+                {
+                    result.append(text, lastPos, pos - lastPos);
+                    result += newValue;
+                    lastPos = pos + oldValue.size();
+                    pos = lastPos;
+                }
+                else
+                {
+                    pos++;
+                }
+            }
         }
 
         result.append(text, lastPos, std::string::npos);
         text.swap(result);
     }
-    static std::string ReplaceColonStyleParam(const std::string& path, const std::string& keyUtf8, const std::string& replacementUtf8)
+    static std::string ReplaceColonStyleParam(const std::string& path, const std::string& keyUtf8, const std::string& replacementUtf8, bool keyCaseSensitive)
     {
         if (keyUtf8.empty())
         {
@@ -5212,7 +5291,7 @@ namespace
         {
             if (path[i] == ':' && (i == 0 || path[i - 1] == '/'))
             {
-                if (i + 1 + keyUtf8.size() <= path.size() && path.compare(i + 1, keyUtf8.size(), keyUtf8) == 0)
+                if (AsciiEqualsAt(path, i + 1, keyUtf8, keyCaseSensitive))
                 {
                     const size_t after = i + 1 + keyUtf8.size();
                     if (after == path.size() || !IsWordChar(path[after]))
@@ -5780,7 +5859,7 @@ std::string GB_UrlOperator::RemoveUrlQueryKey(const std::string& urlUtf8, const 
 }
 
 
-std::string GB_UrlOperator::ReplaceUrlPathParams(const std::string& urlUtf8, const std::vector<GB_UrlOperator::UrlKeyValue>& params, bool encodeValue)
+std::string GB_UrlOperator::ReplaceUrlPathParams(const std::string& urlUtf8, const std::vector<GB_UrlOperator::UrlKeyValue>& params, bool encodeValue, bool keyCaseSensitive)
 {
     if (urlUtf8.empty() || params.empty())
     {
@@ -5812,10 +5891,10 @@ std::string GB_UrlOperator::ReplaceUrlPathParams(const std::string& urlUtf8, con
 
         // "{id}" 风格
         const std::string braceToken = "{" + p.keyUtf8 + "}";
-        ReplaceAllInplace(newPath, braceToken, replacement);
+        ReplaceAllInplace(newPath, braceToken, replacement, keyCaseSensitive);
 
         // ":id" 风格（路径段开头）
-        newPath = ReplaceColonStyleParam(newPath, p.keyUtf8, replacement);
+        newPath = ReplaceColonStyleParam(newPath, p.keyUtf8, replacement, keyCaseSensitive);
     }
 
     return prefix + newPath + suffix;
