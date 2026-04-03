@@ -1,0 +1,4 @@
+[submodule "GlobalThirdParty"]
+	path = GlobalThirdParty
+	url = https://github.com/RayShark0605/GlobalThirdParty
+	branch = Branch_2026.4.2

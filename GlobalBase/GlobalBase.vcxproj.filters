@@ -99,6 +99,9 @@
     <ClInclude Include="Geometry\GB_Polygon.h">
       <Filter>头文件\Geometry</Filter>
     </ClInclude>
+    <ClInclude Include="GB_DelayLoadRuntime.h">
+      <Filter>头文件</Filter>
+    </ClInclude>
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="GB_Utf8String.cpp">
@@ -169,6 +172,12 @@
     </ClCompile>
     <ClCompile Include="Geometry\GB_Polygon.cpp">
       <Filter>源文件\Geometry</Filter>
+    </ClCompile>
+    <ClCompile Include="GB_DelayLoadRuntime.cpp">
+      <Filter>源文件</Filter>
+    </ClCompile>
+    <ClCompile Include="GB_DllMain.cpp">
+      <Filter>源文件</Filter>
     </ClCompile>
   </ItemGroup>
 </Project>
