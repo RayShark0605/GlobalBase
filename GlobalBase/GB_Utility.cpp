@@ -7,10 +7,51 @@
 #include <climits>
 #include <langinfo.h>
 #include <cstring>
+#include <cstdio>
+#include <cctype>
 #endif
 
 
 using namespace std;
+
+namespace
+{
+#if !defined(_WIN32)
+    static string NormalizeConsoleEncodingName(const char* encodingName)
+    {
+        if (encodingName == nullptr)
+        {
+            return string();
+        }
+
+        string normalized;
+        const string raw = encodingName;
+        normalized.reserve(raw.size());
+
+        for (size_t i = 0; i < raw.size(); i++)
+        {
+            const unsigned char ch = static_cast<unsigned char>(raw[i]);
+            if (ch == '-' || ch == '_' || ch == '.' || ch == ' ')
+            {
+                continue;
+            }
+            normalized.push_back(static_cast<char>(std::tolower(ch)));
+        }
+
+        return normalized;
+    }
+
+    static bool ConsoleEncodingEquals(const char* currentEncodingName, const char* normalizedExpectedName)
+    {
+        if (normalizedExpectedName == nullptr)
+        {
+            return false;
+        }
+
+        return NormalizeConsoleEncodingName(currentEncodingName) == normalizedExpectedName;
+    }
+#endif
+}
 
 void GB_GetConsoleEncodingCode(unsigned int& code)
 {
@@ -20,59 +61,60 @@ void GB_GetConsoleEncodingCode(unsigned int& code)
     {
         cp = ::GetACP(); // 兜底
     }
-	code = cp;
+    code = cp;
 #else
     const char* cur = setlocale(LC_CTYPE, nullptr);
     if (!cur || string(cur) == "C" || string(cur) == "POSIX")
     {
         setlocale(LC_CTYPE, ""); // 让它从环境继承
     }
+
     const char* cs = nl_langinfo(CODESET);
     if (cs && *cs)
     {
-        if (strcmp(cs, "UTF-8") == 0)
+        if (ConsoleEncodingEquals(cs, "utf8"))
         {
             code = 65001; // UTF-8
         }
-        else if (strcmp(cs, "GB18030") == 0)
+        else if (ConsoleEncodingEquals(cs, "gb18030"))
         {
             code = 54936; // GB18030
         }
-        else if (strcmp(cs, "GBK") == 0)
+        else if (ConsoleEncodingEquals(cs, "gbk") || ConsoleEncodingEquals(cs, "gb2312") || ConsoleEncodingEquals(cs, "cp936"))
         {
-            code = 936; // GBK
+            code = 936; // GBK 系
         }
-        else if (strcmp(cs, "Big5") == 0)
+        else if (ConsoleEncodingEquals(cs, "big5") || ConsoleEncodingEquals(cs, "cp950"))
         {
             code = 950; // Big5
         }
-        else if (strcmp(cs, "Shift_JIS") == 0)
+        else if (ConsoleEncodingEquals(cs, "shiftjis") || ConsoleEncodingEquals(cs, "sjis") || ConsoleEncodingEquals(cs, "cp932"))
         {
-            code = 932; // Shift_JIS
+            code = 932; // Shift_JIS 系
         }
-        else if (strcmp(cs, "CP949") == 0)
+        else if (ConsoleEncodingEquals(cs, "cp949") || ConsoleEncodingEquals(cs, "euckr"))
         {
-            code = 949; // CP949
+            code = 949; // CP949 / EUC-KR 系
         }
-        else if (strcmp(cs, "windows-1250") == 0)
+        else if (ConsoleEncodingEquals(cs, "windows1250") || ConsoleEncodingEquals(cs, "cp1250"))
         {
-            code = 1250; // windows-1250
+            code = 1250;
         }
-        else if (strcmp(cs, "windows-1251") == 0)
+        else if (ConsoleEncodingEquals(cs, "windows1251") || ConsoleEncodingEquals(cs, "cp1251"))
         {
-            code = 1251; // windows-1251
+            code = 1251;
         }
-        else if (strcmp(cs, "windows-1252") == 0)
+        else if (ConsoleEncodingEquals(cs, "windows1252") || ConsoleEncodingEquals(cs, "cp1252"))
         {
-            code = 1252; // windows-1252
+            code = 1252;
         }
-        else if (strcmp(cs, "CP437") == 0)
+        else if (ConsoleEncodingEquals(cs, "cp437"))
         {
-            code = 437; // CP437
+            code = 437;
         }
-        else if (strcmp(cs, "CP850") == 0)
+        else if (ConsoleEncodingEquals(cs, "cp850"))
         {
-            code = 850; // CP850
+            code = 850;
         }
         else
         {
@@ -81,39 +123,39 @@ void GB_GetConsoleEncodingCode(unsigned int& code)
     }
     else
     {
-        code = UINT_MAX; // 未知编码，兜底为 UTF-8
-	}
+        code = UINT_MAX; // 未知编码
+    }
 #endif
 }
 
 void GB_GetConsoleEncodingString(string& encodingString)
 {
 #if defined(_WIN32)
-	UINT cp = ::GetConsoleOutputCP();
+    UINT cp = ::GetConsoleOutputCP();
     if (cp == 0)
     {
         cp = ::GetACP(); // 兜底
     }
     switch (cp)
     {
-        case 65001: encodingString = "UTF-8"; break;
-        case 54936: encodingString = "GB18030"; break;
-        case 936:   encodingString = "GBK"; break;
-        case 950:   encodingString = "Big5"; break;
-        case 932:   encodingString = "Shift_JIS"; break;
-        case 949:   encodingString = "CP949"; break;
-        case 1250:  encodingString = "windows-1250"; break;
-        case 1251:  encodingString = "windows-1251"; break;
-        case 1252:  encodingString = "windows-1252"; break;
-        case 437:   encodingString = "CP437"; break;
-        case 850:   encodingString = "CP850"; break;
-        default:
-        {
-            char buf[32] = {};
-            snprintf(buf, sizeof(buf), "CP%u", cp);
-            encodingString = buf;
-            break;
-        }
+    case 65001: encodingString = "UTF-8"; break;
+    case 54936: encodingString = "GB18030"; break;
+    case 936:   encodingString = "GBK"; break;
+    case 950:   encodingString = "Big5"; break;
+    case 932:   encodingString = "Shift_JIS"; break;
+    case 949:   encodingString = "CP949"; break;
+    case 1250:  encodingString = "windows-1250"; break;
+    case 1251:  encodingString = "windows-1251"; break;
+    case 1252:  encodingString = "windows-1252"; break;
+    case 437:   encodingString = "CP437"; break;
+    case 850:   encodingString = "CP850"; break;
+    default:
+    {
+        char buf[32] = {};
+        snprintf(buf, sizeof(buf), "CP%u", cp);
+        encodingString = buf;
+        break;
+    }
     }
 #else
     const char* cur = setlocale(LC_CTYPE, nullptr);
@@ -136,15 +178,28 @@ void GB_GetConsoleEncodingString(string& encodingString)
 bool GB_SetConsoleEncoding(unsigned int codePageId)
 {
 #if defined(_WIN32)
-    if (!::SetConsoleOutputCP(codePageId)) // 同时设置输出与输入码页
+    const UINT oldOutputCodePage = ::GetConsoleOutputCP();
+    const UINT oldInputCodePage = ::GetConsoleCP();
+
+    if (!::SetConsoleOutputCP(codePageId))
     {
         return false;
     }
-    if (!::SetConsoleCP(codePageId)) // 回滚输出码页（尽力而为）
+
+    if (!::SetConsoleCP(codePageId))
     {
-        ::SetConsoleOutputCP(::GetConsoleOutputCP());
+        if (oldOutputCodePage != 0)
+        {
+            (void)::SetConsoleOutputCP(oldOutputCodePage);
+        }
+
+        if (oldInputCodePage != 0)
+        {
+            (void)::SetConsoleCP(oldInputCodePage);
+        }
         return false;
     }
+
     return true;
 #else
     // POSIX: 只能设置进程locale，不保证改变终端的实际显示编码
@@ -185,9 +240,9 @@ bool GB_SetConsoleEncoding(unsigned int codePageId)
     {
         if (tryWithCurrentTerritory("UTF-8"))
         {
-            // 再用 CODESET 校验
+            // 再用 CODESET 校验（不同平台可能返回 UTF8 / UTF-8 等不同写法）
             const char* cs = nl_langinfo(CODESET);
-            return (cs && strcmp(cs, "UTF-8") == 0);
+            return ConsoleEncodingEquals(cs, "utf8");
         }
         candidates = {
             "C.UTF-8",        // Debian/Ubuntu等常见

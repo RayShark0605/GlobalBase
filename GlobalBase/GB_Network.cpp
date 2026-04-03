@@ -4135,7 +4135,6 @@ bool GB_CanConnectToInternet(unsigned int timeoutMs)
         unsigned short port;
     };
 
-    // 端点顺序：先不依赖 DNS 的数值 IP，再尝试常见域名
     constexpr static ProbeEndpoint endpoints[] =
     {
         { "www.baidu.com", 443 },
