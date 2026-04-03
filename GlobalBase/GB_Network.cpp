@@ -1174,12 +1174,19 @@ namespace
     {
         try
         {
-            size_t idx = 0;
-            const unsigned long long v = std::stoull(TrimCopy(text), &idx, 10);
-            if (idx == 0)
+            const std::string trimmed = TrimCopy(text);
+            if (trimmed.empty())
             {
                 return false;
             }
+
+            size_t idx = 0;
+            const unsigned long long v = std::stoull(trimmed, &idx, 10);
+            if (idx != trimmed.size())
+            {
+                return false;
+            }
+
             value = v;
             return true;
         }
@@ -1187,6 +1194,58 @@ namespace
         {
             return false;
         }
+    }
+
+    static std::vector<std::string> SplitHeaderParameters(const std::string& headerValue)
+    {
+        std::vector<std::string> parts;
+        std::string current;
+        current.reserve(headerValue.size());
+
+        bool inQuotes = false;
+        bool escaping = false;
+
+        for (size_t i = 0; i < headerValue.size(); i++)
+        {
+            const char c = headerValue[i];
+
+            if (escaping)
+            {
+                current.push_back(c);
+                escaping = false;
+                continue;
+            }
+
+            if (c == '\\' && inQuotes)
+            {
+                current.push_back(c);
+                escaping = true;
+                continue;
+            }
+
+            if (c == '"')
+            {
+                inQuotes = !inQuotes;
+                current.push_back(c);
+                continue;
+            }
+
+            if (c == ';' && !inQuotes)
+            {
+                parts.push_back(TrimCopy(current));
+                current.clear();
+                continue;
+            }
+
+            current.push_back(c);
+        }
+
+        if (!current.empty() || !parts.empty())
+        {
+            parts.push_back(TrimCopy(current));
+        }
+
+        return parts;
     }
 
     static std::string PercentDecode(const std::string& text)
@@ -1352,27 +1411,7 @@ namespace
         std::string filename = "";
         std::string filenameStar = "";
 
-        std::vector<std::string> parts;
-        {
-            std::string current;
-            for (size_t i = 0; i < headerValue.size(); i++)
-            {
-                const char c = headerValue[i];
-                if (c == ';')
-                {
-                    parts.push_back(TrimCopy(current));
-                    current.clear();
-                }
-                else
-                {
-                    current.push_back(c);
-                }
-            }
-            if (!current.empty())
-            {
-                parts.push_back(TrimCopy(current));
-            }
-        }
+        const std::vector<std::string> parts = SplitHeaderParameters(headerValue);
 
         for (size_t i = 0; i < parts.size(); i++)
         {

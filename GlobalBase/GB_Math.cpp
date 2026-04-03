@@ -49,7 +49,7 @@ std::string GB_RandomString(size_t length, const std::vector<char32_t>& characte
 	std::uniform_int_distribution<size_t> distribution(0, characterPool.size() - 1);
 
 	std::string result;
-	result.reserve(length);
+	result.reserve(length * 4);
 
 	for (size_t i = 0; i < length; i++)
 	{
