@@ -19,6 +19,12 @@
     <Filter Include="源文件\Geometry">
       <UniqueIdentifier>{0cbb106f-8501-4381-b21f-321df6f0aa56}</UniqueIdentifier>
     </Filter>
+    <Filter Include="头文件\CV">
+      <UniqueIdentifier>{d820c2dc-3035-47c0-8355-0c662c51d389}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="源文件\CV">
+      <UniqueIdentifier>{59fbc03a-5560-4280-9d2d-1bb7fcf4c3e7}</UniqueIdentifier>
+    </Filter>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="GB_BaseTypes.h">
@@ -102,6 +108,9 @@
     <ClInclude Include="GB_DelayLoadRuntime.h">
       <Filter>头文件</Filter>
     </ClInclude>
+    <ClInclude Include="CV\GB_ColorRGBA.h">
+      <Filter>头文件\CV</Filter>
+    </ClInclude>
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="GB_Utf8String.cpp">
@@ -178,6 +187,9 @@
     </ClCompile>
     <ClCompile Include="GB_DllMain.cpp">
       <Filter>源文件</Filter>
+    </ClCompile>
+    <ClCompile Include="CV\GB_ColorRGBA.cpp">
+      <Filter>源文件\CV</Filter>
     </ClCompile>
   </ItemGroup>
 </Project>
