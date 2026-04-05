@@ -4,6 +4,7 @@
 #include "../GlobalBasePort.h"
 
 #include <array>
+#include <cassert>
 #include <cstddef>
 #include <cstdint>
 #include <string>
@@ -22,7 +23,7 @@ struct GB_ColorLinearRGBA;
  * - R/G/B/A 公开存储，方便直接访问与批量处理；
  * - 提供常用颜色运算、插值、Alpha 混合、颜色空间转换等能力。
  */
-struct GB_ColorRGBA
+struct GLOBALBASE_PORT GB_ColorRGBA
 {
 public:
     uint8_t r = 0;
@@ -30,7 +31,7 @@ public:
     uint8_t b = 0;
     uint8_t a = 255;
 
-	static const GB_ColorRGBA Transparent;
+    static const GB_ColorRGBA Transparent;
     static const GB_ColorRGBA Black;
     static const GB_ColorRGBA White;
     static const GB_ColorRGBA Red;
@@ -52,14 +53,14 @@ public:
     /**
      * @brief 默认构造：不透明黑色。
      */
-    constexpr GB_ColorRGBA() noexcept: r(0), g(0), b(0), a(255)
+    constexpr GB_ColorRGBA() noexcept : r(0), g(0), b(0), a(255)
     {
     }
 
     /**
      * @brief 以灰度值构造。
      */
-    constexpr explicit GB_ColorRGBA(uint8_t gray, uint8_t alpha = 255) noexcept: r(gray), g(gray), b(gray), a(alpha)
+    constexpr explicit GB_ColorRGBA(uint8_t gray, uint8_t alpha = 255) noexcept : r(gray), g(gray), b(gray), a(alpha)
     {
     }
 
@@ -73,14 +74,14 @@ public:
     /**
      * @brief 以 RGB 三通道构造，Alpha 默认为 255。
      */
-    constexpr GB_ColorRGBA(uint8_t red, uint8_t green, uint8_t blue) noexcept: r(red), g(green), b(blue), a(255)
+    constexpr GB_ColorRGBA(uint8_t red, uint8_t green, uint8_t blue) noexcept : r(red), g(green), b(blue), a(255)
     {
     }
 
     /**
      * @brief 从 4 字节数组构造。
      */
-    constexpr explicit GB_ColorRGBA(const std::array<uint8_t, 4>& rgbaArray) noexcept: r(rgbaArray[0]), g(rgbaArray[1]), b(rgbaArray[2]), a(rgbaArray[3])
+    constexpr explicit GB_ColorRGBA(const std::array<uint8_t, 4>& rgbaArray) noexcept : r(rgbaArray[0]), g(rgbaArray[1]), b(rgbaArray[2]), a(rgbaArray[3])
     {
     }
 
@@ -106,6 +107,7 @@ public:
      */
     constexpr uint8_t& operator[](size_t channelIndex) noexcept
     {
+        assert(channelIndex < 4);
         return Data()[channelIndex];
     }
 
@@ -115,6 +117,7 @@ public:
      */
     constexpr const uint8_t& operator[](size_t channelIndex) const noexcept
     {
+        assert(channelIndex < 4);
         return Data()[channelIndex];
     }
 
@@ -178,7 +181,7 @@ public:
      * @param includeAlpha 是否把 Alpha 也编码进字符串。
      * @param upperCase 是否使用大写十六进制字符。
      */
-    GLOBALBASE_PORT std::string ToHexString(bool includeAlpha = false, bool upperCase = true) const;
+    std::string ToHexString(bool includeAlpha = false, bool upperCase = true) const;
 
     /**
      * @brief 解析十六进制颜色字符串。
@@ -192,7 +195,7 @@ public:
      *
      * @return true 表示解析成功；false 表示输入非法，outColor 保持不变。
      */
-    GLOBALBASE_PORT static bool TryParseHexString(const std::string& colorText, GB_ColorRGBA& outColor);
+    static bool TryParseHexString(const std::string& colorText, GB_ColorRGBA& outColor);
 
     /**
      * @brief 转为显式定义字节顺序的 32 位打包值：0xRRGGBBAA。
@@ -416,32 +419,32 @@ public:
     /**
      * @brief 转 HSV。
      */
-    GLOBALBASE_PORT GB_ColorHSV ToHsv() const noexcept;
+    GB_ColorHSV ToHsv() const noexcept;
 
     /**
      * @brief 从 HSV 构造 RGBA。
      */
-    GLOBALBASE_PORT static GB_ColorRGBA FromHsv(const GB_ColorHSV& hsvColor) noexcept;
+    static GB_ColorRGBA FromHsv(const GB_ColorHSV& hsvColor) noexcept;
 
     /**
      * @brief 转 HSL。
      */
-    GLOBALBASE_PORT GB_ColorHSL ToHsl() const noexcept;
+    GB_ColorHSL ToHsl() const noexcept;
 
     /**
      * @brief 从 HSL 构造 RGBA。
      */
-    GLOBALBASE_PORT static GB_ColorRGBA FromHsl(const GB_ColorHSL& hslColor) noexcept;
+    static GB_ColorRGBA FromHsl(const GB_ColorHSL& hslColor) noexcept;
 
     /**
      * @brief 转线性 RGB（sRGB -> Linear）。
      */
-    GLOBALBASE_PORT GB_ColorLinearRGBA ToLinearRgba() const noexcept;
+    GB_ColorLinearRGBA ToLinearRgba() const noexcept;
 
     /**
      * @brief 从线性 RGB 构造（Linear -> sRGB）。
      */
-    GLOBALBASE_PORT static GB_ColorRGBA FromLinearRgba(const GB_ColorLinearRGBA& linearColor) noexcept;
+    static GB_ColorRGBA FromLinearRgba(const GB_ColorLinearRGBA& linearColor) noexcept;
 
     /**
      * @brief 相等比较。

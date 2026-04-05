@@ -111,6 +111,9 @@
     <ClInclude Include="CV\GB_ColorRGBA.h">
       <Filter>头文件\CV</Filter>
     </ClInclude>
+    <ClInclude Include="CV\GB_Image.h">
+      <Filter>头文件\CV</Filter>
+    </ClInclude>
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="GB_Utf8String.cpp">
@@ -189,6 +192,9 @@
       <Filter>源文件</Filter>
     </ClCompile>
     <ClCompile Include="CV\GB_ColorRGBA.cpp">
+      <Filter>源文件\CV</Filter>
+    </ClCompile>
+    <ClCompile Include="CV\GB_Image.cpp">
       <Filter>源文件\CV</Filter>
     </ClCompile>
   </ItemGroup>
