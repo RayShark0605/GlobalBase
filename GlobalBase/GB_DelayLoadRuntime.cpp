@@ -166,14 +166,40 @@ namespace
         {
             L"zlibd1.dll",
             L"libcurl-d.dll",
-            L"libcrypto-3-x64.dll"
+            L"libcrypto-3-x64.dll",
+            L"opencv_core4d.dll",
+            L"opencv_imgcodecs4d.dll",
+            L"opencv_imgproc4d.dll",
+            L"libpng16d.dll",
+            L"jpeg62.dll",
+            L"liblzma.dll",
+            L"tiffd.dll",
+            L"libwebp.dll",
+            L"libwebpdecoder.dll",
+            L"libwebpdemux.dll",
+            L"libwebpmux.dll",
+            L"openjp2.dll",
+            L"libsharpyuv.dll"
         };
 #else
         static const std::vector<std::wstring> dllNames =
         {
             L"zlib1.dll",
             L"libcurl.dll",
-            L"libcrypto-3-x64.dll"
+            L"libcrypto-3-x64.dll",
+            L"opencv_core4.dll",
+            L"opencv_imgcodecs4.dll",
+            L"opencv_imgproc4.dll",
+            L"libpng16.dll",
+            L"jpeg62.dll",
+            L"liblzma.dll",
+            L"tiff.dll",
+            L"libwebp.dll",
+            L"libwebpdecoder.dll",
+            L"libwebpdemux.dll",
+            L"libwebpmux.dll",
+            L"openjp2.dll",
+            L"libsharpyuv.dll"
         };
 #endif
         return dllNames;
@@ -205,6 +231,27 @@ namespace
 
             filePathBuffer.resize(filePathBuffer.size() * 2, L'\0');
         }
+    }
+
+    static std::wstring GetLastErrorMessage(DWORD errorCode)
+    {
+        LPWSTR buffer = nullptr;
+        const DWORD length = ::FormatMessageW(
+            FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
+            nullptr,
+            errorCode,
+            0,
+            reinterpret_cast<LPWSTR>(&buffer),
+            0,
+            nullptr);
+
+        std::wstring message;
+        if (length > 0 && buffer != nullptr)
+        {
+            message.assign(buffer, length);
+            ::LocalFree(buffer);
+        }
+        return message;
     }
 
     bool IsManagedDelayLoadDll(const char* dllName)
@@ -255,6 +302,9 @@ namespace
         {
             return moduleHandle;
         }
+
+        const DWORD errorCode = ::GetLastError();
+        const std::wstring errorMessage = GetLastErrorMessage(errorCode);
 
         const std::wstring fallbackPath = JoinPath(globalBaseDirectory, dllName);
 

@@ -213,6 +213,8 @@ public:
     bool ConvertColorInPlace(GB_ImageColorConversion conversion);
 
 private:
+    bool EnsureImageImpl();
+
     class Impl;
     Impl* imageImpl = nullptr;
 };

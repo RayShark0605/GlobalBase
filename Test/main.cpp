@@ -5,17 +5,25 @@
 #include "GB_DateTime.h"
 #include "GB_Network.h"
 #include "GB_DelayLoadRuntime.h"
+#include "CV/GB_Image.h"
 
 using namespace std;
 int main(int argc, char* argv[])
 {
     GB_InitializeRuntime();
-    GB_DateTime utcDateTime = GB_DateTime::GetUtcTimeFromNetwork();
-    GB_DateTime localDateTime = utcDateTime + GB_TimeDuration::CreateFromHours(8);
-    std::string localDate = localDateTime.ToIsoString();
-	const GB_TimeDuration duration = utcDateTime - localDateTime;
 
-    const GB_NetworkResponse response = GB_RequestUrlData(GB_STR("http://localhost:8080/geoserver/gwc/service/wmts?service=WMTS&version=1.1.1&request=GetCapabilities"));
+    const std::string imageFilePath = GB_STR("Test.tiff");
+
+    const GB_Image image(imageFilePath);
+    const bool isEmpty = image.IsEmpty();
+    const size_t width = image.GetWidth();
+    const size_t height = image.GetHeight();
+    const size_t rows = image.GetRows();
+    const size_t cols = image.GetCols();
+    const int channels = image.GetChannels();
+    const GB_ImageDepth depth = image.GetDepth();
+
+
 
     return 0;
 }

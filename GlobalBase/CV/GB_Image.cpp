@@ -5,9 +5,19 @@
 #include <limits>
 #include <utility>
 #include <vector>
+
+#ifdef _MSC_VER
+#  pragma warning(push)
+#  pragma warning(disable: 4819)
+#endif
+
 #include <opencv2/core.hpp>
 #include <opencv2/imgcodecs.hpp>
 #include <opencv2/imgproc.hpp>
+
+#ifdef _MSC_VER
+#  pragma warning(pop)
+#endif
 
 namespace gbImageInternal
 {
@@ -434,12 +444,9 @@ GB_Image::GB_Image(const GB_Image& other, GB_ImageCopyMode copyMode) : imageImpl
     }
 }
 
-GB_Image::GB_Image(GB_Image&& other) noexcept : imageImpl(new Impl())
+GB_Image::GB_Image(GB_Image&& other) noexcept : imageImpl(other.imageImpl)
 {
-    if (other.imageImpl != nullptr)
-    {
-        imageImpl->imageMat = std::move(other.imageImpl->imageMat);
-    }
+    other.imageImpl = nullptr;
 }
 
 GB_Image::GB_Image(const cv::Mat& imageMat, GB_ImageCopyMode copyMode) : imageImpl(new Impl())
@@ -466,6 +473,11 @@ GB_Image& GB_Image::operator=(const GB_Image& other)
         return *this;
     }
 
+    if (imageImpl == nullptr)
+    {
+        imageImpl = new Impl();
+    }
+
     imageImpl->imageMat = other.imageImpl->imageMat;
     return *this;
 }
@@ -477,13 +489,9 @@ GB_Image& GB_Image::operator=(GB_Image&& other) noexcept
         return *this;
     }
 
-    if (other.imageImpl == nullptr)
-    {
-        Clear();
-        return *this;
-    }
-
-    imageImpl->imageMat = std::move(other.imageImpl->imageMat);
+    delete imageImpl;
+    imageImpl = other.imageImpl;
+    other.imageImpl = nullptr;
     return *this;
 }
 
@@ -494,17 +502,44 @@ void GB_Image::Swap(GB_Image& other) noexcept
         return;
     }
 
-    imageImpl->imageMat.swap(other.imageImpl->imageMat);
+    std::swap(imageImpl, other.imageImpl);
 }
 
 void GB_Image::Clear()
 {
-    imageImpl->imageMat.release();
+    if (imageImpl != nullptr)
+    {
+        imageImpl->imageMat.release();
+    }
+}
+
+bool GB_Image::EnsureImageImpl()
+{
+    if (imageImpl != nullptr)
+    {
+        return true;
+    }
+
+    try
+    {
+        imageImpl = new Impl();
+        return true;
+    }
+    catch (...)
+    {
+        imageImpl = nullptr;
+        return false;
+    }
 }
 
 bool GB_Image::Create(size_t rows, size_t cols, GB_ImageDepth depth, int channels, bool zeroInitialize)
 {
     Clear();
+
+    if (!EnsureImageImpl())
+    {
+        return false;
+    }
 
     if (rows == 0 || cols == 0)
     {
@@ -624,6 +659,12 @@ bool GB_Image::LoadFromMemory(const void* encodedData, size_t encodedSize, const
             return false;
         }
 
+        if (!EnsureImageImpl())
+        {
+            Clear();
+            return false;
+        }
+
         imageImpl->imageMat = std::move(decodedImage);
         return true;
     }
@@ -705,6 +746,12 @@ bool GB_Image::EncodeToMemory(GB_ByteBuffer& encodedBytes, const std::string& fi
 bool GB_Image::SetFromCvMat(const cv::Mat& imageMat, GB_ImageCopyMode copyMode)
 {
     if (imageMat.empty())
+    {
+        Clear();
+        return false;
+    }
+
+    if (!EnsureImageImpl())
     {
         Clear();
         return false;
