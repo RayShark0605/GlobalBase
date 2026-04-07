@@ -4,9 +4,11 @@
 #include "../Geometry/GB_GeometryInterface.h"
 
 #include <cctype>
+#include <cmath>
 #include <cstring>
 #include <limits>
 #include <locale>
+#include <mutex>
 #include <sstream>
 #include <utility>
 #include <vector>
@@ -17,6 +19,7 @@
 #endif
 
 #include <opencv2/core.hpp>
+#include <opencv2/core/utils/logger.hpp>
 #include <opencv2/imgcodecs.hpp>
 #include <opencv2/imgproc.hpp>
 
@@ -26,6 +29,28 @@
 
 namespace GBImage_Internal
 {
+    /**
+     * @brief 将 OpenCV 日志级别一次性收敛到 Error。
+     *
+     * OpenCV 在首次进入部分编解码或图像处理路径时，可能会输出并行后端插件探测
+     * 的 INFO 日志。这里在 GB_Image 模块内统一将日志级别压到 ERROR，避免污染
+     * 调用方的控制台输出。
+     */
+    static void EnsureOpenCvErrorLogOnly()
+    {
+        static std::once_flag configureLogLevelOnce;
+        std::call_once(configureLogLevelOnce, []()
+            {
+                try
+                {
+                    cv::utils::logging::setLogLevel(cv::utils::logging::LOG_LEVEL_ERROR);
+                }
+                catch (...)
+                {
+                }
+            });
+    }
+
     /**
      * @brief 将 size_t 安全转换为 int。
      *
@@ -1014,6 +1039,297 @@ namespace GBImage_Internal
 
         return offset == buffer.size();
     }
+
+    /**
+     * @brief 将角度规范化到 [0, 360) 区间。
+     */
+    static double NormalizeAngleDegrees(double angleDegrees)
+    {
+        double normalizedAngle = std::fmod(angleDegrees, 360.0);
+        if (normalizedAngle < 0.0)
+        {
+            normalizedAngle += 360.0;
+        }
+
+        if (normalizedAngle >= 360.0)
+        {
+            normalizedAngle -= 360.0;
+        }
+
+        return normalizedAngle;
+    }
+
+    /**
+     * @brief 判断两个双精度数是否近似相等。
+     */
+    static bool IsNearlyEqual(double leftValue, double rightValue, double epsilon = 1e-10)
+    {
+        return std::fabs(leftValue - rightValue) <= epsilon;
+    }
+
+    /**
+     * @brief 判断颜色是否可视为全 0。
+     */
+    static bool IsZeroColor(const GB_ColorRGBA& pixelColor)
+    {
+        return pixelColor.r == 0 && pixelColor.g == 0 && pixelColor.b == 0 && pixelColor.a == 0;
+    }
+
+    /**
+     * @brief 根据旋转选项解析背景色。
+     */
+    static GB_ColorRGBA ResolveRotateBackgroundColor(const GB_ImageRotateOptions& rotateOptions)
+    {
+        switch (rotateOptions.backgroundMode)
+        {
+        case GB_ImageRotateBackgroundMode::Black:
+            return GB_ColorRGBA::Black;
+        case GB_ImageRotateBackgroundMode::White:
+            return GB_ColorRGBA::White;
+        case GB_ImageRotateBackgroundMode::Transparent:
+            return GB_ColorRGBA::Transparent;
+        case GB_ImageRotateBackgroundMode::Custom:
+            return rotateOptions.backgroundColor;
+        default:
+            break;
+        }
+
+        return GB_ColorRGBA::Black;
+    }
+
+    /**
+     * @brief 将旋转背景色映射为可用于 setTo 的标量值。
+     *
+     * 对于 2 通道图像，这里按 Gray + Alpha 解释背景值。
+     */
+    static bool TryGetRotateFillScalar(int channels, ImageChannelLayout channelLayout, const GB_ColorRGBA& backgroundColor, cv::Scalar& fillScalar)
+    {
+        switch (channels)
+        {
+        case 1:
+            fillScalar = cv::Scalar(RgbaToGray8(backgroundColor));
+            return true;
+
+        case 2:
+            fillScalar = cv::Scalar(RgbaToGray8(backgroundColor), backgroundColor.a);
+            return true;
+
+        case 3:
+            switch (channelLayout)
+            {
+            case ImageChannelLayout::Bgr:
+                fillScalar = cv::Scalar(backgroundColor.b, backgroundColor.g, backgroundColor.r);
+                return true;
+            case ImageChannelLayout::Rgb:
+                fillScalar = cv::Scalar(backgroundColor.r, backgroundColor.g, backgroundColor.b);
+                return true;
+            default:
+                break;
+            }
+            break;
+
+        case 4:
+            switch (channelLayout)
+            {
+            case ImageChannelLayout::Bgra:
+                fillScalar = cv::Scalar(backgroundColor.b, backgroundColor.g, backgroundColor.r, backgroundColor.a);
+                return true;
+            case ImageChannelLayout::Rgba:
+                fillScalar = cv::Scalar(backgroundColor.r, backgroundColor.g, backgroundColor.b, backgroundColor.a);
+                return true;
+            default:
+                break;
+            }
+            break;
+
+        default:
+            break;
+        }
+
+        fillScalar = cv::Scalar();
+        return false;
+    }
+
+    /**
+     * @brief 创建并预填充旋转结果图像。
+     *
+     * 对超过 4 通道的图像，当前仅稳定支持数值全 0 的背景。
+     */
+    static bool CreatePrefilledRotateDestination(const cv::Mat& sourceImage,
+        ImageChannelLayout channelLayout,
+        const GB_ImageRotateOptions& rotateOptions,
+        int dstRows,
+        int dstCols,
+        cv::Mat& destinationImage)
+    {
+        destinationImage.release();
+
+        if (sourceImage.empty() || dstRows <= 0 || dstCols <= 0)
+        {
+            return false;
+        }
+
+        try
+        {
+            const GB_ColorRGBA backgroundColor = ResolveRotateBackgroundColor(rotateOptions);
+            const int channels = sourceImage.channels();
+
+            if (channels > 4)
+            {
+                if (backgroundColor != GB_ColorRGBA::Black && !IsZeroColor(backgroundColor))
+                {
+                    return false;
+                }
+
+                destinationImage = cv::Mat::zeros(dstRows, dstCols, sourceImage.type());
+                return !destinationImage.empty();
+            }
+
+            destinationImage.create(dstRows, dstCols, sourceImage.type());
+            if (destinationImage.empty())
+            {
+                return false;
+            }
+
+            cv::Scalar fillScalar;
+            if (!TryGetRotateFillScalar(channels, channelLayout, backgroundColor, fillScalar))
+            {
+                destinationImage.release();
+                return false;
+            }
+
+            destinationImage.setTo(fillScalar);
+            return true;
+        }
+        catch (...)
+        {
+            destinationImage.release();
+            return false;
+        }
+    }
+
+    /**
+     * @brief 获取图像旋转中心。
+     *
+     * 使用 (cols - 1) / 2 与 (rows - 1) / 2，能够与像素中心坐标对齐，
+     * 避免偶数尺寸图像在旋转时产生额外的半像素偏移。
+     */
+    static cv::Point2d GetRotationCenter(const cv::Mat& imageMat)
+    {
+        return cv::Point2d((static_cast<double>(imageMat.cols) - 1.0) * 0.5, (static_cast<double>(imageMat.rows) - 1.0) * 0.5);
+    }
+
+    /**
+     * @brief 用 2x3 仿射矩阵变换一个点。
+     */
+    static cv::Point2d TransformAffinePoint(const cv::Mat& affineMatrix, const cv::Point2d& sourcePoint)
+    {
+        const double x = affineMatrix.at<double>(0, 0) * sourcePoint.x + affineMatrix.at<double>(0, 1) * sourcePoint.y + affineMatrix.at<double>(0, 2);
+        const double y = affineMatrix.at<double>(1, 0) * sourcePoint.x + affineMatrix.at<double>(1, 1) * sourcePoint.y + affineMatrix.at<double>(1, 2);
+        return cv::Point2d(x, y);
+    }
+
+    /**
+     * @brief 在 expandOutput=true 时，计算完整包围旋转结果所需的尺寸，并同步修正平移量。
+     */
+    static bool AdjustRotationMatrixForExpandedOutput(const cv::Mat& sourceImage, cv::Mat& affineMatrix, int& dstRows, int& dstCols)
+    {
+        if (sourceImage.empty() || affineMatrix.rows != 2 || affineMatrix.cols != 3)
+        {
+            return false;
+        }
+
+        const std::vector<cv::Point2d> sourceCorners =
+        {
+            cv::Point2d(-0.5, -0.5),
+            cv::Point2d(static_cast<double>(sourceImage.cols) - 0.5, -0.5),
+            cv::Point2d(static_cast<double>(sourceImage.cols) - 0.5, static_cast<double>(sourceImage.rows) - 0.5),
+            cv::Point2d(-0.5, static_cast<double>(sourceImage.rows) - 0.5)
+        };
+
+        double minX = 0.0;
+        double minY = 0.0;
+        double maxX = 0.0;
+        double maxY = 0.0;
+        bool firstPoint = true;
+
+        for (size_t i = 0; i < sourceCorners.size(); i++)
+        {
+            const cv::Point2d transformedPoint = TransformAffinePoint(affineMatrix, sourceCorners[i]);
+            if (firstPoint)
+            {
+                minX = transformedPoint.x;
+                maxX = transformedPoint.x;
+                minY = transformedPoint.y;
+                maxY = transformedPoint.y;
+                firstPoint = false;
+            }
+            else
+            {
+                if (transformedPoint.x < minX)
+                {
+                    minX = transformedPoint.x;
+                }
+                if (transformedPoint.x > maxX)
+                {
+                    maxX = transformedPoint.x;
+                }
+                if (transformedPoint.y < minY)
+                {
+                    minY = transformedPoint.y;
+                }
+                if (transformedPoint.y > maxY)
+                {
+                    maxY = transformedPoint.y;
+                }
+            }
+        }
+
+        const double dstWidthDouble = std::ceil(maxX) - std::floor(minX);
+        const double dstHeightDouble = std::ceil(maxY) - std::floor(minY);
+        if (dstWidthDouble <= 0.0 || dstHeightDouble <= 0.0)
+        {
+            return false;
+        }
+
+        const size_t dstWidthSize = static_cast<size_t>(dstWidthDouble);
+        const size_t dstHeightSize = static_cast<size_t>(dstHeightDouble);
+        if (!TryConvertSizeToInt(dstWidthSize, dstCols) || !TryConvertSizeToInt(dstHeightSize, dstRows))
+        {
+            return false;
+        }
+
+        affineMatrix.at<double>(0, 2) -= std::floor(minX);
+        affineMatrix.at<double>(1, 2) -= std::floor(minY);
+        return true;
+    }
+
+    /**
+     * @brief 判断是否是 90 度整数倍旋转，并返回可直接使用的 cv::rotate 代码。
+     */
+    static bool TryGetCvRotateCode(double normalizedAngleDegrees, int& rotateCode)
+    {
+        if (IsNearlyEqual(normalizedAngleDegrees, 90.0))
+        {
+            rotateCode = cv::ROTATE_90_COUNTERCLOCKWISE;
+            return true;
+        }
+
+        if (IsNearlyEqual(normalizedAngleDegrees, 180.0))
+        {
+            rotateCode = cv::ROTATE_180;
+            return true;
+        }
+
+        if (IsNearlyEqual(normalizedAngleDegrees, 270.0))
+        {
+            rotateCode = cv::ROTATE_90_CLOCKWISE;
+            return true;
+        }
+
+        rotateCode = -1;
+        return false;
+    }
 }
 
 /**
@@ -1082,6 +1398,7 @@ GB_Image::GB_Image(const GB_Image& other) : imageImpl(new Impl())
  */
 GB_Image::GB_Image(const GB_Image& other, GB_ImageCopyMode copyMode) : imageImpl(new Impl())
 {
+    GBImage_Internal::EnsureOpenCvErrorLogOnly();
     if (other.imageImpl == nullptr)
     {
         return;
@@ -1220,6 +1537,7 @@ bool GB_Image::EnsureImageImpl()
  */
 bool GB_Image::Create(size_t rows, size_t cols, GB_ImageDepth depth, int channels, bool zeroInitialize)
 {
+    GBImage_Internal::EnsureOpenCvErrorLogOnly();
     if (rows == 0 || cols == 0)
     {
         return false;
@@ -1301,6 +1619,7 @@ bool GB_Image::LoadFromMemory(const GB_ByteBuffer& encodedBytes, const GB_ImageL
  */
 bool GB_Image::LoadFromMemory(const void* encodedData, size_t encodedSize, const GB_ImageLoadOptions& loadOptions)
 {
+    GBImage_Internal::EnsureOpenCvErrorLogOnly();
     if (encodedData == nullptr || encodedSize == 0)
     {
         return false;
@@ -1405,6 +1724,7 @@ bool GB_Image::SaveToFile(const std::string& filePathUtf8, const GB_ImageSaveOpt
  */
 bool GB_Image::EncodeToMemory(GB_ByteBuffer& encodedBytes, const std::string& fileExt, const GB_ImageSaveOptions& saveOptions) const
 {
+    GBImage_Internal::EnsureOpenCvErrorLogOnly();
     encodedBytes.clear();
 
     if (IsEmpty())
@@ -1457,6 +1777,7 @@ bool GB_Image::EncodeToMemory(GB_ByteBuffer& encodedBytes, const std::string& fi
  */
 bool GB_Image::SetFromCvMat(const cv::Mat& imageMat, GB_ImageCopyMode copyMode)
 {
+    GBImage_Internal::EnsureOpenCvErrorLogOnly();
     if (imageMat.empty())
     {
         return false;
@@ -1499,6 +1820,7 @@ bool GB_Image::SetFromCvMat(const cv::Mat& imageMat, GB_ImageCopyMode copyMode)
  */
 cv::Mat GB_Image::ToCvMat(GB_ImageCopyMode copyMode) const
 {
+    GBImage_Internal::EnsureOpenCvErrorLogOnly();
     if (IsEmpty())
     {
         return cv::Mat();
@@ -1630,6 +1952,7 @@ bool GB_Image::ToColorMatrix(std::vector<std::vector<GB_ColorRGBA>>& colorMatrix
  */
 bool GB_Image::SetFromColorMatrix(const std::vector<std::vector<GB_ColorRGBA>>& colorMatrix)
 {
+    GBImage_Internal::EnsureOpenCvErrorLogOnly();
     if (colorMatrix.empty() || colorMatrix[0].empty())
     {
         return false;
@@ -2404,6 +2727,7 @@ bool GB_Image::SetPixelColor(size_t row, size_t col, const GB_ColorRGBA& pixelCo
  */
 bool GB_Image::Fill(const GB_ColorRGBA& pixelColor)
 {
+    GBImage_Internal::EnsureOpenCvErrorLogOnly();
     if (IsEmpty() || imageImpl->imageMat.depth() != CV_8U)
     {
         return false;
@@ -2431,6 +2755,7 @@ bool GB_Image::Fill(const GB_ColorRGBA& pixelColor)
  */
 GB_Image GB_Image::Clone() const
 {
+    GBImage_Internal::EnsureOpenCvErrorLogOnly();
     GB_Image resultImage;
     if (IsEmpty())
     {
@@ -2455,6 +2780,7 @@ GB_Image GB_Image::Clone() const
  */
 bool GB_Image::Detach()
 {
+    GBImage_Internal::EnsureOpenCvErrorLogOnly();
     if (IsEmpty())
     {
         return true;
@@ -2476,6 +2802,7 @@ bool GB_Image::Detach()
  */
 GB_Image GB_Image::ConvertTo(GB_ImageDepth targetDepth, double scale, double shift) const
 {
+    GBImage_Internal::EnsureOpenCvErrorLogOnly();
     GB_Image resultImage;
     if (IsEmpty())
     {
@@ -2526,6 +2853,7 @@ bool GB_Image::ConvertToInPlace(GB_ImageDepth targetDepth, double scale, double 
  */
 GB_Image GB_Image::Flip(bool horizontalFlip, bool verticalFlip) const
 {
+    GBImage_Internal::EnsureOpenCvErrorLogOnly();
     GB_Image resultImage;
     if (IsEmpty())
     {
@@ -2578,10 +2906,114 @@ bool GB_Image::FlipInPlace(bool horizontalFlip, bool verticalFlip)
 }
 
 /**
+ * @brief 旋转图像。
+ */
+GB_Image GB_Image::Rotate(double angleDegrees, const GB_ImageRotateOptions& rotateOptions) const
+{
+    GBImage_Internal::EnsureOpenCvErrorLogOnly();
+    GB_Image resultImage;
+    if (IsEmpty())
+    {
+        return resultImage;
+    }
+
+    const double normalizedAngle = GBImage_Internal::NormalizeAngleDegrees(angleDegrees);
+    if (GBImage_Internal::IsNearlyEqual(normalizedAngle, 0.0))
+    {
+        return Clone();
+    }
+
+    int cvRotateCode = -1;
+    const bool isQuarterTurn = GBImage_Internal::TryGetCvRotateCode(normalizedAngle, cvRotateCode);
+    if (isQuarterTurn && (rotateOptions.expandOutput || cvRotateCode == cv::ROTATE_180))
+    {
+        try
+        {
+            cv::rotate(imageImpl->imageMat, resultImage.imageImpl->imageMat, cvRotateCode);
+            resultImage.imageImpl->channelLayout = imageImpl->channelLayout;
+        }
+        catch (...)
+        {
+            resultImage.Clear();
+        }
+
+        return resultImage;
+    }
+
+    int dstRows = imageImpl->imageMat.rows;
+    int dstCols = imageImpl->imageMat.cols;
+
+    try
+    {
+        cv::Mat rotationMatrix = cv::getRotationMatrix2D(GBImage_Internal::GetRotationCenter(imageImpl->imageMat), angleDegrees, 1.0);
+        if (rotationMatrix.empty())
+        {
+            return resultImage;
+        }
+
+        if (rotateOptions.expandOutput)
+        {
+            if (!GBImage_Internal::AdjustRotationMatrixForExpandedOutput(imageImpl->imageMat, rotationMatrix, dstRows, dstCols))
+            {
+                return resultImage;
+            }
+        }
+
+        if (!GBImage_Internal::CreatePrefilledRotateDestination(
+            imageImpl->imageMat,
+            imageImpl->channelLayout,
+            rotateOptions,
+            dstRows,
+            dstCols,
+            resultImage.imageImpl->imageMat))
+        {
+            return resultImage;
+        }
+
+        cv::warpAffine(
+            imageImpl->imageMat,
+            resultImage.imageImpl->imageMat,
+            rotationMatrix,
+            cv::Size(dstCols, dstRows),
+            GBImage_Internal::ToCvInterpolation(rotateOptions.interpolation),
+            cv::BORDER_TRANSPARENT);
+
+        resultImage.imageImpl->channelLayout = imageImpl->channelLayout;
+    }
+    catch (...)
+    {
+        resultImage.Clear();
+    }
+
+    return resultImage;
+}
+
+/**
+ * @brief 原地旋转图像。
+ */
+bool GB_Image::RotateInPlace(double angleDegrees, const GB_ImageRotateOptions& rotateOptions)
+{
+    if (IsEmpty())
+    {
+        return false;
+    }
+
+    GB_Image rotatedImage = Rotate(angleDegrees, rotateOptions);
+    if (rotatedImage.IsEmpty())
+    {
+        return false;
+    }
+
+    Swap(rotatedImage);
+    return true;
+}
+
+/**
  * @brief 生成缩放后的新图像。
  */
 GB_Image GB_Image::Resize(size_t newRows, size_t newCols, GB_ImageInterpolation interpolation) const
 {
+    GBImage_Internal::EnsureOpenCvErrorLogOnly();
     GB_Image resultImage;
     if (IsEmpty() || newRows == 0 || newCols == 0)
     {
@@ -2643,6 +3075,7 @@ bool GB_Image::ResizeInPlace(size_t newRows, size_t newCols, GB_ImageInterpolati
  */
 GB_Image GB_Image::Crop(size_t row, size_t col, size_t cropRows, size_t cropCols, GB_ImageCopyMode copyMode) const
 {
+    GBImage_Internal::EnsureOpenCvErrorLogOnly();
     GB_Image resultImage;
     if (IsEmpty() || cropRows == 0 || cropCols == 0)
     {
@@ -2718,6 +3151,7 @@ bool GB_Image::CropInPlace(size_t row, size_t col, size_t cropRows, size_t cropC
  */
 GB_Image GB_Image::ConvertColor(GB_ImageColorConversion conversion) const
 {
+    GBImage_Internal::EnsureOpenCvErrorLogOnly();
     GB_Image resultImage;
     if (IsEmpty())
     {

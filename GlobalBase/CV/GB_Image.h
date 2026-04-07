@@ -86,6 +86,65 @@ enum class GB_ImageColorConversion
 };
 
 /**
+ * @brief 图像旋转后的空白区域填充值模式。
+ */
+enum class GB_ImageRotateBackgroundMode
+{
+    /**
+     * @brief 使用黑色背景。
+     */
+    Black = 0,
+
+    /**
+     * @brief 使用白色背景。
+     */
+    White,
+
+    /**
+     * @brief 使用全透明背景。
+     *
+     * 对不带 Alpha 的图像，会退化为数值为 0 的黑色背景。
+     */
+    Transparent,
+
+    /**
+     * @brief 使用 backgroundColor 指定的自定义背景色。
+     */
+    Custom
+};
+
+/**
+ * @brief 图像旋转选项。
+ */
+struct GB_ImageRotateOptions
+{
+    /**
+     * @brief 是否自动扩展输出尺寸以完整容纳旋转后的图像。
+     *
+     * - false：输出尺寸保持与原图一致，旋转后可能发生裁剪；
+     * - true：输出尺寸会自动扩大到足以容纳旋转后的完整内容。
+     */
+    bool expandOutput = true;
+
+    /**
+     * @brief 旋转采样时使用的插值方式。
+     */
+    GB_ImageInterpolation interpolation = GB_ImageInterpolation::Linear;
+
+    /**
+     * @brief 空白区域的填充值模式。
+     */
+    GB_ImageRotateBackgroundMode backgroundMode = GB_ImageRotateBackgroundMode::Transparent;
+
+    /**
+     * @brief 自定义空白填充值。
+     *
+     * 仅当 backgroundMode 为 Custom 时使用。
+     */
+    GB_ColorRGBA backgroundColor = GB_ColorRGBA::Black;
+};
+
+/**
  * @brief 图像读取选项。
  */
 struct GB_ImageLoadOptions
@@ -475,6 +534,24 @@ public:
      * @brief 原地翻转图像。
      */
     bool FlipInPlace(bool horizontalFlip, bool verticalFlip);
+
+    /**
+     * @brief 旋转图像。
+     *
+     * @param angleDegrees 旋转角度，单位为度。正值表示逆时针旋转，负值表示顺时针旋转。
+     * @param rotateOptions 旋转选项。
+     *
+     * 说明：
+     * - 当 expandOutput 为 false 时，输出尺寸与原图一致，旋转后可能产生裁剪；
+     * - 当 expandOutput 为 true 时，会自动调整输出尺寸与平移量，尽量完整保留旋转结果；
+     * - 对 1 / 2 / 3 / 4 通道图像可稳定指定背景值；对于超过 4 通道的图像，当前仅稳定支持零背景。
+     */
+    GB_Image Rotate(double angleDegrees, const GB_ImageRotateOptions& rotateOptions = GB_ImageRotateOptions()) const;
+
+    /**
+     * @brief 原地旋转图像。
+     */
+    bool RotateInPlace(double angleDegrees, const GB_ImageRotateOptions& rotateOptions = GB_ImageRotateOptions());
 
     /**
      * @brief 生成缩放后的新图像。
