@@ -134,15 +134,18 @@ struct GB_ImageSaveOptions
  *
  * 设计目标：
  * - 只描述“已经完整在内存中的图像”；
+ * - 头文件不引入第三方头文件；
  * - 默认拷贝语义为浅拷贝，多个对象可共享同一份底层像素缓冲区；
  * - 可通过 Clone()、Detach() 或显式 DeepCopy 获取独立副本；
  * - 像素坐标统一使用 (row, col)；
- * - 对 3 通道 / 4 通道图像，默认存储顺序为 BGR / BGRA。
+ * - 对 3 通道 / 4 通道图像，默认存储顺序为 BGR / BGRA；
+ * - 经过颜色空间转换后，内部也可以临时处于 RGB / RGBA 顺序，类会跟踪其实际通道顺序。
  *
  * 说明：
  * - 读取、创建、从外部对象设置等会修改当前图像内容的接口，采用“成功后提交”的语义：
  *   只有在新图像真正构造成功后，当前对象内部状态才会被替换；
- * - 与 GB_ColorRGBA 交互时，会自动在逻辑 RGBA 与底层 BGR / BGRA 之间完成转换。
+ * - 与 GB_ColorRGBA 交互时，会根据当前实际通道顺序，在逻辑 RGBA 与底层像素排列之间自动完成转换；
+ * - 保存或编码时，若当前内部为 RGB / RGBA 顺序，会自动转换为适合写出的通道顺序。
  */
 class GLOBALBASE_PORT GB_Image
 {
@@ -264,6 +267,7 @@ public:
      * @brief 导出为外部矩阵对象。
      *
      * DeepCopy 时返回独立副本；ShallowCopy 时返回共享底层缓冲区的视图。
+     * 返回的通道顺序与当前对象内部实际通道顺序保持一致。
      */
     cv::Mat ToCvMat(GB_ImageCopyMode copyMode = GB_ImageCopyMode::ShallowCopy) const;
 
@@ -319,8 +323,8 @@ public:
      *
      * 仅对 8 位、1 / 3 / 4 通道图像提供稳定支持：
      * - 1 通道：读取时扩展为灰度 RGBA，A 固定为 255；
-     * - 3 通道：按 BGR <-> RGBA 转换；
-     * - 4 通道：按 BGRA <-> RGBA 转换。
+     * - 3 通道：根据当前实际通道顺序（BGR 或 RGB）转换为 RGBA；
+     * - 4 通道：根据当前实际通道顺序（BGRA 或 RGBA）转换为 RGBA。
      */
     bool GetPixelColor(size_t row, size_t col, GB_ColorRGBA& pixelColor) const;
 
@@ -329,8 +333,8 @@ public:
      *
      * 仅对 8 位、1 / 3 / 4 通道图像提供稳定支持：
      * - 1 通道：按灰度写入；
-     * - 3 通道：按 BGR 写入，忽略 alpha；
-     * - 4 通道：按 BGRA 写入。
+     * - 3 通道：根据当前实际通道顺序（BGR 或 RGB）写入，忽略 alpha；
+     * - 4 通道：根据当前实际通道顺序（BGRA 或 RGBA）写入。
      */
     bool SetPixelColor(size_t row, size_t col, const GB_ColorRGBA& pixelColor);
 
@@ -338,6 +342,7 @@ public:
      * @brief 用指定颜色填充整幅图像。
      *
      * 当前实现仅对 8 位、1 / 3 / 4 通道图像提供稳定支持。
+     * 对 3 / 4 通道图像，会按照当前实际通道顺序写入像素值。
      */
     bool Fill(const GB_ColorRGBA& pixelColor);
 
@@ -377,11 +382,15 @@ public:
 
     /**
      * @brief 返回颜色空间转换后的新图像。
+     *
+     * 转换结果会保留其真实通道顺序信息。
      */
     GB_Image ConvertColor(GB_ImageColorConversion conversion) const;
 
     /**
      * @brief 原地执行颜色空间转换。
+     *
+     * 转换后会同步更新当前对象记录的通道顺序信息。
      */
     bool ConvertColorInPlace(GB_ImageColorConversion conversion);
 

@@ -378,6 +378,17 @@ namespace gbImageInternal
         return cv::INTER_LINEAR;
     }
 
+    enum class ImageChannelLayout
+    {
+        Empty = 0,
+        Gray,
+        Bgr,
+        Bgra,
+        Rgb,
+        Rgba,
+        Other
+    };
+
     static bool TryGetCvColorCode(GB_ImageColorConversion conversion, int& cvColorCode)
     {
         switch (conversion)
@@ -437,12 +448,300 @@ namespace gbImageInternal
         cvColorCode = -1;
         return false;
     }
+
+    static ImageChannelLayout InferChannelLayout(const cv::Mat& imageMat)
+    {
+        if (imageMat.empty())
+        {
+            return ImageChannelLayout::Empty;
+        }
+
+        switch (imageMat.channels())
+        {
+        case 1:
+            return ImageChannelLayout::Gray;
+        case 3:
+            return ImageChannelLayout::Bgr;
+        case 4:
+            return ImageChannelLayout::Bgra;
+        default:
+            break;
+        }
+
+        return ImageChannelLayout::Other;
+    }
+
+    static ImageChannelLayout GetConvertedChannelLayout(GB_ImageColorConversion conversion)
+    {
+        switch (conversion)
+        {
+        case GB_ImageColorConversion::GrayToBgr:
+        case GB_ImageColorConversion::BgraToBgr:
+        case GB_ImageColorConversion::RgbToBgr:
+        case GB_ImageColorConversion::RgbaToBgr:
+            return ImageChannelLayout::Bgr;
+
+        case GB_ImageColorConversion::GrayToBgra:
+        case GB_ImageColorConversion::BgrToBgra:
+        case GB_ImageColorConversion::RgbaToBgra:
+        case GB_ImageColorConversion::RgbToBgra:
+            return ImageChannelLayout::Bgra;
+
+        case GB_ImageColorConversion::BgrToGray:
+        case GB_ImageColorConversion::BgraToGray:
+        case GB_ImageColorConversion::RgbToGray:
+        case GB_ImageColorConversion::RgbaToGray:
+            return ImageChannelLayout::Gray;
+
+        case GB_ImageColorConversion::BgrToRgb:
+        case GB_ImageColorConversion::GrayToRgb:
+            return ImageChannelLayout::Rgb;
+
+        case GB_ImageColorConversion::BgraToRgba:
+        case GB_ImageColorConversion::GrayToRgba:
+            return ImageChannelLayout::Rgba;
+
+        default:
+            break;
+        }
+
+        return ImageChannelLayout::Other;
+    }
+
+    static bool IsConversionSourceLayoutCompatible(GB_ImageColorConversion conversion, ImageChannelLayout channelLayout)
+    {
+        switch (conversion)
+        {
+        case GB_ImageColorConversion::GrayToBgr:
+        case GB_ImageColorConversion::GrayToBgra:
+        case GB_ImageColorConversion::GrayToRgb:
+        case GB_ImageColorConversion::GrayToRgba:
+            return channelLayout == ImageChannelLayout::Gray;
+
+        case GB_ImageColorConversion::BgrToGray:
+        case GB_ImageColorConversion::BgrToBgra:
+        case GB_ImageColorConversion::BgrToRgb:
+            return channelLayout == ImageChannelLayout::Bgr;
+
+        case GB_ImageColorConversion::BgraToGray:
+        case GB_ImageColorConversion::BgraToBgr:
+        case GB_ImageColorConversion::BgraToRgba:
+            return channelLayout == ImageChannelLayout::Bgra;
+
+        case GB_ImageColorConversion::RgbToBgr:
+        case GB_ImageColorConversion::RgbToGray:
+        case GB_ImageColorConversion::RgbToBgra:
+            return channelLayout == ImageChannelLayout::Rgb;
+
+        case GB_ImageColorConversion::RgbaToBgra:
+        case GB_ImageColorConversion::RgbaToGray:
+        case GB_ImageColorConversion::RgbaToBgr:
+            return channelLayout == ImageChannelLayout::Rgba;
+
+        default:
+            break;
+        }
+
+        return false;
+    }
+
+    static unsigned char* GetPixelPtr(cv::Mat& imageMat, size_t row, size_t col)
+    {
+        if (imageMat.empty() || imageMat.depth() != CV_8U)
+        {
+            return nullptr;
+        }
+
+        if (row >= static_cast<size_t>(imageMat.rows) || col >= static_cast<size_t>(imageMat.cols))
+        {
+            return nullptr;
+        }
+
+        const size_t pixelSize = imageMat.elemSize();
+        return imageMat.ptr<unsigned char>(static_cast<int>(row)) + col * pixelSize;
+    }
+
+    static const unsigned char* GetPixelPtr(const cv::Mat& imageMat, size_t row, size_t col)
+    {
+        if (imageMat.empty() || imageMat.depth() != CV_8U)
+        {
+            return nullptr;
+        }
+
+        if (row >= static_cast<size_t>(imageMat.rows) || col >= static_cast<size_t>(imageMat.cols))
+        {
+            return nullptr;
+        }
+
+        const size_t pixelSize = imageMat.elemSize();
+        return imageMat.ptr<unsigned char>(static_cast<int>(row)) + col * pixelSize;
+    }
+
+    static bool ReadPixelColor(const unsigned char* pixelPtr, ImageChannelLayout channelLayout, GB_ColorRGBA& pixelColor)
+    {
+        if (pixelPtr == nullptr)
+        {
+            return false;
+        }
+
+        switch (channelLayout)
+        {
+        case ImageChannelLayout::Gray:
+            pixelColor.r = pixelPtr[0];
+            pixelColor.g = pixelPtr[0];
+            pixelColor.b = pixelPtr[0];
+            pixelColor.a = 255;
+            return true;
+
+        case ImageChannelLayout::Bgr:
+            pixelColor.r = pixelPtr[2];
+            pixelColor.g = pixelPtr[1];
+            pixelColor.b = pixelPtr[0];
+            pixelColor.a = 255;
+            return true;
+
+        case ImageChannelLayout::Bgra:
+            pixelColor.r = pixelPtr[2];
+            pixelColor.g = pixelPtr[1];
+            pixelColor.b = pixelPtr[0];
+            pixelColor.a = pixelPtr[3];
+            return true;
+
+        case ImageChannelLayout::Rgb:
+            pixelColor.r = pixelPtr[0];
+            pixelColor.g = pixelPtr[1];
+            pixelColor.b = pixelPtr[2];
+            pixelColor.a = 255;
+            return true;
+
+        case ImageChannelLayout::Rgba:
+            pixelColor.r = pixelPtr[0];
+            pixelColor.g = pixelPtr[1];
+            pixelColor.b = pixelPtr[2];
+            pixelColor.a = pixelPtr[3];
+            return true;
+
+        default:
+            break;
+        }
+
+        return false;
+    }
+
+    static bool WritePixelColor(unsigned char* pixelPtr, ImageChannelLayout channelLayout, const GB_ColorRGBA& pixelColor)
+    {
+        if (pixelPtr == nullptr)
+        {
+            return false;
+        }
+
+        switch (channelLayout)
+        {
+        case ImageChannelLayout::Gray:
+            pixelPtr[0] = RgbaToGray8(pixelColor);
+            return true;
+
+        case ImageChannelLayout::Bgr:
+            pixelPtr[0] = pixelColor.b;
+            pixelPtr[1] = pixelColor.g;
+            pixelPtr[2] = pixelColor.r;
+            return true;
+
+        case ImageChannelLayout::Bgra:
+            pixelPtr[0] = pixelColor.b;
+            pixelPtr[1] = pixelColor.g;
+            pixelPtr[2] = pixelColor.r;
+            pixelPtr[3] = pixelColor.a;
+            return true;
+
+        case ImageChannelLayout::Rgb:
+            pixelPtr[0] = pixelColor.r;
+            pixelPtr[1] = pixelColor.g;
+            pixelPtr[2] = pixelColor.b;
+            return true;
+
+        case ImageChannelLayout::Rgba:
+            pixelPtr[0] = pixelColor.r;
+            pixelPtr[1] = pixelColor.g;
+            pixelPtr[2] = pixelColor.b;
+            pixelPtr[3] = pixelColor.a;
+            return true;
+
+        default:
+            break;
+        }
+
+        return false;
+    }
+
+    static bool GetFillScalar(const GB_ColorRGBA& pixelColor, ImageChannelLayout channelLayout, cv::Scalar& fillScalar)
+    {
+        switch (channelLayout)
+        {
+        case ImageChannelLayout::Gray:
+            fillScalar = cv::Scalar(RgbaToGray8(pixelColor));
+            return true;
+
+        case ImageChannelLayout::Bgr:
+            fillScalar = cv::Scalar(pixelColor.b, pixelColor.g, pixelColor.r);
+            return true;
+
+        case ImageChannelLayout::Bgra:
+            fillScalar = cv::Scalar(pixelColor.b, pixelColor.g, pixelColor.r, pixelColor.a);
+            return true;
+
+        case ImageChannelLayout::Rgb:
+            fillScalar = cv::Scalar(pixelColor.r, pixelColor.g, pixelColor.b);
+            return true;
+
+        case ImageChannelLayout::Rgba:
+            fillScalar = cv::Scalar(pixelColor.r, pixelColor.g, pixelColor.b, pixelColor.a);
+            return true;
+
+        default:
+            break;
+        }
+
+        return false;
+    }
+
+    static bool PrepareImageForEncoding(const cv::Mat& sourceImage, ImageChannelLayout channelLayout, cv::Mat& encodedImage)
+    {
+        if (sourceImage.empty())
+        {
+            return false;
+        }
+
+        try
+        {
+            switch (channelLayout)
+            {
+            case ImageChannelLayout::Rgb:
+                cv::cvtColor(sourceImage, encodedImage, cv::COLOR_RGB2BGR);
+                return !encodedImage.empty();
+
+            case ImageChannelLayout::Rgba:
+                cv::cvtColor(sourceImage, encodedImage, cv::COLOR_RGBA2BGRA);
+                return !encodedImage.empty();
+
+            default:
+                encodedImage = sourceImage;
+                return true;
+            }
+        }
+        catch (...)
+        {
+            encodedImage.release();
+            return false;
+        }
+    }
 }
 
 class GB_Image::Impl
 {
 public:
     cv::Mat imageMat;
+    gbImageInternal::ImageChannelLayout channelLayout = gbImageInternal::ImageChannelLayout::Empty;
 };
 
 GB_Image::GB_Image() : imageImpl(new Impl())
@@ -474,6 +773,7 @@ GB_Image::GB_Image(const GB_Image& other) : imageImpl(new Impl())
     if (other.imageImpl != nullptr)
     {
         imageImpl->imageMat = other.imageImpl->imageMat;
+        imageImpl->channelLayout = other.imageImpl->channelLayout;
     }
 }
 
@@ -492,6 +792,8 @@ GB_Image::GB_Image(const GB_Image& other, GB_ImageCopyMode copyMode) : imageImpl
     {
         imageImpl->imageMat = other.imageImpl->imageMat;
     }
+
+    imageImpl->channelLayout = other.imageImpl->channelLayout;
 }
 
 GB_Image::GB_Image(GB_Image&& other) noexcept : imageImpl(other.imageImpl)
@@ -529,6 +831,7 @@ GB_Image& GB_Image::operator=(const GB_Image& other)
     }
 
     imageImpl->imageMat = other.imageImpl->imageMat;
+    imageImpl->channelLayout = other.imageImpl->channelLayout;
     return *this;
 }
 
@@ -560,6 +863,7 @@ void GB_Image::Clear()
     if (imageImpl != nullptr)
     {
         imageImpl->imageMat.release();
+        imageImpl->channelLayout = gbImageInternal::ImageChannelLayout::Empty;
     }
 }
 
@@ -620,6 +924,7 @@ bool GB_Image::Create(size_t rows, size_t cols, GB_ImageDepth depth, int channel
         }
 
         imageImpl->imageMat = std::move(newImageMat);
+        imageImpl->channelLayout = gbImageInternal::InferChannelLayout(imageImpl->imageMat);
         return true;
     }
     catch (...)
@@ -711,6 +1016,7 @@ bool GB_Image::LoadFromMemory(const void* encodedData, size_t encodedSize, const
         }
 
         imageImpl->imageMat = std::move(decodedImage);
+        imageImpl->channelLayout = gbImageInternal::InferChannelLayout(imageImpl->imageMat);
         return true;
     }
     catch (...)
@@ -771,8 +1077,14 @@ bool GB_Image::EncodeToMemory(GB_ByteBuffer& encodedBytes, const std::string& fi
         std::vector<int> imwriteParams;
         gbImageInternal::BuildImwriteParams(normalizedExt, saveOptions, imwriteParams);
 
+        cv::Mat imageForEncode;
+        if (!gbImageInternal::PrepareImageForEncoding(imageImpl->imageMat, imageImpl->channelLayout, imageForEncode))
+        {
+            return false;
+        }
+
         std::vector<unsigned char> cvEncodedBytes;
-        if (!cv::imencode(normalizedExt, imageImpl->imageMat, cvEncodedBytes, imwriteParams))
+        if (!cv::imencode(normalizedExt, imageForEncode, cvEncodedBytes, imwriteParams))
         {
             return false;
         }
@@ -817,6 +1129,7 @@ bool GB_Image::SetFromCvMat(const cv::Mat& imageMat, GB_ImageCopyMode copyMode)
         }
 
         imageImpl->imageMat = std::move(newImageMat);
+        imageImpl->channelLayout = gbImageInternal::InferChannelLayout(imageImpl->imageMat);
         return true;
     }
     catch (...)
@@ -1004,129 +1317,58 @@ const unsigned char* GB_Image::GetRowData(size_t row) const
 
 bool GB_Image::GetPixelColor(size_t row, size_t col, GB_ColorRGBA& pixelColor) const
 {
-    if (!IsValidPixelCoordinate(row, col))
+    if (IsEmpty())
     {
         return false;
     }
 
-    if (imageImpl->imageMat.depth() != CV_8U)
+    const unsigned char* pixelPtr = gbImageInternal::GetPixelPtr(imageImpl->imageMat, row, col);
+    if (pixelPtr == nullptr)
     {
         return false;
     }
 
-    const int channelCount = imageImpl->imageMat.channels();
-    const unsigned char* pixelPtr = imageImpl->imageMat.ptr<unsigned char>(static_cast<int>(row)) + col * static_cast<size_t>(channelCount);
-
-    if (channelCount == 1)
-    {
-        pixelColor.r = pixelPtr[0];
-        pixelColor.g = pixelPtr[0];
-        pixelColor.b = pixelPtr[0];
-        pixelColor.a = 255;
-        return true;
-    }
-
-    if (channelCount == 3)
-    {
-        pixelColor.r = pixelPtr[2];
-        pixelColor.g = pixelPtr[1];
-        pixelColor.b = pixelPtr[0];
-        pixelColor.a = 255;
-        return true;
-    }
-
-    if (channelCount == 4)
-    {
-        pixelColor.r = pixelPtr[2];
-        pixelColor.g = pixelPtr[1];
-        pixelColor.b = pixelPtr[0];
-        pixelColor.a = pixelPtr[3];
-        return true;
-    }
-
-    return false;
+    return gbImageInternal::ReadPixelColor(pixelPtr, imageImpl->channelLayout, pixelColor);
 }
 
 bool GB_Image::SetPixelColor(size_t row, size_t col, const GB_ColorRGBA& pixelColor)
-{
-    if (!IsValidPixelCoordinate(row, col))
-    {
-        return false;
-    }
-
-    if (imageImpl->imageMat.depth() != CV_8U)
-    {
-        return false;
-    }
-
-    const int channelCount = imageImpl->imageMat.channels();
-    unsigned char* pixelPtr = imageImpl->imageMat.ptr<unsigned char>(static_cast<int>(row)) + col * static_cast<size_t>(channelCount);
-
-    if (channelCount == 1)
-    {
-        pixelPtr[0] = gbImageInternal::RgbaToGray8(pixelColor);
-        return true;
-    }
-
-    if (channelCount == 3)
-    {
-        pixelPtr[0] = pixelColor.b;
-        pixelPtr[1] = pixelColor.g;
-        pixelPtr[2] = pixelColor.r;
-        return true;
-    }
-
-    if (channelCount == 4)
-    {
-        pixelPtr[0] = pixelColor.b;
-        pixelPtr[1] = pixelColor.g;
-        pixelPtr[2] = pixelColor.r;
-        pixelPtr[3] = pixelColor.a;
-        return true;
-    }
-
-    return false;
-}
-
-bool GB_Image::Fill(const GB_ColorRGBA& pixelColor)
 {
     if (IsEmpty())
     {
         return false;
     }
 
-    if (imageImpl->imageMat.depth() != CV_8U)
+    unsigned char* pixelPtr = gbImageInternal::GetPixelPtr(imageImpl->imageMat, row, col);
+    if (pixelPtr == nullptr)
+    {
+        return false;
+    }
+
+    return gbImageInternal::WritePixelColor(pixelPtr, imageImpl->channelLayout, pixelColor);
+}
+
+bool GB_Image::Fill(const GB_ColorRGBA& pixelColor)
+{
+    if (IsEmpty() || imageImpl->imageMat.depth() != CV_8U)
     {
         return false;
     }
 
     try
     {
-        const int channelCount = imageImpl->imageMat.channels();
-        if (channelCount == 1)
+        cv::Scalar fillScalar;
+        if (!gbImageInternal::GetFillScalar(pixelColor, imageImpl->channelLayout, fillScalar))
         {
-            imageImpl->imageMat.setTo(cv::Scalar(gbImageInternal::RgbaToGray8(pixelColor)));
-            return true;
+            return false;
         }
 
-        if (channelCount == 3)
-        {
-            imageImpl->imageMat.setTo(cv::Scalar(pixelColor.b, pixelColor.g, pixelColor.r));
-            return true;
-        }
-
-        if (channelCount == 4)
-        {
-            imageImpl->imageMat.setTo(cv::Scalar(pixelColor.b, pixelColor.g, pixelColor.r, pixelColor.a));
-            return true;
-        }
+        imageImpl->imageMat.setTo(fillScalar);
+        return true;
     }
     catch (...)
     {
         return false;
     }
-
-    return false;
 }
 
 GB_Image GB_Image::Clone() const
@@ -1140,6 +1382,7 @@ GB_Image GB_Image::Clone() const
     try
     {
         resultImage.imageImpl->imageMat = imageImpl->imageMat.clone();
+        resultImage.imageImpl->channelLayout = imageImpl->channelLayout;
     }
     catch (...)
     {
@@ -1190,6 +1433,7 @@ GB_Image GB_Image::Resize(size_t newRows, size_t newCols, GB_ImageInterpolation 
     try
     {
         cv::resize(imageImpl->imageMat, resultImage.imageImpl->imageMat, cv::Size(cvCols, cvRows), 0.0, 0.0, gbImageInternal::ToCvInterpolation(interpolation));
+        resultImage.imageImpl->channelLayout = imageImpl->channelLayout;
     }
     catch (...)
     {
@@ -1262,6 +1506,8 @@ GB_Image GB_Image::Crop(size_t row, size_t col, size_t cropRows, size_t cropCols
         {
             resultImage.imageImpl->imageMat = roiView;
         }
+
+        resultImage.imageImpl->channelLayout = imageImpl->channelLayout;
     }
     catch (...)
     {
@@ -1302,9 +1548,15 @@ GB_Image GB_Image::ConvertColor(GB_ImageColorConversion conversion) const
         return resultImage;
     }
 
+    if (!gbImageInternal::IsConversionSourceLayoutCompatible(conversion, imageImpl->channelLayout))
+    {
+        return resultImage;
+    }
+
     try
     {
         cv::cvtColor(imageImpl->imageMat, resultImage.imageImpl->imageMat, cvColorCode);
+        resultImage.imageImpl->channelLayout = gbImageInternal::GetConvertedChannelLayout(conversion);
     }
     catch (...)
     {
