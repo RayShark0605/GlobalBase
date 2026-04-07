@@ -103,7 +103,8 @@ enum class GB_ImageRotateBackgroundMode
     /**
      * @brief 使用全透明背景。
      *
-     * 对不带 Alpha 的图像，会退化为数值为 0 的黑色背景。
+     * 当源图像不带 Alpha 且当前旋转需要透明背景时，结果图像会先提升为 4 通道，
+     * 以保证旋转后新增的空白区域能够保持真实透明，而不是退化为数值为 0 的黑色背景。
      */
     Transparent,
 
@@ -544,6 +545,8 @@ public:
      * 说明：
      * - 当 expandOutput 为 false 时，输出尺寸与原图一致，旋转后可能产生裁剪；
      * - 当 expandOutput 为 true 时，会自动调整输出尺寸与平移量，尽量完整保留旋转结果；
+     * - 当 backgroundMode 为 Transparent 且源图像本身不带 Alpha 时，结果图像会自动提升为 4 通道，
+     *   以保证旋转后新增的空白区域保持透明；
      * - 对 1 / 2 / 3 / 4 通道图像可稳定指定背景值；对于超过 4 通道的图像，当前仅稳定支持零背景。
      */
     GB_Image Rotate(double angleDegrees, const GB_ImageRotateOptions& rotateOptions = GB_ImageRotateOptions()) const;

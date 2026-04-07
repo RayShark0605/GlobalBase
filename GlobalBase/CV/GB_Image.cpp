@@ -1098,6 +1098,99 @@ namespace GBImage_Internal
     }
 
     /**
+     * @brief 判断当前旋转是否需要先为源图像补出 Alpha 通道。
+     *
+     * 当请求 Transparent 背景而源图像本身不带 Alpha 时，
+     * 需要先提升为 4 通道，否则旋转后新增的空白区域只能得到数值为 0 的颜色，
+     * 无法表达真实透明。
+     */
+    static bool ShouldPromoteRotateSourceToFourChannels(const cv::Mat& sourceImage,
+        ImageChannelLayout channelLayout,
+        const GB_ImageRotateOptions& rotateOptions)
+    {
+        if (sourceImage.empty() || rotateOptions.backgroundMode != GB_ImageRotateBackgroundMode::Transparent)
+        {
+            return false;
+        }
+
+        switch (channelLayout)
+        {
+        case ImageChannelLayout::Gray:
+            return sourceImage.channels() == 1;
+
+        case ImageChannelLayout::Bgr:
+        case ImageChannelLayout::Rgb:
+            return sourceImage.channels() == 3;
+
+        default:
+            break;
+        }
+
+        return false;
+    }
+
+    /**
+     * @brief 为旋转准备实际参与运算的源图像。
+     *
+     * 当需要透明背景但源图像不带 Alpha 时，这里会先转换为 4 通道图像，
+     * 以保证旋转结果中的空白区域能够保持透明。
+     */
+    static bool PrepareRotateSourceImage(const cv::Mat& sourceImage,
+        ImageChannelLayout channelLayout,
+        const GB_ImageRotateOptions& rotateOptions,
+        cv::Mat& rotateSourceImage,
+        ImageChannelLayout& rotateSourceLayout)
+    {
+        rotateSourceImage.release();
+        rotateSourceLayout = channelLayout;
+
+        if (sourceImage.empty())
+        {
+            return false;
+        }
+
+        if (!ShouldPromoteRotateSourceToFourChannels(sourceImage, channelLayout, rotateOptions))
+        {
+            rotateSourceImage = sourceImage;
+            return true;
+        }
+
+        try
+        {
+            switch (channelLayout)
+            {
+            case ImageChannelLayout::Gray:
+                cv::cvtColor(sourceImage, rotateSourceImage, cv::COLOR_GRAY2BGRA);
+                rotateSourceLayout = ImageChannelLayout::Bgra;
+                return !rotateSourceImage.empty();
+
+            case ImageChannelLayout::Bgr:
+                cv::cvtColor(sourceImage, rotateSourceImage, cv::COLOR_BGR2BGRA);
+                rotateSourceLayout = ImageChannelLayout::Bgra;
+                return !rotateSourceImage.empty();
+
+            case ImageChannelLayout::Rgb:
+                cv::cvtColor(sourceImage, rotateSourceImage, cv::COLOR_RGB2RGBA);
+                rotateSourceLayout = ImageChannelLayout::Rgba;
+                return !rotateSourceImage.empty();
+
+            default:
+                break;
+            }
+        }
+        catch (...)
+        {
+            rotateSourceImage.release();
+            rotateSourceLayout = channelLayout;
+            return false;
+        }
+
+        rotateSourceImage.release();
+        rotateSourceLayout = channelLayout;
+        return false;
+    }
+
+    /**
      * @brief 将旋转背景色映射为可用于 setTo 的标量值。
      *
      * 对于 2 通道图像，这里按 Gray + Alpha 解释背景值。
@@ -1153,6 +1246,7 @@ namespace GBImage_Internal
     /**
      * @brief 创建并预填充旋转结果图像。
      *
+     * 传入的 sourceImage 可以是原始图像，也可以是为了支持透明背景而临时提升后的 4 通道图像。
      * 对超过 4 通道的图像，当前仅稳定支持数值全 0 的背景。
      */
     static bool CreatePrefilledRotateDestination(const cv::Mat& sourceImage,
@@ -2917,20 +3011,25 @@ GB_Image GB_Image::Rotate(double angleDegrees, const GB_ImageRotateOptions& rota
         return resultImage;
     }
 
+    cv::Mat rotateSourceImage;
+    GBImage_Internal::ImageChannelLayout rotateSourceLayout = GBImage_Internal::ImageChannelLayout::Empty;
+    if (!GBImage_Internal::PrepareRotateSourceImage(
+        imageImpl->imageMat,
+        imageImpl->channelLayout,
+        rotateOptions,
+        rotateSourceImage,
+        rotateSourceLayout))
+    {
+        return resultImage;
+    }
+
     const double normalizedAngle = GBImage_Internal::NormalizeAngleDegrees(angleDegrees);
     if (GBImage_Internal::IsNearlyEqual(normalizedAngle, 0.0))
     {
-        return Clone();
-    }
-
-    int cvRotateCode = -1;
-    const bool isQuarterTurn = GBImage_Internal::TryGetCvRotateCode(normalizedAngle, cvRotateCode);
-    if (isQuarterTurn && (rotateOptions.expandOutput || cvRotateCode == cv::ROTATE_180))
-    {
         try
         {
-            cv::rotate(imageImpl->imageMat, resultImage.imageImpl->imageMat, cvRotateCode);
-            resultImage.imageImpl->channelLayout = imageImpl->channelLayout;
+            resultImage.imageImpl->imageMat = rotateSourceImage.clone();
+            resultImage.imageImpl->channelLayout = rotateSourceLayout;
         }
         catch (...)
         {
@@ -2940,12 +3039,29 @@ GB_Image GB_Image::Rotate(double angleDegrees, const GB_ImageRotateOptions& rota
         return resultImage;
     }
 
-    int dstRows = imageImpl->imageMat.rows;
-    int dstCols = imageImpl->imageMat.cols;
+    int cvRotateCode = -1;
+    const bool isQuarterTurn = GBImage_Internal::TryGetCvRotateCode(normalizedAngle, cvRotateCode);
+    if (isQuarterTurn && (rotateOptions.expandOutput || cvRotateCode == cv::ROTATE_180))
+    {
+        try
+        {
+            cv::rotate(rotateSourceImage, resultImage.imageImpl->imageMat, cvRotateCode);
+            resultImage.imageImpl->channelLayout = rotateSourceLayout;
+        }
+        catch (...)
+        {
+            resultImage.Clear();
+        }
+
+        return resultImage;
+    }
+
+    int dstRows = rotateSourceImage.rows;
+    int dstCols = rotateSourceImage.cols;
 
     try
     {
-        cv::Mat rotationMatrix = cv::getRotationMatrix2D(GBImage_Internal::GetRotationCenter(imageImpl->imageMat), angleDegrees, 1.0);
+        cv::Mat rotationMatrix = cv::getRotationMatrix2D(GBImage_Internal::GetRotationCenter(rotateSourceImage), angleDegrees, 1.0);
         if (rotationMatrix.empty())
         {
             return resultImage;
@@ -2953,15 +3069,15 @@ GB_Image GB_Image::Rotate(double angleDegrees, const GB_ImageRotateOptions& rota
 
         if (rotateOptions.expandOutput)
         {
-            if (!GBImage_Internal::AdjustRotationMatrixForExpandedOutput(imageImpl->imageMat, rotationMatrix, dstRows, dstCols))
+            if (!GBImage_Internal::AdjustRotationMatrixForExpandedOutput(rotateSourceImage, rotationMatrix, dstRows, dstCols))
             {
                 return resultImage;
             }
         }
 
         if (!GBImage_Internal::CreatePrefilledRotateDestination(
-            imageImpl->imageMat,
-            imageImpl->channelLayout,
+            rotateSourceImage,
+            rotateSourceLayout,
             rotateOptions,
             dstRows,
             dstCols,
@@ -2971,14 +3087,14 @@ GB_Image GB_Image::Rotate(double angleDegrees, const GB_ImageRotateOptions& rota
         }
 
         cv::warpAffine(
-            imageImpl->imageMat,
+            rotateSourceImage,
             resultImage.imageImpl->imageMat,
             rotationMatrix,
             cv::Size(dstCols, dstRows),
             GBImage_Internal::ToCvInterpolation(rotateOptions.interpolation),
             cv::BORDER_TRANSPARENT);
 
-        resultImage.imageImpl->channelLayout = imageImpl->channelLayout;
+        resultImage.imageImpl->channelLayout = rotateSourceLayout;
     }
     catch (...)
     {
