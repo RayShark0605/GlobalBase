@@ -323,9 +323,11 @@ public:
     bool SetFromColorMatrix(const std::vector<std::vector<GB_ColorRGBA>>& colorMatrix);
 
     /**
-     * @brief 序列化为二进制安全的 std::string。
+     * @brief 序列化为便于人类阅读的文本字符串。
      *
-     * 返回字符串可能包含 '\0' 等非文本字节，内部格式与 SerializeToBinary() 一致。
+     * 当前文本格式逐像素输出逻辑 RGBA 颜色值，
+     * 仅对 8 位、1 / 3 / 4 通道图像提供稳定支持。
+     * 序列化失败时返回空字符串；空图像会输出 "(GB_Image empty)"。
      */
     std::string SerializeToString() const;
 
@@ -335,8 +337,10 @@ public:
     GB_ByteBuffer SerializeToBinary() const;
 
     /**
-     * @brief 从二进制安全的 std::string 反序列化。
+     * @brief 从文本字符串反序列化。
      *
+     * 当前仅支持由 SerializeToString() 生成的文本格式。
+     * 反序列化成功后，内部会生成 8 位 4 通道 BGRA 图像。
      * 失败时，对象保持原有内容不变。
      */
     bool Deserialize(const std::string& data);

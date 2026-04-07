@@ -1705,8 +1705,7 @@ std::string GB_Image::SerializeToString() const
         return std::string("(") + GetClassType() + " empty)";
     }
 
-    std::vector<std::vector<GB_ColorRGBA>> colorMatrix;
-    if (!ToColorMatrix(colorMatrix))
+    if (!GBImage_Internal::IsColorMatrixSupported(imageImpl->imageMat, imageImpl->channelLayout))
     {
         return std::string();
     }
@@ -1716,18 +1715,11 @@ std::string GB_Image::SerializeToString() const
         std::ostringstream oss;
         oss.imbue(std::locale::classic());
         oss << "(" << GetClassType();
-
-        if (colorMatrix.empty())
-        {
-            oss << " empty)";
-            return oss.str();
-        }
-
-        oss << " rows=" << colorMatrix.size();
-        oss << " cols=" << colorMatrix[0].size();
+        oss << " rows=" << GetRows();
+        oss << " cols=" << GetCols();
         oss << " pixels=[";
 
-        for (size_t rowIndex = 0; rowIndex < colorMatrix.size(); rowIndex++)
+        for (size_t rowIndex = 0; rowIndex < GetRows(); rowIndex++)
         {
             if (rowIndex != 0)
             {
@@ -1735,15 +1727,19 @@ std::string GB_Image::SerializeToString() const
             }
 
             oss << "[";
-            const std::vector<GB_ColorRGBA>& colorRow = colorMatrix[rowIndex];
-            for (size_t colIndex = 0; colIndex < colorRow.size(); colIndex++)
+            for (size_t colIndex = 0; colIndex < GetCols(); colIndex++)
             {
                 if (colIndex != 0)
                 {
                     oss << ",";
                 }
 
-                const GB_ColorRGBA& pixelColor = colorRow[colIndex];
+                GB_ColorRGBA pixelColor;
+                if (!GetPixelColor(rowIndex, colIndex, pixelColor))
+                {
+                    return std::string();
+                }
+
                 oss << "(GB_ColorRGBA "
                     << static_cast<unsigned int>(pixelColor.r) << ","
                     << static_cast<unsigned int>(pixelColor.g) << ","
@@ -1951,7 +1947,6 @@ bool GB_Image::Deserialize(const std::string& data)
     size_t offset = 0;
     size_t rows = 0;
     size_t cols = 0;
-    std::vector<std::vector<GB_ColorRGBA>> colorMatrix;
 
     if (!ConsumeChar(data, offset, '(') || !ConsumeLiteral(data, offset, GetClassType().c_str()))
     {
@@ -1990,9 +1985,21 @@ bool GB_Image::Deserialize(const std::string& data)
         return false;
     }
 
+    int cvRows = 0;
+    int cvCols = 0;
+    if (!GBImage_Internal::TryConvertSizeToInt(rows, cvRows)
+        || !GBImage_Internal::TryConvertSizeToInt(cols, cvCols))
+    {
+        return false;
+    }
+
     try
     {
-        colorMatrix.resize(rows);
+        cv::Mat newImageMat(cvRows, cvCols, CV_8UC4);
+        if (newImageMat.empty())
+        {
+            return false;
+        }
 
         for (size_t rowIndex = 0; rowIndex < rows; rowIndex++)
         {
@@ -2006,8 +2013,11 @@ bool GB_Image::Deserialize(const std::string& data)
                 return false;
             }
 
-            std::vector<GB_ColorRGBA>& colorRow = colorMatrix[rowIndex];
-            colorRow.resize(cols);
+            unsigned char* rowData = newImageMat.ptr<unsigned char>(static_cast<int>(rowIndex));
+            if (rowData == nullptr)
+            {
+                return false;
+            }
 
             for (size_t colIndex = 0; colIndex < cols; colIndex++)
             {
@@ -2016,10 +2026,17 @@ bool GB_Image::Deserialize(const std::string& data)
                     return false;
                 }
 
-                if (!ParseColorText(data, offset, colorRow[colIndex]))
+                GB_ColorRGBA pixelColor;
+                if (!ParseColorText(data, offset, pixelColor))
                 {
                     return false;
                 }
+
+                unsigned char* pixelData = rowData + colIndex * 4;
+                pixelData[0] = pixelColor.b;
+                pixelData[1] = pixelColor.g;
+                pixelData[2] = pixelColor.r;
+                pixelData[3] = pixelColor.a;
             }
 
             if (!ConsumeChar(data, offset, ']'))
@@ -2040,11 +2057,8 @@ bool GB_Image::Deserialize(const std::string& data)
         }
 
         GB_Image newImage;
-        if (!newImage.SetFromColorMatrix(colorMatrix))
-        {
-            return false;
-        }
-
+        newImage.imageImpl->imageMat = std::move(newImageMat);
+        newImage.imageImpl->channelLayout = GBImage_Internal::ImageChannelLayout::Bgra;
         Swap(newImage);
         return true;
     }
@@ -2095,7 +2109,11 @@ bool GB_Image::Deserialize(const GB_ByteBuffer& data)
         return false;
     }
 
-    if (magic != GB_ClassMagicNumber || typeId != GetClassTypeId() || payloadVersion != expectedPayloadVersion)
+    if (magic != GB_ClassMagicNumber
+        || typeId != GetClassTypeId()
+        || payloadVersion != expectedPayloadVersion
+        || reserved0 != 0
+        || reserved1 != 0)
     {
         return false;
     }
