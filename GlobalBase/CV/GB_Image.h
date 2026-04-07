@@ -8,6 +8,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <string>
+#include <vector>
 
 namespace cv
 {
@@ -295,6 +296,59 @@ public:
     cv::Mat ToCvMat(GB_ImageCopyMode copyMode = GB_ImageCopyMode::ShallowCopy) const;
 
     /**
+     * @brief 获取当前类的稳定类型字符串。
+     */
+    const std::string& GetClassType() const;
+
+    /**
+     * @brief 获取当前类的稳定类型 Id。
+     */
+    uint64_t GetClassTypeId() const;
+
+    /**
+     * @brief 导出为逻辑 RGBA 二维矩阵。
+     *
+     * 仅对 8 位、1 / 3 / 4 通道图像提供稳定支持。
+     * 导出失败时，colorMatrix 会被清空。
+     */
+    bool ToColorMatrix(std::vector<std::vector<GB_ColorRGBA>>& colorMatrix) const;
+
+    /**
+     * @brief 根据逻辑 RGBA 二维矩阵设置当前图像。
+     *
+     * 输入矩阵必须为规则矩阵，且行列数都大于 0。
+     * 设置成功后，内部会创建 8 位 4 通道图像，并按 BGRA 排列保存像素。
+     * 设置失败时，对象保持原有内容不变。
+     */
+    bool SetFromColorMatrix(const std::vector<std::vector<GB_ColorRGBA>>& colorMatrix);
+
+    /**
+     * @brief 序列化为二进制安全的 std::string。
+     *
+     * 返回字符串可能包含 '\0' 等非文本字节，内部格式与 SerializeToBinary() 一致。
+     */
+    std::string SerializeToString() const;
+
+    /**
+     * @brief 序列化为 GB_ByteBuffer。
+     */
+    GB_ByteBuffer SerializeToBinary() const;
+
+    /**
+     * @brief 从二进制安全的 std::string 反序列化。
+     *
+     * 失败时，对象保持原有内容不变。
+     */
+    bool Deserialize(const std::string& data);
+
+    /**
+     * @brief 从 GB_ByteBuffer 反序列化。
+     *
+     * 失败时，对象保持原有内容不变。
+     */
+    bool Deserialize(const GB_ByteBuffer& data);
+
+    /**
      * @brief 当前是否为空图像。
      */
     bool IsEmpty() const;
@@ -389,6 +443,34 @@ public:
      * @brief 让当前对象与共享源脱离，确保之后拥有独立的像素缓冲区。
      */
     bool Detach();
+
+    /**
+     * @brief 转换像素位深，并可附带线性变换。
+     *
+     * 结果图像的通道数与当前图像保持一致，通道排列信息也会被保留。
+     * 计算公式与 OpenCV 的 convertTo 一致：dst = src * scale + shift。
+     */
+    GB_Image ConvertTo(GB_ImageDepth targetDepth, double scale = 1.0, double shift = 0.0) const;
+
+    /**
+     * @brief 原地转换像素位深，并可附带线性变换。
+     */
+    bool ConvertToInPlace(GB_ImageDepth targetDepth, double scale = 1.0, double shift = 0.0);
+
+    /**
+     * @brief 翻转图像。
+     *
+     * - 仅 horizontalFlip 为 true：左右翻转；
+     * - 仅 verticalFlip 为 true：上下翻转；
+     * - 两者都为 true：同时左右和上下翻转；
+     * - 两者都为 false：返回深拷贝。
+     */
+    GB_Image Flip(bool horizontalFlip, bool verticalFlip) const;
+
+    /**
+     * @brief 原地翻转图像。
+     */
+    bool FlipInPlace(bool horizontalFlip, bool verticalFlip);
 
     /**
      * @brief 生成缩放后的新图像。

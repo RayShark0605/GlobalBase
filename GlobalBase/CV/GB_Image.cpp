@@ -1,8 +1,13 @@
 ﻿#include "GB_Image.h"
 #include "../GB_FileSystem.h"
 #include "../GB_IO.h"
+#include "../Geometry/GB_GeometryInterface.h"
 
+#include <cctype>
+#include <cstring>
 #include <limits>
+#include <locale>
+#include <sstream>
 #include <utility>
 #include <vector>
 
@@ -19,7 +24,7 @@
 #  pragma warning(pop)
 #endif
 
-namespace gbImageInternal
+namespace GBImage_Internal
 {
     /**
      * @brief 将 size_t 安全转换为 int。
@@ -238,6 +243,9 @@ namespace gbImageInternal
      * @brief 将双通道灰度+Alpha 图像扩展为 4 通道 BGRA。
      *
      * 约定 sourceImage 的两个通道分别为 Gray、Alpha。
+     *
+     * 这里使用通道混排接口一次性完成 2 -> 4 通道映射，
+     * 避免 split/merge 带来的额外中间矩阵分配与数据搬运。
      */
     static bool ConvertGrayAlphaToBgra(const cv::Mat& sourceImage, cv::Mat& targetImage)
     {
@@ -248,21 +256,21 @@ namespace gbImageInternal
 
         try
         {
-            std::vector<cv::Mat> sourceChannels;
-            cv::split(sourceImage, sourceChannels);
-            if (sourceChannels.size() != 2 || sourceChannels[0].empty() || sourceChannels[1].empty())
+            cv::Mat convertedImage(sourceImage.rows, sourceImage.cols, CV_MAKETYPE(sourceImage.depth(), 4));
+
+            const cv::Mat sourceImages[] = { sourceImage };
+            cv::Mat targetImages[] = { convertedImage };
+            const int fromTo[] =
             {
-                return false;
-            }
+                0, 0,
+                0, 1,
+                0, 2,
+                1, 3
+            };
 
-            std::vector<cv::Mat> targetChannels;
-            targetChannels.reserve(4);
-            targetChannels.push_back(sourceChannels[0]);
-            targetChannels.push_back(sourceChannels[0]);
-            targetChannels.push_back(sourceChannels[0]);
-            targetChannels.push_back(sourceChannels[1]);
+            cv::mixChannels(sourceImages, 1, targetImages, 1, fromTo, 4);
 
-            cv::merge(targetChannels, targetImage);
+            targetImage = std::move(convertedImage);
             return !targetImage.empty();
         }
         catch (...)
@@ -626,25 +634,6 @@ namespace gbImageInternal
     }
 
     /**
-     * @brief 获取 8 位图像指定像素的首字节指针。
-     */
-    static unsigned char* GetPixelPtr(cv::Mat& imageMat, size_t row, size_t col)
-    {
-        if (imageMat.empty() || imageMat.depth() != CV_8U)
-        {
-            return nullptr;
-        }
-
-        if (row >= static_cast<size_t>(imageMat.rows) || col >= static_cast<size_t>(imageMat.cols))
-        {
-            return nullptr;
-        }
-
-        const size_t pixelSize = imageMat.elemSize();
-        return imageMat.ptr<unsigned char>(static_cast<int>(row)) + col * pixelSize;
-    }
-
-    /**
      * @brief 获取 8 位图像指定像素的只读首字节指针。
      */
     static const unsigned char* GetPixelPtr(const cv::Mat& imageMat, size_t row, size_t col)
@@ -661,6 +650,14 @@ namespace gbImageInternal
 
         const size_t pixelSize = imageMat.elemSize();
         return imageMat.ptr<unsigned char>(static_cast<int>(row)) + col * pixelSize;
+    }
+
+    /**
+     * @brief 获取 8 位图像指定像素的首字节指针。
+     */
+    static unsigned char* GetPixelPtr(cv::Mat& imageMat, size_t row, size_t col)
+    {
+        return const_cast<unsigned char*>(GetPixelPtr(static_cast<const cv::Mat&>(imageMat), row, col));
     }
 
     /**
@@ -836,6 +833,187 @@ namespace gbImageInternal
             return false;
         }
     }
+
+    /**
+     * @brief 安全计算两个 size_t 的乘积。
+     */
+    static bool TryMultiplySize(size_t leftValue, size_t rightValue, size_t& resultValue)
+    {
+        if (leftValue != 0 && rightValue > std::numeric_limits<size_t>::max() / leftValue)
+        {
+            return false;
+        }
+
+        resultValue = leftValue * rightValue;
+        return true;
+    }
+
+    /**
+     * @brief 将 uint64_t 安全转换为 size_t。
+     */
+    static bool TryConvertUInt64ToSize(uint64_t value, size_t& sizeValue)
+    {
+        if (value > static_cast<uint64_t>(std::numeric_limits<size_t>::max()))
+        {
+            return false;
+        }
+
+        sizeValue = static_cast<size_t>(value);
+        return true;
+    }
+
+    /**
+     * @brief 判断当前图像是否支持与 GB_ColorRGBA 稳定互转。
+     */
+    static bool IsColorMatrixSupported(const cv::Mat& imageMat, ImageChannelLayout channelLayout)
+    {
+        if (imageMat.empty() || imageMat.depth() != CV_8U)
+        {
+            return false;
+        }
+
+        switch (channelLayout)
+        {
+        case ImageChannelLayout::Gray:
+            return imageMat.channels() == 1;
+
+        case ImageChannelLayout::Bgr:
+        case ImageChannelLayout::Rgb:
+            return imageMat.channels() == 3;
+
+        case ImageChannelLayout::Bgra:
+        case ImageChannelLayout::Rgba:
+            return imageMat.channels() == 4;
+
+        default:
+            break;
+        }
+
+        return false;
+    }
+
+    /**
+     * @brief 判断通道排列信息是否与通道数相容。
+     */
+    static bool IsChannelLayoutValidForChannels(int channels, ImageChannelLayout channelLayout, bool isEmptyImage)
+    {
+        if (isEmptyImage)
+        {
+            return channels == 0 && channelLayout == ImageChannelLayout::Empty;
+        }
+
+        switch (channelLayout)
+        {
+        case ImageChannelLayout::Gray:
+            return channels == 1;
+
+        case ImageChannelLayout::Bgr:
+        case ImageChannelLayout::Rgb:
+            return channels == 3;
+
+        case ImageChannelLayout::Bgra:
+        case ImageChannelLayout::Rgba:
+            return channels == 4;
+
+        case ImageChannelLayout::Other:
+            return channels > 0;
+
+        default:
+            break;
+        }
+
+        return false;
+    }
+
+    /**
+     * @brief 计算紧凑序列化时的像素字节数。
+     */
+    static bool GetCompactPixelByteSize(size_t rows, size_t cols, size_t bytesPerPixel, size_t& totalByteSize)
+    {
+        size_t pixelCount = 0;
+        if (!TryMultiplySize(rows, cols, pixelCount))
+        {
+            return false;
+        }
+
+        return TryMultiplySize(pixelCount, bytesPerPixel, totalByteSize);
+    }
+
+    /**
+     * @brief 追加原始字节到缓冲区尾部。
+     */
+    static void AppendRawBytes(GB_ByteBuffer& buffer, const unsigned char* rawData, size_t byteCount)
+    {
+        if (rawData == nullptr || byteCount == 0)
+        {
+            return;
+        }
+
+        buffer.insert(buffer.end(), rawData, rawData + byteCount);
+    }
+
+    /**
+     * @brief 将图像按“逐行紧凑”方式写入字节缓冲区。
+     *
+     * 无论底层是否连续，写入的数据都只覆盖当前逻辑图像区域，且不包含行间 padding。
+     */
+    static bool CopyMatToCompactBytes(const cv::Mat& imageMat, GB_ByteBuffer& buffer)
+    {
+        if (imageMat.empty())
+        {
+            return true;
+        }
+
+        const size_t rowByteSize = static_cast<size_t>(imageMat.cols) * imageMat.elemSize();
+        for (int rowIndex = 0; rowIndex < imageMat.rows; rowIndex++)
+        {
+            const unsigned char* rowData = imageMat.ptr<unsigned char>(rowIndex);
+            if (rowData == nullptr && rowByteSize != 0)
+            {
+                return false;
+            }
+
+            AppendRawBytes(buffer, rowData, rowByteSize);
+        }
+
+        return true;
+    }
+
+    /**
+     * @brief 将紧凑像素字节流逐行拷贝回图像。
+     */
+    static bool CopyCompactBytesToMat(const GB_ByteBuffer& buffer, size_t dataOffset, cv::Mat& imageMat)
+    {
+        if (imageMat.empty())
+        {
+            return dataOffset == buffer.size();
+        }
+
+        const size_t rowByteSize = static_cast<size_t>(imageMat.cols) * imageMat.elemSize();
+        size_t offset = dataOffset;
+
+        for (int rowIndex = 0; rowIndex < imageMat.rows; rowIndex++)
+        {
+            if (offset + rowByteSize > buffer.size())
+            {
+                return false;
+            }
+
+            unsigned char* rowData = imageMat.ptr<unsigned char>(rowIndex);
+            if (rowData == nullptr && rowByteSize != 0)
+            {
+                return false;
+            }
+
+            if (rowByteSize != 0)
+            {
+                std::memcpy(rowData, buffer.data() + offset, rowByteSize);
+            }
+            offset += rowByteSize;
+        }
+
+        return offset == buffer.size();
+    }
 }
 
 /**
@@ -845,7 +1023,7 @@ class GB_Image::Impl
 {
 public:
     cv::Mat imageMat;
-    gbImageInternal::ImageChannelLayout channelLayout = gbImageInternal::ImageChannelLayout::Empty;
+    GBImage_Internal::ImageChannelLayout channelLayout = GBImage_Internal::ImageChannelLayout::Empty;
 };
 
 /**
@@ -1009,7 +1187,7 @@ void GB_Image::Clear()
     if (imageImpl != nullptr)
     {
         imageImpl->imageMat.release();
-        imageImpl->channelLayout = gbImageInternal::ImageChannelLayout::Empty;
+        imageImpl->channelLayout = GBImage_Internal::ImageChannelLayout::Empty;
     }
 }
 
@@ -1050,7 +1228,7 @@ bool GB_Image::Create(size_t rows, size_t cols, GB_ImageDepth depth, int channel
     int cvRows = 0;
     int cvCols = 0;
     int cvType = 0;
-    if (!gbImageInternal::TryConvertSizeToInt(rows, cvRows) || !gbImageInternal::TryConvertSizeToInt(cols, cvCols) || !gbImageInternal::TryGetCvType(depth, channels, cvType))
+    if (!GBImage_Internal::TryConvertSizeToInt(rows, cvRows) || !GBImage_Internal::TryConvertSizeToInt(cols, cvCols) || !GBImage_Internal::TryGetCvType(depth, channels, cvType))
     {
         return false;
     }
@@ -1078,7 +1256,7 @@ bool GB_Image::Create(size_t rows, size_t cols, GB_ImageDepth depth, int channel
         }
 
         imageImpl->imageMat = std::move(newImageMat);
-        imageImpl->channelLayout = gbImageInternal::InferChannelLayout(imageImpl->imageMat);
+        imageImpl->channelLayout = GBImage_Internal::InferChannelLayout(imageImpl->imageMat);
         return true;
     }
     catch (...)
@@ -1129,7 +1307,7 @@ bool GB_Image::LoadFromMemory(const void* encodedData, size_t encodedSize, const
     }
 
     int cvEncodedSize = 0;
-    if (!gbImageInternal::TryConvertSizeToInt(encodedSize, cvEncodedSize))
+    if (!GBImage_Internal::TryConvertSizeToInt(encodedSize, cvEncodedSize))
     {
         return false;
     }
@@ -1137,7 +1315,7 @@ bool GB_Image::LoadFromMemory(const void* encodedData, size_t encodedSize, const
     try
     {
         const cv::Mat encodedView(1, cvEncodedSize, CV_8UC1, const_cast<void*>(encodedData));
-        const int imreadFlags = gbImageInternal::GetImreadFlags(loadOptions);
+        const int imreadFlags = GBImage_Internal::GetImreadFlags(loadOptions);
 
         cv::Mat decodedImage;
         if (loadOptions.pageIndex == 0)
@@ -1147,7 +1325,7 @@ bool GB_Image::LoadFromMemory(const void* encodedData, size_t encodedSize, const
         else
         {
             int beginIndex = 0;
-            if (!gbImageInternal::TryConvertSizeToInt(loadOptions.pageIndex, beginIndex))
+            if (!GBImage_Internal::TryConvertSizeToInt(loadOptions.pageIndex, beginIndex))
             {
                 return false;
             }
@@ -1172,7 +1350,7 @@ bool GB_Image::LoadFromMemory(const void* encodedData, size_t encodedSize, const
             return false;
         }
 
-        if (!gbImageInternal::ApplyLoadPostProcess(decodedImage, loadOptions))
+        if (!GBImage_Internal::ApplyLoadPostProcess(decodedImage, loadOptions))
         {
             return false;
         }
@@ -1183,7 +1361,7 @@ bool GB_Image::LoadFromMemory(const void* encodedData, size_t encodedSize, const
         }
 
         imageImpl->imageMat = std::move(decodedImage);
-        imageImpl->channelLayout = gbImageInternal::InferChannelLayout(imageImpl->imageMat);
+        imageImpl->channelLayout = GBImage_Internal::InferChannelLayout(imageImpl->imageMat);
         return true;
     }
     catch (...)
@@ -1207,7 +1385,7 @@ bool GB_Image::SaveToFile(const std::string& filePathUtf8, const GB_ImageSaveOpt
         return false;
     }
 
-    const std::string fileExt = gbImageInternal::NormalizeFileExtension(GB_GetFileExt(filePathUtf8));
+    const std::string fileExt = GBImage_Internal::NormalizeFileExtension(GB_GetFileExt(filePathUtf8));
     if (fileExt.empty())
     {
         return false;
@@ -1234,7 +1412,7 @@ bool GB_Image::EncodeToMemory(GB_ByteBuffer& encodedBytes, const std::string& fi
         return false;
     }
 
-    const std::string normalizedExt = gbImageInternal::NormalizeFileExtension(fileExt);
+    const std::string normalizedExt = GBImage_Internal::NormalizeFileExtension(fileExt);
     if (normalizedExt.empty())
     {
         return false;
@@ -1248,10 +1426,10 @@ bool GB_Image::EncodeToMemory(GB_ByteBuffer& encodedBytes, const std::string& fi
         }
 
         std::vector<int> imwriteParams;
-        gbImageInternal::BuildImwriteParams(normalizedExt, saveOptions, imwriteParams);
+        GBImage_Internal::BuildImwriteParams(normalizedExt, saveOptions, imwriteParams);
 
         cv::Mat imageForEncode;
-        if (!gbImageInternal::PrepareImageForEncoding(imageImpl->imageMat, imageImpl->channelLayout, imageForEncode))
+        if (!GBImage_Internal::PrepareImageForEncoding(imageImpl->imageMat, imageImpl->channelLayout, imageForEncode))
         {
             return false;
         }
@@ -1307,7 +1485,7 @@ bool GB_Image::SetFromCvMat(const cv::Mat& imageMat, GB_ImageCopyMode copyMode)
         }
 
         imageImpl->imageMat = std::move(newImageMat);
-        imageImpl->channelLayout = gbImageInternal::InferChannelLayout(imageImpl->imageMat);
+        imageImpl->channelLayout = GBImage_Internal::InferChannelLayout(imageImpl->imageMat);
         return true;
     }
     catch (...)
@@ -1338,6 +1516,668 @@ cv::Mat GB_Image::ToCvMat(GB_ImageCopyMode copyMode) const
     catch (...)
     {
         return cv::Mat();
+    }
+}
+
+/**
+ * @brief 返回当前类类型字符串。
+ */
+const std::string& GB_Image::GetClassType() const
+{
+    static const std::string classType = "GB_Image";
+    return classType;
+}
+
+/**
+ * @brief 返回当前类类型 Id。
+ */
+uint64_t GB_Image::GetClassTypeId() const
+{
+    static const uint64_t classTypeId = GB_GenerateClassTypeId(GetClassType());
+    return classTypeId;
+}
+
+/**
+ * @brief 导出为逻辑 RGBA 二维矩阵。
+ */
+bool GB_Image::ToColorMatrix(std::vector<std::vector<GB_ColorRGBA>>& colorMatrix) const
+{
+    colorMatrix.clear();
+
+    if (IsEmpty() || !GBImage_Internal::IsColorMatrixSupported(imageImpl->imageMat, imageImpl->channelLayout))
+    {
+        return false;
+    }
+
+    const size_t rows = GetRows();
+    const size_t cols = GetCols();
+
+    try
+    {
+        std::vector<std::vector<GB_ColorRGBA>> newColorMatrix;
+        newColorMatrix.resize(rows);
+
+        for (size_t rowIndex = 0; rowIndex < rows; rowIndex++)
+        {
+            std::vector<GB_ColorRGBA>& colorRow = newColorMatrix[rowIndex];
+            colorRow.resize(cols);
+
+            const unsigned char* rowData = GetRowData(rowIndex);
+            if (rowData == nullptr)
+            {
+                return false;
+            }
+
+            switch (imageImpl->channelLayout)
+            {
+            case GBImage_Internal::ImageChannelLayout::Gray:
+                for (size_t colIndex = 0; colIndex < cols; colIndex++)
+                {
+                    const uint8_t grayValue = rowData[colIndex];
+                    colorRow[colIndex] = GB_ColorRGBA(grayValue, grayValue, grayValue, 255);
+                }
+                break;
+
+            case GBImage_Internal::ImageChannelLayout::Bgr:
+                for (size_t colIndex = 0; colIndex < cols; colIndex++)
+                {
+                    const unsigned char* pixelData = rowData + colIndex * 3;
+                    colorRow[colIndex] = GB_ColorRGBA(pixelData[2], pixelData[1], pixelData[0], 255);
+                }
+                break;
+
+            case GBImage_Internal::ImageChannelLayout::Bgra:
+                for (size_t colIndex = 0; colIndex < cols; colIndex++)
+                {
+                    const unsigned char* pixelData = rowData + colIndex * 4;
+                    colorRow[colIndex] = GB_ColorRGBA(pixelData[2], pixelData[1], pixelData[0], pixelData[3]);
+                }
+                break;
+
+            case GBImage_Internal::ImageChannelLayout::Rgb:
+                for (size_t colIndex = 0; colIndex < cols; colIndex++)
+                {
+                    const unsigned char* pixelData = rowData + colIndex * 3;
+                    colorRow[colIndex] = GB_ColorRGBA(pixelData[0], pixelData[1], pixelData[2], 255);
+                }
+                break;
+
+            case GBImage_Internal::ImageChannelLayout::Rgba:
+                for (size_t colIndex = 0; colIndex < cols; colIndex++)
+                {
+                    const unsigned char* pixelData = rowData + colIndex * 4;
+                    colorRow[colIndex] = GB_ColorRGBA(pixelData[0], pixelData[1], pixelData[2], pixelData[3]);
+                }
+                break;
+
+            default:
+                return false;
+            }
+        }
+
+        colorMatrix.swap(newColorMatrix);
+        return true;
+    }
+    catch (...)
+    {
+        colorMatrix.clear();
+        return false;
+    }
+}
+
+/**
+ * @brief 根据逻辑 RGBA 二维矩阵设置当前图像。
+ */
+bool GB_Image::SetFromColorMatrix(const std::vector<std::vector<GB_ColorRGBA>>& colorMatrix)
+{
+    if (colorMatrix.empty() || colorMatrix[0].empty())
+    {
+        return false;
+    }
+
+    const size_t rows = colorMatrix.size();
+    const size_t cols = colorMatrix[0].size();
+    for (size_t rowIndex = 1; rowIndex < rows; rowIndex++)
+    {
+        if (colorMatrix[rowIndex].size() != cols)
+        {
+            return false;
+        }
+    }
+
+    int cvRows = 0;
+    int cvCols = 0;
+    if (!GBImage_Internal::TryConvertSizeToInt(rows, cvRows) || !GBImage_Internal::TryConvertSizeToInt(cols, cvCols))
+    {
+        return false;
+    }
+
+    try
+    {
+        cv::Mat newImageMat(cvRows, cvCols, CV_8UC4);
+        if (newImageMat.empty())
+        {
+            return false;
+        }
+
+        for (size_t rowIndex = 0; rowIndex < rows; rowIndex++)
+        {
+            unsigned char* rowData = newImageMat.ptr<unsigned char>(static_cast<int>(rowIndex));
+            if (rowData == nullptr)
+            {
+                return false;
+            }
+
+            const std::vector<GB_ColorRGBA>& colorRow = colorMatrix[rowIndex];
+            for (size_t colIndex = 0; colIndex < cols; colIndex++)
+            {
+                const GB_ColorRGBA& pixelColor = colorRow[colIndex];
+                unsigned char* pixelData = rowData + colIndex * 4;
+                pixelData[0] = pixelColor.b;
+                pixelData[1] = pixelColor.g;
+                pixelData[2] = pixelColor.r;
+                pixelData[3] = pixelColor.a;
+            }
+        }
+
+        if (!EnsureImageImpl())
+        {
+            return false;
+        }
+
+        imageImpl->imageMat = std::move(newImageMat);
+        imageImpl->channelLayout = GBImage_Internal::ImageChannelLayout::Bgra;
+        return true;
+    }
+    catch (...)
+    {
+        return false;
+    }
+}
+
+/**
+ * @brief 序列化为便于人类阅读的文本字符串。
+ */
+std::string GB_Image::SerializeToString() const
+{
+    if (IsEmpty())
+    {
+        return std::string("(") + GetClassType() + " empty)";
+    }
+
+    std::vector<std::vector<GB_ColorRGBA>> colorMatrix;
+    if (!ToColorMatrix(colorMatrix))
+    {
+        return std::string();
+    }
+
+    try
+    {
+        std::ostringstream oss;
+        oss.imbue(std::locale::classic());
+        oss << "(" << GetClassType();
+
+        if (colorMatrix.empty())
+        {
+            oss << " empty)";
+            return oss.str();
+        }
+
+        oss << " rows=" << colorMatrix.size();
+        oss << " cols=" << colorMatrix[0].size();
+        oss << " pixels=[";
+
+        for (size_t rowIndex = 0; rowIndex < colorMatrix.size(); rowIndex++)
+        {
+            if (rowIndex != 0)
+            {
+                oss << ",";
+            }
+
+            oss << "[";
+            const std::vector<GB_ColorRGBA>& colorRow = colorMatrix[rowIndex];
+            for (size_t colIndex = 0; colIndex < colorRow.size(); colIndex++)
+            {
+                if (colIndex != 0)
+                {
+                    oss << ",";
+                }
+
+                const GB_ColorRGBA& pixelColor = colorRow[colIndex];
+                oss << "(GB_ColorRGBA "
+                    << static_cast<unsigned int>(pixelColor.r) << ","
+                    << static_cast<unsigned int>(pixelColor.g) << ","
+                    << static_cast<unsigned int>(pixelColor.b) << ","
+                    << static_cast<unsigned int>(pixelColor.a) << ")";
+            }
+            oss << "]";
+        }
+
+        oss << "])";
+        return oss.str();
+    }
+    catch (...)
+    {
+        return std::string();
+    }
+}
+
+/**
+ * @brief 序列化为二进制缓冲区。
+ */
+GB_ByteBuffer GB_Image::SerializeToBinary() const
+{
+    constexpr static uint16_t payloadVersion = 1;
+    constexpr static size_t headerByteSize = 48;
+
+    const size_t rows = GetRows();
+    const size_t cols = GetCols();
+    const size_t bytesPerPixel = GetBytesPerPixel();
+    const bool isEmptyImage = IsEmpty();
+
+    size_t compactPixelByteSize = 0;
+    if (!isEmptyImage)
+    {
+        if (!GBImage_Internal::GetCompactPixelByteSize(rows, cols, bytesPerPixel, compactPixelByteSize))
+        {
+            return GB_ByteBuffer();
+        }
+    }
+
+    GB_ByteBuffer buffer;
+    try
+    {
+        buffer.reserve(headerByteSize + compactPixelByteSize);
+
+        GB_ByteBufferIO::AppendUInt32LE(buffer, GB_ClassMagicNumber);
+        GB_ByteBufferIO::AppendUInt64LE(buffer, GetClassTypeId());
+        GB_ByteBufferIO::AppendUInt16LE(buffer, payloadVersion);
+        GB_ByteBufferIO::AppendUInt16LE(buffer, 0);
+
+        GB_ByteBufferIO::AppendUInt64LE(buffer, static_cast<uint64_t>(rows));
+        GB_ByteBufferIO::AppendUInt64LE(buffer, static_cast<uint64_t>(cols));
+        GB_ByteBufferIO::AppendUInt16LE(buffer, static_cast<uint16_t>(GetDepth()));
+        GB_ByteBufferIO::AppendUInt16LE(buffer, static_cast<uint16_t>(GetChannels()));
+        GB_ByteBufferIO::AppendUInt16LE(buffer, static_cast<uint16_t>(isEmptyImage ? GBImage_Internal::ImageChannelLayout::Empty : imageImpl->channelLayout));
+        GB_ByteBufferIO::AppendUInt16LE(buffer, 0);
+        GB_ByteBufferIO::AppendUInt64LE(buffer, static_cast<uint64_t>(compactPixelByteSize));
+
+        if (!isEmptyImage && !GBImage_Internal::CopyMatToCompactBytes(imageImpl->imageMat, buffer))
+        {
+            return GB_ByteBuffer();
+        }
+
+        return buffer;
+    }
+    catch (...)
+    {
+        return GB_ByteBuffer();
+    }
+}
+
+namespace
+{
+    static void SkipAsciiWhitespace(const std::string& text, size_t& offset)
+    {
+        while (offset < text.size() && std::isspace(static_cast<unsigned char>(text[offset])) != 0)
+        {
+            offset++;
+        }
+    }
+
+    static bool ConsumeChar(const std::string& text, size_t& offset, char expectedChar)
+    {
+        SkipAsciiWhitespace(text, offset);
+        if (offset >= text.size() || text[offset] != expectedChar)
+        {
+            return false;
+        }
+
+        offset++;
+        return true;
+    }
+
+    static bool ConsumeLiteral(const std::string& text, size_t& offset, const char* literalText)
+    {
+        if (literalText == nullptr)
+        {
+            return false;
+        }
+
+        SkipAsciiWhitespace(text, offset);
+        const size_t literalLength = std::strlen(literalText);
+        if (offset + literalLength > text.size())
+        {
+            return false;
+        }
+
+        if (text.compare(offset, literalLength, literalText) != 0)
+        {
+            return false;
+        }
+
+        offset += literalLength;
+        return true;
+    }
+
+    static bool ParseUIntComponent(const std::string& text, size_t& offset, unsigned int& componentValue)
+    {
+        SkipAsciiWhitespace(text, offset);
+        if (offset >= text.size() || !std::isdigit(static_cast<unsigned char>(text[offset])))
+        {
+            return false;
+        }
+
+        unsigned int parsedValue = 0;
+        while (offset < text.size() && std::isdigit(static_cast<unsigned char>(text[offset])) != 0)
+        {
+            const unsigned int digitValue = static_cast<unsigned int>(text[offset] - '0');
+            if (parsedValue > (std::numeric_limits<unsigned int>::max() - digitValue) / 10u)
+            {
+                return false;
+            }
+
+            parsedValue = parsedValue * 10u + digitValue;
+            offset++;
+        }
+
+        componentValue = parsedValue;
+        return true;
+    }
+
+    static bool ParseSizeValue(const std::string& text, size_t& offset, size_t& sizeValue)
+    {
+        SkipAsciiWhitespace(text, offset);
+        if (offset >= text.size() || !std::isdigit(static_cast<unsigned char>(text[offset])))
+        {
+            return false;
+        }
+
+        size_t parsedValue = 0;
+        while (offset < text.size() && std::isdigit(static_cast<unsigned char>(text[offset])) != 0)
+        {
+            const size_t digitValue = static_cast<size_t>(text[offset] - '0');
+            if (parsedValue > (std::numeric_limits<size_t>::max() - digitValue) / static_cast<size_t>(10))
+            {
+                return false;
+            }
+
+            parsedValue = parsedValue * static_cast<size_t>(10) + digitValue;
+            offset++;
+        }
+
+        sizeValue = parsedValue;
+        return true;
+    }
+
+    static bool ParseColorText(const std::string& text, size_t& offset, GB_ColorRGBA& pixelColor)
+    {
+        size_t localOffset = offset;
+        unsigned int red = 0;
+        unsigned int green = 0;
+        unsigned int blue = 0;
+        unsigned int alpha = 0;
+
+        if (!ConsumeChar(text, localOffset, '(')
+            || !ConsumeLiteral(text, localOffset, "GB_ColorRGBA")
+            || !ParseUIntComponent(text, localOffset, red)
+            || !ConsumeChar(text, localOffset, ',')
+            || !ParseUIntComponent(text, localOffset, green)
+            || !ConsumeChar(text, localOffset, ',')
+            || !ParseUIntComponent(text, localOffset, blue)
+            || !ConsumeChar(text, localOffset, ',')
+            || !ParseUIntComponent(text, localOffset, alpha)
+            || !ConsumeChar(text, localOffset, ')'))
+        {
+            return false;
+        }
+
+        if (red > 255u || green > 255u || blue > 255u || alpha > 255u)
+        {
+            return false;
+        }
+
+        pixelColor = GB_ColorRGBA(static_cast<uint8_t>(red), static_cast<uint8_t>(green), static_cast<uint8_t>(blue), static_cast<uint8_t>(alpha));
+        offset = localOffset;
+        return true;
+    }
+}
+
+/**
+ * @brief 从文本字符串反序列化。
+ */
+bool GB_Image::Deserialize(const std::string& data)
+{
+    size_t offset = 0;
+    size_t rows = 0;
+    size_t cols = 0;
+    std::vector<std::vector<GB_ColorRGBA>> colorMatrix;
+
+    if (!ConsumeChar(data, offset, '(') || !ConsumeLiteral(data, offset, GetClassType().c_str()))
+    {
+        return false;
+    }
+
+    if (ConsumeLiteral(data, offset, "empty"))
+    {
+        if (!ConsumeChar(data, offset, ')'))
+        {
+            return false;
+        }
+
+        SkipAsciiWhitespace(data, offset);
+        if (offset != data.size())
+        {
+            return false;
+        }
+
+        Clear();
+        return true;
+    }
+
+    if (!ConsumeLiteral(data, offset, "rows=")
+        || !ParseSizeValue(data, offset, rows)
+        || !ConsumeLiteral(data, offset, "cols=")
+        || !ParseSizeValue(data, offset, cols)
+        || !ConsumeLiteral(data, offset, "pixels=")
+        || !ConsumeChar(data, offset, '['))
+    {
+        return false;
+    }
+
+    if (rows == 0 || cols == 0)
+    {
+        return false;
+    }
+
+    try
+    {
+        colorMatrix.resize(rows);
+
+        for (size_t rowIndex = 0; rowIndex < rows; rowIndex++)
+        {
+            if (rowIndex != 0 && !ConsumeChar(data, offset, ','))
+            {
+                return false;
+            }
+
+            if (!ConsumeChar(data, offset, '['))
+            {
+                return false;
+            }
+
+            std::vector<GB_ColorRGBA>& colorRow = colorMatrix[rowIndex];
+            colorRow.resize(cols);
+
+            for (size_t colIndex = 0; colIndex < cols; colIndex++)
+            {
+                if (colIndex != 0 && !ConsumeChar(data, offset, ','))
+                {
+                    return false;
+                }
+
+                if (!ParseColorText(data, offset, colorRow[colIndex]))
+                {
+                    return false;
+                }
+            }
+
+            if (!ConsumeChar(data, offset, ']'))
+            {
+                return false;
+            }
+        }
+
+        if (!ConsumeChar(data, offset, ']') || !ConsumeChar(data, offset, ')'))
+        {
+            return false;
+        }
+
+        SkipAsciiWhitespace(data, offset);
+        if (offset != data.size())
+        {
+            return false;
+        }
+
+        GB_Image newImage;
+        if (!newImage.SetFromColorMatrix(colorMatrix))
+        {
+            return false;
+        }
+
+        Swap(newImage);
+        return true;
+    }
+    catch (...)
+    {
+        return false;
+    }
+}
+
+/**
+ * @brief 从二进制缓冲区反序列化。
+ */
+bool GB_Image::Deserialize(const GB_ByteBuffer& data)
+{
+    constexpr static uint16_t expectedPayloadVersion = 1;
+    constexpr static size_t minByteSize = 48;
+
+    if (data.size() < minByteSize)
+    {
+        return false;
+    }
+
+    size_t offset = 0;
+    uint32_t magic = 0;
+    uint64_t typeId = 0;
+    uint16_t payloadVersion = 0;
+    uint16_t reserved0 = 0;
+    uint64_t rowsValue = 0;
+    uint64_t colsValue = 0;
+    uint16_t depthValue = 0;
+    uint16_t channelsValue = 0;
+    uint16_t channelLayoutValue = 0;
+    uint16_t reserved1 = 0;
+    uint64_t rawDataByteSizeValue = 0;
+
+    if (!GB_ByteBufferIO::ReadUInt32LE(data, offset, magic)
+        || !GB_ByteBufferIO::ReadUInt64LE(data, offset, typeId)
+        || !GB_ByteBufferIO::ReadUInt16LE(data, offset, payloadVersion)
+        || !GB_ByteBufferIO::ReadUInt16LE(data, offset, reserved0)
+        || !GB_ByteBufferIO::ReadUInt64LE(data, offset, rowsValue)
+        || !GB_ByteBufferIO::ReadUInt64LE(data, offset, colsValue)
+        || !GB_ByteBufferIO::ReadUInt16LE(data, offset, depthValue)
+        || !GB_ByteBufferIO::ReadUInt16LE(data, offset, channelsValue)
+        || !GB_ByteBufferIO::ReadUInt16LE(data, offset, channelLayoutValue)
+        || !GB_ByteBufferIO::ReadUInt16LE(data, offset, reserved1)
+        || !GB_ByteBufferIO::ReadUInt64LE(data, offset, rawDataByteSizeValue))
+    {
+        return false;
+    }
+
+    if (magic != GB_ClassMagicNumber || typeId != GetClassTypeId() || payloadVersion != expectedPayloadVersion)
+    {
+        return false;
+    }
+
+    size_t rows = 0;
+    size_t cols = 0;
+    size_t rawDataByteSize = 0;
+    if (!GBImage_Internal::TryConvertUInt64ToSize(rowsValue, rows)
+        || !GBImage_Internal::TryConvertUInt64ToSize(colsValue, cols)
+        || !GBImage_Internal::TryConvertUInt64ToSize(rawDataByteSizeValue, rawDataByteSize))
+    {
+        return false;
+    }
+
+    const GB_ImageDepth imageDepth = static_cast<GB_ImageDepth>(depthValue);
+    const int channels = static_cast<int>(channelsValue);
+    const GBImage_Internal::ImageChannelLayout channelLayout = static_cast<GBImage_Internal::ImageChannelLayout>(channelLayoutValue);
+
+    const bool isEmptyImage = rows == 0 || cols == 0 || channels == 0 || imageDepth == GB_ImageDepth::Unknown;
+    if (!GBImage_Internal::IsChannelLayoutValidForChannels(channels, channelLayout, isEmptyImage))
+    {
+        return false;
+    }
+
+    if (isEmptyImage)
+    {
+        if (rows != 0 || cols != 0 || channels != 0 || imageDepth != GB_ImageDepth::Unknown || channelLayout != GBImage_Internal::ImageChannelLayout::Empty || rawDataByteSize != 0 || offset != data.size())
+        {
+            return false;
+        }
+
+        Clear();
+        return true;
+    }
+
+    int cvRows = 0;
+    int cvCols = 0;
+    int cvType = 0;
+    if (!GBImage_Internal::TryConvertSizeToInt(rows, cvRows)
+        || !GBImage_Internal::TryConvertSizeToInt(cols, cvCols)
+        || !GBImage_Internal::TryGetCvType(imageDepth, channels, cvType))
+    {
+        return false;
+    }
+
+    const size_t bytesPerPixel = GBImage_Internal::GetBytesPerChannel(imageDepth) * static_cast<size_t>(channels);
+    size_t expectedRawDataByteSize = 0;
+    if (!GBImage_Internal::GetCompactPixelByteSize(rows, cols, bytesPerPixel, expectedRawDataByteSize))
+    {
+        return false;
+    }
+
+    if (rawDataByteSize != expectedRawDataByteSize || offset + rawDataByteSize != data.size())
+    {
+        return false;
+    }
+
+    try
+    {
+        cv::Mat newImageMat(cvRows, cvCols, cvType);
+        if (newImageMat.empty())
+        {
+            return false;
+        }
+
+        if (!GBImage_Internal::CopyCompactBytesToMat(data, offset, newImageMat))
+        {
+            return false;
+        }
+
+        if (!EnsureImageImpl())
+        {
+            return false;
+        }
+
+        imageImpl->imageMat = std::move(newImageMat);
+        imageImpl->channelLayout = channelLayout;
+        return true;
+    }
+    catch (...)
+    {
+        return false;
     }
 }
 
@@ -1396,7 +2236,7 @@ GB_ImageDepth GB_Image::GetDepth() const
         return GB_ImageDepth::Unknown;
     }
 
-    return gbImageInternal::CvDepthToImageDepth(imageImpl->imageMat.depth());
+    return GBImage_Internal::CvDepthToImageDepth(imageImpl->imageMat.depth());
 }
 
 size_t GB_Image::GetBitDepth() const
@@ -1406,7 +2246,11 @@ size_t GB_Image::GetBitDepth() const
 
 size_t GB_Image::GetBytesPerChannel() const
 {
-    return gbImageInternal::GetBytesPerChannel(GetDepth());
+    if (IsEmpty())
+    {
+        return 0;
+    }
+    return imageImpl->imageMat.elemSize1();
 }
 
 size_t GB_Image::GetBytesPerPixel() const
@@ -1509,13 +2353,13 @@ bool GB_Image::GetPixelColor(size_t row, size_t col, GB_ColorRGBA& pixelColor) c
         return false;
     }
 
-    const unsigned char* pixelPtr = gbImageInternal::GetPixelPtr(imageImpl->imageMat, row, col);
+    const unsigned char* pixelPtr = GBImage_Internal::GetPixelPtr(imageImpl->imageMat, row, col);
     if (pixelPtr == nullptr)
     {
         return false;
     }
 
-    return gbImageInternal::ReadPixelColor(pixelPtr, imageImpl->channelLayout, pixelColor);
+    return GBImage_Internal::ReadPixelColor(pixelPtr, imageImpl->channelLayout, pixelColor);
 }
 
 /**
@@ -1528,13 +2372,13 @@ bool GB_Image::SetPixelColor(size_t row, size_t col, const GB_ColorRGBA& pixelCo
         return false;
     }
 
-    unsigned char* pixelPtr = gbImageInternal::GetPixelPtr(imageImpl->imageMat, row, col);
+    unsigned char* pixelPtr = GBImage_Internal::GetPixelPtr(imageImpl->imageMat, row, col);
     if (pixelPtr == nullptr)
     {
         return false;
     }
 
-    return gbImageInternal::WritePixelColor(pixelPtr, imageImpl->channelLayout, pixelColor);
+    return GBImage_Internal::WritePixelColor(pixelPtr, imageImpl->channelLayout, pixelColor);
 }
 
 /**
@@ -1550,7 +2394,7 @@ bool GB_Image::Fill(const GB_ColorRGBA& pixelColor)
     try
     {
         cv::Scalar fillScalar;
-        if (!gbImageInternal::GetFillScalar(pixelColor, imageImpl->channelLayout, fillScalar))
+        if (!GBImage_Internal::GetFillScalar(pixelColor, imageImpl->channelLayout, fillScalar))
         {
             return false;
         }
@@ -1610,6 +2454,112 @@ bool GB_Image::Detach()
 }
 
 /**
+ * @brief 转换像素位深，并附带线性变换。
+ */
+GB_Image GB_Image::ConvertTo(GB_ImageDepth targetDepth, double scale, double shift) const
+{
+    GB_Image resultImage;
+    if (IsEmpty())
+    {
+        return resultImage;
+    }
+
+    int cvType = 0;
+    if (!GBImage_Internal::TryGetCvType(targetDepth, GetChannels(), cvType))
+    {
+        return resultImage;
+    }
+
+    try
+    {
+        imageImpl->imageMat.convertTo(resultImage.imageImpl->imageMat, cvType, scale, shift);
+        resultImage.imageImpl->channelLayout = imageImpl->channelLayout;
+    }
+    catch (...)
+    {
+        resultImage.Clear();
+    }
+
+    return resultImage;
+}
+
+/**
+ * @brief 原地转换像素位深，并附带线性变换。
+ */
+bool GB_Image::ConvertToInPlace(GB_ImageDepth targetDepth, double scale, double shift)
+{
+    if (IsEmpty())
+    {
+        return false;
+    }
+
+    GB_Image convertedImage = ConvertTo(targetDepth, scale, shift);
+    if (convertedImage.IsEmpty())
+    {
+        return false;
+    }
+
+    Swap(convertedImage);
+    return true;
+}
+
+/**
+ * @brief 翻转图像。
+ */
+GB_Image GB_Image::Flip(bool horizontalFlip, bool verticalFlip) const
+{
+    GB_Image resultImage;
+    if (IsEmpty())
+    {
+        return resultImage;
+    }
+
+    if (!horizontalFlip && !verticalFlip)
+    {
+        return Clone();
+    }
+
+    const int flipCode = horizontalFlip ? (verticalFlip ? -1 : 1) : 0;
+
+    try
+    {
+        cv::flip(imageImpl->imageMat, resultImage.imageImpl->imageMat, flipCode);
+        resultImage.imageImpl->channelLayout = imageImpl->channelLayout;
+    }
+    catch (...)
+    {
+        resultImage.Clear();
+    }
+
+    return resultImage;
+}
+
+/**
+ * @brief 原地翻转图像。
+ */
+bool GB_Image::FlipInPlace(bool horizontalFlip, bool verticalFlip)
+{
+    if (IsEmpty())
+    {
+        return false;
+    }
+
+    if (!horizontalFlip && !verticalFlip)
+    {
+        return true;
+    }
+
+    GB_Image flippedImage = Flip(horizontalFlip, verticalFlip);
+    if (flippedImage.IsEmpty())
+    {
+        return false;
+    }
+
+    Swap(flippedImage);
+    return true;
+}
+
+/**
  * @brief 生成缩放后的新图像。
  */
 GB_Image GB_Image::Resize(size_t newRows, size_t newCols, GB_ImageInterpolation interpolation) const
@@ -1627,14 +2577,14 @@ GB_Image GB_Image::Resize(size_t newRows, size_t newCols, GB_ImageInterpolation 
 
     int cvRows = 0;
     int cvCols = 0;
-    if (!gbImageInternal::TryConvertSizeToInt(newRows, cvRows) || !gbImageInternal::TryConvertSizeToInt(newCols, cvCols))
+    if (!GBImage_Internal::TryConvertSizeToInt(newRows, cvRows) || !GBImage_Internal::TryConvertSizeToInt(newCols, cvCols))
     {
         return resultImage;
     }
 
     try
     {
-        cv::resize(imageImpl->imageMat, resultImage.imageImpl->imageMat, cv::Size(cvCols, cvRows), 0.0, 0.0, gbImageInternal::ToCvInterpolation(interpolation));
+        cv::resize(imageImpl->imageMat, resultImage.imageImpl->imageMat, cv::Size(cvCols, cvRows), 0.0, 0.0, GBImage_Internal::ToCvInterpolation(interpolation));
         resultImage.imageImpl->channelLayout = imageImpl->channelLayout;
     }
     catch (...)
@@ -1697,7 +2647,7 @@ GB_Image GB_Image::Crop(size_t row, size_t col, size_t cropRows, size_t cropCols
     int cvCol = 0;
     int cvCropRows = 0;
     int cvCropCols = 0;
-    if (!gbImageInternal::TryConvertSizeToInt(row, cvRow) || !gbImageInternal::TryConvertSizeToInt(col, cvCol) || !gbImageInternal::TryConvertSizeToInt(cropRows, cvCropRows) || !gbImageInternal::TryConvertSizeToInt(cropCols, cvCropCols))
+    if (!GBImage_Internal::TryConvertSizeToInt(row, cvRow) || !GBImage_Internal::TryConvertSizeToInt(col, cvCol) || !GBImage_Internal::TryConvertSizeToInt(cropRows, cvCropRows) || !GBImage_Internal::TryConvertSizeToInt(cropCols, cvCropCols))
     {
         return resultImage;
     }
@@ -1757,12 +2707,12 @@ GB_Image GB_Image::ConvertColor(GB_ImageColorConversion conversion) const
     }
 
     int cvColorCode = -1;
-    if (!gbImageInternal::TryGetCvColorCode(conversion, cvColorCode))
+    if (!GBImage_Internal::TryGetCvColorCode(conversion, cvColorCode))
     {
         return resultImage;
     }
 
-    if (!gbImageInternal::IsConversionSourceLayoutCompatible(conversion, imageImpl->channelLayout))
+    if (!GBImage_Internal::IsConversionSourceLayoutCompatible(conversion, imageImpl->channelLayout))
     {
         return resultImage;
     }
@@ -1770,7 +2720,7 @@ GB_Image GB_Image::ConvertColor(GB_ImageColorConversion conversion) const
     try
     {
         cv::cvtColor(imageImpl->imageMat, resultImage.imageImpl->imageMat, cvColorCode);
-        resultImage.imageImpl->channelLayout = gbImageInternal::GetConvertedChannelLayout(conversion);
+        resultImage.imageImpl->channelLayout = GBImage_Internal::GetConvertedChannelLayout(conversion);
     }
     catch (...)
     {

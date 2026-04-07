@@ -2,6 +2,7 @@
 #define GLOBALBASE_COLOR_RGBA_H_H
 
 #include "../GlobalBasePort.h"
+#include "../GB_BaseTypes.h"
 
 #include <array>
 #include <cassert>
@@ -445,6 +446,39 @@ public:
      * @brief 从线性 RGB 构造（Linear -> sRGB）。
      */
     static GB_ColorRGBA FromLinearRgba(const GB_ColorLinearRGBA& linearColor) noexcept;
+
+    /**
+     * @brief 返回当前类类型字符串。
+     */
+    const std::string& GetClassType() const;
+
+    /**
+     * @brief 返回当前类类型 Id。
+     */
+    uint64_t GetClassTypeId() const;
+
+    /**
+     * @brief 序列化为便于人类阅读的文本字符串。
+     *
+     * 文本格式为：
+     * (GB_ColorRGBA r,g,b,a)
+     */
+    std::string SerializeToString() const;
+
+    /**
+     * @brief 序列化为二进制缓冲区。
+     */
+    GB_ByteBuffer SerializeToBinary() const;
+
+    /**
+     * @brief 从文本字符串反序列化。
+     */
+    bool Deserialize(const std::string& data);
+
+    /**
+     * @brief 从二进制缓冲区反序列化。
+     */
+    bool Deserialize(const GB_ByteBuffer& data);
 
     /**
      * @brief 相等比较。

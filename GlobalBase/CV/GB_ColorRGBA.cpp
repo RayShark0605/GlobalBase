@@ -1,7 +1,12 @@
 ﻿#include "GB_ColorRGBA.h"
 
+#include "../GB_IO.h"
+#include "../Geometry/GB_GeometryInterface.h"
+
 #include <algorithm>
 #include <cmath>
+#include <locale>
+#include <sstream>
 
 namespace
 {
@@ -409,4 +414,139 @@ GB_ColorLinearRGBA GB_ColorRGBA::ToLinearRgba() const noexcept
 GB_ColorRGBA GB_ColorRGBA::FromLinearRgba(const GB_ColorLinearRGBA& linearColor) noexcept
 {
     return GB_ColorRGBA::FromFloat(LinearToSrgb(linearColor.r), LinearToSrgb(linearColor.g), LinearToSrgb(linearColor.b), ClampUnitFloat(linearColor.a));
+}
+
+
+const std::string& GB_ColorRGBA::GetClassType() const
+{
+    static const std::string classType = "GB_ColorRGBA";
+    return classType;
+}
+
+uint64_t GB_ColorRGBA::GetClassTypeId() const
+{
+    static const uint64_t classTypeId = GB_GenerateClassTypeId(GetClassType());
+    return classTypeId;
+}
+
+std::string GB_ColorRGBA::SerializeToString() const
+{
+    std::ostringstream oss;
+    oss.imbue(std::locale::classic());
+    oss << "(" << GetClassType()
+        << " " << static_cast<unsigned int>(r)
+        << "," << static_cast<unsigned int>(g)
+        << "," << static_cast<unsigned int>(b)
+        << "," << static_cast<unsigned int>(a) << ")";
+    return oss.str();
+}
+
+GB_ByteBuffer GB_ColorRGBA::SerializeToBinary() const
+{
+    constexpr static uint16_t payloadVersion = 1;
+
+    GB_ByteBuffer buffer;
+    buffer.reserve(20);
+
+    GB_ByteBufferIO::AppendUInt32LE(buffer, GB_ClassMagicNumber);
+    GB_ByteBufferIO::AppendUInt64LE(buffer, GetClassTypeId());
+    GB_ByteBufferIO::AppendUInt16LE(buffer, payloadVersion);
+    GB_ByteBufferIO::AppendUInt16LE(buffer, 0);
+
+    buffer.push_back(r);
+    buffer.push_back(g);
+    buffer.push_back(b);
+    buffer.push_back(a);
+
+    return buffer;
+}
+
+bool GB_ColorRGBA::Deserialize(const std::string& data)
+{
+    std::istringstream iss(data);
+    iss.imbue(std::locale::classic());
+
+    char leftParen = 0;
+    std::string type = "";
+    char comma1 = 0;
+    char comma2 = 0;
+    char comma3 = 0;
+    char rightParen = 0;
+
+    unsigned int parsedRed = 0;
+    unsigned int parsedGreen = 0;
+    unsigned int parsedBlue = 0;
+    unsigned int parsedAlpha = 0;
+
+    if (!(iss >> leftParen >> type >> parsedRed >> comma1 >> parsedGreen >> comma2 >> parsedBlue >> comma3 >> parsedAlpha >> rightParen))
+    {
+        return false;
+    }
+
+    if (leftParen != '('
+        || rightParen != ')'
+        || comma1 != ','
+        || comma2 != ','
+        || comma3 != ','
+        || type != GetClassType()
+        || parsedRed > 255
+        || parsedGreen > 255
+        || parsedBlue > 255
+        || parsedAlpha > 255)
+    {
+        return false;
+    }
+
+    iss >> std::ws;
+    if (!iss.eof())
+    {
+        return false;
+    }
+
+    r = static_cast<uint8_t>(parsedRed);
+    g = static_cast<uint8_t>(parsedGreen);
+    b = static_cast<uint8_t>(parsedBlue);
+    a = static_cast<uint8_t>(parsedAlpha);
+    return true;
+}
+
+bool GB_ColorRGBA::Deserialize(const GB_ByteBuffer& data)
+{
+    constexpr static uint16_t expectedPayloadVersion = 1;
+    constexpr static size_t minSize = 20;
+
+    if (data.size() < minSize)
+    {
+        return false;
+    }
+
+    size_t offset = 0;
+    uint32_t magic = 0;
+    uint64_t typeId = 0;
+    uint16_t payloadVersion = 0;
+    uint16_t reserved = 0;
+
+    if (!GB_ByteBufferIO::ReadUInt32LE(data, offset, magic)
+        || !GB_ByteBufferIO::ReadUInt64LE(data, offset, typeId)
+        || !GB_ByteBufferIO::ReadUInt16LE(data, offset, payloadVersion)
+        || !GB_ByteBufferIO::ReadUInt16LE(data, offset, reserved))
+    {
+        return false;
+    }
+
+    if (magic != GB_ClassMagicNumber || typeId != GetClassTypeId() || payloadVersion != expectedPayloadVersion)
+    {
+        return false;
+    }
+
+    if (offset + 4 > data.size())
+    {
+        return false;
+    }
+
+    r = data[offset];
+    g = data[offset + 1];
+    b = data[offset + 2];
+    a = data[offset + 3];
+    return true;
 }
