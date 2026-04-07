@@ -4,6 +4,7 @@
 #include "../GlobalBasePort.h"
 #include "../GB_BaseTypes.h"
 #include "GB_ColorRGBA.h"
+
 #include <cstddef>
 #include <cstdint>
 #include <string>
@@ -68,78 +69,133 @@ enum class GB_ImageColorConversion
     RgbaToBgr
 };
 
+/**
+ * @brief 图像读取选项。
+ */
 struct GB_ImageLoadOptions
 {
-    // 解码后的目标颜色模式。
-    // - Unchanged：尽量保持源图像原始通道数/位深。
-    // - Gray / BGR：按目标通道数读取；若 preserveBitDepth 为 true，则尽量保留 16bit/32bit 深度。
-    // - BGRA：先按 Unchanged 解码，再在内存中转换为 BGRA。
+    /**
+     * @brief 解码后的目标颜色模式。
+     *
+     * - Unchanged：尽量保持源图像原始通道数与位深。
+     * - Gray / BGR：按目标通道数读取；当 preserveBitDepth 为 true 时，尽量保留源位深。
+     * - BGRA：先按原始通道数读取，再在内存中转换为 BGRA。
+     */
     GB_ImageColorMode colorMode = GB_ImageColorMode::Unchanged;
 
-    // 是否尽量保留源图像位深。
-    // 说明：当 colorMode 为 Unchanged 或 BGRA 时，内部会优先保留源位深。
+    /**
+     * @brief 是否尽量保留源图像位深。
+     *
+     * 当 colorMode 为 Unchanged 或 BGRA 时，会优先保持原位深。
+     */
     bool preserveBitDepth = true;
 
-    // 是否忽略 EXIF 方向。
-    // 仅当 OpenCV 的相应解码路径支持该标志时生效。
+    /**
+     * @brief 是否忽略图像方向元数据。
+     *
+     * 仅当底层解码路径支持该选项时生效。
+     */
     bool ignoreExifOrientation = false;
 
-    // 多页图像/动画图像时读取的页索引，0 表示第一页。
+    /**
+     * @brief 多页图像或动画图像时要读取的页索引，0 表示第一页。
+     */
     size_t pageIndex = 0;
 };
 
+/**
+ * @brief 图像保存选项。
+ */
 struct GB_ImageSaveOptions
 {
-    // 目标文件已存在时是否允许覆盖。
+    /**
+     * @brief 目标文件已存在时是否允许覆盖。
+     */
     bool overwrite = true;
 
-    // JPEG 质量：[0, 100]，越大通常质量越高、文件也越大。
+    /**
+     * @brief JPEG 质量，范围 [0, 100]，越大通常质量越高、文件也越大。
+     */
     int jpegQuality = 95;
 
-    // PNG 压缩等级：[0, 9]，越大压缩越强，通常编码更慢。
+    /**
+     * @brief PNG 压缩等级，范围 [0, 9]，越大压缩越强，通常编码更慢。
+     */
     int pngCompression = 3;
 
-    // WebP 质量：[1, 100]。
+    /**
+     * @brief WebP 质量，范围 [1, 100]。
+     */
     int webpQuality = 95;
 };
 
 /**
- * @brief 基于 OpenCV 的内存图像对象。
+ * @brief 内存图像对象。
  *
  * 设计目标：
  * - 只描述“已经完整在内存中的图像”；
- * - 头文件不 include 任何第三方库；
- * - 默认拷贝语义为浅拷贝（与 cv::Mat 一致，O(1) 共享底层像素缓冲区）；
- * - 通过 Clone()/Detach()/显式 DeepCopy 构造实现深拷贝；
- * - 像素坐标系与 OpenCV 保持一致，统一使用 (row, col)。
+ * - 默认拷贝语义为浅拷贝，多个对象可共享同一份底层像素缓冲区；
+ * - 可通过 Clone()、Detach() 或显式 DeepCopy 获取独立副本；
+ * - 像素坐标统一使用 (row, col)；
+ * - 对 3 通道 / 4 通道图像，默认存储顺序为 BGR / BGRA。
  *
  * 说明：
- * - 对 3 通道/4 通道图像，本类默认遵循 OpenCV 的常见存储顺序：BGR / BGRA。
- * - 与 GB_ColorRGBA 的交互接口，会自动在“逻辑 RGBA”与“底层 BGR/BGRA”之间转换。
+ * - 读取、创建、从外部对象设置等会修改当前图像内容的接口，采用“成功后提交”的语义：
+ *   只有在新图像真正构造成功后，当前对象内部状态才会被替换；
+ * - 与 GB_ColorRGBA 交互时，会自动在逻辑 RGBA 与底层 BGR / BGRA 之间完成转换。
  */
 class GLOBALBASE_PORT GB_Image
 {
 public:
     GB_Image();
 
+    /**
+     * @brief 从文件读取图像。
+     *
+     * 若读取失败，对象保持原有内容不变。
+     */
     explicit GB_Image(const std::string& filePathUtf8, const GB_ImageLoadOptions& loadOptions = GB_ImageLoadOptions());
+
+    /**
+     * @brief 从已编码的内存字节流读取图像。
+     *
+     * 若读取失败，对象保持原有内容不变。
+     */
     explicit GB_Image(const GB_ByteBuffer& encodedBytes, const GB_ImageLoadOptions& loadOptions = GB_ImageLoadOptions());
+
+    /**
+     * @brief 从已编码的内存块读取图像。
+     *
+     * 若读取失败，对象保持原有内容不变。
+     */
     GB_Image(const void* encodedData, size_t encodedSize, const GB_ImageLoadOptions& loadOptions = GB_ImageLoadOptions());
 
-    // 创建指定尺寸/位深/通道数的图像。
-    // zeroInitialize=true 时会清零（例如 8UC3 时得到全黑图像）。
+    /**
+     * @brief 创建指定尺寸、位深、通道数的图像。
+     *
+     * @param rows 图像行数。
+     * @param cols 图像列数。
+     * @param depth 像素位深。
+     * @param channels 通道数，必须大于 0。
+     * @param zeroInitialize 是否在创建后立即清零。
+     */
     GB_Image(size_t rows, size_t cols, GB_ImageDepth depth, int channels, bool zeroInitialize = true);
 
-    // 默认拷贝：浅拷贝（O(1)）
+    /**
+     * @brief 默认拷贝：浅拷贝，O(1) 共享底层像素缓冲区。
+     */
     GB_Image(const GB_Image& other);
 
-    // 可显式指定浅拷贝/深拷贝。
+    /**
+     * @brief 可显式指定浅拷贝或深拷贝。
+     */
     GB_Image(const GB_Image& other, GB_ImageCopyMode copyMode);
 
     GB_Image(GB_Image&& other) noexcept;
 
-    // 允许与 cv::Mat 互转，但头文件不 include OpenCV；
-    // 使用这些接口的调用方，在自己的 .cpp 中自行 include 对应 OpenCV 头文件即可。
+    /**
+     * @brief 从外部矩阵对象构造图像。
+     */
     explicit GB_Image(const cv::Mat& imageMat, GB_ImageCopyMode copyMode = GB_ImageCopyMode::ShallowCopy);
 
     ~GB_Image();
@@ -148,20 +204,67 @@ public:
     GB_Image& operator=(GB_Image&& other) noexcept;
 
     void Swap(GB_Image& other) noexcept;
+
+    /**
+     * @brief 清空当前图像内容。
+     *
+     * 清空后对象仍保持可继续复用。
+     */
     void Clear();
 
+    /**
+     * @brief 创建指定尺寸、位深、通道数的图像。
+     *
+     * 创建失败时，对象保持原有内容不变。
+     */
     bool Create(size_t rows, size_t cols, GB_ImageDepth depth, int channels, bool zeroInitialize = true);
 
+    /**
+     * @brief 从文件读取图像。
+     *
+     * 读取失败时，对象保持原有内容不变。
+     */
     bool LoadFromFile(const std::string& filePathUtf8, const GB_ImageLoadOptions& loadOptions = GB_ImageLoadOptions());
+
+    /**
+     * @brief 从已编码字节流读取图像。
+     *
+     * 读取失败时，对象保持原有内容不变。
+     */
     bool LoadFromMemory(const GB_ByteBuffer& encodedBytes, const GB_ImageLoadOptions& loadOptions = GB_ImageLoadOptions());
+
+    /**
+     * @brief 从已编码内存块读取图像。
+     *
+     * 读取失败时，对象保持原有内容不变。
+     */
     bool LoadFromMemory(const void* encodedData, size_t encodedSize, const GB_ImageLoadOptions& loadOptions = GB_ImageLoadOptions());
 
+    /**
+     * @brief 保存到文件。
+     */
     bool SaveToFile(const std::string& filePathUtf8, const GB_ImageSaveOptions& saveOptions = GB_ImageSaveOptions()) const;
 
-    // fileExt 可传入 ".png" / ".jpg" / "png" / "jpg" 等。
+    /**
+     * @brief 编码到内存。
+     *
+     * @param encodedBytes 输出的编码字节流。
+     * @param fileExt 目标格式扩展名，可传入 ".png"、".jpg"、"png"、"jpg" 等。
+     */
     bool EncodeToMemory(GB_ByteBuffer& encodedBytes, const std::string& fileExt, const GB_ImageSaveOptions& saveOptions = GB_ImageSaveOptions()) const;
 
+    /**
+     * @brief 从外部矩阵对象设置当前图像。
+     *
+     * 设置失败时，对象保持原有内容不变。
+     */
     bool SetFromCvMat(const cv::Mat& imageMat, GB_ImageCopyMode copyMode = GB_ImageCopyMode::ShallowCopy);
+
+    /**
+     * @brief 导出为外部矩阵对象。
+     *
+     * DeepCopy 时返回独立副本；ShallowCopy 时返回共享底层缓冲区的视图。
+     */
     cv::Mat ToCvMat(GB_ImageCopyMode copyMode = GB_ImageCopyMode::ShallowCopy) const;
 
     bool IsEmpty() const;
@@ -176,40 +279,110 @@ public:
     size_t GetBytesPerPixel() const;
     size_t GetRowStrideBytes() const;
 
-    // 返回当前“逻辑图像区域”的像素数据总字节数：rows * cols * elemSize。
-    // 若当前对象只是某个更大图像的 ROI/浅视图，则该值不一定等于底层共享缓冲区的真实分配大小。
+    /**
+     * @brief 返回当前逻辑图像区域的像素总字节数。
+     *
+     * 该值等于 rows * cols * elemSize。
+     * 若当前对象只是某个更大图像的 ROI 或浅视图，则它不一定等于底层共享缓冲区的真实分配大小。
+     */
     size_t GetTotalByteSize() const;
 
     bool IsContinuous() const;
     bool IsValidPixelCoordinate(size_t row, size_t col) const;
 
+    /**
+     * @brief 获取首像素地址。
+     *
+     * 对于非连续图像，只能保证返回首行首像素地址，不能据此假定整张图像可按一段连续内存处理。
+     */
     unsigned char* GetData();
+
+    /**
+     * @brief 获取首像素只读地址。
+     *
+     * 对于非连续图像，只能保证返回首行首像素地址，不能据此假定整张图像可按一段连续内存处理。
+     */
     const unsigned char* GetData() const;
+
+    /**
+     * @brief 获取指定行起始地址。
+     */
     unsigned char* GetRowData(size_t row);
+
+    /**
+     * @brief 获取指定行起始地址（只读）。
+     */
     const unsigned char* GetRowData(size_t row) const;
 
-    // 仅对 8 位、1/3/4 通道图像提供稳定的 GB_ColorRGBA 像素读写。
-    // - 1 通道：读取时扩展为灰度 RGBA（A=255）；写入时按灰度写入。
-    // - 3 通道：按 BGR <-> RGBA 转换；写入时忽略 alpha。
-    // - 4 通道：按 BGRA <-> RGBA 转换。
+    /**
+     * @brief 读取单个像素颜色。
+     *
+     * 仅对 8 位、1 / 3 / 4 通道图像提供稳定支持：
+     * - 1 通道：读取时扩展为灰度 RGBA，A 固定为 255；
+     * - 3 通道：按 BGR <-> RGBA 转换；
+     * - 4 通道：按 BGRA <-> RGBA 转换。
+     */
     bool GetPixelColor(size_t row, size_t col, GB_ColorRGBA& pixelColor) const;
+
+    /**
+     * @brief 写入单个像素颜色。
+     *
+     * 仅对 8 位、1 / 3 / 4 通道图像提供稳定支持：
+     * - 1 通道：按灰度写入；
+     * - 3 通道：按 BGR 写入，忽略 alpha；
+     * - 4 通道：按 BGRA 写入。
+     */
     bool SetPixelColor(size_t row, size_t col, const GB_ColorRGBA& pixelColor);
+
+    /**
+     * @brief 用指定颜色填充整幅图像。
+     *
+     * 当前实现仅对 8 位、1 / 3 / 4 通道图像提供稳定支持。
+     */
     bool Fill(const GB_ColorRGBA& pixelColor);
 
-    // 返回深拷贝图像。
+    /**
+     * @brief 返回深拷贝图像。
+     */
     GB_Image Clone() const;
 
-    // 将当前对象“原地脱离共享”，确保之后与原共享对象不再共用像素缓冲区。
+    /**
+     * @brief 让当前对象与共享源脱离，确保之后拥有独立的像素缓冲区。
+     */
     bool Detach();
 
+    /**
+     * @brief 生成缩放后的新图像。
+     */
     GB_Image Resize(size_t newRows, size_t newCols, GB_ImageInterpolation interpolation = GB_ImageInterpolation::Linear) const;
+
+    /**
+     * @brief 原地缩放图像。
+     */
     bool ResizeInPlace(size_t newRows, size_t newCols, GB_ImageInterpolation interpolation = GB_ImageInterpolation::Linear);
 
-    // 注意参数顺序：统一使用 (row, col, rows, cols)。
+    /**
+     * @brief 裁剪子图。
+     *
+     * 参数顺序统一为 (row, col, rows, cols)。
+     */
     GB_Image Crop(size_t row, size_t col, size_t cropRows, size_t cropCols, GB_ImageCopyMode copyMode = GB_ImageCopyMode::DeepCopy) const;
+
+    /**
+     * @brief 原地裁剪子图。
+     *
+     * 参数顺序统一为 (row, col, rows, cols)。
+     */
     bool CropInPlace(size_t row, size_t col, size_t cropRows, size_t cropCols, GB_ImageCopyMode copyMode = GB_ImageCopyMode::DeepCopy);
 
+    /**
+     * @brief 返回颜色空间转换后的新图像。
+     */
     GB_Image ConvertColor(GB_ImageColorConversion conversion) const;
+
+    /**
+     * @brief 原地执行颜色空间转换。
+     */
     bool ConvertColorInPlace(GB_ImageColorConversion conversion);
 
 private:

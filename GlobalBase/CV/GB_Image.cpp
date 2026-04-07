@@ -1,6 +1,7 @@
 ﻿#include "GB_Image.h"
 #include "../GB_FileSystem.h"
 #include "../GB_IO.h"
+
 #include <algorithm>
 #include <limits>
 #include <utility>
@@ -198,6 +199,39 @@ namespace gbImageInternal
         return imreadFlags;
     }
 
+    static bool ConvertGrayAlphaToBgra(const cv::Mat& sourceImage, cv::Mat& targetImage)
+    {
+        if (sourceImage.empty() || sourceImage.channels() != 2)
+        {
+            return false;
+        }
+
+        try
+        {
+            std::vector<cv::Mat> sourceChannels;
+            cv::split(sourceImage, sourceChannels);
+            if (sourceChannels.size() != 2 || sourceChannels[0].empty() || sourceChannels[1].empty())
+            {
+                return false;
+            }
+
+            std::vector<cv::Mat> targetChannels;
+            targetChannels.reserve(4);
+            targetChannels.push_back(sourceChannels[0]);
+            targetChannels.push_back(sourceChannels[0]);
+            targetChannels.push_back(sourceChannels[0]);
+            targetChannels.push_back(sourceChannels[1]);
+
+            cv::merge(targetChannels, targetImage);
+            return !targetImage.empty();
+        }
+        catch (...)
+        {
+            targetImage.release();
+            return false;
+        }
+    }
+
     static bool ApplyLoadPostProcess(cv::Mat& imageMat, const GB_ImageLoadOptions& loadOptions)
     {
         if (imageMat.empty())
@@ -212,12 +246,12 @@ namespace gbImageInternal
 
         try
         {
-            if (imageMat.channels() == 4)
+            switch (imageMat.channels())
             {
+            case 4:
                 return true;
-            }
 
-            if (imageMat.channels() == 3)
+            case 3:
             {
                 cv::Mat convertedImage;
                 cv::cvtColor(imageMat, convertedImage, cv::COLOR_BGR2BGRA);
@@ -225,12 +259,28 @@ namespace gbImageInternal
                 return true;
             }
 
-            if (imageMat.channels() == 1)
+            case 2:
+            {
+                cv::Mat convertedImage;
+                if (!ConvertGrayAlphaToBgra(imageMat, convertedImage))
+                {
+                    return false;
+                }
+
+                imageMat = std::move(convertedImage);
+                return true;
+            }
+
+            case 1:
             {
                 cv::Mat convertedImage;
                 cv::cvtColor(imageMat, convertedImage, cv::COLOR_GRAY2BGRA);
                 imageMat = std::move(convertedImage);
                 return true;
+            }
+
+            default:
+                break;
             }
         }
         catch (...)
@@ -256,10 +306,10 @@ namespace gbImageInternal
 
         for (size_t i = 0; i < normalizedExt.size(); i++)
         {
-            const unsigned char ch = static_cast<unsigned char>(normalizedExt[i]);
-            if (ch >= static_cast<unsigned char>('A') && ch <= static_cast<unsigned char>('Z'))
+            const unsigned char character = static_cast<unsigned char>(normalizedExt[i]);
+            if (character >= static_cast<unsigned char>('A') && character <= static_cast<unsigned char>('Z'))
             {
-                normalizedExt[i] = static_cast<char>(ch - static_cast<unsigned char>('A') + static_cast<unsigned char>('a'));
+                normalizedExt[i] = static_cast<char>(character - static_cast<unsigned char>('A') + static_cast<unsigned char>('a'));
             }
         }
 
@@ -534,13 +584,6 @@ bool GB_Image::EnsureImageImpl()
 
 bool GB_Image::Create(size_t rows, size_t cols, GB_ImageDepth depth, int channels, bool zeroInitialize)
 {
-    Clear();
-
-    if (!EnsureImageImpl())
-    {
-        return false;
-    }
-
     if (rows == 0 || cols == 0)
     {
         return false;
@@ -556,22 +599,33 @@ bool GB_Image::Create(size_t rows, size_t cols, GB_ImageDepth depth, int channel
 
     try
     {
+        cv::Mat newImageMat;
         if (zeroInitialize)
         {
-            imageImpl->imageMat = cv::Mat::zeros(cvRows, cvCols, cvType);
+            newImageMat = cv::Mat::zeros(cvRows, cvCols, cvType);
         }
         else
         {
-            imageImpl->imageMat.create(cvRows, cvCols, cvType);
+            newImageMat.create(cvRows, cvCols, cvType);
         }
+
+        if (newImageMat.empty())
+        {
+            return false;
+        }
+
+        if (!EnsureImageImpl())
+        {
+            return false;
+        }
+
+        imageImpl->imageMat = std::move(newImageMat);
+        return true;
     }
     catch (...)
     {
-        Clear();
         return false;
     }
-
-    return !imageImpl->imageMat.empty();
 }
 
 bool GB_Image::LoadFromFile(const std::string& filePathUtf8, const GB_ImageLoadOptions& loadOptions)
@@ -579,7 +633,6 @@ bool GB_Image::LoadFromFile(const std::string& filePathUtf8, const GB_ImageLoadO
     const GB_ByteBuffer encodedBytes = GB_ReadFileToBinary(filePathUtf8);
     if (encodedBytes.empty())
     {
-        Clear();
         return false;
     }
 
@@ -590,7 +643,6 @@ bool GB_Image::LoadFromMemory(const GB_ByteBuffer& encodedBytes, const GB_ImageL
 {
     if (encodedBytes.empty())
     {
-        Clear();
         return false;
     }
 
@@ -599,8 +651,6 @@ bool GB_Image::LoadFromMemory(const GB_ByteBuffer& encodedBytes, const GB_ImageL
 
 bool GB_Image::LoadFromMemory(const void* encodedData, size_t encodedSize, const GB_ImageLoadOptions& loadOptions)
 {
-    Clear();
-
     if (encodedData == nullptr || encodedSize == 0)
     {
         return false;
@@ -627,13 +677,11 @@ bool GB_Image::LoadFromMemory(const void* encodedData, size_t encodedSize, const
             int beginIndex = 0;
             if (!gbImageInternal::TryConvertSizeToInt(loadOptions.pageIndex, beginIndex))
             {
-                Clear();
                 return false;
             }
 
             if (beginIndex == std::numeric_limits<int>::max())
             {
-                Clear();
                 return false;
             }
 
@@ -641,27 +689,24 @@ bool GB_Image::LoadFromMemory(const void* encodedData, size_t encodedSize, const
             std::vector<cv::Mat> decodedPages;
             if (!cv::imdecodemulti(encodedView, imreadFlags, decodedPages, cv::Range(beginIndex, endIndex)) || decodedPages.empty())
             {
-                Clear();
                 return false;
             }
+
             decodedImage = std::move(decodedPages[0]);
         }
 
         if (decodedImage.empty())
         {
-            Clear();
             return false;
         }
 
         if (!gbImageInternal::ApplyLoadPostProcess(decodedImage, loadOptions))
         {
-            Clear();
             return false;
         }
 
         if (!EnsureImageImpl())
         {
-            Clear();
             return false;
         }
 
@@ -670,7 +715,6 @@ bool GB_Image::LoadFromMemory(const void* encodedData, size_t encodedSize, const
     }
     catch (...)
     {
-        Clear();
         return false;
     }
 }
@@ -733,7 +777,7 @@ bool GB_Image::EncodeToMemory(GB_ByteBuffer& encodedBytes, const std::string& fi
             return false;
         }
 
-        encodedBytes.assign(cvEncodedBytes.begin(), cvEncodedBytes.end());
+        encodedBytes.swap(cvEncodedBytes);
         return !encodedBytes.empty();
     }
     catch (...)
@@ -747,31 +791,36 @@ bool GB_Image::SetFromCvMat(const cv::Mat& imageMat, GB_ImageCopyMode copyMode)
 {
     if (imageMat.empty())
     {
-        Clear();
-        return false;
-    }
-
-    if (!EnsureImageImpl())
-    {
-        Clear();
         return false;
     }
 
     try
     {
+        cv::Mat newImageMat;
         if (copyMode == GB_ImageCopyMode::DeepCopy)
         {
-            imageImpl->imageMat = imageMat.clone();
+            newImageMat = imageMat.clone();
         }
         else
         {
-            imageImpl->imageMat = imageMat;
+            newImageMat = imageMat;
         }
+
+        if (newImageMat.empty())
+        {
+            return false;
+        }
+
+        if (!EnsureImageImpl())
+        {
+            return false;
+        }
+
+        imageImpl->imageMat = std::move(newImageMat);
         return true;
     }
     catch (...)
     {
-        Clear();
         return false;
     }
 }
@@ -783,12 +832,19 @@ cv::Mat GB_Image::ToCvMat(GB_ImageCopyMode copyMode) const
         return cv::Mat();
     }
 
-    if (copyMode == GB_ImageCopyMode::DeepCopy)
+    try
     {
-        return imageImpl->imageMat.clone();
-    }
+        if (copyMode == GB_ImageCopyMode::DeepCopy)
+        {
+            return imageImpl->imageMat.clone();
+        }
 
-    return imageImpl->imageMat;
+        return imageImpl->imageMat;
+    }
+    catch (...)
+    {
+        return cv::Mat();
+    }
 }
 
 bool GB_Image::IsEmpty() const
@@ -802,6 +858,7 @@ size_t GB_Image::GetWidth() const
     {
         return 0;
     }
+
     return static_cast<size_t>(imageImpl->imageMat.cols);
 }
 
@@ -811,6 +868,7 @@ size_t GB_Image::GetHeight() const
     {
         return 0;
     }
+
     return static_cast<size_t>(imageImpl->imageMat.rows);
 }
 
@@ -830,6 +888,7 @@ int GB_Image::GetChannels() const
     {
         return 0;
     }
+
     return imageImpl->imageMat.channels();
 }
 
@@ -839,6 +898,7 @@ GB_ImageDepth GB_Image::GetDepth() const
     {
         return GB_ImageDepth::Unknown;
     }
+
     return gbImageInternal::CvDepthToImageDepth(imageImpl->imageMat.depth());
 }
 
@@ -858,6 +918,7 @@ size_t GB_Image::GetBytesPerPixel() const
     {
         return 0;
     }
+
     return imageImpl->imageMat.elemSize();
 }
 
@@ -867,6 +928,7 @@ size_t GB_Image::GetRowStrideBytes() const
     {
         return 0;
     }
+
     return imageImpl->imageMat.step[0];
 }
 
@@ -876,6 +938,7 @@ size_t GB_Image::GetTotalByteSize() const
     {
         return 0;
     }
+
     return imageImpl->imageMat.total() * imageImpl->imageMat.elemSize();
 }
 
@@ -885,6 +948,7 @@ bool GB_Image::IsContinuous() const
     {
         return false;
     }
+
     return imageImpl->imageMat.isContinuous();
 }
 
@@ -904,6 +968,7 @@ unsigned char* GB_Image::GetData()
     {
         return nullptr;
     }
+
     return imageImpl->imageMat.data;
 }
 
@@ -913,6 +978,7 @@ const unsigned char* GB_Image::GetData() const
     {
         return nullptr;
     }
+
     return imageImpl->imageMat.data;
 }
 
@@ -922,6 +988,7 @@ unsigned char* GB_Image::GetRowData(size_t row)
     {
         return nullptr;
     }
+
     return imageImpl->imageMat.ptr<unsigned char>(static_cast<int>(row));
 }
 
@@ -931,6 +998,7 @@ const unsigned char* GB_Image::GetRowData(size_t row) const
     {
         return nullptr;
     }
+
     return imageImpl->imageMat.ptr<unsigned char>(static_cast<int>(row));
 }
 
@@ -1063,7 +1131,22 @@ bool GB_Image::Fill(const GB_ColorRGBA& pixelColor)
 
 GB_Image GB_Image::Clone() const
 {
-    return GB_Image(*this, GB_ImageCopyMode::DeepCopy);
+    GB_Image resultImage;
+    if (IsEmpty())
+    {
+        return resultImage;
+    }
+
+    try
+    {
+        resultImage.imageImpl->imageMat = imageImpl->imageMat.clone();
+    }
+    catch (...)
+    {
+        resultImage.Clear();
+    }
+
+    return resultImage;
 }
 
 bool GB_Image::Detach()
@@ -1092,6 +1175,11 @@ GB_Image GB_Image::Resize(size_t newRows, size_t newCols, GB_ImageInterpolation 
         return resultImage;
     }
 
+    if (newRows == GetRows() && newCols == GetCols())
+    {
+        return Clone();
+    }
+
     int cvRows = 0;
     int cvCols = 0;
     if (!gbImageInternal::TryConvertSizeToInt(newRows, cvRows) || !gbImageInternal::TryConvertSizeToInt(newCols, cvCols))
@@ -1116,6 +1204,11 @@ bool GB_Image::ResizeInPlace(size_t newRows, size_t newCols, GB_ImageInterpolati
     if (IsEmpty())
     {
         return false;
+    }
+
+    if (newRows == GetRows() && newCols == GetCols())
+    {
+        return true;
     }
 
     GB_Image resizedImage = Resize(newRows, newCols, interpolation);
