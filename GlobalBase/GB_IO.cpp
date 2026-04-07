@@ -15,18 +15,16 @@
 #include <unistd.h>
 #endif
 
-using namespace std;
-
-bool GB_WriteUtf8ToFile(const string& filePathUtf8, const string& utf8Content, bool appendMode, bool addBomIfNewFile)
+bool GB_WriteUtf8ToFile(const std::string& filePathUtf8, const std::string& utf8Content, bool appendMode, bool addBomIfNewFile)
 {
     const bool existedBefore = GB_IsFileExists(filePathUtf8);
-	if (!existedBefore)
-	{
-		if (!GB_CreateFileRecursive(filePathUtf8))
-		{
-			return false; // 创建失败
-		}
-	}
+    if (!existedBefore)
+    {
+        if (!GB_CreateFileRecursive(filePathUtf8))
+        {
+            return false; // 创建失败
+        }
+    }
 
 #ifdef _WIN32
     // 将 UTF-8 路径转为 UTF-16 以使用 *W API
@@ -190,7 +188,7 @@ std::vector<unsigned char> GB_ReadFileToBinary(const std::string& filePathUtf8)
             return std::wstring();
         }
         return w;
-    };
+        };
 
     const std::wstring pathW = Utf8ToUtf16(filePathUtf8);
     if (pathW.empty())
@@ -274,6 +272,13 @@ std::vector<unsigned char> GB_ReadFileToBinary(const std::string& filePathUtf8)
         return {};
     }
 
+    // off_t 是有符号类型，对于普通文件不应为负，此处做防御性检查
+    if (st.st_size < 0)
+    {
+        ::close(fd);
+        return {};
+    }
+
     const uint64_t fileSize64 = static_cast<uint64_t>(st.st_size);
     if (fileSize64 > static_cast<uint64_t>(std::numeric_limits<size_t>::max()))
     {
@@ -316,7 +321,11 @@ std::vector<unsigned char> GB_ReadFileToBinary(const std::string& filePathUtf8)
 #endif
 }
 
-bool GB_WriteBinaryToFile(const GB_ByteBuffer& data, const std::string& filePathUtf8)
+// ─────────────────────────────────────────────────────────────────────────────
+// 内部辅助：将原始字节块写入文件（平台专属实现）。
+// 两个公开重载共用此函数，从而避免 string 重载中的多余数据拷贝。
+// ─────────────────────────────────────────────────────────────────────────────
+static bool WriteBinaryToFileImpl(const void* rawData, size_t byteSize, const std::string& filePathUtf8)
 {
     if (filePathUtf8.empty())
     {
@@ -381,7 +390,7 @@ bool GB_WriteBinaryToFile(const GB_ByteBuffer& data, const std::string& filePath
         }
 
         return utf16;
-    };
+        };
 
     const std::wstring filePathUtf16 = Utf8ToUtf16(filePathUtf8);
     if (filePathUtf16.empty())
@@ -389,7 +398,7 @@ bool GB_WriteBinaryToFile(const GB_ByteBuffer& data, const std::string& filePath
         return false;
     }
 
-    // shareMode=0 会导致文件无法再被打开直到句柄关闭，里更容易被外部因素影响
+    // shareMode=0 会导致文件无法再被打开直到句柄关闭，更容易被外部因素影响
     const DWORD shareMode = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
 
     HANDLE fileHandle = ::CreateFileW(
@@ -410,10 +419,10 @@ bool GB_WriteBinaryToFile(const GB_ByteBuffer& data, const std::string& filePath
 
     // 2) 可选：预设文件大小（best-effort，失败不影响正确性）
     // 这样在部分文件系统上可能减少碎片/元数据抖动；不做 Flush/同步以保证速度优先
-    if (!data.empty())
+    if (byteSize > 0)
     {
         LARGE_INTEGER targetSize;
-        targetSize.QuadPart = static_cast<LONGLONG>(data.size());
+        targetSize.QuadPart = static_cast<LONGLONG>(byteSize);
 
         if (::SetFilePointerEx(fileHandle, targetSize, nullptr, FILE_BEGIN) != FALSE)
         {
@@ -425,22 +434,20 @@ bool GB_WriteBinaryToFile(const GB_ByteBuffer& data, const std::string& filePath
     }
 
     // 3) 写入（支持 partial write）
-    if (!data.empty())
+    if (byteSize > 0)
     {
-        const size_t totalSize = data.size();
         size_t totalWritten = 0;
-
         const DWORD chunkBytes = 64u * 1024u * 1024u;
 
-        while (totalWritten < totalSize)
+        while (totalWritten < byteSize)
         {
-            const size_t remainingBytes = totalSize - totalWritten;
+            const size_t remainingBytes = byteSize - totalWritten;
             const DWORD toWrite = static_cast<DWORD>(remainingBytes > chunkBytes ? chunkBytes : remainingBytes);
 
             DWORD writtenBytes = 0;
             const BOOL writeOk = ::WriteFile(
                 fileHandle,
-                data.data() + totalWritten,
+                static_cast<const unsigned char*>(rawData) + totalWritten,
                 toWrite,
                 &writtenBytes,
                 nullptr);
@@ -482,9 +489,9 @@ bool GB_WriteBinaryToFile(const GB_ByteBuffer& data, const std::string& filePath
 
 #if defined(__linux__)
     // best-effort 预分配，失败不影响正确性
-    if (!data.empty())
+    if (byteSize > 0)
     {
-        (void)::posix_fallocate(fileDescriptor, 0, static_cast<off_t>(data.size()));
+        (void)::posix_fallocate(fileDescriptor, 0, static_cast<off_t>(byteSize));
     }
 #endif
 
@@ -492,15 +499,15 @@ bool GB_WriteBinaryToFile(const GB_ByteBuffer& data, const std::string& filePath
 
     // write() 允许 partial write：成功也可能少写
     size_t totalWritten = 0;
-    const size_t totalSize = data.size();
     const size_t chunkBytes = 64u * 1024u * 1024u;
 
-    while (totalWritten < totalSize)
+    while (totalWritten < byteSize)
     {
-        const size_t remainingBytes = totalSize - totalWritten;
+        const size_t remainingBytes = byteSize - totalWritten;
         const size_t toWrite = remainingBytes > chunkBytes ? chunkBytes : remainingBytes;
 
-        const ssize_t writtenBytes = ::write(fileDescriptor, data.data() + totalWritten, toWrite);
+        const ssize_t writtenBytes = ::write(fileDescriptor,
+            static_cast<const unsigned char*>(rawData) + totalWritten, toWrite);
         if (writtenBytes < 0)
         {
             if (errno == EINTR)
@@ -530,10 +537,15 @@ bool GB_WriteBinaryToFile(const GB_ByteBuffer& data, const std::string& filePath
 #endif
 }
 
+bool GB_WriteBinaryToFile(const GB_ByteBuffer& data, const std::string& filePathUtf8)
+{
+    return WriteBinaryToFileImpl(data.data(), data.size(), filePathUtf8);
+}
+
 bool GB_WriteBinaryToFile(const std::string& data, const std::string& filePathUtf8)
 {
-    const GB_ByteBuffer buffer(data.begin(), data.end());
-	return GB_WriteBinaryToFile(buffer, filePathUtf8);
+    // 直接将 string 的原始内存传入底层函数，避免额外的内存分配和数据拷贝
+    return WriteBinaryToFileImpl(data.data(), data.size(), filePathUtf8);
 }
 
 void GB_ByteBufferIO::AppendUInt16LE(GB_ByteBuffer& buffer, uint16_t value)
@@ -590,9 +602,9 @@ bool GB_ByteBufferIO::ReadUInt32LE(const GB_ByteBuffer& buffer, size_t& offset, 
         return false;
     }
 
-    value = static_cast<uint32_t>(buffer[offset]) 
-        | (static_cast<uint32_t>(buffer[offset + 1]) << 8) 
-        | (static_cast<uint32_t>(buffer[offset + 2]) << 16) 
+    value = static_cast<uint32_t>(buffer[offset])
+        | (static_cast<uint32_t>(buffer[offset + 1]) << 8)
+        | (static_cast<uint32_t>(buffer[offset + 2]) << 16)
         | (static_cast<uint32_t>(buffer[offset + 3]) << 24);
 
     offset += 4;
@@ -630,7 +642,3 @@ bool GB_ByteBufferIO::ReadDoubleLE(const GB_ByteBuffer& buffer, size_t& offset, 
     std::memcpy(&value, &bits, sizeof(value));
     return true;
 }
-
-
-
-
