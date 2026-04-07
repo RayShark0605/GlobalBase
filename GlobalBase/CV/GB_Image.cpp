@@ -2,7 +2,6 @@
 #include "../GB_FileSystem.h"
 #include "../GB_IO.h"
 
-#include <algorithm>
 #include <limits>
 #include <utility>
 #include <vector>
@@ -22,6 +21,12 @@
 
 namespace gbImageInternal
 {
+    /**
+     * @brief 将 size_t 安全转换为 int。
+     *
+     * 底层矩阵接口大量使用 int 作为尺寸类型；这里统一做边界检查，
+     * 避免超范围尺寸在后续构造时发生截断。
+     */
     static bool TryConvertSizeToInt(size_t value, int& intValue)
     {
         if (value > static_cast<size_t>(std::numeric_limits<int>::max()))
@@ -33,6 +38,9 @@ namespace gbImageInternal
         return true;
     }
 
+    /**
+     * @brief 将整数限制到给定闭区间。
+     */
     static int ClampInt(int value, int minValue, int maxValue)
     {
         if (value < minValue)
@@ -46,6 +54,9 @@ namespace gbImageInternal
         return value;
     }
 
+    /**
+     * @brief 将整数限制到 8 位无符号字节范围。
+     */
     static uint8_t ClampToByte(int value)
     {
         if (value <= 0)
@@ -59,12 +70,20 @@ namespace gbImageInternal
         return static_cast<uint8_t>(value);
     }
 
+    /**
+     * @brief 将 RGBA 颜色按常用亮度权重转换为 8 位灰度值。
+     *
+     * Alpha 不参与灰度计算。
+     */
     static uint8_t RgbaToGray8(const GB_ColorRGBA& pixelColor)
     {
         const int grayValue = (299 * static_cast<int>(pixelColor.r) + 587 * static_cast<int>(pixelColor.g) + 114 * static_cast<int>(pixelColor.b) + 500) / 1000;
         return ClampToByte(grayValue);
     }
 
+    /**
+     * @brief 将 GB_ImageDepth 映射为底层深度枚举。
+     */
     static bool TryGetCvDepth(GB_ImageDepth imageDepth, int& cvDepth)
     {
         switch (imageDepth)
@@ -98,6 +117,9 @@ namespace gbImageInternal
         return false;
     }
 
+    /**
+     * @brief 将底层深度枚举映射回 GB_ImageDepth。
+     */
     static GB_ImageDepth CvDepthToImageDepth(int cvDepth)
     {
         switch (cvDepth)
@@ -123,6 +145,9 @@ namespace gbImageInternal
         return GB_ImageDepth::Unknown;
     }
 
+    /**
+     * @brief 获取单通道字节数。
+     */
     static size_t GetBytesPerChannel(GB_ImageDepth imageDepth)
     {
         switch (imageDepth)
@@ -145,9 +170,16 @@ namespace gbImageInternal
         return 0;
     }
 
+    /**
+     * @brief 组合得到底层图像类型。
+     *
+     * 这里不把通道数限制为 1/2/3/4，而是放宽到当前底层支持的上限；
+     * 这样 Create() 能够创建更通用的多通道图像。
+     * 像素读写、Fill() 等接口仍只对 8 位 1/3/4 通道提供稳定支持。
+     */
     static bool TryGetCvType(GB_ImageDepth imageDepth, int channels, int& cvType)
     {
-        if (channels <= 0 || channels > 4)
+        if (channels <= 0 || channels > CV_CN_MAX)
         {
             return false;
         }
@@ -162,6 +194,9 @@ namespace gbImageInternal
         return true;
     }
 
+    /**
+     * @brief 根据读取选项拼装解码标志。
+     */
     static int GetImreadFlags(const GB_ImageLoadOptions& loadOptions)
     {
         int imreadFlags = 0;
@@ -199,6 +234,11 @@ namespace gbImageInternal
         return imreadFlags;
     }
 
+    /**
+     * @brief 将双通道灰度+Alpha 图像扩展为 4 通道 BGRA。
+     *
+     * 约定 sourceImage 的两个通道分别为 Gray、Alpha。
+     */
     static bool ConvertGrayAlphaToBgra(const cv::Mat& sourceImage, cv::Mat& targetImage)
     {
         if (sourceImage.empty() || sourceImage.channels() != 2)
@@ -232,6 +272,11 @@ namespace gbImageInternal
         }
     }
 
+    /**
+     * @brief 对刚解码出的图像做读入后的规范化处理。
+     *
+     * 当前只在请求 BGRA 时做额外转换；其余模式直接保留解码结果。
+     */
     static bool ApplyLoadPostProcess(cv::Mat& imageMat, const GB_ImageLoadOptions& loadOptions)
     {
         if (imageMat.empty())
@@ -291,6 +336,11 @@ namespace gbImageInternal
         return false;
     }
 
+    /**
+     * @brief 规范化文件扩展名。
+     *
+     * 结果统一带前导点，并转换为小写。
+     */
     static std::string NormalizeFileExtension(const std::string& fileExt)
     {
         if (fileExt.empty())
@@ -331,6 +381,9 @@ namespace gbImageInternal
         return fileExt == ".webp";
     }
 
+    /**
+     * @brief 按扩展名生成编码参数。
+     */
     static void BuildImwriteParams(const std::string& fileExt, const GB_ImageSaveOptions& saveOptions, std::vector<int>& imwriteParams)
     {
         imwriteParams.clear();
@@ -357,6 +410,9 @@ namespace gbImageInternal
         }
     }
 
+    /**
+     * @brief 将缩放插值枚举映射为底层插值类型。
+     */
     static int ToCvInterpolation(GB_ImageInterpolation interpolation)
     {
         switch (interpolation)
@@ -378,6 +434,12 @@ namespace gbImageInternal
         return cv::INTER_LINEAR;
     }
 
+    /**
+     * @brief 记录当前图像内部真实的通道排列方式。
+     *
+     * 这与“通道个数”不同：3 通道既可能是 BGR，也可能是 RGB；
+     * 4 通道既可能是 BGRA，也可能是 RGBA。
+     */
     enum class ImageChannelLayout
     {
         Empty = 0,
@@ -389,6 +451,9 @@ namespace gbImageInternal
         Other
     };
 
+    /**
+     * @brief 将颜色转换枚举映射为底层颜色转换码。
+     */
     static bool TryGetCvColorCode(GB_ImageColorConversion conversion, int& cvColorCode)
     {
         switch (conversion)
@@ -449,6 +514,12 @@ namespace gbImageInternal
         return false;
     }
 
+    /**
+     * @brief 根据图像来源推断默认通道排列。
+     *
+     * 对常见的 1/3/4 通道图像分别推断为 Gray、Bgr、Bgra；
+     * 其它情况统一记为 Other。
+     */
     static ImageChannelLayout InferChannelLayout(const cv::Mat& imageMat)
     {
         if (imageMat.empty())
@@ -471,6 +542,9 @@ namespace gbImageInternal
         return ImageChannelLayout::Other;
     }
 
+    /**
+     * @brief 预估颜色转换后的通道排列。
+     */
     static ImageChannelLayout GetConvertedChannelLayout(GB_ImageColorConversion conversion)
     {
         switch (conversion)
@@ -508,6 +582,12 @@ namespace gbImageInternal
         return ImageChannelLayout::Other;
     }
 
+    /**
+     * @brief 判断当前通道排列是否允许执行指定转换。
+     *
+     * 例如 BgrToGray 只能用于当前真实排列为 BGR 的 3 通道图像，
+     * 不能拿 RGB 图像直接套用同一个转换码。
+     */
     static bool IsConversionSourceLayoutCompatible(GB_ImageColorConversion conversion, ImageChannelLayout channelLayout)
     {
         switch (conversion)
@@ -545,6 +625,9 @@ namespace gbImageInternal
         return false;
     }
 
+    /**
+     * @brief 获取 8 位图像指定像素的首字节指针。
+     */
     static unsigned char* GetPixelPtr(cv::Mat& imageMat, size_t row, size_t col)
     {
         if (imageMat.empty() || imageMat.depth() != CV_8U)
@@ -561,6 +644,9 @@ namespace gbImageInternal
         return imageMat.ptr<unsigned char>(static_cast<int>(row)) + col * pixelSize;
     }
 
+    /**
+     * @brief 获取 8 位图像指定像素的只读首字节指针。
+     */
     static const unsigned char* GetPixelPtr(const cv::Mat& imageMat, size_t row, size_t col)
     {
         if (imageMat.empty() || imageMat.depth() != CV_8U)
@@ -577,6 +663,9 @@ namespace gbImageInternal
         return imageMat.ptr<unsigned char>(static_cast<int>(row)) + col * pixelSize;
     }
 
+    /**
+     * @brief 按当前通道排列读取单个像素，并转换为逻辑 RGBA。
+     */
     static bool ReadPixelColor(const unsigned char* pixelPtr, ImageChannelLayout channelLayout, GB_ColorRGBA& pixelColor)
     {
         if (pixelPtr == nullptr)
@@ -628,6 +717,9 @@ namespace gbImageInternal
         return false;
     }
 
+    /**
+     * @brief 按当前通道排列写入单个逻辑 RGBA 像素。
+     */
     static bool WritePixelColor(unsigned char* pixelPtr, ImageChannelLayout channelLayout, const GB_ColorRGBA& pixelColor)
     {
         if (pixelPtr == nullptr)
@@ -674,6 +766,9 @@ namespace gbImageInternal
         return false;
     }
 
+    /**
+     * @brief 为整幅填充构造与当前通道排列匹配的标量值。
+     */
     static bool GetFillScalar(const GB_ColorRGBA& pixelColor, ImageChannelLayout channelLayout, cv::Scalar& fillScalar)
     {
         switch (channelLayout)
@@ -705,6 +800,12 @@ namespace gbImageInternal
         return false;
     }
 
+    /**
+     * @brief 在编码前将图像整理成写出端更容易接受的通道顺序。
+     *
+     * 当前只在内部真实排列为 RGB / RGBA 时做显式转换；
+     * 其它情况直接沿用原图像。
+     */
     static bool PrepareImageForEncoding(const cv::Mat& sourceImage, ImageChannelLayout channelLayout, cv::Mat& encodedImage)
     {
         if (sourceImage.empty())
@@ -737,6 +838,9 @@ namespace gbImageInternal
     }
 }
 
+/**
+ * @brief GB_Image 的内部实现。
+ */
 class GB_Image::Impl
 {
 public:
@@ -744,30 +848,48 @@ public:
     gbImageInternal::ImageChannelLayout channelLayout = gbImageInternal::ImageChannelLayout::Empty;
 };
 
+/**
+ * @brief 构造空图像。
+ */
 GB_Image::GB_Image() : imageImpl(new Impl())
 {
 }
 
+/**
+ * @brief 构造并从文件读取图像。
+ */
 GB_Image::GB_Image(const std::string& filePathUtf8, const GB_ImageLoadOptions& loadOptions) : imageImpl(new Impl())
 {
     (void)LoadFromFile(filePathUtf8, loadOptions);
 }
 
+/**
+ * @brief 构造并从编码字节流读取图像。
+ */
 GB_Image::GB_Image(const GB_ByteBuffer& encodedBytes, const GB_ImageLoadOptions& loadOptions) : imageImpl(new Impl())
 {
     (void)LoadFromMemory(encodedBytes, loadOptions);
 }
 
+/**
+ * @brief 构造并从编码内存块读取图像。
+ */
 GB_Image::GB_Image(const void* encodedData, size_t encodedSize, const GB_ImageLoadOptions& loadOptions) : imageImpl(new Impl())
 {
     (void)LoadFromMemory(encodedData, encodedSize, loadOptions);
 }
 
+/**
+ * @brief 构造指定规格的图像。
+ */
 GB_Image::GB_Image(size_t rows, size_t cols, GB_ImageDepth depth, int channels, bool zeroInitialize) : imageImpl(new Impl())
 {
     (void)Create(rows, cols, depth, channels, zeroInitialize);
 }
 
+/**
+ * @brief 默认拷贝构造：浅拷贝共享底层像素缓冲区。
+ */
 GB_Image::GB_Image(const GB_Image& other) : imageImpl(new Impl())
 {
     if (other.imageImpl != nullptr)
@@ -777,6 +899,9 @@ GB_Image::GB_Image(const GB_Image& other) : imageImpl(new Impl())
     }
 }
 
+/**
+ * @brief 按指定拷贝方式构造图像。
+ */
 GB_Image::GB_Image(const GB_Image& other, GB_ImageCopyMode copyMode) : imageImpl(new Impl())
 {
     if (other.imageImpl == nullptr)
@@ -796,22 +921,34 @@ GB_Image::GB_Image(const GB_Image& other, GB_ImageCopyMode copyMode) : imageImpl
     imageImpl->channelLayout = other.imageImpl->channelLayout;
 }
 
+/**
+ * @brief 移动构造。
+ */
 GB_Image::GB_Image(GB_Image&& other) noexcept : imageImpl(other.imageImpl)
 {
     other.imageImpl = nullptr;
 }
 
+/**
+ * @brief 从外部矩阵对象构造图像。
+ */
 GB_Image::GB_Image(const cv::Mat& imageMat, GB_ImageCopyMode copyMode) : imageImpl(new Impl())
 {
     (void)SetFromCvMat(imageMat, copyMode);
 }
 
+/**
+ * @brief 析构。
+ */
 GB_Image::~GB_Image()
 {
     delete imageImpl;
     imageImpl = nullptr;
 }
 
+/**
+ * @brief 拷贝赋值：浅拷贝共享底层像素缓冲区。
+ */
 GB_Image& GB_Image::operator=(const GB_Image& other)
 {
     if (this == &other)
@@ -835,6 +972,9 @@ GB_Image& GB_Image::operator=(const GB_Image& other)
     return *this;
 }
 
+/**
+ * @brief 移动赋值。
+ */
 GB_Image& GB_Image::operator=(GB_Image&& other) noexcept
 {
     if (this == &other)
@@ -848,6 +988,9 @@ GB_Image& GB_Image::operator=(GB_Image&& other) noexcept
     return *this;
 }
 
+/**
+ * @brief 交换两个对象的内部状态。
+ */
 void GB_Image::Swap(GB_Image& other) noexcept
 {
     if (this == &other)
@@ -858,6 +1001,9 @@ void GB_Image::Swap(GB_Image& other) noexcept
     std::swap(imageImpl, other.imageImpl);
 }
 
+/**
+ * @brief 释放当前图像内容，但保留对象可复用。
+ */
 void GB_Image::Clear()
 {
     if (imageImpl != nullptr)
@@ -867,6 +1013,9 @@ void GB_Image::Clear()
     }
 }
 
+/**
+ * @brief 确保内部实现对象存在。
+ */
 bool GB_Image::EnsureImageImpl()
 {
     if (imageImpl != nullptr)
@@ -886,6 +1035,11 @@ bool GB_Image::EnsureImageImpl()
     }
 }
 
+/**
+ * @brief 创建指定规格的新图像。
+ *
+ * 只有创建完全成功后，才会替换当前对象中的旧图像。
+ */
 bool GB_Image::Create(size_t rows, size_t cols, GB_ImageDepth depth, int channels, bool zeroInitialize)
 {
     if (rows == 0 || cols == 0)
@@ -933,6 +1087,11 @@ bool GB_Image::Create(size_t rows, size_t cols, GB_ImageDepth depth, int channel
     }
 }
 
+/**
+ * @brief 从文件读取图像。
+ *
+ * 读取失败时，当前对象保持原状。
+ */
 bool GB_Image::LoadFromFile(const std::string& filePathUtf8, const GB_ImageLoadOptions& loadOptions)
 {
     const GB_ByteBuffer encodedBytes = GB_ReadFileToBinary(filePathUtf8);
@@ -944,6 +1103,9 @@ bool GB_Image::LoadFromFile(const std::string& filePathUtf8, const GB_ImageLoadO
     return LoadFromMemory(encodedBytes, loadOptions);
 }
 
+/**
+ * @brief 从编码字节流读取图像。
+ */
 bool GB_Image::LoadFromMemory(const GB_ByteBuffer& encodedBytes, const GB_ImageLoadOptions& loadOptions)
 {
     if (encodedBytes.empty())
@@ -954,6 +1116,11 @@ bool GB_Image::LoadFromMemory(const GB_ByteBuffer& encodedBytes, const GB_ImageL
     return LoadFromMemory(encodedBytes.data(), encodedBytes.size(), loadOptions);
 }
 
+/**
+ * @brief 从编码内存块读取图像。
+ *
+ * 读取失败时，当前对象保持原状。
+ */
 bool GB_Image::LoadFromMemory(const void* encodedData, size_t encodedSize, const GB_ImageLoadOptions& loadOptions)
 {
     if (encodedData == nullptr || encodedSize == 0)
@@ -1025,6 +1192,9 @@ bool GB_Image::LoadFromMemory(const void* encodedData, size_t encodedSize, const
     }
 }
 
+/**
+ * @brief 将当前图像编码后写入文件。
+ */
 bool GB_Image::SaveToFile(const std::string& filePathUtf8, const GB_ImageSaveOptions& saveOptions) const
 {
     if (IsEmpty() || filePathUtf8.empty())
@@ -1052,6 +1222,9 @@ bool GB_Image::SaveToFile(const std::string& filePathUtf8, const GB_ImageSaveOpt
     return GB_WriteBinaryToFile(encodedBytes, filePathUtf8);
 }
 
+/**
+ * @brief 将当前图像编码到内存字节流。
+ */
 bool GB_Image::EncodeToMemory(GB_ByteBuffer& encodedBytes, const std::string& fileExt, const GB_ImageSaveOptions& saveOptions) const
 {
     encodedBytes.clear();
@@ -1099,6 +1272,11 @@ bool GB_Image::EncodeToMemory(GB_ByteBuffer& encodedBytes, const std::string& fi
     }
 }
 
+/**
+ * @brief 用外部矩阵对象替换当前图像内容。
+ *
+ * 设置失败时，当前对象保持原状。
+ */
 bool GB_Image::SetFromCvMat(const cv::Mat& imageMat, GB_ImageCopyMode copyMode)
 {
     if (imageMat.empty())
@@ -1138,6 +1316,9 @@ bool GB_Image::SetFromCvMat(const cv::Mat& imageMat, GB_ImageCopyMode copyMode)
     }
 }
 
+/**
+ * @brief 导出为外部矩阵对象。
+ */
 cv::Mat GB_Image::ToCvMat(GB_ImageCopyMode copyMode) const
 {
     if (IsEmpty())
@@ -1160,6 +1341,9 @@ cv::Mat GB_Image::ToCvMat(GB_ImageCopyMode copyMode) const
     }
 }
 
+/**
+ * @brief 当前是否为空图像。
+ */
 bool GB_Image::IsEmpty() const
 {
     return imageImpl == nullptr || imageImpl->imageMat.empty();
@@ -1315,6 +1499,9 @@ const unsigned char* GB_Image::GetRowData(size_t row) const
     return imageImpl->imageMat.ptr<unsigned char>(static_cast<int>(row));
 }
 
+/**
+ * @brief 读取单个逻辑 RGBA 像素。
+ */
 bool GB_Image::GetPixelColor(size_t row, size_t col, GB_ColorRGBA& pixelColor) const
 {
     if (IsEmpty())
@@ -1331,6 +1518,9 @@ bool GB_Image::GetPixelColor(size_t row, size_t col, GB_ColorRGBA& pixelColor) c
     return gbImageInternal::ReadPixelColor(pixelPtr, imageImpl->channelLayout, pixelColor);
 }
 
+/**
+ * @brief 写入单个逻辑 RGBA 像素。
+ */
 bool GB_Image::SetPixelColor(size_t row, size_t col, const GB_ColorRGBA& pixelColor)
 {
     if (IsEmpty())
@@ -1347,6 +1537,9 @@ bool GB_Image::SetPixelColor(size_t row, size_t col, const GB_ColorRGBA& pixelCo
     return gbImageInternal::WritePixelColor(pixelPtr, imageImpl->channelLayout, pixelColor);
 }
 
+/**
+ * @brief 用指定颜色填充整幅图像。
+ */
 bool GB_Image::Fill(const GB_ColorRGBA& pixelColor)
 {
     if (IsEmpty() || imageImpl->imageMat.depth() != CV_8U)
@@ -1371,6 +1564,9 @@ bool GB_Image::Fill(const GB_ColorRGBA& pixelColor)
     }
 }
 
+/**
+ * @brief 生成当前图像的深拷贝副本。
+ */
 GB_Image GB_Image::Clone() const
 {
     GB_Image resultImage;
@@ -1392,6 +1588,9 @@ GB_Image GB_Image::Clone() const
     return resultImage;
 }
 
+/**
+ * @brief 若当前与其它对象共享像素缓冲区，则克隆出独立副本。
+ */
 bool GB_Image::Detach()
 {
     if (IsEmpty())
@@ -1410,6 +1609,9 @@ bool GB_Image::Detach()
     }
 }
 
+/**
+ * @brief 生成缩放后的新图像。
+ */
 GB_Image GB_Image::Resize(size_t newRows, size_t newCols, GB_ImageInterpolation interpolation) const
 {
     GB_Image resultImage;
@@ -1443,6 +1645,9 @@ GB_Image GB_Image::Resize(size_t newRows, size_t newCols, GB_ImageInterpolation 
     return resultImage;
 }
 
+/**
+ * @brief 原地缩放图像。
+ */
 bool GB_Image::ResizeInPlace(size_t newRows, size_t newCols, GB_ImageInterpolation interpolation)
 {
     if (IsEmpty())
@@ -1465,6 +1670,9 @@ bool GB_Image::ResizeInPlace(size_t newRows, size_t newCols, GB_ImageInterpolati
     return true;
 }
 
+/**
+ * @brief 裁剪子图。
+ */
 GB_Image GB_Image::Crop(size_t row, size_t col, size_t cropRows, size_t cropCols, GB_ImageCopyMode copyMode) const
 {
     GB_Image resultImage;
@@ -1517,6 +1725,9 @@ GB_Image GB_Image::Crop(size_t row, size_t col, size_t cropRows, size_t cropCols
     return resultImage;
 }
 
+/**
+ * @brief 原地裁剪子图。
+ */
 bool GB_Image::CropInPlace(size_t row, size_t col, size_t cropRows, size_t cropCols, GB_ImageCopyMode copyMode)
 {
     if (IsEmpty())
@@ -1534,6 +1745,9 @@ bool GB_Image::CropInPlace(size_t row, size_t col, size_t cropRows, size_t cropC
     return true;
 }
 
+/**
+ * @brief 生成颜色转换后的新图像。
+ */
 GB_Image GB_Image::ConvertColor(GB_ImageColorConversion conversion) const
 {
     GB_Image resultImage;
@@ -1566,6 +1780,9 @@ GB_Image GB_Image::ConvertColor(GB_ImageColorConversion conversion) const
     return resultImage;
 }
 
+/**
+ * @brief 原地执行颜色转换。
+ */
 bool GB_Image::ConvertColorInPlace(GB_ImageColorConversion conversion)
 {
     if (IsEmpty())
@@ -1583,6 +1800,9 @@ bool GB_Image::ConvertColorInPlace(GB_ImageColorConversion conversion)
     return true;
 }
 
+/**
+ * @brief 交换两个 GB_Image。
+ */
 void swap(GB_Image& leftImage, GB_Image& rightImage) noexcept
 {
     leftImage.Swap(rightImage);

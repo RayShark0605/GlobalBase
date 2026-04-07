@@ -14,6 +14,9 @@ namespace cv
     class Mat;
 }
 
+/**
+ * @brief 像素单通道的数据类型。
+ */
 enum class GB_ImageDepth
 {
     Unknown = 0,
@@ -26,12 +29,18 @@ enum class GB_ImageDepth
     Float64
 };
 
+/**
+ * @brief 图像拷贝方式。
+ */
 enum class GB_ImageCopyMode
 {
     ShallowCopy = 0,
     DeepCopy
 };
 
+/**
+ * @brief 图像缩放插值方式。
+ */
 enum class GB_ImageInterpolation
 {
     Nearest = 0,
@@ -41,6 +50,9 @@ enum class GB_ImageInterpolation
     Lanczos4
 };
 
+/**
+ * @brief 图像读取后的目标颜色模式。
+ */
 enum class GB_ImageColorMode
 {
     Unchanged = 0,
@@ -49,6 +61,9 @@ enum class GB_ImageColorMode
     BGRA
 };
 
+/**
+ * @brief 颜色空间或通道顺序转换类型。
+ */
 enum class GB_ImageColorConversion
 {
     GrayToBgr = 0,
@@ -130,26 +145,29 @@ struct GB_ImageSaveOptions
 };
 
 /**
- * @brief 内存图像对象。
+ * @brief 已完整驻留在内存中的图像对象。
  *
- * 设计目标：
- * - 只描述“已经完整在内存中的图像”；
+ * 设计原则：
+ * - 只描述“整幅图像都已在内存中”的场景；
  * - 头文件不引入第三方头文件；
- * - 默认拷贝语义为浅拷贝，多个对象可共享同一份底层像素缓冲区；
+ * - 默认拷贝为浅拷贝，多个对象可共享同一块像素缓冲区；
  * - 可通过 Clone()、Detach() 或显式 DeepCopy 获取独立副本；
- * - 像素坐标统一使用 (row, col)；
- * - 对 3 通道 / 4 通道图像，默认存储顺序为 BGR / BGRA；
- * - 经过颜色空间转换后，内部也可以临时处于 RGB / RGBA 顺序，类会跟踪其实际通道顺序。
+ * - 统一使用 (row, col) 表示像素坐标；
+ * - 对 3 通道 / 4 通道图像，常规顺序默认为 BGR / BGRA；
+ * - 当执行颜色转换后，内部也可以处于 RGB / RGBA 顺序，对象会同步记录当前实际通道顺序。
  *
- * 说明：
- * - 读取、创建、从外部对象设置等会修改当前图像内容的接口，采用“成功后提交”的语义：
- *   只有在新图像真正构造成功后，当前对象内部状态才会被替换；
- * - 与 GB_ColorRGBA 交互时，会根据当前实际通道顺序，在逻辑 RGBA 与底层像素排列之间自动完成转换；
- * - 保存或编码时，若当前内部为 RGB / RGBA 顺序，会自动转换为适合写出的通道顺序。
+ * 约定：
+ * - Create()、LoadFromFile()、LoadFromMemory()、SetFromCvMat() 这类会修改内容的接口，
+ *   都采用“构造成功后再提交”的语义；若中途失败，当前对象保持原有内容不变；
+ * - 与 GB_ColorRGBA 交互时，会根据当前实际通道顺序自动完成逻辑 RGBA 与底层像素排列之间的映射；
+ * - 保存或编码时，若当前内部为 RGB / RGBA 顺序，会先转换成适合写出的通道顺序。
  */
 class GLOBALBASE_PORT GB_Image
 {
 public:
+    /**
+     * @brief 构造空图像。
+     */
     GB_Image();
 
     /**
@@ -179,7 +197,7 @@ public:
      * @param rows 图像行数。
      * @param cols 图像列数。
      * @param depth 像素位深。
-     * @param channels 通道数，必须大于 0。
+     * @param channels 通道数，必须大于 0，且处于底层支持范围内。
      * @param zeroInitialize 是否在创建后立即清零。
      */
     GB_Image(size_t rows, size_t cols, GB_ImageDepth depth, int channels, bool zeroInitialize = true);
@@ -206,6 +224,9 @@ public:
     GB_Image& operator=(const GB_Image& other);
     GB_Image& operator=(GB_Image&& other) noexcept;
 
+    /**
+     * @brief 交换两个图像对象的内部状态。
+     */
     void Swap(GB_Image& other) noexcept;
 
     /**
@@ -245,6 +266,8 @@ public:
 
     /**
      * @brief 保存到文件。
+     *
+     * 保存失败时，不会对目标文件做额外保证；是否允许覆盖由 saveOptions.overwrite 控制。
      */
     bool SaveToFile(const std::string& filePathUtf8, const GB_ImageSaveOptions& saveOptions = GB_ImageSaveOptions()) const;
 
@@ -267,11 +290,15 @@ public:
      * @brief 导出为外部矩阵对象。
      *
      * DeepCopy 时返回独立副本；ShallowCopy 时返回共享底层缓冲区的视图。
-     * 返回的通道顺序与当前对象内部实际通道顺序保持一致。
+     * 返回值的通道顺序与当前对象内部记录的实际顺序一致。
      */
     cv::Mat ToCvMat(GB_ImageCopyMode copyMode = GB_ImageCopyMode::ShallowCopy) const;
 
+    /**
+     * @brief 当前是否为空图像。
+     */
     bool IsEmpty() const;
+
     size_t GetWidth() const;
     size_t GetHeight() const;
     size_t GetRows() const;
@@ -291,7 +318,14 @@ public:
      */
     size_t GetTotalByteSize() const;
 
+    /**
+     * @brief 当前图像是否按单段连续内存存储。
+     */
     bool IsContinuous() const;
+
+    /**
+     * @brief 判断给定像素坐标是否有效。
+     */
     bool IsValidPixelCoordinate(size_t row, size_t col) const;
 
     /**
@@ -395,6 +429,9 @@ public:
     bool ConvertColorInPlace(GB_ImageColorConversion conversion);
 
 private:
+    /**
+     * @brief 确保内部实现对象已创建。
+     */
     bool EnsureImageImpl();
 
     class Impl;
