@@ -3013,12 +3013,7 @@ GB_Image GB_Image::Rotate(double angleDegrees, const GB_ImageRotateOptions& rota
 
     cv::Mat rotateSourceImage;
     GBImage_Internal::ImageChannelLayout rotateSourceLayout = GBImage_Internal::ImageChannelLayout::Empty;
-    if (!GBImage_Internal::PrepareRotateSourceImage(
-        imageImpl->imageMat,
-        imageImpl->channelLayout,
-        rotateOptions,
-        rotateSourceImage,
-        rotateSourceLayout))
+    if (!GBImage_Internal::PrepareRotateSourceImage(imageImpl->imageMat, imageImpl->channelLayout, rotateOptions, rotateSourceImage, rotateSourceLayout))
     {
         return resultImage;
     }
@@ -3075,24 +3070,14 @@ GB_Image GB_Image::Rotate(double angleDegrees, const GB_ImageRotateOptions& rota
             }
         }
 
-        if (!GBImage_Internal::CreatePrefilledRotateDestination(
-            rotateSourceImage,
-            rotateSourceLayout,
-            rotateOptions,
-            dstRows,
-            dstCols,
-            resultImage.imageImpl->imageMat))
+        if (!GBImage_Internal::CreatePrefilledRotateDestination(rotateSourceImage, rotateSourceLayout, rotateOptions,
+            dstRows, dstCols, resultImage.imageImpl->imageMat))
         {
             return resultImage;
         }
 
-        cv::warpAffine(
-            rotateSourceImage,
-            resultImage.imageImpl->imageMat,
-            rotationMatrix,
-            cv::Size(dstCols, dstRows),
-            GBImage_Internal::ToCvInterpolation(rotateOptions.interpolation),
-            cv::BORDER_TRANSPARENT);
+        cv::warpAffine(rotateSourceImage, resultImage.imageImpl->imageMat, rotationMatrix, cv::Size(dstCols, dstRows),
+            GBImage_Internal::ToCvInterpolation(rotateOptions.interpolation), cv::BORDER_TRANSPARENT);
 
         resultImage.imageImpl->channelLayout = rotateSourceLayout;
     }
