@@ -15,6 +15,34 @@
 #include <unistd.h>
 #endif
 
+#ifdef _WIN32
+// 将 UTF-8 路径转为 UTF-16 以使用 *W API
+static inline std::wstring Utf8ToUtf16(const std::string& s)
+{
+    if (s.empty())
+    {
+        return std::wstring();
+    }
+    // 计算长度
+    const int need = ::MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, s.c_str(),
+        static_cast<int>(s.size()), nullptr, 0);
+    if (need <= 0)
+    {
+        return std::wstring();
+    }
+    std::wstring w;
+    w.resize(static_cast<size_t>(need));
+    // 真正转换
+    const int written = ::MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, s.c_str(),
+        static_cast<int>(s.size()), &w[0], need);
+    if (written <= 0)
+    {
+        return std::wstring();
+    }
+    return w;
+}
+#endif
+
 bool GB_WriteUtf8ToFile(const std::string& filePathUtf8, const std::string& utf8Content, bool appendMode, bool addBomIfNewFile)
 {
     const bool existedBefore = GB_IsFileExists(filePathUtf8);
@@ -27,32 +55,6 @@ bool GB_WriteUtf8ToFile(const std::string& filePathUtf8, const std::string& utf8
     }
 
 #ifdef _WIN32
-    // 将 UTF-8 路径转为 UTF-16 以使用 *W API
-    auto Utf8ToUtf16 = [](const std::string& s) -> std::wstring
-        {
-            if (s.empty())
-            {
-                return std::wstring();
-            }
-            // 计算长度
-            const int need = ::MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, s.c_str(),
-                static_cast<int>(s.size()), nullptr, 0);
-            if (need <= 0)
-            {
-                return std::wstring();
-            }
-            std::wstring w;
-            w.resize(static_cast<size_t>(need));
-            // 真正转换
-            const int written = ::MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, s.c_str(),
-                static_cast<int>(s.size()), &w[0], need);
-            if (written <= 0)
-            {
-                return std::wstring();
-            }
-            return w;
-        };
-
     const std::wstring pathW = Utf8ToUtf16(filePathUtf8);
     if (pathW.empty())
     {
@@ -167,29 +169,6 @@ std::vector<unsigned char> GB_ReadFileToBinary(const std::string& filePathUtf8)
     }
 
 #ifdef _WIN32
-    auto Utf8ToUtf16 = [](const std::string& s) -> std::wstring {
-        if (s.empty())
-        {
-            return std::wstring();
-        }
-
-        const int need = ::MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, s.c_str(), static_cast<int>(s.size()), nullptr, 0);
-        if (need <= 0)
-        {
-            return std::wstring();
-        }
-
-        std::wstring w;
-        w.resize(static_cast<size_t>(need));
-
-        const int written = ::MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, s.c_str(), static_cast<int>(s.size()), &w[0], need);
-        if (written <= 0)
-        {
-            return std::wstring();
-        }
-        return w;
-        };
-
     const std::wstring pathW = Utf8ToUtf16(filePathUtf8);
     if (pathW.empty())
     {
@@ -354,44 +333,6 @@ static bool WriteBinaryToFileImpl(const void* rawData, size_t byteSize, const st
     }
 
 #ifdef _WIN32
-    auto Utf8ToUtf16 = [](const std::string& utf8) -> std::wstring {
-        if (utf8.empty())
-        {
-            return std::wstring();
-        }
-
-        const int requiredChars = ::MultiByteToWideChar(
-            CP_UTF8,
-            MB_ERR_INVALID_CHARS,
-            utf8.c_str(),
-            static_cast<int>(utf8.size()),
-            nullptr,
-            0);
-
-        if (requiredChars <= 0)
-        {
-            return std::wstring();
-        }
-
-        std::wstring utf16;
-        utf16.resize(static_cast<size_t>(requiredChars));
-
-        const int writtenChars = ::MultiByteToWideChar(
-            CP_UTF8,
-            MB_ERR_INVALID_CHARS,
-            utf8.c_str(),
-            static_cast<int>(utf8.size()),
-            &utf16[0],
-            requiredChars);
-
-        if (writtenChars <= 0)
-        {
-            return std::wstring();
-        }
-
-        return utf16;
-        };
-
     const std::wstring filePathUtf16 = Utf8ToUtf16(filePathUtf8);
     if (filePathUtf16.empty())
     {
