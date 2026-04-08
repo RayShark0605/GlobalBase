@@ -183,7 +183,13 @@ bool GB_ReadWriteLock::TryLockSharedFor(const std::chrono::duration<Rep, Period>
 	{
 		if (readersCondition_.wait_until(lockGuard, deadline) == std::cv_status::timeout)
 		{
-			return false;
+			// 超时后重检条件：wait_until 返回 timeout 时，mutex 已重新获取，
+			// 此时条件可能恰好已满足（例如写者在超时前一刻释放了锁）。
+			if (writerActive_ || waitingWriters_ > 0)
+			{
+				return false;
+			}
+			break;
 		}
 	}
 
@@ -202,6 +208,13 @@ bool GB_ReadWriteLock::TryLockFor(const std::chrono::duration<Rep, Period>& time
 	{
 		if (writersCondition_.wait_until(lockGuard, deadline) == std::cv_status::timeout)
 		{
+			// 超时后重检条件：wait_until 返回 timeout 时，mutex 已重新获取，
+			// 此时条件可能恰好已满足（例如最后一个读者在超时前一刻释放了锁）。
+			if (!writerActive_ && activeReaders_ == 0)
+			{
+				break;
+			}
+
 			waitingWriters_--;
 
 			// 如果没有写者在排队了，放行读者
