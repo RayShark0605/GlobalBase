@@ -3,17 +3,14 @@
 
 #include <cstddef>
 #include <cstdint>
-
 #include <functional>
 #include <map>
-#include <memory>
 #include <mutex>
 #include <string>
 #include <type_traits>
 #include <typeindex>
 #include <typeinfo>
 #include <utility>
-#include <vector>
 
 #include "GB_BaseTypes.h"
 #include "GlobalBasePort.h"
@@ -22,10 +19,6 @@ enum class GB_VariantType
 {
     Empty = 0,
     Bool,
-    Int8,
-    UInt8,
-    Int16,
-    UInt16,
     Int32,
     UInt32,
     Int64,
@@ -60,7 +53,8 @@ public:
         && !std::is_same<TDecayed, std::string>::value
         && !std::is_same<TDecayed, GB_ByteBuffer>::value,
         int>::type = 0>
-    GB_Variant(TValue&& value): holder_(new Holder<TDecayed>(std::forward<TValue>(value)))
+    GB_Variant(TValue&& value)
+        : holder_(new Holder<TDecayed>(std::forward<TValue>(value)))
     {
     }
 
@@ -78,9 +72,6 @@ public:
         *this = std::move(newValue);
         return *this;
     }
-
-    bool operator==(const GB_Variant& other) const noexcept;
-    bool operator!=(const GB_Variant& other) const noexcept;
 
     bool IsEmpty() const noexcept;
     GB_VariantType Type() const noexcept;
@@ -103,33 +94,30 @@ public:
     TValue* AnyCast() noexcept
     {
         typedef typename std::decay<TValue>::type ValueType;
-
         if (!Is<ValueType>())
         {
             return nullptr;
         }
 
-        return &static_cast<Holder<ValueType>*>(holder_.get())->value;
+        return &static_cast<Holder<ValueType>*>(holder_)->value;
     }
 
     template<typename TValue>
     const TValue* AnyCast() const noexcept
     {
         typedef typename std::decay<TValue>::type ValueType;
-
         if (!Is<ValueType>())
         {
             return nullptr;
         }
 
-        return &static_cast<const Holder<ValueType>*>(holder_.get())->value;
+        return &static_cast<const Holder<ValueType>*>(holder_)->value;
     }
 
     template<typename TValue>
     bool AnyCast(TValue& outValue) const noexcept
     {
         const TValue* value = AnyCast<TValue>();
-
         if (value == nullptr)
         {
             return false;
@@ -139,48 +127,7 @@ public:
         return true;
     }
 
-    bool CanCast(GB_VariantType targetType) const noexcept;
-
-    template<typename TValue>
-    bool CanCast() const noexcept
-    {
-        typedef typename std::decay<TValue>::type ValueType;
-
-        if constexpr (std::is_same_v<ValueType, std::string>)
-        {
-            return CanCast(GB_VariantType::String);
-        }
-        else if constexpr (std::is_same_v<ValueType, GB_ByteBuffer>)
-        {
-            return Is<GB_ByteBuffer>();
-        }
-        else if constexpr (std::is_same_v<ValueType, bool>)
-        {
-            return CanCast(GB_VariantType::Bool);
-        }
-        else if constexpr (std::is_same_v<ValueType, float>)
-        {
-            return CanCast(GB_VariantType::Float);
-        }
-        else if constexpr (std::is_same_v<ValueType, double> || std::is_same_v<ValueType, long double>)
-        {
-            return CanCast(GB_VariantType::Double);
-        }
-        else if constexpr (std::is_integral_v<ValueType>)
-        {
-            return CanCast(DeduceVariantType<ValueType>());
-        }
-        else
-        {
-            return Is<ValueType>();
-        }
-    }
-
     bool ToBool(bool* ok = nullptr) const noexcept;
-    std::int8_t ToInt8(bool* ok = nullptr) const noexcept;
-    std::uint8_t ToUInt8(bool* ok = nullptr) const noexcept;
-    std::int16_t ToInt16(bool* ok = nullptr) const noexcept;
-    std::uint16_t ToUInt16(bool* ok = nullptr) const noexcept;
     int ToInt(bool* ok = nullptr) const noexcept;
     unsigned int ToUInt(bool* ok = nullptr) const noexcept;
     long long ToInt64(bool* ok = nullptr) const noexcept;
@@ -189,6 +136,7 @@ public:
     float ToFloat(bool* ok = nullptr) const noexcept;
     double ToDouble(bool* ok = nullptr) const noexcept;
     std::string ToString(bool* ok = nullptr) const noexcept;
+    GB_ByteBuffer ToBinary(bool* ok = nullptr) const noexcept;
 
     bool Serialize(GB_ByteBuffer& outData) const noexcept;
     GB_ByteBuffer Serialize() const noexcept;
@@ -205,8 +153,7 @@ public:
             return false;
         }
 
-        return RegisterCustomType(
-            std::type_index(typeid(TValue)),
+        return RegisterCustomType(std::type_index(typeid(TValue)),
             typeName,
             [serializeFunc](const void* object, GB_ByteBuffer& outData) -> bool
             {
@@ -226,70 +173,39 @@ public:
                     return false;
                 }
             },
-            [deserializeFunc](const GB_ByteBuffer& data) -> std::unique_ptr<struct HolderBase>
+            [deserializeFunc](const GB_ByteBuffer& data) -> HolderBase*
             {
                 try
                 {
                     TValue value;
                     if (!deserializeFunc(data, value))
                     {
-                        return std::unique_ptr<HolderBase>();
+                        return nullptr;
                     }
 
-                    return std::unique_ptr<HolderBase>(new Holder<TValue>(std::move(value)));
+                    return new Holder<TValue>(std::move(value));
                 }
                 catch (...)
                 {
-                    return std::unique_ptr<HolderBase>();
+                    return nullptr;
                 }
             });
     }
 
 private:
-    template<typename TValue, typename = void>
-    struct HasEqualOperator : std::false_type
-    {
-    };
-
-    template<typename TValue>
-    struct HasEqualOperator<TValue,
-        std::void_t<decltype(std::declval<const TValue&>() == std::declval<const TValue&>())>> : std::true_type
-    {
-    };
-
-    template<typename TValue, typename = void>
-    struct HasLessOperator : std::false_type
-    {
-    };
-
-    template<typename TValue>
-    struct HasLessOperator<TValue,
-        std::void_t<decltype(std::declval<const TValue&>() < std::declval<const TValue&>())>> : std::true_type
-    {
-    };
-
-    template<typename TValue, typename = void>
-    struct HasStdHash : std::false_type
-    {
-    };
-
-    template<typename TValue>
-    struct HasStdHash<TValue,
-        std::void_t<decltype(std::hash<TValue>()(std::declval<const TValue&>()))>> : std::true_type
-    {
-    };
-
     struct HolderBase
     {
-        virtual ~HolderBase() {}
+        virtual ~HolderBase()
+        {
+        }
+
         virtual const std::type_info& GetTypeInfo() const noexcept = 0;
         virtual GB_VariantType GetVariantType() const noexcept = 0;
-        virtual std::unique_ptr<HolderBase> Clone() const = 0;
+        virtual HolderBase* Clone() const = 0;
         virtual const void* GetConstPtr() const noexcept = 0;
         virtual void* GetPtr() noexcept = 0;
-        virtual bool TryEquals(const HolderBase& other, bool& outResult) const noexcept = 0;
-        virtual bool TryLess(const HolderBase& other, bool& outResult) const noexcept = 0;
-        virtual bool TryHash(std::size_t& outHash) const noexcept = 0;
+        virtual std::string GetStableTypeName() const = 0;
+        virtual bool SerializePayload(GB_ByteBuffer& outData) const noexcept = 0;
     };
 
     template<typename TValue>
@@ -317,9 +233,9 @@ private:
             return DeduceVariantType<ValueType>();
         }
 
-        std::unique_ptr<HolderBase> Clone() const override
+        HolderBase* Clone() const override
         {
-            return std::unique_ptr<HolderBase>(new Holder<ValueType>(value));
+            return new Holder<ValueType>(value);
         }
 
         const void* GetConstPtr() const noexcept override
@@ -332,82 +248,14 @@ private:
             return &value;
         }
 
-        bool TryEquals(const HolderBase& other, bool& outResult) const noexcept override
+        std::string GetStableTypeName() const override
         {
-            const Holder<ValueType>* rightHolder = dynamic_cast<const Holder<ValueType>*>(&other);
-            if (rightHolder == nullptr)
-            {
-                return false;
-            }
-
-            if constexpr (std::is_arithmetic_v<ValueType>
-                || std::is_same_v<ValueType, std::string>
-                || std::is_same_v<ValueType, GB_ByteBuffer>
-                || HasEqualOperator<ValueType>::value)
-            {
-                try
-                {
-                    outResult = value == rightHolder->value;
-                    return true;
-                }
-                catch (...)
-                {
-                    return false;
-                }
-            }
-            else
-            {
-                return false;
-            }
+            return GetStableBuiltinTypeName<ValueType>();
         }
 
-        bool TryLess(const HolderBase& other, bool& outResult) const noexcept override
+        bool SerializePayload(GB_ByteBuffer& outData) const noexcept override
         {
-            const Holder<ValueType>* rightHolder = dynamic_cast<const Holder<ValueType>*>(&other);
-            if (rightHolder == nullptr)
-            {
-                return false;
-            }
-
-            if constexpr (std::is_arithmetic_v<ValueType>
-                || std::is_same_v<ValueType, std::string>
-                || std::is_same_v<ValueType, GB_ByteBuffer>
-                || HasLessOperator<ValueType>::value)
-            {
-                try
-                {
-                    outResult = value < rightHolder->value;
-                    return true;
-                }
-                catch (...)
-                {
-                    return false;
-                }
-            }
-            else
-            {
-                return false;
-            }
-        }
-
-        bool TryHash(std::size_t& outHash) const noexcept override
-        {
-            if constexpr (HasStdHash<ValueType>::value)
-            {
-                try
-                {
-                    outHash = std::hash<ValueType>()(value);
-                    return true;
-                }
-                catch (...)
-                {
-                    return false;
-                }
-            }
-            else
-            {
-                return false;
-            }
+            return SerializeValue(value, outData);
         }
 
         ValueType value;
@@ -417,7 +265,7 @@ private:
     {
         std::string typeName;
         std::function<bool(const void* object, GB_ByteBuffer& outData)> serializeFunc;
-        std::function<std::unique_ptr<HolderBase>(const GB_ByteBuffer& data)> deserializeFunc;
+        std::function<HolderBase* (const GB_ByteBuffer& data)> deserializeFunc;
     };
 
     template<typename TValue>
@@ -425,109 +273,238 @@ private:
     {
         typedef typename std::decay<TValue>::type ValueType;
 
-        if constexpr (std::is_same_v<ValueType, bool>)
+        if (std::is_same<ValueType, bool>::value)
         {
             return GB_VariantType::Bool;
         }
-        else if constexpr (std::is_same_v<ValueType, std::string>)
+
+        if (std::is_same<ValueType, std::string>::value)
         {
             return GB_VariantType::String;
         }
-        else if constexpr (std::is_same_v<ValueType, GB_ByteBuffer>)
+
+        if (std::is_same<ValueType, GB_ByteBuffer>::value)
         {
             return GB_VariantType::Binary;
         }
-        else if constexpr (std::is_same_v<ValueType, float>)
+
+        if (std::is_same<ValueType, float>::value)
         {
             return GB_VariantType::Float;
         }
-        else if constexpr (std::is_same_v<ValueType, double> || std::is_same_v<ValueType, long double>)
+
+        if (std::is_same<ValueType, double>::value || std::is_same<ValueType, long double>::value)
         {
             return GB_VariantType::Double;
         }
-        else if constexpr (std::is_integral_v<ValueType>)
+
+        if (std::is_integral<ValueType>::value)
         {
-            if constexpr (std::is_signed_v<ValueType>)
+            if (std::is_same<ValueType, bool>::value)
             {
-                if constexpr (sizeof(ValueType) <= 1)
-                {
-                    return GB_VariantType::Int8;
-                }
-                else if constexpr (sizeof(ValueType) <= 2)
-                {
-                    return GB_VariantType::Int16;
-                }
-                else if constexpr (sizeof(ValueType) <= 4)
-                {
-                    return GB_VariantType::Int32;
-                }
-                else
-                {
-                    return GB_VariantType::Int64;
-                }
+                return GB_VariantType::Bool;
             }
-            else
+
+            if (std::is_signed<ValueType>::value)
             {
-                if constexpr (sizeof(ValueType) <= 1)
-                {
-                    return GB_VariantType::UInt8;
-                }
-                else if constexpr (sizeof(ValueType) <= 2)
-                {
-                    return GB_VariantType::UInt16;
-                }
-                else if constexpr (sizeof(ValueType) <= 4)
-                {
-                    return GB_VariantType::UInt32;
-                }
-                else
-                {
-                    return GB_VariantType::UInt64;
-                }
+                return sizeof(ValueType) <= 4 ? GB_VariantType::Int32 : GB_VariantType::Int64;
             }
+
+            return sizeof(ValueType) <= 4 ? GB_VariantType::UInt32 : GB_VariantType::UInt64;
         }
-        else
-        {
-            return GB_VariantType::Custom;
-        }
+
+        return GB_VariantType::Custom;
     }
 
-    static bool RegisterCustomType(
-        const std::type_index& typeIndex,
+    template<typename TValue>
+    static std::string GetStableBuiltinTypeName()
+    {
+        typedef typename std::decay<TValue>::type ValueType;
+
+        if (std::is_same<ValueType, bool>::value)
+        {
+            return "bool";
+        }
+
+        if (std::is_same<ValueType, char>::value)
+        {
+            return "char";
+        }
+
+        if (std::is_same<ValueType, signed char>::value)
+        {
+            return "signed char";
+        }
+
+        if (std::is_same<ValueType, unsigned char>::value)
+        {
+            return "unsigned char";
+        }
+
+        if (std::is_same<ValueType, short>::value)
+        {
+            return "short";
+        }
+
+        if (std::is_same<ValueType, unsigned short>::value)
+        {
+            return "unsigned short";
+        }
+
+        if (std::is_same<ValueType, int>::value)
+        {
+            return "int";
+        }
+
+        if (std::is_same<ValueType, unsigned int>::value)
+        {
+            return "unsigned int";
+        }
+
+        if (std::is_same<ValueType, long>::value)
+        {
+            return "long";
+        }
+
+        if (std::is_same<ValueType, unsigned long>::value)
+        {
+            return "unsigned long";
+        }
+
+        if (std::is_same<ValueType, long long>::value)
+        {
+            return "long long";
+        }
+
+        if (std::is_same<ValueType, unsigned long long>::value)
+        {
+            return "unsigned long long";
+        }
+
+        if (std::is_same<ValueType, float>::value)
+        {
+            return "float";
+        }
+
+        if (std::is_same<ValueType, double>::value)
+        {
+            return "double";
+        }
+
+        if (std::is_same<ValueType, long double>::value)
+        {
+            return "long double";
+        }
+
+        if (std::is_same<ValueType, std::string>::value)
+        {
+            return "std::string";
+        }
+
+        if (std::is_same<ValueType, GB_ByteBuffer>::value)
+        {
+            return "GB_ByteBuffer";
+        }
+
+        return std::string();
+    }
+
+    template<typename TValue, bool IsIntegral, bool IsFloatingPoint, bool IsString, bool IsBinary>
+    struct SerializeValueHelper;
+
+    template<typename TValue>
+    static bool SerializeValue(const TValue& value, GB_ByteBuffer& outData) noexcept
+    {
+        typedef typename std::decay<TValue>::type ValueType;
+        return SerializeValueHelper<ValueType,
+            std::is_integral<ValueType>::value,
+            std::is_floating_point<ValueType>::value,
+            std::is_same<ValueType, std::string>::value,
+            std::is_same<ValueType, GB_ByteBuffer>::value>::Do(value, outData);
+    }
+
+    template<typename TValue>
+    static typename std::enable_if<std::is_integral<typename std::decay<TValue>::type>::value, bool>::type
+        SerializeBuiltinValue(const TValue& value, GB_ByteBuffer& outData) noexcept;
+
+    template<typename TValue>
+    static typename std::enable_if<std::is_floating_point<typename std::decay<TValue>::type>::value, bool>::type
+        SerializeBuiltinValue(const TValue& value, GB_ByteBuffer& outData) noexcept;
+
+    static bool SerializeBuiltinValue(const std::string& value, GB_ByteBuffer& outData) noexcept;
+    static bool SerializeBuiltinValue(const GB_ByteBuffer& value, GB_ByteBuffer& outData) noexcept;
+    static bool DeserializeBuiltinValue(const std::string& stableTypeName,
+        const GB_ByteBuffer& payload,
+        HolderBase*& outHolder) noexcept;
+
+    template<typename TValue>
+    struct SerializeValueHelper<TValue, true, false, false, false>
+    {
+        static bool Do(const TValue& value, GB_ByteBuffer& outData) noexcept
+        {
+            return SerializeBuiltinValue(value, outData);
+        }
+    };
+
+    template<typename TValue>
+    struct SerializeValueHelper<TValue, false, true, false, false>
+    {
+        static bool Do(const TValue& value, GB_ByteBuffer& outData) noexcept
+        {
+            return SerializeBuiltinValue(value, outData);
+        }
+    };
+
+    template<typename TValue>
+    struct SerializeValueHelper<TValue, false, false, true, false>
+    {
+        static bool Do(const TValue& value, GB_ByteBuffer& outData) noexcept
+        {
+            return SerializeBuiltinValue(value, outData);
+        }
+    };
+
+    template<typename TValue>
+    struct SerializeValueHelper<TValue, false, false, false, true>
+    {
+        static bool Do(const TValue& value, GB_ByteBuffer& outData) noexcept
+        {
+            return SerializeBuiltinValue(value, outData);
+        }
+    };
+
+    template<typename TValue>
+    struct SerializeValueHelper<TValue, false, false, false, false>
+    {
+        static bool Do(const TValue& value, GB_ByteBuffer& outData) noexcept
+        {
+            std::lock_guard<std::mutex> lock(GetCustomTypeRegistryMutex());
+            const std::map<std::type_index, CustomTypeRegistration>& registryByType = GetCustomTypeRegistryByType();
+            const typename std::map<std::type_index, CustomTypeRegistration>::const_iterator iter =
+                registryByType.find(std::type_index(typeid(TValue)));
+            if (iter == registryByType.end())
+            {
+                outData.clear();
+                return false;
+            }
+
+            return iter->second.serializeFunc(&value, outData);
+        }
+    };
+
+    static bool RegisterCustomType(const std::type_index& typeIndex,
         const std::string& typeName,
         std::function<bool(const void* object, GB_ByteBuffer& outData)> serializeFunc,
-        std::function<std::unique_ptr<HolderBase>(const GB_ByteBuffer& data)> deserializeFunc);
+        std::function<HolderBase* (const GB_ByteBuffer& data)> deserializeFunc);
+
     static std::mutex& GetCustomTypeRegistryMutex();
     static std::map<std::type_index, CustomTypeRegistration>& GetCustomTypeRegistryByType();
-    static std::map<std::string, CustomTypeRegistration>& GetCustomTypeRegistryByName();
+    static std::map<std::string, const CustomTypeRegistration*>& GetCustomTypeRegistryByName();
 
     const HolderBase* GetHolder() const noexcept;
     HolderBase* GetHolder() noexcept;
 
-    static bool TryInternalEquals(const GB_Variant& left, const GB_Variant& right, bool& outResult) noexcept;
-    static bool TryInternalLess(const GB_Variant& left, const GB_Variant& right, bool& outResult) noexcept;
-    static bool TryInternalHash(const GB_Variant& value, std::size_t& outHash) noexcept;
-
-    std::unique_ptr<HolderBase> holder_;
-
-    friend struct GB_VariantLess;
-    friend struct GB_VariantEqual;
-    friend struct GB_VariantHash;
-};
-
-struct GLOBALBASE_PORT GB_VariantLess
-{
-    bool operator()(const GB_Variant& left, const GB_Variant& right) const noexcept;
-};
-
-struct GLOBALBASE_PORT GB_VariantEqual
-{
-    bool operator()(const GB_Variant& left, const GB_Variant& right) const noexcept;
-};
-
-struct GLOBALBASE_PORT GB_VariantHash
-{
-    std::size_t operator()(const GB_Variant& value) const noexcept;
+    HolderBase* holder_;
 };
 
 #endif // GB_VARIANT_H
