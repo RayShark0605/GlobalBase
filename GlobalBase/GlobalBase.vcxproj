@@ -40,6 +40,7 @@
     <ClInclude Include="GB_Timer.h" />
     <ClInclude Include="GB_Utf8String.h" />
     <ClInclude Include="GB_Utility.h" />
+    <ClInclude Include="GB_Variant.h" />
     <ClInclude Include="Geometry\GB_GeometryInterface.h" />
     <ClInclude Include="Geometry\GB_Matrix3x3.h" />
     <ClInclude Include="Geometry\GB_Point2d.h" />
@@ -71,6 +72,7 @@
     <ClCompile Include="GB_Timer.cpp" />
     <ClCompile Include="GB_Utf8String.cpp" />
     <ClCompile Include="GB_Utility.cpp" />
+    <ClCompile Include="GB_Variant.cpp" />
     <ClCompile Include="Geometry\GB_GeometryInterface.cpp" />
     <ClCompile Include="Geometry\GB_Matrix3x3.cpp" />
     <ClCompile Include="Geometry\GB_Point2d.cpp" />
