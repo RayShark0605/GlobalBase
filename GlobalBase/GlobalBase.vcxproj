@@ -27,6 +27,7 @@
     <ClInclude Include="GB_DateTime.h" />
     <ClInclude Include="GB_DelayLoadRuntime.h" />
     <ClInclude Include="GB_FileSystem.h" />
+    <ClInclude Include="GB_FormatParser.h" />
     <ClInclude Include="GB_Interval.h" />
     <ClInclude Include="GB_IO.h" />
     <ClInclude Include="GB_Logger.h" />
@@ -60,6 +61,7 @@
     <ClCompile Include="GB_DelayLoadRuntime.cpp" />
     <ClCompile Include="GB_DllMain.cpp" />
     <ClCompile Include="GB_FileSystem.cpp" />
+    <ClCompile Include="GB_FormatParser.cpp" />
     <ClCompile Include="GB_IO.cpp" />
     <ClCompile Include="GB_Logger.cpp" />
     <ClCompile Include="GB_Math.cpp" />
@@ -197,8 +199,8 @@
       <SubSystem>Windows</SubSystem>
       <GenerateDebugInformation>true</GenerateDebugInformation>
       <EnableUAC>false</EnableUAC>
-      <AdditionalDependencies>libcurl-d.lib;libcrypto.lib;zlibd.lib;opencv_core4d.lib;opencv_imgcodecs4d.lib;opencv_imgproc4d.lib;%(AdditionalDependencies)</AdditionalDependencies>
-      <DelayLoadDLLs>zlibd1.dll;libcurl-d.dll;libcrypto-3-x64.dll;opencv_core4d.dll;opencv_imgcodecs4d.dll;opencv_imgproc4d.dll;%(DelayLoadDLLs)</DelayLoadDLLs>
+      <AdditionalDependencies>libcurl-d.lib;libcrypto.lib;zlibd.lib;opencv_core4d.lib;opencv_imgcodecs4d.lib;opencv_imgproc4d.lib;gdald.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <DelayLoadDLLs>zlibd1.dll;libcurl-d.dll;libcrypto-3-x64.dll;opencv_core4d.dll;opencv_imgcodecs4d.dll;opencv_imgproc4d.dll;gdald.dll;%(DelayLoadDLLs)</DelayLoadDLLs>
     </Link>
     <PostBuildEvent>
       <Command>
@@ -229,11 +231,9 @@
       <SubSystem>Windows</SubSystem>
       <GenerateDebugInformation>true</GenerateDebugInformation>
       <EnableUAC>false</EnableUAC>
-      <AdditionalDependencies>libcurl.lib;libcrypto.lib;zlib.lib;opencv_core4.lib;
-opencv_imgcodecs4.lib
-;opencv_imgproc4.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>libcurl.lib;libcrypto.lib;zlib.lib;opencv_core4.lib;opencv_imgcodecs4.lib;opencv_imgproc4.lib;gdal.lib;%(AdditionalDependencies)</AdditionalDependencies>
       <LinkTimeCodeGeneration>UseLinkTimeCodeGeneration</LinkTimeCodeGeneration>
-      <DelayLoadDLLs>libcurl.dll;libcrypto-3-x64.dll;zlib1.dll;opencv_core4.dll;opencv_imgcodecs4.dll;opencv_imgproc4.dll;%(DelayLoadDLLs)</DelayLoadDLLs>
+      <DelayLoadDLLs>libcurl.dll;libcrypto-3-x64.dll;zlib1.dll;opencv_core4.dll;opencv_imgcodecs4.dll;opencv_imgproc4.dll;gdal.dll;%(DelayLoadDLLs)</DelayLoadDLLs>
     </Link>
     <PostBuildEvent>
       <Command>

@@ -969,6 +969,10 @@ namespace std
     };
 }
 
+using GB_VariantMap = std::map<std::string, GB_Variant>;
+
+using GB_VariantList = std::vector<GB_Variant>;
+
 #ifdef _MSC_VER
 #  pragma warning(pop)
 #endif

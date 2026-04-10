@@ -117,6 +117,9 @@
     <ClInclude Include="GB_Variant.h">
       <Filter>头文件</Filter>
     </ClInclude>
+    <ClInclude Include="GB_FormatParser.h">
+      <Filter>头文件</Filter>
+    </ClInclude>
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="GB_Utf8String.cpp">
@@ -201,6 +204,9 @@
       <Filter>源文件\CV</Filter>
     </ClCompile>
     <ClCompile Include="GB_Variant.cpp">
+      <Filter>源文件</Filter>
+    </ClCompile>
+    <ClCompile Include="GB_FormatParser.cpp">
       <Filter>源文件</Filter>
     </ClCompile>
   </ItemGroup>

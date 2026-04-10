@@ -1,5 +1,11 @@
 ﻿#include "GB_DelayLoadRuntime.h"
 
+#ifdef max
+#undef max
+#endif
+#include "GB_FileSystem.h"
+#include "GB_Utf8String.h"
+
 #include <windows.h>
 #include <delayimp.h>
 
@@ -159,49 +165,15 @@ namespace
         return GetRuntimeDisplayName() + L" 运行时依赖加载失败";
     }
 
-    const std::vector<std::wstring>& GetManagedDelayLoadDllNames()
+    const std::vector<std::wstring> GetManagedDelayLoadDllNames()
     {
-#ifdef _DEBUG
-        static const std::vector<std::wstring> dllNames =
+		const static std::string dependenciesPath = GB_GetExeDirectory() + "GlobalBaseDependencies";
+        const std::vector<std::string> existsDllsPath = GB_GetFilesList(dependenciesPath, false);
+        std::vector<std::wstring> dllNames(existsDllsPath.size());
+        for (int i = 0; i < existsDllsPath.size(); i++)
         {
-            L"zlibd1.dll",
-            L"libcurl-d.dll",
-            L"libcrypto-3-x64.dll",
-            L"opencv_core4d.dll",
-            L"opencv_imgcodecs4d.dll",
-            L"opencv_imgproc4d.dll",
-            L"libpng16d.dll",
-            L"jpeg62.dll",
-            L"liblzma.dll",
-            L"tiffd.dll",
-            L"libwebp.dll",
-            L"libwebpdecoder.dll",
-            L"libwebpdemux.dll",
-            L"libwebpmux.dll",
-            L"openjp2.dll",
-            L"libsharpyuv.dll"
-        };
-#else
-        static const std::vector<std::wstring> dllNames =
-        {
-            L"zlib1.dll",
-            L"libcurl.dll",
-            L"libcrypto-3-x64.dll",
-            L"opencv_core4.dll",
-            L"opencv_imgcodecs4.dll",
-            L"opencv_imgproc4.dll",
-            L"libpng16.dll",
-            L"jpeg62.dll",
-            L"liblzma.dll",
-            L"tiff.dll",
-            L"libwebp.dll",
-            L"libwebpdecoder.dll",
-            L"libwebpdemux.dll",
-            L"libwebpmux.dll",
-            L"openjp2.dll",
-            L"libsharpyuv.dll"
-        };
-#endif
+            dllNames[i] = GB_Utf8ToWString(GB_GetFileName(existsDllsPath[i], true));
+        }
         return dllNames;
     }
 
