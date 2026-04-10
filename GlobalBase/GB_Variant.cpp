@@ -10,11 +10,11 @@
 
 namespace
 {
-    static const unsigned char kMagic0 = 'G';
-    static const unsigned char kMagic1 = 'B';
-    static const unsigned char kMagic2 = 'V';
-    static const unsigned char kMagic3 = 'R';
-    static const unsigned short kCurrentVersion = 1;
+    const unsigned char kMagic0 = 'G';
+    const unsigned char kMagic1 = 'B';
+    const unsigned char kMagic2 = 'V';
+    const unsigned char kMagic3 = 'R';
+    const unsigned short kCurrentVersion = 1;
 
     void SetSuccessFlag(bool* ok, const bool value) noexcept
     {
@@ -22,6 +22,33 @@ namespace
         {
             *ok = value;
         }
+    }
+
+    template<typename TValue>
+    const TValue* TryGetStoredValue(const std::type_info& storedTypeInfo, const void* storedValuePtr) noexcept
+    {
+        typedef typename std::decay<TValue>::type ValueType;
+        if (storedValuePtr == nullptr || storedTypeInfo != typeid(ValueType))
+        {
+            return nullptr;
+        }
+
+        return static_cast<const ValueType*>(storedValuePtr);
+    }
+
+    bool IsValidVariantType(const GB_VariantType type) noexcept
+    {
+        return type == GB_VariantType::Empty
+            || type == GB_VariantType::Bool
+            || type == GB_VariantType::Int32
+            || type == GB_VariantType::UInt32
+            || type == GB_VariantType::Int64
+            || type == GB_VariantType::UInt64
+            || type == GB_VariantType::Float
+            || type == GB_VariantType::Double
+            || type == GB_VariantType::String
+            || type == GB_VariantType::Binary
+            || type == GB_VariantType::Custom;
     }
 
     bool IsAsciiSpace(const unsigned char ch) noexcept
@@ -230,8 +257,10 @@ namespace
         }
 
         const long double truncatedValue = std::trunc(static_cast<long double>(value));
-        if (truncatedValue < static_cast<long double>(std::numeric_limits<long long>::min())
-            || truncatedValue > static_cast<long double>(std::numeric_limits<long long>::max()))
+        static const long double kMinSignedLongLongValue = -9223372036854775808.0L;
+        static const long double kSignedLongLongUpperBound = 9223372036854775808.0L;
+        if (truncatedValue < kMinSignedLongLongValue
+            || truncatedValue >= kSignedLongLongUpperBound)
         {
             return false;
         }
@@ -249,8 +278,9 @@ namespace
         }
 
         const long double truncatedValue = std::trunc(static_cast<long double>(value));
+        static const long double kUnsignedLongLongUpperBound = 18446744073709551616.0L;
         if (truncatedValue < 0.0L
-            || truncatedValue > static_cast<long double>(std::numeric_limits<unsigned long long>::max()))
+            || truncatedValue >= kUnsignedLongLongUpperBound)
         {
             return false;
         }
@@ -368,7 +398,7 @@ namespace
 
     bool ReadUInt16(const GB_ByteBuffer& data, std::size_t& offset, unsigned short& outValue) noexcept
     {
-        if (offset + 2 > data.size())
+        if (offset > data.size() || data.size() - offset < 2)
         {
             return false;
         }
@@ -381,7 +411,7 @@ namespace
 
     bool ReadUInt32(const GB_ByteBuffer& data, std::size_t& offset, unsigned int& outValue) noexcept
     {
-        if (offset + 4 > data.size())
+        if (offset > data.size() || data.size() - offset < 4)
         {
             return false;
         }
@@ -396,7 +426,7 @@ namespace
 
     bool ReadUInt64(const GB_ByteBuffer& data, std::size_t& offset, unsigned long long& outValue) noexcept
     {
-        if (offset + 8 > data.size())
+        if (offset > data.size() || data.size() - offset < 8)
         {
             return false;
         }
@@ -462,345 +492,6 @@ namespace
 
         offset += length;
         return true;
-    }
-
-    template<typename TValue>
-    bool TryGetExactValue(const GB_Variant& variant, TValue& outValue) noexcept
-    {
-        const TValue* value = variant.AnyCast<TValue>();
-        if (value == nullptr)
-        {
-            return false;
-        }
-
-        outValue = *value;
-        return true;
-    }
-
-    bool TryGetSignedValue(const GB_Variant& variant, long long& outValue) noexcept
-    {
-        bool boolValue = false;
-        if (TryGetExactValue(variant, boolValue))
-        {
-            outValue = boolValue ? 1LL : 0LL;
-            return true;
-        }
-
-        char charValue = 0;
-        if (TryGetExactValue(variant, charValue))
-        {
-            outValue = static_cast<long long>(charValue);
-            return true;
-        }
-
-        signed char signedCharValue = 0;
-        if (TryGetExactValue(variant, signedCharValue))
-        {
-            outValue = static_cast<long long>(signedCharValue);
-            return true;
-        }
-
-        short shortValue = 0;
-        if (TryGetExactValue(variant, shortValue))
-        {
-            outValue = static_cast<long long>(shortValue);
-            return true;
-        }
-
-        int intValue = 0;
-        if (TryGetExactValue(variant, intValue))
-        {
-            outValue = static_cast<long long>(intValue);
-            return true;
-        }
-
-        long longValue = 0;
-        if (TryGetExactValue(variant, longValue))
-        {
-            outValue = static_cast<long long>(longValue);
-            return true;
-        }
-
-        long long longLongValue = 0;
-        if (TryGetExactValue(variant, longLongValue))
-        {
-            outValue = longLongValue;
-            return true;
-        }
-
-        unsigned char unsignedCharValue = 0;
-        if (TryGetExactValue(variant, unsignedCharValue))
-        {
-            outValue = static_cast<long long>(unsignedCharValue);
-            return true;
-        }
-
-        unsigned short unsignedShortValue = 0;
-        if (TryGetExactValue(variant, unsignedShortValue))
-        {
-            outValue = static_cast<long long>(unsignedShortValue);
-            return true;
-        }
-
-        unsigned int unsignedIntValue = 0;
-        if (TryGetExactValue(variant, unsignedIntValue))
-        {
-            if (static_cast<unsigned long long>(unsignedIntValue)
-                > static_cast<unsigned long long>(std::numeric_limits<long long>::max()))
-            {
-                return false;
-            }
-
-            outValue = static_cast<long long>(unsignedIntValue);
-            return true;
-        }
-
-        unsigned long unsignedLongValue = 0;
-        if (TryGetExactValue(variant, unsignedLongValue))
-        {
-            if (static_cast<unsigned long long>(unsignedLongValue)
-                > static_cast<unsigned long long>(std::numeric_limits<long long>::max()))
-            {
-                return false;
-            }
-
-            outValue = static_cast<long long>(unsignedLongValue);
-            return true;
-        }
-
-        unsigned long long unsignedLongLongValue = 0;
-        if (TryGetExactValue(variant, unsignedLongLongValue))
-        {
-            if (unsignedLongLongValue > static_cast<unsigned long long>(std::numeric_limits<long long>::max()))
-            {
-                return false;
-            }
-
-            outValue = static_cast<long long>(unsignedLongLongValue);
-            return true;
-        }
-
-        float floatValue = 0.0f;
-        if (TryGetExactValue(variant, floatValue))
-        {
-            return ConvertFloatingPointToSignedInteger(floatValue, outValue);
-        }
-
-        double doubleValue = 0.0;
-        if (TryGetExactValue(variant, doubleValue))
-        {
-            return ConvertFloatingPointToSignedInteger(doubleValue, outValue);
-        }
-
-        long double longDoubleValue = 0.0L;
-        if (TryGetExactValue(variant, longDoubleValue))
-        {
-            return ConvertFloatingPointToSignedInteger(longDoubleValue, outValue);
-        }
-
-        const std::string* stringPtr = variant.AnyCast<std::string>();
-        if (stringPtr != nullptr)
-        {
-            return TryParseSignedInteger(*stringPtr, outValue);
-        }
-
-        return false;
-    }
-
-    bool TryGetUnsignedValue(const GB_Variant& variant, unsigned long long& outValue) noexcept
-    {
-        bool boolValue = false;
-        if (TryGetExactValue(variant, boolValue))
-        {
-            outValue = boolValue ? 1ULL : 0ULL;
-            return true;
-        }
-
-        unsigned char unsignedCharValue = 0;
-        if (TryGetExactValue(variant, unsignedCharValue))
-        {
-            outValue = static_cast<unsigned long long>(unsignedCharValue);
-            return true;
-        }
-
-        unsigned short unsignedShortValue = 0;
-        if (TryGetExactValue(variant, unsignedShortValue))
-        {
-            outValue = static_cast<unsigned long long>(unsignedShortValue);
-            return true;
-        }
-
-        unsigned int unsignedIntValue = 0;
-        if (TryGetExactValue(variant, unsignedIntValue))
-        {
-            outValue = static_cast<unsigned long long>(unsignedIntValue);
-            return true;
-        }
-
-        unsigned long unsignedLongValue = 0;
-        if (TryGetExactValue(variant, unsignedLongValue))
-        {
-            outValue = static_cast<unsigned long long>(unsignedLongValue);
-            return true;
-        }
-
-        unsigned long long unsignedLongLongValue = 0;
-        if (TryGetExactValue(variant, unsignedLongLongValue))
-        {
-            outValue = unsignedLongLongValue;
-            return true;
-        }
-
-        char charValue = 0;
-        if (TryGetExactValue(variant, charValue))
-        {
-            if (charValue < 0)
-            {
-                return false;
-            }
-
-            outValue = static_cast<unsigned long long>(charValue);
-            return true;
-        }
-
-        signed char signedCharValue = 0;
-        if (TryGetExactValue(variant, signedCharValue))
-        {
-            if (signedCharValue < 0)
-            {
-                return false;
-            }
-
-            outValue = static_cast<unsigned long long>(signedCharValue);
-            return true;
-        }
-
-        short shortValue = 0;
-        if (TryGetExactValue(variant, shortValue))
-        {
-            if (shortValue < 0)
-            {
-                return false;
-            }
-
-            outValue = static_cast<unsigned long long>(shortValue);
-            return true;
-        }
-
-        int intValue = 0;
-        if (TryGetExactValue(variant, intValue))
-        {
-            if (intValue < 0)
-            {
-                return false;
-            }
-
-            outValue = static_cast<unsigned long long>(intValue);
-            return true;
-        }
-
-        long longValue = 0;
-        if (TryGetExactValue(variant, longValue))
-        {
-            if (longValue < 0)
-            {
-                return false;
-            }
-
-            outValue = static_cast<unsigned long long>(longValue);
-            return true;
-        }
-
-        long long longLongValue = 0;
-        if (TryGetExactValue(variant, longLongValue))
-        {
-            if (longLongValue < 0)
-            {
-                return false;
-            }
-
-            outValue = static_cast<unsigned long long>(longLongValue);
-            return true;
-        }
-
-        float floatValue = 0.0f;
-        if (TryGetExactValue(variant, floatValue))
-        {
-            return ConvertFloatingPointToUnsignedInteger(floatValue, outValue);
-        }
-
-        double doubleValue = 0.0;
-        if (TryGetExactValue(variant, doubleValue))
-        {
-            return ConvertFloatingPointToUnsignedInteger(doubleValue, outValue);
-        }
-
-        long double longDoubleValue = 0.0L;
-        if (TryGetExactValue(variant, longDoubleValue))
-        {
-            return ConvertFloatingPointToUnsignedInteger(longDoubleValue, outValue);
-        }
-
-        const std::string* stringPtr = variant.AnyCast<std::string>();
-        if (stringPtr != nullptr)
-        {
-            return TryParseUnsignedInteger(*stringPtr, outValue);
-        }
-
-        return false;
-    }
-
-    bool TryGetFloatingValue(const GB_Variant& variant, long double& outValue) noexcept
-    {
-        float floatValue = 0.0f;
-        if (TryGetExactValue(variant, floatValue))
-        {
-            outValue = static_cast<long double>(floatValue);
-            return true;
-        }
-
-        double doubleValue = 0.0;
-        if (TryGetExactValue(variant, doubleValue))
-        {
-            outValue = static_cast<long double>(doubleValue);
-            return true;
-        }
-
-        long double longDoubleValue = 0.0L;
-        if (TryGetExactValue(variant, longDoubleValue))
-        {
-            outValue = longDoubleValue;
-            return true;
-        }
-
-        bool boolValue = false;
-        if (TryGetExactValue(variant, boolValue))
-        {
-            outValue = boolValue ? 1.0L : 0.0L;
-            return true;
-        }
-
-        long long signedValue = 0;
-        if (TryGetSignedValue(variant, signedValue))
-        {
-            outValue = static_cast<long double>(signedValue);
-            return true;
-        }
-
-        unsigned long long unsignedValue = 0;
-        if (TryGetUnsignedValue(variant, unsignedValue))
-        {
-            outValue = static_cast<long double>(unsignedValue);
-            return true;
-        }
-
-        const std::string* stringPtr = variant.AnyCast<std::string>();
-        if (stringPtr != nullptr)
-        {
-            return TryParseFloatingPoint(*stringPtr, outValue);
-        }
-
-        return false;
     }
 
     bool ReadExactInteger(const GB_ByteBuffer& payload,
@@ -1390,7 +1081,6 @@ GB_Variant::GB_Variant(GB_Variant&& other) noexcept
 GB_Variant::~GB_Variant()
 {
     delete holder_;
-    holder_ = nullptr;
 }
 
 GB_Variant& GB_Variant::operator=(const GB_Variant& other)
@@ -1474,28 +1164,398 @@ void GB_Variant::Reset() noexcept
     holder_ = nullptr;
 }
 
-bool GB_Variant::ToBool(bool* ok) const noexcept
+bool GB_Variant::TryGetSignedValue(long long& outValue) const noexcept
 {
-    SetSuccessFlag(ok, false);
-
-    if (holder_ == nullptr)
+    const HolderBase* const holder = GetHolder();
+    if (holder == nullptr)
     {
         return false;
     }
 
-    bool boolValue = false;
-    if (TryGetExactValue(*this, boolValue))
+    const std::type_info& typeInfo = holder->GetTypeInfo();
+    const void* const valuePtr = holder->GetConstPtr();
+
+    if (const bool* const boolValue = TryGetStoredValue<bool>(typeInfo, valuePtr))
     {
-        SetSuccessFlag(ok, true);
-        return boolValue;
+        outValue = *boolValue ? 1LL : 0LL;
+        return true;
     }
 
-    const std::string* stringPtr = AnyCast<std::string>();
-    if (stringPtr != nullptr)
+    if (const char* const charValue = TryGetStoredValue<char>(typeInfo, valuePtr))
+    {
+        outValue = static_cast<long long>(*charValue);
+        return true;
+    }
+
+    if (const signed char* const signedCharValue = TryGetStoredValue<signed char>(typeInfo, valuePtr))
+    {
+        outValue = static_cast<long long>(*signedCharValue);
+        return true;
+    }
+
+    if (const short* const shortValue = TryGetStoredValue<short>(typeInfo, valuePtr))
+    {
+        outValue = static_cast<long long>(*shortValue);
+        return true;
+    }
+
+    if (const int* const intValue = TryGetStoredValue<int>(typeInfo, valuePtr))
+    {
+        outValue = static_cast<long long>(*intValue);
+        return true;
+    }
+
+    if (const long* const longValue = TryGetStoredValue<long>(typeInfo, valuePtr))
+    {
+        outValue = static_cast<long long>(*longValue);
+        return true;
+    }
+
+    if (const long long* const longLongValue = TryGetStoredValue<long long>(typeInfo, valuePtr))
+    {
+        outValue = *longLongValue;
+        return true;
+    }
+
+    if (const unsigned char* const unsignedCharValue = TryGetStoredValue<unsigned char>(typeInfo, valuePtr))
+    {
+        outValue = static_cast<long long>(*unsignedCharValue);
+        return true;
+    }
+
+    if (const unsigned short* const unsignedShortValue = TryGetStoredValue<unsigned short>(typeInfo, valuePtr))
+    {
+        outValue = static_cast<long long>(*unsignedShortValue);
+        return true;
+    }
+
+    if (const unsigned int* const unsignedIntValue = TryGetStoredValue<unsigned int>(typeInfo, valuePtr))
+    {
+        if (static_cast<unsigned long long>(*unsignedIntValue)
+        > static_cast<unsigned long long>(std::numeric_limits<long long>::max()))
+        {
+            return false;
+        }
+
+        outValue = static_cast<long long>(*unsignedIntValue);
+        return true;
+    }
+
+    if (const unsigned long* const unsignedLongValue = TryGetStoredValue<unsigned long>(typeInfo, valuePtr))
+    {
+        if (static_cast<unsigned long long>(*unsignedLongValue)
+        > static_cast<unsigned long long>(std::numeric_limits<long long>::max()))
+        {
+            return false;
+        }
+
+        outValue = static_cast<long long>(*unsignedLongValue);
+        return true;
+    }
+
+    if (const unsigned long long* const unsignedLongLongValue = TryGetStoredValue<unsigned long long>(typeInfo, valuePtr))
+    {
+        if (*unsignedLongLongValue > static_cast<unsigned long long>(std::numeric_limits<long long>::max()))
+        {
+            return false;
+        }
+
+        outValue = static_cast<long long>(*unsignedLongLongValue);
+        return true;
+    }
+
+    if (const float* const floatValue = TryGetStoredValue<float>(typeInfo, valuePtr))
+    {
+        return ConvertFloatingPointToSignedInteger(*floatValue, outValue);
+    }
+
+    if (const double* const doubleValue = TryGetStoredValue<double>(typeInfo, valuePtr))
+    {
+        return ConvertFloatingPointToSignedInteger(*doubleValue, outValue);
+    }
+
+    if (const long double* const longDoubleValue = TryGetStoredValue<long double>(typeInfo, valuePtr))
+    {
+        return ConvertFloatingPointToSignedInteger(*longDoubleValue, outValue);
+    }
+
+    if (const std::string* const stringValue = TryGetStoredValue<std::string>(typeInfo, valuePtr))
+    {
+        return TryParseSignedInteger(*stringValue, outValue);
+    }
+
+    return false;
+}
+
+bool GB_Variant::TryGetUnsignedValue(unsigned long long& outValue) const noexcept
+{
+    const HolderBase* const holder = GetHolder();
+    if (holder == nullptr)
+    {
+        return false;
+    }
+
+    const std::type_info& typeInfo = holder->GetTypeInfo();
+    const void* const valuePtr = holder->GetConstPtr();
+
+    if (const bool* const boolValue = TryGetStoredValue<bool>(typeInfo, valuePtr))
+    {
+        outValue = *boolValue ? 1ULL : 0ULL;
+        return true;
+    }
+
+    if (const unsigned char* const unsignedCharValue = TryGetStoredValue<unsigned char>(typeInfo, valuePtr))
+    {
+        outValue = static_cast<unsigned long long>(*unsignedCharValue);
+        return true;
+    }
+
+    if (const unsigned short* const unsignedShortValue = TryGetStoredValue<unsigned short>(typeInfo, valuePtr))
+    {
+        outValue = static_cast<unsigned long long>(*unsignedShortValue);
+        return true;
+    }
+
+    if (const unsigned int* const unsignedIntValue = TryGetStoredValue<unsigned int>(typeInfo, valuePtr))
+    {
+        outValue = static_cast<unsigned long long>(*unsignedIntValue);
+        return true;
+    }
+
+    if (const unsigned long* const unsignedLongValue = TryGetStoredValue<unsigned long>(typeInfo, valuePtr))
+    {
+        outValue = static_cast<unsigned long long>(*unsignedLongValue);
+        return true;
+    }
+
+    if (const unsigned long long* const unsignedLongLongValue = TryGetStoredValue<unsigned long long>(typeInfo, valuePtr))
+    {
+        outValue = *unsignedLongLongValue;
+        return true;
+    }
+
+    if (const char* const charValue = TryGetStoredValue<char>(typeInfo, valuePtr))
+    {
+        if (static_cast<int>(*charValue) < 0)
+        {
+            return false;
+        }
+
+        outValue = static_cast<unsigned long long>(*charValue);
+        return true;
+    }
+
+    if (const signed char* const signedCharValue = TryGetStoredValue<signed char>(typeInfo, valuePtr))
+    {
+        if (*signedCharValue < 0)
+        {
+            return false;
+        }
+
+        outValue = static_cast<unsigned long long>(*signedCharValue);
+        return true;
+    }
+
+    if (const short* const shortValue = TryGetStoredValue<short>(typeInfo, valuePtr))
+    {
+        if (*shortValue < 0)
+        {
+            return false;
+        }
+
+        outValue = static_cast<unsigned long long>(*shortValue);
+        return true;
+    }
+
+    if (const int* const intValue = TryGetStoredValue<int>(typeInfo, valuePtr))
+    {
+        if (*intValue < 0)
+        {
+            return false;
+        }
+
+        outValue = static_cast<unsigned long long>(*intValue);
+        return true;
+    }
+
+    if (const long* const longValue = TryGetStoredValue<long>(typeInfo, valuePtr))
+    {
+        if (*longValue < 0)
+        {
+            return false;
+        }
+
+        outValue = static_cast<unsigned long long>(*longValue);
+        return true;
+    }
+
+    if (const long long* const longLongValue = TryGetStoredValue<long long>(typeInfo, valuePtr))
+    {
+        if (*longLongValue < 0)
+        {
+            return false;
+        }
+
+        outValue = static_cast<unsigned long long>(*longLongValue);
+        return true;
+    }
+
+    if (const float* const floatValue = TryGetStoredValue<float>(typeInfo, valuePtr))
+    {
+        return ConvertFloatingPointToUnsignedInteger(*floatValue, outValue);
+    }
+
+    if (const double* const doubleValue = TryGetStoredValue<double>(typeInfo, valuePtr))
+    {
+        return ConvertFloatingPointToUnsignedInteger(*doubleValue, outValue);
+    }
+
+    if (const long double* const longDoubleValue = TryGetStoredValue<long double>(typeInfo, valuePtr))
+    {
+        return ConvertFloatingPointToUnsignedInteger(*longDoubleValue, outValue);
+    }
+
+    if (const std::string* const stringValue = TryGetStoredValue<std::string>(typeInfo, valuePtr))
+    {
+        return TryParseUnsignedInteger(*stringValue, outValue);
+    }
+
+    return false;
+}
+
+bool GB_Variant::TryGetFloatingValue(long double& outValue) const noexcept
+{
+    const HolderBase* const holder = GetHolder();
+    if (holder == nullptr)
+    {
+        return false;
+    }
+
+    const std::type_info& typeInfo = holder->GetTypeInfo();
+    const void* const valuePtr = holder->GetConstPtr();
+
+    if (const float* const floatValue = TryGetStoredValue<float>(typeInfo, valuePtr))
+    {
+        outValue = static_cast<long double>(*floatValue);
+        return true;
+    }
+
+    if (const double* const doubleValue = TryGetStoredValue<double>(typeInfo, valuePtr))
+    {
+        outValue = static_cast<long double>(*doubleValue);
+        return true;
+    }
+
+    if (const long double* const longDoubleValue = TryGetStoredValue<long double>(typeInfo, valuePtr))
+    {
+        outValue = *longDoubleValue;
+        return true;
+    }
+
+    if (const bool* const boolValue = TryGetStoredValue<bool>(typeInfo, valuePtr))
+    {
+        outValue = *boolValue ? 1.0L : 0.0L;
+        return true;
+    }
+
+    if (const char* const charValue = TryGetStoredValue<char>(typeInfo, valuePtr))
+    {
+        outValue = static_cast<long double>(*charValue);
+        return true;
+    }
+
+    if (const signed char* const signedCharValue = TryGetStoredValue<signed char>(typeInfo, valuePtr))
+    {
+        outValue = static_cast<long double>(*signedCharValue);
+        return true;
+    }
+
+    if (const unsigned char* const unsignedCharValue = TryGetStoredValue<unsigned char>(typeInfo, valuePtr))
+    {
+        outValue = static_cast<long double>(*unsignedCharValue);
+        return true;
+    }
+
+    if (const short* const shortValue = TryGetStoredValue<short>(typeInfo, valuePtr))
+    {
+        outValue = static_cast<long double>(*shortValue);
+        return true;
+    }
+
+    if (const unsigned short* const unsignedShortValue = TryGetStoredValue<unsigned short>(typeInfo, valuePtr))
+    {
+        outValue = static_cast<long double>(*unsignedShortValue);
+        return true;
+    }
+
+    if (const int* const intValue = TryGetStoredValue<int>(typeInfo, valuePtr))
+    {
+        outValue = static_cast<long double>(*intValue);
+        return true;
+    }
+
+    if (const unsigned int* const unsignedIntValue = TryGetStoredValue<unsigned int>(typeInfo, valuePtr))
+    {
+        outValue = static_cast<long double>(*unsignedIntValue);
+        return true;
+    }
+
+    if (const long* const longValue = TryGetStoredValue<long>(typeInfo, valuePtr))
+    {
+        outValue = static_cast<long double>(*longValue);
+        return true;
+    }
+
+    if (const unsigned long* const unsignedLongValue = TryGetStoredValue<unsigned long>(typeInfo, valuePtr))
+    {
+        outValue = static_cast<long double>(*unsignedLongValue);
+        return true;
+    }
+
+    if (const long long* const longLongValue = TryGetStoredValue<long long>(typeInfo, valuePtr))
+    {
+        outValue = static_cast<long double>(*longLongValue);
+        return true;
+    }
+
+    if (const unsigned long long* const unsignedLongLongValue = TryGetStoredValue<unsigned long long>(typeInfo, valuePtr))
+    {
+        outValue = static_cast<long double>(*unsignedLongLongValue);
+        return true;
+    }
+
+    if (const std::string* const stringValue = TryGetStoredValue<std::string>(typeInfo, valuePtr))
+    {
+        return TryParseFloatingPoint(*stringValue, outValue);
+    }
+
+    return false;
+}
+
+bool GB_Variant::ToBool(bool* ok) const noexcept
+{
+    SetSuccessFlag(ok, false);
+
+    const HolderBase* const holder = GetHolder();
+    if (holder == nullptr)
+    {
+        return false;
+    }
+
+    const std::type_info& typeInfo = holder->GetTypeInfo();
+    const void* const valuePtr = holder->GetConstPtr();
+
+    if (const bool* const boolValue = TryGetStoredValue<bool>(typeInfo, valuePtr))
+    {
+        SetSuccessFlag(ok, true);
+        return *boolValue;
+    }
+
+    if (const std::string* const stringValue = TryGetStoredValue<std::string>(typeInfo, valuePtr))
     {
         try
         {
-            const std::string normalized = ToLowerAscii(TrimAscii(*stringPtr));
+            const std::string normalized = ToLowerAscii(TrimAscii(*stringValue));
             if (normalized == "true" || normalized == "1" || normalized == "yes" || normalized == "on")
             {
                 SetSuccessFlag(ok, true);
@@ -1513,15 +1573,20 @@ bool GB_Variant::ToBool(bool* ok) const noexcept
         }
 
         long long parsedSignedValue = 0;
-        if (TryParseSignedInteger(*stringPtr, parsedSignedValue))
+        if (TryParseSignedInteger(*stringValue, parsedSignedValue))
         {
             SetSuccessFlag(ok, true);
             return parsedSignedValue != 0;
         }
 
         long double parsedFloatingValue = 0.0L;
-        if (TryParseFloatingPoint(*stringPtr, parsedFloatingValue))
+        if (TryParseFloatingPoint(*stringValue, parsedFloatingValue))
         {
+            if (std::isnan(parsedFloatingValue))
+            {
+                return false;
+            }
+
             SetSuccessFlag(ok, true);
             return parsedFloatingValue != 0.0L;
         }
@@ -1530,22 +1595,27 @@ bool GB_Variant::ToBool(bool* ok) const noexcept
     }
 
     long long signedValue = 0;
-    if (TryGetSignedValue(*this, signedValue))
+    if (TryGetSignedValue(signedValue))
     {
         SetSuccessFlag(ok, true);
         return signedValue != 0;
     }
 
     unsigned long long unsignedValue = 0;
-    if (TryGetUnsignedValue(*this, unsignedValue))
+    if (TryGetUnsignedValue(unsignedValue))
     {
         SetSuccessFlag(ok, true);
         return unsignedValue != 0;
     }
 
     long double floatingValue = 0.0L;
-    if (TryGetFloatingValue(*this, floatingValue))
+    if (TryGetFloatingValue(floatingValue))
     {
+        if (std::isnan(floatingValue))
+        {
+            return false;
+        }
+
         SetSuccessFlag(ok, true);
         return floatingValue != 0.0L;
     }
@@ -1558,7 +1628,7 @@ int GB_Variant::ToInt(bool* ok) const noexcept
     SetSuccessFlag(ok, false);
 
     long long value = 0;
-    if (!TryGetSignedValue(*this, value))
+    if (!TryGetSignedValue(value))
     {
         return 0;
     }
@@ -1578,7 +1648,7 @@ unsigned int GB_Variant::ToUInt(bool* ok) const noexcept
     SetSuccessFlag(ok, false);
 
     unsigned long long value = 0;
-    if (!TryGetUnsignedValue(*this, value))
+    if (!TryGetUnsignedValue(value))
     {
         return 0U;
     }
@@ -1598,7 +1668,7 @@ long long GB_Variant::ToInt64(bool* ok) const noexcept
     SetSuccessFlag(ok, false);
 
     long long value = 0;
-    if (!TryGetSignedValue(*this, value))
+    if (!TryGetSignedValue(value))
     {
         return 0LL;
     }
@@ -1612,7 +1682,7 @@ unsigned long long GB_Variant::ToUInt64(bool* ok) const noexcept
     SetSuccessFlag(ok, false);
 
     unsigned long long value = 0;
-    if (!TryGetUnsignedValue(*this, value))
+    if (!TryGetUnsignedValue(value))
     {
         return 0ULL;
     }
@@ -1626,7 +1696,7 @@ std::size_t GB_Variant::ToSizeT(bool* ok) const noexcept
     SetSuccessFlag(ok, false);
 
     unsigned long long value = 0;
-    if (!TryGetUnsignedValue(*this, value))
+    if (!TryGetUnsignedValue(value))
     {
         return 0U;
     }
@@ -1645,7 +1715,7 @@ float GB_Variant::ToFloat(bool* ok) const noexcept
     SetSuccessFlag(ok, false);
 
     long double value = 0.0L;
-    if (!TryGetFloatingValue(*this, value))
+    if (!TryGetFloatingValue(value))
     {
         return 0.0f;
     }
@@ -1665,7 +1735,7 @@ double GB_Variant::ToDouble(bool* ok) const noexcept
     SetSuccessFlag(ok, false);
 
     long double value = 0.0L;
-    if (!TryGetFloatingValue(*this, value))
+    if (!TryGetFloatingValue(value))
     {
         return 0.0;
     }
@@ -1684,130 +1754,117 @@ std::string GB_Variant::ToString(bool* ok) const noexcept
 {
     SetSuccessFlag(ok, false);
 
-    if (holder_ == nullptr)
+    const HolderBase* const holder = GetHolder();
+    if (holder == nullptr)
     {
         return std::string();
     }
 
     try
     {
-        const std::string* stringPtr = AnyCast<std::string>();
-        if (stringPtr != nullptr)
+        const std::type_info& typeInfo = holder->GetTypeInfo();
+        const void* const valuePtr = holder->GetConstPtr();
+
+        if (const std::string* const stringValue = TryGetStoredValue<std::string>(typeInfo, valuePtr))
         {
             SetSuccessFlag(ok, true);
-            return *stringPtr;
+            return *stringValue;
         }
 
-        bool boolValue = false;
-        if (TryGetExactValue(*this, boolValue))
+        if (const bool* const boolValue = TryGetStoredValue<bool>(typeInfo, valuePtr))
         {
             SetSuccessFlag(ok, true);
-            return boolValue ? "true" : "false";
+            return *boolValue ? "true" : "false";
         }
 
-        char charValue = 0;
-        if (TryGetExactValue(*this, charValue))
+        if (const char* const charValue = TryGetStoredValue<char>(typeInfo, valuePtr))
         {
             SetSuccessFlag(ok, true);
-            return IntegerToString(static_cast<int>(charValue));
+            return IntegerToString(static_cast<int>(*charValue));
         }
 
-        signed char signedCharValue = 0;
-        if (TryGetExactValue(*this, signedCharValue))
+        if (const signed char* const signedCharValue = TryGetStoredValue<signed char>(typeInfo, valuePtr))
         {
             SetSuccessFlag(ok, true);
-            return IntegerToString(static_cast<int>(signedCharValue));
+            return IntegerToString(static_cast<int>(*signedCharValue));
         }
 
-        unsigned char unsignedCharValue = 0;
-        if (TryGetExactValue(*this, unsignedCharValue))
+        if (const unsigned char* const unsignedCharValue = TryGetStoredValue<unsigned char>(typeInfo, valuePtr))
         {
             SetSuccessFlag(ok, true);
-            return IntegerToString(static_cast<unsigned int>(unsignedCharValue));
+            return IntegerToString(static_cast<unsigned int>(*unsignedCharValue));
         }
 
-        short shortValue = 0;
-        if (TryGetExactValue(*this, shortValue))
+        if (const short* const shortValue = TryGetStoredValue<short>(typeInfo, valuePtr))
         {
             SetSuccessFlag(ok, true);
-            return IntegerToString(shortValue);
+            return IntegerToString(*shortValue);
         }
 
-        unsigned short unsignedShortValue = 0;
-        if (TryGetExactValue(*this, unsignedShortValue))
+        if (const unsigned short* const unsignedShortValue = TryGetStoredValue<unsigned short>(typeInfo, valuePtr))
         {
             SetSuccessFlag(ok, true);
-            return IntegerToString(unsignedShortValue);
+            return IntegerToString(*unsignedShortValue);
         }
 
-        int intValue = 0;
-        if (TryGetExactValue(*this, intValue))
+        if (const int* const intValue = TryGetStoredValue<int>(typeInfo, valuePtr))
         {
             SetSuccessFlag(ok, true);
-            return IntegerToString(intValue);
+            return IntegerToString(*intValue);
         }
 
-        unsigned int unsignedIntValue = 0;
-        if (TryGetExactValue(*this, unsignedIntValue))
+        if (const unsigned int* const unsignedIntValue = TryGetStoredValue<unsigned int>(typeInfo, valuePtr))
         {
             SetSuccessFlag(ok, true);
-            return IntegerToString(unsignedIntValue);
+            return IntegerToString(*unsignedIntValue);
         }
 
-        long longValue = 0;
-        if (TryGetExactValue(*this, longValue))
+        if (const long* const longValue = TryGetStoredValue<long>(typeInfo, valuePtr))
         {
             SetSuccessFlag(ok, true);
-            return IntegerToString(longValue);
+            return IntegerToString(*longValue);
         }
 
-        unsigned long unsignedLongValue = 0;
-        if (TryGetExactValue(*this, unsignedLongValue))
+        if (const unsigned long* const unsignedLongValue = TryGetStoredValue<unsigned long>(typeInfo, valuePtr))
         {
             SetSuccessFlag(ok, true);
-            return IntegerToString(unsignedLongValue);
+            return IntegerToString(*unsignedLongValue);
         }
 
-        long long longLongValue = 0;
-        if (TryGetExactValue(*this, longLongValue))
+        if (const long long* const longLongValue = TryGetStoredValue<long long>(typeInfo, valuePtr))
         {
             SetSuccessFlag(ok, true);
-            return IntegerToString(longLongValue);
+            return IntegerToString(*longLongValue);
         }
 
-        unsigned long long unsignedLongLongValue = 0;
-        if (TryGetExactValue(*this, unsignedLongLongValue))
+        if (const unsigned long long* const unsignedLongLongValue = TryGetStoredValue<unsigned long long>(typeInfo, valuePtr))
         {
             SetSuccessFlag(ok, true);
-            return IntegerToString(unsignedLongLongValue);
+            return IntegerToString(*unsignedLongLongValue);
         }
 
-        float floatValue = 0.0f;
-        if (TryGetExactValue(*this, floatValue))
+        if (const float* const floatValue = TryGetStoredValue<float>(typeInfo, valuePtr))
         {
             SetSuccessFlag(ok, true);
-            return FloatingPointToString(floatValue);
+            return FloatingPointToString(*floatValue);
         }
 
-        double doubleValue = 0.0;
-        if (TryGetExactValue(*this, doubleValue))
+        if (const double* const doubleValue = TryGetStoredValue<double>(typeInfo, valuePtr))
         {
             SetSuccessFlag(ok, true);
-            return FloatingPointToString(doubleValue);
+            return FloatingPointToString(*doubleValue);
         }
 
-        long double longDoubleValue = 0.0L;
-        if (TryGetExactValue(*this, longDoubleValue))
+        if (const long double* const longDoubleValue = TryGetStoredValue<long double>(typeInfo, valuePtr))
         {
             SetSuccessFlag(ok, true);
-            return FloatingPointToString(longDoubleValue);
+            return FloatingPointToString(*longDoubleValue);
         }
 
-        const GB_ByteBuffer* binaryPtr = AnyCast<GB_ByteBuffer>();
-        if (binaryPtr != nullptr)
+        if (const GB_ByteBuffer* const binaryValue = TryGetStoredValue<GB_ByteBuffer>(typeInfo, valuePtr))
         {
             SetSuccessFlag(ok, true);
-            return BinaryToHexString(*binaryPtr);
+            return BinaryToHexString(*binaryValue);
         }
     }
     catch (...)
@@ -1828,18 +1885,19 @@ GB_ByteBuffer GB_Variant::ToBinary(bool* ok) const noexcept
 
     try
     {
-        const GB_ByteBuffer* binaryPtr = AnyCast<GB_ByteBuffer>();
-        if (binaryPtr != nullptr)
+        const std::type_info& typeInfo = holder_->GetTypeInfo();
+        const void* const valuePtr = holder_->GetConstPtr();
+
+        if (const GB_ByteBuffer* const binaryValue = TryGetStoredValue<GB_ByteBuffer>(typeInfo, valuePtr))
         {
             SetSuccessFlag(ok, true);
-            return *binaryPtr;
+            return *binaryValue;
         }
 
-        const std::string* stringPtr = AnyCast<std::string>();
-        if (stringPtr != nullptr)
+        if (const std::string* const stringValue = TryGetStoredValue<std::string>(typeInfo, valuePtr))
         {
             SetSuccessFlag(ok, true);
-            return GB_StringToByteBuffer(*stringPtr);
+            return GB_StringToByteBuffer(*stringValue);
         }
 
         if (Type() == GB_VariantType::Custom)
@@ -1913,6 +1971,12 @@ bool GB_Variant::Serialize(GB_ByteBuffer& outData) const noexcept
             }
         }
 
+        if (stableTypeName.size() > static_cast<std::size_t>(std::numeric_limits<unsigned int>::max()))
+        {
+            outData.clear();
+            return false;
+        }
+
         WriteUInt32(outData, static_cast<unsigned int>(stableTypeName.size()));
         WriteUInt64(outData, static_cast<unsigned long long>(payload.size()));
         outData.insert(outData.end(), stableTypeName.begin(), stableTypeName.end());
@@ -1948,8 +2012,6 @@ bool GB_Variant::DeserializeFromBinary(const GB_ByteBuffer& data) noexcept
 
 bool GB_Variant::Deserialize(const GB_ByteBuffer& data, GB_Variant& outValue) noexcept
 {
-    outValue.Reset();
-
     if (data.size() < 4 + 2 + 2 + 4 + 8)
     {
         return false;
@@ -1974,6 +2036,12 @@ bool GB_Variant::Deserialize(const GB_ByteBuffer& data, GB_Variant& outValue) no
 
     unsigned short variantTypeValue = 0;
     if (!ReadUInt16(data, offset, variantTypeValue))
+    {
+        return false;
+    }
+
+    const GB_VariantType variantType = static_cast<GB_VariantType>(variantTypeValue);
+    if (!IsValidVariantType(variantType))
     {
         return false;
     }
@@ -2018,20 +2086,15 @@ bool GB_Variant::Deserialize(const GB_ByteBuffer& data, GB_Variant& outValue) no
         return false;
     }
 
-    const GB_VariantType variantType = static_cast<GB_VariantType>(variantTypeValue);
+    HolderBase* newHolder = nullptr;
     if (variantType == GB_VariantType::Empty)
     {
         if (!stableTypeName.empty() || !payload.empty())
         {
             return false;
         }
-
-        outValue.Reset();
-        return true;
     }
-
-    HolderBase* newHolder = nullptr;
-    if (IsBuiltinStableTypeName(stableTypeName))
+    else if (IsBuiltinStableTypeName(stableTypeName))
     {
         if (!DeserializeBuiltinValue(stableTypeName, variantType, payload, newHolder))
         {
@@ -2040,6 +2103,11 @@ bool GB_Variant::Deserialize(const GB_ByteBuffer& data, GB_Variant& outValue) no
     }
     else
     {
+        if (variantType != GB_VariantType::Custom)
+        {
+            return false;
+        }
+
         std::function<HolderBase* (const GB_ByteBuffer& data)> deserializeFuncCopy;
         {
             std::lock_guard<std::mutex> lock(GetCustomTypeRegistryMutex());
@@ -2059,17 +2127,23 @@ bool GB_Variant::Deserialize(const GB_ByteBuffer& data, GB_Variant& outValue) no
         }
         catch (...)
         {
-            newHolder = nullptr;
+            return false;
         }
 
-        if (newHolder == nullptr || newHolder->GetVariantType() != variantType)
+        if (newHolder == nullptr || newHolder->GetVariantType() != GB_VariantType::Custom)
         {
             delete newHolder;
             return false;
         }
     }
 
-    outValue.Reset();
+    if (variantType == GB_VariantType::Empty)
+    {
+        outValue.Reset();
+        return true;
+    }
+
+    delete outValue.holder_;
     outValue.holder_ = newHolder;
     return true;
 }
@@ -2103,15 +2177,31 @@ bool GB_Variant::RegisterCustomType(const std::type_index& typeIndex,
     registration.serializeFunc = std::move(serializeFunc);
     registration.deserializeFunc = std::move(deserializeFunc);
 
-    const std::pair<std::map<std::type_index, CustomTypeRegistration>::iterator, bool> insertResult =
-        registryByType.insert(std::make_pair(typeIndex, std::move(registration)));
-    if (!insertResult.second)
+    try
+    {
+        const std::pair<std::map<std::type_index, CustomTypeRegistration>::iterator, bool> insertResult =
+            registryByType.insert(std::make_pair(typeIndex, std::move(registration)));
+        if (!insertResult.second)
+        {
+            return false;
+        }
+
+        try
+        {
+            registryByName.insert(std::make_pair(typeName, &insertResult.first->second));
+        }
+        catch (...)
+        {
+            registryByType.erase(insertResult.first);
+            return false;
+        }
+
+        return true;
+    }
+    catch (...)
     {
         return false;
     }
-
-    registryByName.insert(std::make_pair(typeName, &insertResult.first->second));
-    return true;
 }
 
 std::mutex& GB_Variant::GetCustomTypeRegistryMutex()

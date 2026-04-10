@@ -30,6 +30,11 @@ enum class GB_VariantType
     Custom
 };
 
+#ifdef _MSC_VER
+#  pragma warning(push)
+#  pragma warning(disable: 4251)
+#endif
+
 class GLOBALBASE_PORT GB_Variant
 {
 public:
@@ -496,6 +501,10 @@ private:
         }
     };
 
+    bool TryGetSignedValue(long long& outValue) const noexcept;
+    bool TryGetUnsignedValue(unsigned long long& outValue) const noexcept;
+    bool TryGetFloatingValue(long double& outValue) const noexcept;
+
     static bool RegisterCustomType(const std::type_index& typeIndex,
         const std::string& typeName,
         std::function<bool(const void* object, GB_ByteBuffer& outData)> serializeFunc,
@@ -510,5 +519,9 @@ private:
 
     HolderBase* holder_;
 };
+
+#ifdef _MSC_VER
+#  pragma warning(pop)
+#endif
 
 #endif // GB_VARIANT_H
