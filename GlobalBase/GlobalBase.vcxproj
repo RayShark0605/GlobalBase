@@ -135,12 +135,12 @@
   </ImportGroup>
   <PropertyGroup Label="UserMacros" />
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
-    <IncludePath>../GlobalThirdParty/include;../GlobalThirdParty/include/opencv4;$(IncludePath)</IncludePath>
+    <IncludePath>../GlobalThirdParty/include;../GlobalThirdParty/include/opencv4;../GlobalThirdParty/include/libxml2;$(IncludePath)</IncludePath>
     <LibraryPath>../GlobalThirdParty/lib/Debug;$(LibraryPath)</LibraryPath>
     <TargetName>GlobalBased</TargetName>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
-    <IncludePath>../GlobalThirdParty/include;../GlobalThirdParty/include/opencv4;$(IncludePath)</IncludePath>
+    <IncludePath>../GlobalThirdParty/include;../GlobalThirdParty/include/opencv4;../GlobalThirdParty/include/libxml2;$(IncludePath)</IncludePath>
     <LibraryPath>../GlobalThirdParty/lib/Release;$(LibraryPath)</LibraryPath>
     <TargetName>GlobalBase</TargetName>
   </PropertyGroup>
@@ -199,7 +199,7 @@
       <SubSystem>Windows</SubSystem>
       <GenerateDebugInformation>true</GenerateDebugInformation>
       <EnableUAC>false</EnableUAC>
-      <AdditionalDependencies>libcurl-d.lib;libcrypto.lib;zlibd.lib;opencv_core4d.lib;opencv_imgcodecs4d.lib;opencv_imgproc4d.lib;gdald.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>libcurl-d.lib;libcrypto.lib;zlibd.lib;opencv_core4d.lib;opencv_imgcodecs4d.lib;opencv_imgproc4d.lib;gdald.lib;libxml2.lib;%(AdditionalDependencies)</AdditionalDependencies>
       <DelayLoadDLLs>zlibd1.dll;libcurl-d.dll;libcrypto-3-x64.dll;opencv_core4d.dll;opencv_imgcodecs4d.dll;opencv_imgproc4d.dll;gdald.dll;%(DelayLoadDLLs)</DelayLoadDLLs>
     </Link>
     <PostBuildEvent>
