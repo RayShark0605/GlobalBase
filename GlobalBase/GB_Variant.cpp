@@ -2,11 +2,11 @@
 
 #include <cerrno>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <iomanip>
 #include <limits>
-#include <sstream>
+#include <string>
 
 namespace
 {
@@ -63,17 +63,21 @@ namespace
     template<typename TValue>
     std::string IntegerToString(const TValue value)
     {
-        std::ostringstream stream;
-        stream << value;
-        return stream.str();
+        return std::to_string(value);
     }
 
     template<typename TValue>
     std::string FloatingPointToString(const TValue value)
     {
-        std::ostringstream stream;
-        stream << std::setprecision(std::numeric_limits<TValue>::max_digits10) << value;
-        return stream.str();
+        const int precision = std::numeric_limits<TValue>::max_digits10;
+        char buffer[64];
+        const int length = std::snprintf(buffer, sizeof(buffer), "%.*Lg", precision, static_cast<long double>(value));
+        if (length < 0 || length >= static_cast<int>(sizeof(buffer)))
+        {
+            return std::string();
+        }
+
+        return std::string(buffer, static_cast<std::size_t>(length));
     }
 
     template<typename TValue>
@@ -82,37 +86,44 @@ namespace
         static_assert(std::is_integral<TValue>::value && std::is_signed<TValue>::value,
             "TValue must be a signed integer type.");
 
-        const std::string trimmedText = TrimAscii(text);
-        if (trimmedText.empty())
+        try
         {
-            return false;
-        }
-
-        errno = 0;
-        char* endPtr = nullptr;
-        const long long parsedValue = std::strtoll(trimmedText.c_str(), &endPtr, 0);
-        if (errno == ERANGE || endPtr == nullptr)
-        {
-            return false;
-        }
-
-        while (*endPtr != '\0')
-        {
-            if (!IsAsciiSpace(static_cast<unsigned char>(*endPtr)))
+            const std::string trimmedText = TrimAscii(text);
+            if (trimmedText.empty())
             {
                 return false;
             }
-            endPtr++;
-        }
 
-        if (parsedValue < static_cast<long long>(std::numeric_limits<TValue>::min())
-            || parsedValue > static_cast<long long>(std::numeric_limits<TValue>::max()))
+            errno = 0;
+            char* endPtr = nullptr;
+            const long long parsedValue = std::strtoll(trimmedText.c_str(), &endPtr, 0);
+            if (errno == ERANGE || endPtr == trimmedText.c_str())
+            {
+                return false;
+            }
+
+            while (*endPtr != '\0')
+            {
+                if (!IsAsciiSpace(static_cast<unsigned char>(*endPtr)))
+                {
+                    return false;
+                }
+                endPtr++;
+            }
+
+            if (parsedValue < static_cast<long long>(std::numeric_limits<TValue>::min())
+                || parsedValue > static_cast<long long>(std::numeric_limits<TValue>::max()))
+            {
+                return false;
+            }
+
+            outValue = static_cast<TValue>(parsedValue);
+            return true;
+        }
+        catch (...)
         {
             return false;
         }
-
-        outValue = static_cast<TValue>(parsedValue);
-        return true;
     }
 
     template<typename TValue>
@@ -121,41 +132,48 @@ namespace
         static_assert(std::is_integral<TValue>::value && !std::is_signed<TValue>::value,
             "TValue must be an unsigned integer type.");
 
-        const std::string trimmedText = TrimAscii(text);
-        if (trimmedText.empty())
+        try
         {
-            return false;
-        }
-
-        if (trimmedText[0] == '-')
-        {
-            return false;
-        }
-
-        errno = 0;
-        char* endPtr = nullptr;
-        const unsigned long long parsedValue = std::strtoull(trimmedText.c_str(), &endPtr, 0);
-        if (errno == ERANGE || endPtr == nullptr)
-        {
-            return false;
-        }
-
-        while (*endPtr != '\0')
-        {
-            if (!IsAsciiSpace(static_cast<unsigned char>(*endPtr)))
+            const std::string trimmedText = TrimAscii(text);
+            if (trimmedText.empty())
             {
                 return false;
             }
-            endPtr++;
-        }
 
-        if (parsedValue > static_cast<unsigned long long>(std::numeric_limits<TValue>::max()))
+            if (trimmedText[0] == '-')
+            {
+                return false;
+            }
+
+            errno = 0;
+            char* endPtr = nullptr;
+            const unsigned long long parsedValue = std::strtoull(trimmedText.c_str(), &endPtr, 0);
+            if (errno == ERANGE || endPtr == trimmedText.c_str())
+            {
+                return false;
+            }
+
+            while (*endPtr != '\0')
+            {
+                if (!IsAsciiSpace(static_cast<unsigned char>(*endPtr)))
+                {
+                    return false;
+                }
+                endPtr++;
+            }
+
+            if (parsedValue > static_cast<unsigned long long>(std::numeric_limits<TValue>::max()))
+            {
+                return false;
+            }
+
+            outValue = static_cast<TValue>(parsedValue);
+            return true;
+        }
+        catch (...)
         {
             return false;
         }
-
-        outValue = static_cast<TValue>(parsedValue);
-        return true;
     }
 
     template<typename TValue>
@@ -163,37 +181,44 @@ namespace
     {
         static_assert(std::is_floating_point<TValue>::value, "TValue must be a floating-point type.");
 
-        const std::string trimmedText = TrimAscii(text);
-        if (trimmedText.empty())
+        try
         {
-            return false;
-        }
-
-        errno = 0;
-        char* endPtr = nullptr;
-        const long double parsedValue = std::strtold(trimmedText.c_str(), &endPtr);
-        if (errno == ERANGE || endPtr == nullptr)
-        {
-            return false;
-        }
-
-        while (*endPtr != '\0')
-        {
-            if (!IsAsciiSpace(static_cast<unsigned char>(*endPtr)))
+            const std::string trimmedText = TrimAscii(text);
+            if (trimmedText.empty())
             {
                 return false;
             }
-            endPtr++;
-        }
 
-        if (parsedValue < -static_cast<long double>(std::numeric_limits<TValue>::max())
-            || parsedValue > static_cast<long double>(std::numeric_limits<TValue>::max()))
+            errno = 0;
+            char* endPtr = nullptr;
+            const long double parsedValue = std::strtold(trimmedText.c_str(), &endPtr);
+            if (errno == ERANGE || endPtr == trimmedText.c_str())
+            {
+                return false;
+            }
+
+            while (*endPtr != '\0')
+            {
+                if (!IsAsciiSpace(static_cast<unsigned char>(*endPtr)))
+                {
+                    return false;
+                }
+                endPtr++;
+            }
+
+            if (parsedValue < -static_cast<long double>(std::numeric_limits<TValue>::max())
+                || parsedValue > static_cast<long double>(std::numeric_limits<TValue>::max()))
+            {
+                return false;
+            }
+
+            outValue = static_cast<TValue>(parsedValue);
+            return true;
+        }
+        catch (...)
         {
             return false;
         }
-
-        outValue = static_cast<TValue>(parsedValue);
-        return true;
     }
 
     template<typename TValue>
@@ -255,6 +280,45 @@ namespace
     {
         static_assert(std::is_integral<TValue>::value && !std::is_signed<TValue>::value,
             "TValue must be an unsigned integer type.");
+
+        if (value > static_cast<unsigned long long>(std::numeric_limits<TValue>::max()))
+        {
+            return false;
+        }
+
+        outValue = static_cast<TValue>(value);
+        return true;
+    }
+
+    template<typename TValue>
+    bool ConvertSignedIntegerToInteger(const long long value, TValue& outValue) noexcept
+    {
+        static_assert(std::is_integral<TValue>::value, "TValue must be an integer type.");
+
+        if (std::is_signed<TValue>::value)
+        {
+            if (value < static_cast<long long>(std::numeric_limits<TValue>::min())
+                || value > static_cast<long long>(std::numeric_limits<TValue>::max()))
+            {
+                return false;
+            }
+        }
+        else
+        {
+            if (value < 0 || static_cast<unsigned long long>(value) > static_cast<unsigned long long>(std::numeric_limits<TValue>::max()))
+            {
+                return false;
+            }
+        }
+
+        outValue = static_cast<TValue>(value);
+        return true;
+    }
+
+    template<typename TValue>
+    bool ConvertUnsignedIntegerToInteger(const unsigned long long value, TValue& outValue) noexcept
+    {
+        static_assert(std::is_integral<TValue>::value, "TValue must be an integer type.");
 
         if (value > static_cast<unsigned long long>(std::numeric_limits<TValue>::max()))
         {
@@ -352,7 +416,7 @@ namespace
         const std::size_t length,
         GB_ByteBuffer& outBytes) noexcept
     {
-        if (offset + length > data.size())
+        if (offset > data.size() || length > data.size() - offset)
         {
             return false;
         }
@@ -376,14 +440,20 @@ namespace
         const std::size_t length,
         std::string& outText) noexcept
     {
-        if (offset + length > data.size())
+        if (offset > data.size() || length > data.size() - offset)
         {
             return false;
         }
 
+        if (length == 0)
+        {
+            outText.clear();
+            return true;
+        }
+
         try
         {
-            outText.assign(reinterpret_cast<const char*>(&data[offset]), length);
+            outText.assign(reinterpret_cast<const char*>(data.data() + offset), length);
         }
         catch (...)
         {
@@ -528,10 +598,10 @@ namespace
             return ConvertFloatingPointToSignedInteger(longDoubleValue, outValue);
         }
 
-        std::string stringValue;
-        if (TryGetExactValue(variant, stringValue))
+        const std::string* stringPtr = variant.AnyCast<std::string>();
+        if (stringPtr != nullptr)
         {
-            return TryParseSignedInteger(stringValue, outValue);
+            return TryParseSignedInteger(*stringPtr, outValue);
         }
 
         return false;
@@ -671,10 +741,10 @@ namespace
             return ConvertFloatingPointToUnsignedInteger(longDoubleValue, outValue);
         }
 
-        std::string stringValue;
-        if (TryGetExactValue(variant, stringValue))
+        const std::string* stringPtr = variant.AnyCast<std::string>();
+        if (stringPtr != nullptr)
         {
-            return TryParseUnsignedInteger(stringValue, outValue);
+            return TryParseUnsignedInteger(*stringPtr, outValue);
         }
 
         return false;
@@ -724,10 +794,10 @@ namespace
             return true;
         }
 
-        std::string stringValue;
-        if (TryGetExactValue(variant, stringValue))
+        const std::string* stringPtr = variant.AnyCast<std::string>();
+        if (stringPtr != nullptr)
         {
-            return TryParseFloatingPoint(stringValue, outValue);
+            return TryParseFloatingPoint(*stringPtr, outValue);
         }
 
         return false;
@@ -748,6 +818,35 @@ namespace
             outValue |= static_cast<unsigned long long>(payload[index]) << (index * 8);
         }
 
+        return true;
+    }
+
+    bool ReadExactSignedInteger(const GB_ByteBuffer& payload,
+        const std::size_t expectedSize,
+        long long& outValue) noexcept
+    {
+        if (expectedSize == 0 || expectedSize > sizeof(unsigned long long))
+        {
+            return false;
+        }
+
+        unsigned long long rawValue = 0;
+        if (!ReadExactInteger(payload, expectedSize, rawValue))
+        {
+            return false;
+        }
+
+        if (expectedSize < sizeof(unsigned long long))
+        {
+            const unsigned int bitCount = static_cast<unsigned int>(expectedSize * 8);
+            const unsigned long long signBit = 1ULL << (bitCount - 1);
+            if ((rawValue & signBit) != 0)
+            {
+                rawValue |= (~0ULL) << bitCount;
+            }
+        }
+
+        std::memcpy(&outValue, &rawValue, sizeof(outValue));
         return true;
     }
 
@@ -774,9 +873,9 @@ GB_Variant::SerializeBuiltinValue(const TValue& value, GB_ByteBuffer& outData) n
     {
         outData.clear();
         outData.reserve(sizeof(ValueType));
+        const unsigned long long shiftedValue = static_cast<unsigned long long>(value);
         for (std::size_t index = 0; index < sizeof(ValueType); index++)
         {
-            const unsigned long long shiftedValue = static_cast<unsigned long long>(value);
             outData.push_back(static_cast<unsigned char>((shiftedValue >> (index * 8)) & 0xFF));
         }
     }
@@ -841,6 +940,7 @@ bool GB_Variant::SerializeBuiltinValue(const GB_ByteBuffer& value, GB_ByteBuffer
 }
 
 bool GB_Variant::DeserializeBuiltinValue(const std::string& stableTypeName,
+    const GB_VariantType variantType,
     const GB_ByteBuffer& payload,
     HolderBase*& outHolder) noexcept
 {
@@ -850,7 +950,8 @@ bool GB_Variant::DeserializeBuiltinValue(const std::string& stableTypeName,
     {
         if (stableTypeName == "bool")
         {
-            if (payload.size() != 1)
+            static_assert(sizeof(bool) == 1, "GB_Variant serialization assumes sizeof(bool) == 1.");
+            if (variantType != GB_VariantType::Bool || payload.size() != 1)
             {
                 return false;
             }
@@ -861,135 +962,266 @@ bool GB_Variant::DeserializeBuiltinValue(const std::string& stableTypeName,
 
         if (stableTypeName == "char")
         {
-            if (payload.size() != sizeof(char))
+            if (payload.size() != 1)
             {
                 return false;
             }
 
-            outHolder = new Holder<char>(static_cast<char>(payload[0]));
+            char value = 0;
+            if (variantType == GB_VariantType::Int32)
+            {
+                long long signedValue = 0;
+                if (!ReadExactSignedInteger(payload, 1, signedValue)
+                    || !ConvertSignedIntegerToInteger(signedValue, value))
+                {
+                    return false;
+                }
+            }
+            else if (variantType == GB_VariantType::UInt32)
+            {
+                unsigned long long unsignedValue = 0;
+                if (!ReadExactInteger(payload, 1, unsignedValue)
+                    || !ConvertUnsignedIntegerToInteger(unsignedValue, value))
+                {
+                    return false;
+                }
+            }
+            else
+            {
+                return false;
+            }
+
+            outHolder = new Holder<char>(value);
             return true;
         }
 
         if (stableTypeName == "signed char")
         {
-            if (payload.size() != sizeof(signed char))
+            if (variantType != GB_VariantType::Int32)
             {
                 return false;
             }
 
-            outHolder = new Holder<signed char>(static_cast<signed char>(payload[0]));
+            long long value = 0;
+            if (!ReadExactSignedInteger(payload, 1, value))
+            {
+                return false;
+            }
+
+            signed char resultValue = 0;
+            if (!ConvertSignedIntegerToInteger(value, resultValue))
+            {
+                return false;
+            }
+
+            outHolder = new Holder<signed char>(resultValue);
             return true;
         }
 
         if (stableTypeName == "unsigned char")
         {
-            if (payload.size() != sizeof(unsigned char))
+            if (variantType != GB_VariantType::UInt32)
             {
                 return false;
             }
 
-            outHolder = new Holder<unsigned char>(static_cast<unsigned char>(payload[0]));
+            unsigned long long value = 0;
+            if (!ReadExactInteger(payload, 1, value))
+            {
+                return false;
+            }
+
+            unsigned char resultValue = 0;
+            if (!ConvertUnsignedIntegerToInteger(value, resultValue))
+            {
+                return false;
+            }
+
+            outHolder = new Holder<unsigned char>(resultValue);
             return true;
         }
 
         if (stableTypeName == "short")
         {
-            unsigned long long rawValue = 0;
-            if (!ReadExactInteger(payload, sizeof(short), rawValue))
+            if (variantType != GB_VariantType::Int32)
             {
                 return false;
             }
 
-            outHolder = new Holder<short>(static_cast<short>(rawValue));
+            long long value = 0;
+            if (!ReadExactSignedInteger(payload, 2, value))
+            {
+                return false;
+            }
+
+            short resultValue = 0;
+            if (!ConvertSignedIntegerToInteger(value, resultValue))
+            {
+                return false;
+            }
+
+            outHolder = new Holder<short>(resultValue);
             return true;
         }
 
         if (stableTypeName == "unsigned short")
         {
-            unsigned long long rawValue = 0;
-            if (!ReadExactInteger(payload, sizeof(unsigned short), rawValue))
+            if (variantType != GB_VariantType::UInt32)
             {
                 return false;
             }
 
-            outHolder = new Holder<unsigned short>(static_cast<unsigned short>(rawValue));
+            unsigned long long value = 0;
+            if (!ReadExactInteger(payload, 2, value))
+            {
+                return false;
+            }
+
+            unsigned short resultValue = 0;
+            if (!ConvertUnsignedIntegerToInteger(value, resultValue))
+            {
+                return false;
+            }
+
+            outHolder = new Holder<unsigned short>(resultValue);
             return true;
         }
 
         if (stableTypeName == "int")
         {
-            unsigned long long rawValue = 0;
-            if (!ReadExactInteger(payload, sizeof(int), rawValue))
+            if (variantType != GB_VariantType::Int32)
             {
                 return false;
             }
 
-            outHolder = new Holder<int>(static_cast<int>(rawValue));
+            long long value = 0;
+            if (!ReadExactSignedInteger(payload, 4, value))
+            {
+                return false;
+            }
+
+            int resultValue = 0;
+            if (!ConvertSignedIntegerToInteger(value, resultValue))
+            {
+                return false;
+            }
+
+            outHolder = new Holder<int>(resultValue);
             return true;
         }
 
         if (stableTypeName == "unsigned int")
         {
-            unsigned long long rawValue = 0;
-            if (!ReadExactInteger(payload, sizeof(unsigned int), rawValue))
+            if (variantType != GB_VariantType::UInt32)
             {
                 return false;
             }
 
-            outHolder = new Holder<unsigned int>(static_cast<unsigned int>(rawValue));
+            unsigned long long value = 0;
+            if (!ReadExactInteger(payload, 4, value))
+            {
+                return false;
+            }
+
+            unsigned int resultValue = 0;
+            if (!ConvertUnsignedIntegerToInteger(value, resultValue))
+            {
+                return false;
+            }
+
+            outHolder = new Holder<unsigned int>(resultValue);
             return true;
         }
 
         if (stableTypeName == "long")
         {
-            unsigned long long rawValue = 0;
-            if (!ReadExactInteger(payload, sizeof(long), rawValue))
+            if (variantType != GB_VariantType::Int32 && variantType != GB_VariantType::Int64)
             {
                 return false;
             }
 
-            outHolder = new Holder<long>(static_cast<long>(rawValue));
+            const std::size_t expectedSize = variantType == GB_VariantType::Int32 ? 4 : 8;
+            long long value = 0;
+            if (!ReadExactSignedInteger(payload, expectedSize, value))
+            {
+                return false;
+            }
+
+            long resultValue = 0;
+            if (!ConvertSignedIntegerToInteger(value, resultValue))
+            {
+                return false;
+            }
+
+            outHolder = new Holder<long>(resultValue);
             return true;
         }
 
         if (stableTypeName == "unsigned long")
         {
-            unsigned long long rawValue = 0;
-            if (!ReadExactInteger(payload, sizeof(unsigned long), rawValue))
+            if (variantType != GB_VariantType::UInt32 && variantType != GB_VariantType::UInt64)
             {
                 return false;
             }
 
-            outHolder = new Holder<unsigned long>(static_cast<unsigned long>(rawValue));
+            const std::size_t expectedSize = variantType == GB_VariantType::UInt32 ? 4 : 8;
+            unsigned long long value = 0;
+            if (!ReadExactInteger(payload, expectedSize, value))
+            {
+                return false;
+            }
+
+            unsigned long resultValue = 0;
+            if (!ConvertUnsignedIntegerToInteger(value, resultValue))
+            {
+                return false;
+            }
+
+            outHolder = new Holder<unsigned long>(resultValue);
             return true;
         }
 
         if (stableTypeName == "long long")
         {
-            unsigned long long rawValue = 0;
-            if (!ReadExactInteger(payload, sizeof(long long), rawValue))
+            if (variantType != GB_VariantType::Int64)
             {
                 return false;
             }
 
-            outHolder = new Holder<long long>(static_cast<long long>(rawValue));
+            long long value = 0;
+            if (!ReadExactSignedInteger(payload, 8, value))
+            {
+                return false;
+            }
+
+            outHolder = new Holder<long long>(value);
             return true;
         }
 
         if (stableTypeName == "unsigned long long")
         {
-            unsigned long long rawValue = 0;
-            if (!ReadExactInteger(payload, sizeof(unsigned long long), rawValue))
+            if (variantType != GB_VariantType::UInt64)
             {
                 return false;
             }
 
-            outHolder = new Holder<unsigned long long>(static_cast<unsigned long long>(rawValue));
+            unsigned long long value = 0;
+            if (!ReadExactInteger(payload, 8, value))
+            {
+                return false;
+            }
+
+            outHolder = new Holder<unsigned long long>(value);
             return true;
         }
 
         if (stableTypeName == "float")
         {
+            if (variantType != GB_VariantType::Float)
+            {
+                return false;
+            }
+
             float value = 0.0f;
             if (!DeserializeFloatingPointValue(payload, value))
             {
@@ -1002,6 +1234,11 @@ bool GB_Variant::DeserializeBuiltinValue(const std::string& stableTypeName,
 
         if (stableTypeName == "double")
         {
+            if (variantType != GB_VariantType::Double)
+            {
+                return false;
+            }
+
             double value = 0.0;
             if (!DeserializeFloatingPointValue(payload, value))
             {
@@ -1014,6 +1251,11 @@ bool GB_Variant::DeserializeBuiltinValue(const std::string& stableTypeName,
 
         if (stableTypeName == "long double")
         {
+            if (variantType != GB_VariantType::Double)
+            {
+                return false;
+            }
+
             long double value = 0.0L;
             if (!DeserializeFloatingPointValue(payload, value))
             {
@@ -1026,12 +1268,22 @@ bool GB_Variant::DeserializeBuiltinValue(const std::string& stableTypeName,
 
         if (stableTypeName == "std::string")
         {
+            if (variantType != GB_VariantType::String)
+            {
+                return false;
+            }
+
             outHolder = new Holder<std::string>(GB_ByteBufferToString(payload));
             return true;
         }
 
         if (stableTypeName == "GB_ByteBuffer")
         {
+            if (variantType != GB_VariantType::Binary)
+            {
+                return false;
+            }
+
             outHolder = new Holder<GB_ByteBuffer>(payload);
             return true;
         }
@@ -1044,6 +1296,32 @@ bool GB_Variant::DeserializeBuiltinValue(const std::string& stableTypeName,
     }
 
     return false;
+}
+
+bool GB_Variant::IsBuiltinStableTypeName(const std::string& typeName)
+{
+    return typeName == "bool"
+        || typeName == "char"
+        || typeName == "signed char"
+        || typeName == "unsigned char"
+        || typeName == "short"
+        || typeName == "unsigned short"
+        || typeName == "int"
+        || typeName == "unsigned int"
+        || typeName == "long"
+        || typeName == "unsigned long"
+        || typeName == "long long"
+        || typeName == "unsigned long long"
+        || typeName == "float"
+        || typeName == "double"
+        || typeName == "long double"
+        || typeName == "std::string"
+        || typeName == "GB_ByteBuffer";
+}
+
+bool GB_Variant::IsReservedTypeName(const std::string& typeName)
+{
+    return typeName == "Empty" || IsBuiltinStableTypeName(typeName);
 }
 
 GB_Variant::GB_Variant()
@@ -1179,8 +1457,8 @@ std::string GB_Variant::TypeName() const
         return stableTypeName;
     }
 
-    const std::map<std::type_index, CustomTypeRegistration>& registryByType = GetCustomTypeRegistryByType();
     std::lock_guard<std::mutex> lock(GetCustomTypeRegistryMutex());
+    const std::map<std::type_index, CustomTypeRegistration>& registryByType = GetCustomTypeRegistryByType();
     const std::map<std::type_index, CustomTypeRegistration>::const_iterator iter = registryByType.find(std::type_index(holder_->GetTypeInfo()));
     if (iter != registryByType.end())
     {
@@ -1212,6 +1490,45 @@ bool GB_Variant::ToBool(bool* ok) const noexcept
         return boolValue;
     }
 
+    const std::string* stringPtr = AnyCast<std::string>();
+    if (stringPtr != nullptr)
+    {
+        try
+        {
+            const std::string normalized = ToLowerAscii(TrimAscii(*stringPtr));
+            if (normalized == "true" || normalized == "1" || normalized == "yes" || normalized == "on")
+            {
+                SetSuccessFlag(ok, true);
+                return true;
+            }
+
+            if (normalized == "false" || normalized == "0" || normalized == "no" || normalized == "off")
+            {
+                SetSuccessFlag(ok, true);
+                return false;
+            }
+        }
+        catch (...)
+        {
+        }
+
+        long long parsedSignedValue = 0;
+        if (TryParseSignedInteger(*stringPtr, parsedSignedValue))
+        {
+            SetSuccessFlag(ok, true);
+            return parsedSignedValue != 0;
+        }
+
+        long double parsedFloatingValue = 0.0L;
+        if (TryParseFloatingPoint(*stringPtr, parsedFloatingValue))
+        {
+            SetSuccessFlag(ok, true);
+            return parsedFloatingValue != 0.0L;
+        }
+
+        return false;
+    }
+
     long long signedValue = 0;
     if (TryGetSignedValue(*this, signedValue))
     {
@@ -1231,23 +1548,6 @@ bool GB_Variant::ToBool(bool* ok) const noexcept
     {
         SetSuccessFlag(ok, true);
         return floatingValue != 0.0L;
-    }
-
-    std::string stringValue;
-    if (TryGetExactValue(*this, stringValue))
-    {
-        const std::string normalized = ToLowerAscii(TrimAscii(stringValue));
-        if (normalized == "true" || normalized == "1" || normalized == "yes" || normalized == "on")
-        {
-            SetSuccessFlag(ok, true);
-            return true;
-        }
-
-        if (normalized == "false" || normalized == "0" || normalized == "no" || normalized == "off")
-        {
-            SetSuccessFlag(ok, true);
-            return false;
-        }
     }
 
     return false;
@@ -1389,123 +1689,129 @@ std::string GB_Variant::ToString(bool* ok) const noexcept
         return std::string();
     }
 
-    std::string stringValue;
-    if (TryGetExactValue(*this, stringValue))
+    try
     {
-        SetSuccessFlag(ok, true);
-        return stringValue;
-    }
+        const std::string* stringPtr = AnyCast<std::string>();
+        if (stringPtr != nullptr)
+        {
+            SetSuccessFlag(ok, true);
+            return *stringPtr;
+        }
 
-    bool boolValue = false;
-    if (TryGetExactValue(*this, boolValue))
-    {
-        SetSuccessFlag(ok, true);
-        return boolValue ? "true" : "false";
-    }
+        bool boolValue = false;
+        if (TryGetExactValue(*this, boolValue))
+        {
+            SetSuccessFlag(ok, true);
+            return boolValue ? "true" : "false";
+        }
 
-    char charValue = 0;
-    if (TryGetExactValue(*this, charValue))
-    {
-        SetSuccessFlag(ok, true);
-        return IntegerToString(static_cast<int>(charValue));
-    }
+        char charValue = 0;
+        if (TryGetExactValue(*this, charValue))
+        {
+            SetSuccessFlag(ok, true);
+            return IntegerToString(static_cast<int>(charValue));
+        }
 
-    signed char signedCharValue = 0;
-    if (TryGetExactValue(*this, signedCharValue))
-    {
-        SetSuccessFlag(ok, true);
-        return IntegerToString(static_cast<int>(signedCharValue));
-    }
+        signed char signedCharValue = 0;
+        if (TryGetExactValue(*this, signedCharValue))
+        {
+            SetSuccessFlag(ok, true);
+            return IntegerToString(static_cast<int>(signedCharValue));
+        }
 
-    unsigned char unsignedCharValue = 0;
-    if (TryGetExactValue(*this, unsignedCharValue))
-    {
-        SetSuccessFlag(ok, true);
-        return IntegerToString(static_cast<unsigned int>(unsignedCharValue));
-    }
+        unsigned char unsignedCharValue = 0;
+        if (TryGetExactValue(*this, unsignedCharValue))
+        {
+            SetSuccessFlag(ok, true);
+            return IntegerToString(static_cast<unsigned int>(unsignedCharValue));
+        }
 
-    short shortValue = 0;
-    if (TryGetExactValue(*this, shortValue))
-    {
-        SetSuccessFlag(ok, true);
-        return IntegerToString(shortValue);
-    }
+        short shortValue = 0;
+        if (TryGetExactValue(*this, shortValue))
+        {
+            SetSuccessFlag(ok, true);
+            return IntegerToString(shortValue);
+        }
 
-    unsigned short unsignedShortValue = 0;
-    if (TryGetExactValue(*this, unsignedShortValue))
-    {
-        SetSuccessFlag(ok, true);
-        return IntegerToString(unsignedShortValue);
-    }
+        unsigned short unsignedShortValue = 0;
+        if (TryGetExactValue(*this, unsignedShortValue))
+        {
+            SetSuccessFlag(ok, true);
+            return IntegerToString(unsignedShortValue);
+        }
 
-    int intValue = 0;
-    if (TryGetExactValue(*this, intValue))
-    {
-        SetSuccessFlag(ok, true);
-        return IntegerToString(intValue);
-    }
+        int intValue = 0;
+        if (TryGetExactValue(*this, intValue))
+        {
+            SetSuccessFlag(ok, true);
+            return IntegerToString(intValue);
+        }
 
-    unsigned int unsignedIntValue = 0;
-    if (TryGetExactValue(*this, unsignedIntValue))
-    {
-        SetSuccessFlag(ok, true);
-        return IntegerToString(unsignedIntValue);
-    }
+        unsigned int unsignedIntValue = 0;
+        if (TryGetExactValue(*this, unsignedIntValue))
+        {
+            SetSuccessFlag(ok, true);
+            return IntegerToString(unsignedIntValue);
+        }
 
-    long longValue = 0;
-    if (TryGetExactValue(*this, longValue))
-    {
-        SetSuccessFlag(ok, true);
-        return IntegerToString(longValue);
-    }
+        long longValue = 0;
+        if (TryGetExactValue(*this, longValue))
+        {
+            SetSuccessFlag(ok, true);
+            return IntegerToString(longValue);
+        }
 
-    unsigned long unsignedLongValue = 0;
-    if (TryGetExactValue(*this, unsignedLongValue))
-    {
-        SetSuccessFlag(ok, true);
-        return IntegerToString(unsignedLongValue);
-    }
+        unsigned long unsignedLongValue = 0;
+        if (TryGetExactValue(*this, unsignedLongValue))
+        {
+            SetSuccessFlag(ok, true);
+            return IntegerToString(unsignedLongValue);
+        }
 
-    long long longLongValue = 0;
-    if (TryGetExactValue(*this, longLongValue))
-    {
-        SetSuccessFlag(ok, true);
-        return IntegerToString(longLongValue);
-    }
+        long long longLongValue = 0;
+        if (TryGetExactValue(*this, longLongValue))
+        {
+            SetSuccessFlag(ok, true);
+            return IntegerToString(longLongValue);
+        }
 
-    unsigned long long unsignedLongLongValue = 0;
-    if (TryGetExactValue(*this, unsignedLongLongValue))
-    {
-        SetSuccessFlag(ok, true);
-        return IntegerToString(unsignedLongLongValue);
-    }
+        unsigned long long unsignedLongLongValue = 0;
+        if (TryGetExactValue(*this, unsignedLongLongValue))
+        {
+            SetSuccessFlag(ok, true);
+            return IntegerToString(unsignedLongLongValue);
+        }
 
-    float floatValue = 0.0f;
-    if (TryGetExactValue(*this, floatValue))
-    {
-        SetSuccessFlag(ok, true);
-        return FloatingPointToString(floatValue);
-    }
+        float floatValue = 0.0f;
+        if (TryGetExactValue(*this, floatValue))
+        {
+            SetSuccessFlag(ok, true);
+            return FloatingPointToString(floatValue);
+        }
 
-    double doubleValue = 0.0;
-    if (TryGetExactValue(*this, doubleValue))
-    {
-        SetSuccessFlag(ok, true);
-        return FloatingPointToString(doubleValue);
-    }
+        double doubleValue = 0.0;
+        if (TryGetExactValue(*this, doubleValue))
+        {
+            SetSuccessFlag(ok, true);
+            return FloatingPointToString(doubleValue);
+        }
 
-    long double longDoubleValue = 0.0L;
-    if (TryGetExactValue(*this, longDoubleValue))
-    {
-        SetSuccessFlag(ok, true);
-        return FloatingPointToString(longDoubleValue);
-    }
+        long double longDoubleValue = 0.0L;
+        if (TryGetExactValue(*this, longDoubleValue))
+        {
+            SetSuccessFlag(ok, true);
+            return FloatingPointToString(longDoubleValue);
+        }
 
-    GB_ByteBuffer binaryValue;
-    if (TryGetExactValue(*this, binaryValue))
+        const GB_ByteBuffer* binaryPtr = AnyCast<GB_ByteBuffer>();
+        if (binaryPtr != nullptr)
+        {
+            SetSuccessFlag(ok, true);
+            return BinaryToHexString(*binaryPtr);
+        }
+    }
+    catch (...)
     {
-        SetSuccessFlag(ok, true);
-        return BinaryToHexString(binaryValue);
     }
 
     return std::string();
@@ -1520,28 +1826,34 @@ GB_ByteBuffer GB_Variant::ToBinary(bool* ok) const noexcept
         return GB_ByteBuffer();
     }
 
-    GB_ByteBuffer binaryValue;
-    if (TryGetExactValue(*this, binaryValue))
+    try
     {
-        SetSuccessFlag(ok, true);
-        return binaryValue;
-    }
-
-    std::string stringValue;
-    if (TryGetExactValue(*this, stringValue))
-    {
-        SetSuccessFlag(ok, true);
-        return GB_StringToByteBuffer(stringValue);
-    }
-
-    if (Type() == GB_VariantType::Custom)
-    {
-        GB_ByteBuffer payload;
-        if (holder_->SerializePayload(payload))
+        const GB_ByteBuffer* binaryPtr = AnyCast<GB_ByteBuffer>();
+        if (binaryPtr != nullptr)
         {
             SetSuccessFlag(ok, true);
-            return payload;
+            return *binaryPtr;
         }
+
+        const std::string* stringPtr = AnyCast<std::string>();
+        if (stringPtr != nullptr)
+        {
+            SetSuccessFlag(ok, true);
+            return GB_StringToByteBuffer(*stringPtr);
+        }
+
+        if (Type() == GB_VariantType::Custom)
+        {
+            GB_ByteBuffer payload;
+            if (holder_->SerializePayload(payload))
+            {
+                SetSuccessFlag(ok, true);
+                return payload;
+            }
+        }
+    }
+    catch (...)
+    {
     }
 
     return GB_ByteBuffer();
@@ -1553,7 +1865,7 @@ bool GB_Variant::Serialize(GB_ByteBuffer& outData) const noexcept
 
     try
     {
-        outData.reserve(32);
+        outData.reserve(64);
         outData.push_back(kMagic0);
         outData.push_back(kMagic1);
         outData.push_back(kMagic2);
@@ -1569,23 +1881,35 @@ bool GB_Variant::Serialize(GB_ByteBuffer& outData) const noexcept
             stableTypeName = holder_->GetStableTypeName();
             if (stableTypeName.empty())
             {
-                std::lock_guard<std::mutex> lock(GetCustomTypeRegistryMutex());
-                const std::map<std::type_index, CustomTypeRegistration>& registryByType = GetCustomTypeRegistryByType();
-                const std::map<std::type_index, CustomTypeRegistration>::const_iterator iter =
-                    registryByType.find(std::type_index(holder_->GetTypeInfo()));
-                if (iter == registryByType.end())
+                std::function<bool(const void* object, GB_ByteBuffer& outData)> serializeFuncCopy;
+                {
+                    std::lock_guard<std::mutex> lock(GetCustomTypeRegistryMutex());
+                    const std::map<std::type_index, CustomTypeRegistration>& registryByType = GetCustomTypeRegistryByType();
+                    const std::map<std::type_index, CustomTypeRegistration>::const_iterator iter =
+                        registryByType.find(std::type_index(holder_->GetTypeInfo()));
+                    if (iter == registryByType.end())
+                    {
+                        outData.clear();
+                        return false;
+                    }
+
+                    stableTypeName = iter->second.typeName;
+                    serializeFuncCopy = iter->second.serializeFunc;
+                }
+
+                if (!serializeFuncCopy(holder_->GetConstPtr(), payload))
                 {
                     outData.clear();
                     return false;
                 }
-
-                stableTypeName = iter->second.typeName;
             }
-
-            if (!holder_->SerializePayload(payload))
+            else
             {
-                outData.clear();
-                return false;
+                if (!holder_->SerializePayload(payload))
+                {
+                    outData.clear();
+                    return false;
+                }
             }
         }
 
@@ -1707,35 +2031,42 @@ bool GB_Variant::Deserialize(const GB_ByteBuffer& data, GB_Variant& outValue) no
     }
 
     HolderBase* newHolder = nullptr;
-    if (!DeserializeBuiltinValue(stableTypeName, payload, newHolder))
+    if (IsBuiltinStableTypeName(stableTypeName))
     {
-        std::lock_guard<std::mutex> lock(GetCustomTypeRegistryMutex());
-        const std::map<std::string, const CustomTypeRegistration*>& registryByName = GetCustomTypeRegistryByName();
-        const std::map<std::string, const CustomTypeRegistration*>::const_iterator iter = registryByName.find(stableTypeName);
-        if (iter == registryByName.end())
+        if (!DeserializeBuiltinValue(stableTypeName, variantType, payload, newHolder))
         {
             return false;
+        }
+    }
+    else
+    {
+        std::function<HolderBase* (const GB_ByteBuffer& data)> deserializeFuncCopy;
+        {
+            std::lock_guard<std::mutex> lock(GetCustomTypeRegistryMutex());
+            const std::map<std::string, const CustomTypeRegistration*>& registryByName = GetCustomTypeRegistryByName();
+            const std::map<std::string, const CustomTypeRegistration*>::const_iterator iter = registryByName.find(stableTypeName);
+            if (iter == registryByName.end())
+            {
+                return false;
+            }
+
+            deserializeFuncCopy = iter->second->deserializeFunc;
         }
 
         try
         {
-            newHolder = iter->second->deserializeFunc(payload);
+            newHolder = deserializeFuncCopy(payload);
         }
         catch (...)
         {
             newHolder = nullptr;
         }
 
-        if (newHolder == nullptr)
+        if (newHolder == nullptr || newHolder->GetVariantType() != variantType)
         {
+            delete newHolder;
             return false;
         }
-    }
-
-    if (newHolder->GetVariantType() != variantType)
-    {
-        delete newHolder;
-        return false;
     }
 
     outValue.Reset();
@@ -1748,7 +2079,7 @@ bool GB_Variant::RegisterCustomType(const std::type_index& typeIndex,
     std::function<bool(const void* object, GB_ByteBuffer& outData)> serializeFunc,
     std::function<HolderBase* (const GB_ByteBuffer& data)> deserializeFunc)
 {
-    if (typeName.empty() || !serializeFunc || !deserializeFunc)
+    if (typeName.empty() || IsReservedTypeName(typeName) || !serializeFunc || !deserializeFunc)
     {
         return false;
     }

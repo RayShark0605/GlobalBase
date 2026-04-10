@@ -115,7 +115,7 @@ public:
     }
 
     template<typename TValue>
-    bool AnyCast(TValue& outValue) const noexcept
+    bool AnyCast(TValue& outValue) const
     {
         const TValue* value = AnyCast<TValue>();
         if (value == nullptr)
@@ -148,7 +148,7 @@ public:
         GB_ByteBuffer(*serializeFunc)(const TValue& value),
         bool (*deserializeFunc)(const GB_ByteBuffer& data, TValue& outValue))
     {
-        if (typeName.empty() || serializeFunc == nullptr || deserializeFunc == nullptr)
+        if (typeName.empty() || IsReservedTypeName(typeName) || serializeFunc == nullptr || deserializeFunc == nullptr)
         {
             return false;
         }
@@ -300,11 +300,6 @@ private:
 
         if (std::is_integral<ValueType>::value)
         {
-            if (std::is_same<ValueType, bool>::value)
-            {
-                return GB_VariantType::Bool;
-            }
-
             if (std::is_signed<ValueType>::value)
             {
                 return sizeof(ValueType) <= 4 ? GB_VariantType::Int32 : GB_VariantType::Int64;
@@ -434,8 +429,12 @@ private:
     static bool SerializeBuiltinValue(const std::string& value, GB_ByteBuffer& outData) noexcept;
     static bool SerializeBuiltinValue(const GB_ByteBuffer& value, GB_ByteBuffer& outData) noexcept;
     static bool DeserializeBuiltinValue(const std::string& stableTypeName,
+        GB_VariantType variantType,
         const GB_ByteBuffer& payload,
         HolderBase*& outHolder) noexcept;
+
+    static bool IsBuiltinStableTypeName(const std::string& typeName);
+    static bool IsReservedTypeName(const std::string& typeName);
 
     template<typename TValue>
     struct SerializeValueHelper<TValue, true, false, false, false>
@@ -478,17 +477,22 @@ private:
     {
         static bool Do(const TValue& value, GB_ByteBuffer& outData) noexcept
         {
-            std::lock_guard<std::mutex> lock(GetCustomTypeRegistryMutex());
-            const std::map<std::type_index, CustomTypeRegistration>& registryByType = GetCustomTypeRegistryByType();
-            const typename std::map<std::type_index, CustomTypeRegistration>::const_iterator iter =
-                registryByType.find(std::type_index(typeid(TValue)));
-            if (iter == registryByType.end())
+            std::function<bool(const void* object, GB_ByteBuffer& outData)> serializeFuncCopy;
             {
-                outData.clear();
-                return false;
+                std::lock_guard<std::mutex> lock(GetCustomTypeRegistryMutex());
+                const std::map<std::type_index, CustomTypeRegistration>& registryByType = GetCustomTypeRegistryByType();
+                const typename std::map<std::type_index, CustomTypeRegistration>::const_iterator iter =
+                    registryByType.find(std::type_index(typeid(TValue)));
+                if (iter == registryByType.end())
+                {
+                    outData.clear();
+                    return false;
+                }
+
+                serializeFuncCopy = iter->second.serializeFunc;
             }
 
-            return iter->second.serializeFunc(&value, outData);
+            return serializeFuncCopy(&value, outData);
         }
     };
 
