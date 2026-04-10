@@ -78,7 +78,7 @@ namespace
 
         if (sizeof(std::size_t) >= sizeof(std::uint64_t))
         {
-            std::uint64_t hashValue = 1469598103934665603ull;
+            std::uint64_t hashValue = 14695981039346656037ull;
             for (std::size_t index = 0; index < size; index++)
             {
                 hashValue ^= static_cast<std::uint64_t>(data[index]);
@@ -2146,7 +2146,8 @@ float GB_Variant::ToFloat(bool* ok) const noexcept
         return 0.0f;
     }
 
-    if (value < -static_cast<long double>(std::numeric_limits<float>::max())
+    if (!std::isfinite(value)
+        || value < -static_cast<long double>(std::numeric_limits<float>::max())
         || value > static_cast<long double>(std::numeric_limits<float>::max()))
     {
         return 0.0f;
@@ -2166,7 +2167,8 @@ double GB_Variant::ToDouble(bool* ok) const noexcept
         return 0.0;
     }
 
-    if (value < -static_cast<long double>(std::numeric_limits<double>::max())
+    if (!std::isfinite(value)
+        || value < -static_cast<long double>(std::numeric_limits<double>::max())
         || value > static_cast<long double>(std::numeric_limits<double>::max()))
     {
         return 0.0;
