@@ -3,6 +3,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <functional>
 #include <map>
 #include <mutex>
@@ -67,6 +68,15 @@ public:
 
     GB_Variant& operator=(const GB_Variant& other);
     GB_Variant& operator=(GB_Variant&& other) noexcept;
+
+    bool operator==(const GB_Variant& other) const noexcept;
+    bool operator!=(const GB_Variant& other) const noexcept;
+    bool operator<(const GB_Variant& other) const noexcept;
+    bool operator>(const GB_Variant& other) const noexcept;
+    bool operator<=(const GB_Variant& other) const noexcept;
+    bool operator>=(const GB_Variant& other) const noexcept;
+
+    std::size_t Hash() const noexcept;
 
     template<typename TValue,
         typename TDecayed = typename std::decay<TValue>::type,
@@ -425,11 +435,48 @@ private:
 
     template<typename TValue>
     static typename std::enable_if<std::is_integral<typename std::decay<TValue>::type>::value, bool>::type
-        SerializeBuiltinValue(const TValue& value, GB_ByteBuffer& outData) noexcept;
+        SerializeBuiltinValue(const TValue& value, GB_ByteBuffer& outData) noexcept
+    {
+        typedef typename std::decay<TValue>::type ValueType;
+
+        try
+        {
+            outData.clear();
+            outData.reserve(sizeof(ValueType));
+            const unsigned long long shiftedValue = static_cast<unsigned long long>(value);
+            for (std::size_t index = 0; index < sizeof(ValueType); index++)
+            {
+                outData.push_back(static_cast<unsigned char>((shiftedValue >> (index * 8)) & 0xFF));
+            }
+        }
+        catch (...)
+        {
+            outData.clear();
+            return false;
+        }
+
+        return true;
+    }
 
     template<typename TValue>
     static typename std::enable_if<std::is_floating_point<typename std::decay<TValue>::type>::value, bool>::type
-        SerializeBuiltinValue(const TValue& value, GB_ByteBuffer& outData) noexcept;
+        SerializeBuiltinValue(const TValue& value, GB_ByteBuffer& outData) noexcept
+    {
+        typedef typename std::decay<TValue>::type ValueType;
+
+        try
+        {
+            outData.resize(sizeof(ValueType));
+            std::memcpy(outData.data(), &value, sizeof(ValueType));
+        }
+        catch (...)
+        {
+            outData.clear();
+            return false;
+        }
+
+        return true;
+    }
 
     static bool SerializeBuiltinValue(const std::string& value, GB_ByteBuffer& outData) noexcept;
     static bool SerializeBuiltinValue(const GB_ByteBuffer& value, GB_ByteBuffer& outData) noexcept;
@@ -504,6 +551,7 @@ private:
     bool TryGetSignedValue(long long& outValue) const noexcept;
     bool TryGetUnsignedValue(unsigned long long& outValue) const noexcept;
     bool TryGetFloatingValue(long double& outValue) const noexcept;
+    int CompareForOrdering(const GB_Variant& other) const noexcept;
 
     static bool RegisterCustomType(const std::type_index& typeIndex,
         const std::string& typeName,
@@ -519,6 +567,18 @@ private:
 
     HolderBase* holder_;
 };
+
+namespace std
+{
+    template<>
+    struct hash<GB_Variant>
+    {
+        std::size_t operator()(const GB_Variant& value) const noexcept
+        {
+            return value.Hash();
+        }
+    };
+}
 
 #ifdef _MSC_VER
 #  pragma warning(pop)

@@ -1,5 +1,6 @@
 ﻿#include "GB_Variant.h"
 
+#include <algorithm>
 #include <cerrno>
 #include <cmath>
 #include <cstdio>
@@ -34,6 +35,352 @@ namespace
         }
 
         return static_cast<const ValueType*>(storedValuePtr);
+    }
+
+    int CompareByteSequence(const unsigned char* const leftData,
+        const std::size_t leftSize,
+        const unsigned char* const rightData,
+        const std::size_t rightSize) noexcept
+    {
+        const std::size_t sharedSize = leftSize < rightSize ? leftSize : rightSize;
+        for (std::size_t index = 0; index < sharedSize; index++)
+        {
+            if (leftData[index] < rightData[index])
+            {
+                return -1;
+            }
+
+            if (leftData[index] > rightData[index])
+            {
+                return 1;
+            }
+        }
+
+        if (leftSize < rightSize)
+        {
+            return -1;
+        }
+
+        if (leftSize > rightSize)
+        {
+            return 1;
+        }
+
+        return 0;
+    }
+
+    std::size_t HashBytes(const unsigned char* const data, const std::size_t size) noexcept
+    {
+        if (data == nullptr || size == 0)
+        {
+            return static_cast<std::size_t>(0);
+        }
+
+        if (sizeof(std::size_t) >= sizeof(std::uint64_t))
+        {
+            std::uint64_t hashValue = 1469598103934665603ull;
+            for (std::size_t index = 0; index < size; index++)
+            {
+                hashValue ^= static_cast<std::uint64_t>(data[index]);
+                hashValue *= 1099511628211ull;
+            }
+
+            return static_cast<std::size_t>(hashValue);
+        }
+
+        std::uint32_t hashValue = 2166136261u;
+        for (std::size_t index = 0; index < size; index++)
+        {
+            hashValue ^= static_cast<std::uint32_t>(data[index]);
+            hashValue *= 16777619u;
+        }
+
+        return static_cast<std::size_t>(hashValue);
+    }
+
+    void HashCombine(std::size_t& seed, const std::size_t value) noexcept
+    {
+        seed ^= value + static_cast<std::size_t>(0x9e3779b97f4a7c15ull) + (seed << 6) + (seed >> 2);
+    }
+
+    template<typename TValue>
+    int CompareOrderedValues(const TValue& leftValue, const TValue& rightValue) noexcept
+    {
+        if (leftValue < rightValue)
+        {
+            return -1;
+        }
+
+        if (rightValue < leftValue)
+        {
+            return 1;
+        }
+
+        return 0;
+    }
+
+    template<typename TValue>
+    int CompareBitwiseValues(const TValue& leftValue, const TValue& rightValue) noexcept
+    {
+        return CompareByteSequence(reinterpret_cast<const unsigned char*>(&leftValue),
+            sizeof(TValue),
+            reinterpret_cast<const unsigned char*>(&rightValue),
+            sizeof(TValue));
+    }
+
+    template<typename TValue>
+    std::size_t HashValueBytes(const TValue& value) noexcept
+    {
+        return HashBytes(reinterpret_cast<const unsigned char*>(&value), sizeof(TValue));
+    }
+
+    std::size_t HashStringBytes(const std::string& value) noexcept
+    {
+        if (value.empty())
+        {
+            return static_cast<std::size_t>(0);
+        }
+
+        return HashBytes(reinterpret_cast<const unsigned char*>(value.data()), value.size());
+    }
+
+    std::size_t HashByteBufferBytes(const GB_ByteBuffer& value) noexcept
+    {
+        if (value.empty())
+        {
+            return static_cast<std::size_t>(0);
+        }
+
+        return HashBytes(value.data(), value.size());
+    }
+
+    bool TryCompareExactStoredValue(const std::type_info& storedTypeInfo,
+        const void* const leftValuePtr,
+        const void* const rightValuePtr,
+        int& outCompare) noexcept
+    {
+        if (leftValuePtr == nullptr || rightValuePtr == nullptr)
+        {
+            return false;
+        }
+
+        if (const bool* const leftValue = TryGetStoredValue<bool>(storedTypeInfo, leftValuePtr))
+        {
+            outCompare = CompareOrderedValues(*leftValue, *static_cast<const bool*>(rightValuePtr));
+            return true;
+        }
+
+        if (const char* const leftValue = TryGetStoredValue<char>(storedTypeInfo, leftValuePtr))
+        {
+            outCompare = CompareOrderedValues(*leftValue, *static_cast<const char*>(rightValuePtr));
+            return true;
+        }
+
+        if (const signed char* const leftValue = TryGetStoredValue<signed char>(storedTypeInfo, leftValuePtr))
+        {
+            outCompare = CompareOrderedValues(*leftValue, *static_cast<const signed char*>(rightValuePtr));
+            return true;
+        }
+
+        if (const unsigned char* const leftValue = TryGetStoredValue<unsigned char>(storedTypeInfo, leftValuePtr))
+        {
+            outCompare = CompareOrderedValues(*leftValue, *static_cast<const unsigned char*>(rightValuePtr));
+            return true;
+        }
+
+        if (const short* const leftValue = TryGetStoredValue<short>(storedTypeInfo, leftValuePtr))
+        {
+            outCompare = CompareOrderedValues(*leftValue, *static_cast<const short*>(rightValuePtr));
+            return true;
+        }
+
+        if (const unsigned short* const leftValue = TryGetStoredValue<unsigned short>(storedTypeInfo, leftValuePtr))
+        {
+            outCompare = CompareOrderedValues(*leftValue, *static_cast<const unsigned short*>(rightValuePtr));
+            return true;
+        }
+
+        if (const int* const leftValue = TryGetStoredValue<int>(storedTypeInfo, leftValuePtr))
+        {
+            outCompare = CompareOrderedValues(*leftValue, *static_cast<const int*>(rightValuePtr));
+            return true;
+        }
+
+        if (const unsigned int* const leftValue = TryGetStoredValue<unsigned int>(storedTypeInfo, leftValuePtr))
+        {
+            outCompare = CompareOrderedValues(*leftValue, *static_cast<const unsigned int*>(rightValuePtr));
+            return true;
+        }
+
+        if (const long* const leftValue = TryGetStoredValue<long>(storedTypeInfo, leftValuePtr))
+        {
+            outCompare = CompareOrderedValues(*leftValue, *static_cast<const long*>(rightValuePtr));
+            return true;
+        }
+
+        if (const unsigned long* const leftValue = TryGetStoredValue<unsigned long>(storedTypeInfo, leftValuePtr))
+        {
+            outCompare = CompareOrderedValues(*leftValue, *static_cast<const unsigned long*>(rightValuePtr));
+            return true;
+        }
+
+        if (const long long* const leftValue = TryGetStoredValue<long long>(storedTypeInfo, leftValuePtr))
+        {
+            outCompare = CompareOrderedValues(*leftValue, *static_cast<const long long*>(rightValuePtr));
+            return true;
+        }
+
+        if (const unsigned long long* const leftValue = TryGetStoredValue<unsigned long long>(storedTypeInfo, leftValuePtr))
+        {
+            outCompare = CompareOrderedValues(*leftValue, *static_cast<const unsigned long long*>(rightValuePtr));
+            return true;
+        }
+
+        if (const float* const leftValue = TryGetStoredValue<float>(storedTypeInfo, leftValuePtr))
+        {
+            outCompare = CompareBitwiseValues(*leftValue, *static_cast<const float*>(rightValuePtr));
+            return true;
+        }
+
+        if (const double* const leftValue = TryGetStoredValue<double>(storedTypeInfo, leftValuePtr))
+        {
+            outCompare = CompareBitwiseValues(*leftValue, *static_cast<const double*>(rightValuePtr));
+            return true;
+        }
+
+        if (const long double* const leftValue = TryGetStoredValue<long double>(storedTypeInfo, leftValuePtr))
+        {
+            outCompare = CompareBitwiseValues(*leftValue, *static_cast<const long double*>(rightValuePtr));
+            return true;
+        }
+
+        if (const std::string* const leftValue = TryGetStoredValue<std::string>(storedTypeInfo, leftValuePtr))
+        {
+            outCompare = CompareOrderedValues(*leftValue, *static_cast<const std::string*>(rightValuePtr));
+            return true;
+        }
+
+        if (const GB_ByteBuffer* const leftValue = TryGetStoredValue<GB_ByteBuffer>(storedTypeInfo, leftValuePtr))
+        {
+            outCompare = CompareOrderedValues(*leftValue, *static_cast<const GB_ByteBuffer*>(rightValuePtr));
+            return true;
+        }
+
+        return false;
+    }
+
+    bool TryHashExactStoredValue(const std::type_info& storedTypeInfo,
+        const void* const valuePtr,
+        std::size_t& outHash) noexcept
+    {
+        if (valuePtr == nullptr)
+        {
+            return false;
+        }
+
+        if (const bool* const value = TryGetStoredValue<bool>(storedTypeInfo, valuePtr))
+        {
+            outHash = HashValueBytes(*value);
+            return true;
+        }
+
+        if (const char* const value = TryGetStoredValue<char>(storedTypeInfo, valuePtr))
+        {
+            outHash = HashValueBytes(*value);
+            return true;
+        }
+
+        if (const signed char* const value = TryGetStoredValue<signed char>(storedTypeInfo, valuePtr))
+        {
+            outHash = HashValueBytes(*value);
+            return true;
+        }
+
+        if (const unsigned char* const value = TryGetStoredValue<unsigned char>(storedTypeInfo, valuePtr))
+        {
+            outHash = HashValueBytes(*value);
+            return true;
+        }
+
+        if (const short* const value = TryGetStoredValue<short>(storedTypeInfo, valuePtr))
+        {
+            outHash = HashValueBytes(*value);
+            return true;
+        }
+
+        if (const unsigned short* const value = TryGetStoredValue<unsigned short>(storedTypeInfo, valuePtr))
+        {
+            outHash = HashValueBytes(*value);
+            return true;
+        }
+
+        if (const int* const value = TryGetStoredValue<int>(storedTypeInfo, valuePtr))
+        {
+            outHash = HashValueBytes(*value);
+            return true;
+        }
+
+        if (const unsigned int* const value = TryGetStoredValue<unsigned int>(storedTypeInfo, valuePtr))
+        {
+            outHash = HashValueBytes(*value);
+            return true;
+        }
+
+        if (const long* const value = TryGetStoredValue<long>(storedTypeInfo, valuePtr))
+        {
+            outHash = HashValueBytes(*value);
+            return true;
+        }
+
+        if (const unsigned long* const value = TryGetStoredValue<unsigned long>(storedTypeInfo, valuePtr))
+        {
+            outHash = HashValueBytes(*value);
+            return true;
+        }
+
+        if (const long long* const value = TryGetStoredValue<long long>(storedTypeInfo, valuePtr))
+        {
+            outHash = HashValueBytes(*value);
+            return true;
+        }
+
+        if (const unsigned long long* const value = TryGetStoredValue<unsigned long long>(storedTypeInfo, valuePtr))
+        {
+            outHash = HashValueBytes(*value);
+            return true;
+        }
+
+        if (const float* const value = TryGetStoredValue<float>(storedTypeInfo, valuePtr))
+        {
+            outHash = HashValueBytes(*value);
+            return true;
+        }
+
+        if (const double* const value = TryGetStoredValue<double>(storedTypeInfo, valuePtr))
+        {
+            outHash = HashValueBytes(*value);
+            return true;
+        }
+
+        if (const long double* const value = TryGetStoredValue<long double>(storedTypeInfo, valuePtr))
+        {
+            outHash = HashValueBytes(*value);
+            return true;
+        }
+
+        if (const std::string* const value = TryGetStoredValue<std::string>(storedTypeInfo, valuePtr))
+        {
+            outHash = HashStringBytes(*value);
+            return true;
+        }
+
+        if (const GB_ByteBuffer* const value = TryGetStoredValue<GB_ByteBuffer>(storedTypeInfo, valuePtr))
+        {
+            outHash = HashByteBufferBytes(*value);
+            return true;
+        }
+
+        return false;
     }
 
     bool IsValidVariantType(const GB_VariantType type) noexcept
@@ -554,50 +901,6 @@ namespace
     }
 }
 
-template<typename TValue>
-typename std::enable_if<std::is_integral<typename std::decay<TValue>::type>::value, bool>::type
-GB_Variant::SerializeBuiltinValue(const TValue& value, GB_ByteBuffer& outData) noexcept
-{
-    typedef typename std::decay<TValue>::type ValueType;
-
-    try
-    {
-        outData.clear();
-        outData.reserve(sizeof(ValueType));
-        const unsigned long long shiftedValue = static_cast<unsigned long long>(value);
-        for (std::size_t index = 0; index < sizeof(ValueType); index++)
-        {
-            outData.push_back(static_cast<unsigned char>((shiftedValue >> (index * 8)) & 0xFF));
-        }
-    }
-    catch (...)
-    {
-        outData.clear();
-        return false;
-    }
-
-    return true;
-}
-
-template<typename TValue>
-typename std::enable_if<std::is_floating_point<typename std::decay<TValue>::type>::value, bool>::type
-GB_Variant::SerializeBuiltinValue(const TValue& value, GB_ByteBuffer& outData) noexcept
-{
-    typedef typename std::decay<TValue>::type ValueType;
-
-    try
-    {
-        outData.resize(sizeof(ValueType));
-        std::memcpy(outData.data(), &value, sizeof(ValueType));
-    }
-    catch (...)
-    {
-        outData.clear();
-        return false;
-    }
-
-    return true;
-}
 
 bool GB_Variant::SerializeBuiltinValue(const std::string& value, GB_ByteBuffer& outData) noexcept
 {
@@ -1112,6 +1415,129 @@ GB_Variant& GB_Variant::operator=(GB_Variant&& other) noexcept
     holder_ = other.holder_;
     other.holder_ = nullptr;
     return *this;
+}
+
+int GB_Variant::CompareForOrdering(const GB_Variant& other) const noexcept
+{
+    if (holder_ == other.holder_)
+    {
+        return 0;
+    }
+
+    const GB_VariantType leftType = Type();
+    const GB_VariantType rightType = other.Type();
+    if (leftType != rightType)
+    {
+        return static_cast<int>(leftType) < static_cast<int>(rightType) ? -1 : 1;
+    }
+
+    if (holder_ == nullptr)
+    {
+        return 0;
+    }
+
+    const std::type_index leftTypeIndex(holder_->GetTypeInfo());
+    const std::type_index rightTypeIndex(other.holder_->GetTypeInfo());
+    if (leftTypeIndex != rightTypeIndex)
+    {
+        return leftTypeIndex < rightTypeIndex ? -1 : 1;
+    }
+
+    int compareResult = 0;
+    if (TryCompareExactStoredValue(holder_->GetTypeInfo(), holder_->GetConstPtr(), other.holder_->GetConstPtr(), compareResult))
+    {
+        return compareResult;
+    }
+
+    GB_ByteBuffer leftPayload;
+    GB_ByteBuffer rightPayload;
+    const bool leftSerialized = holder_->SerializePayload(leftPayload);
+    const bool rightSerialized = other.holder_->SerializePayload(rightPayload);
+    if (leftSerialized != rightSerialized)
+    {
+        return leftSerialized ? 1 : -1;
+    }
+
+    if (leftSerialized)
+    {
+        return CompareByteSequence(leftPayload.empty() ? nullptr : leftPayload.data(),
+            leftPayload.size(),
+            rightPayload.empty() ? nullptr : rightPayload.data(),
+            rightPayload.size());
+    }
+
+    const std::uintptr_t leftAddress = reinterpret_cast<std::uintptr_t>(holder_->GetConstPtr());
+    const std::uintptr_t rightAddress = reinterpret_cast<std::uintptr_t>(other.holder_->GetConstPtr());
+    if (leftAddress < rightAddress)
+    {
+        return -1;
+    }
+
+    if (leftAddress > rightAddress)
+    {
+        return 1;
+    }
+
+    return 0;
+}
+
+bool GB_Variant::operator==(const GB_Variant& other) const noexcept
+{
+    return CompareForOrdering(other) == 0;
+}
+
+bool GB_Variant::operator!=(const GB_Variant& other) const noexcept
+{
+    return CompareForOrdering(other) != 0;
+}
+
+bool GB_Variant::operator<(const GB_Variant& other) const noexcept
+{
+    return CompareForOrdering(other) < 0;
+}
+
+bool GB_Variant::operator>(const GB_Variant& other) const noexcept
+{
+    return CompareForOrdering(other) > 0;
+}
+
+bool GB_Variant::operator<=(const GB_Variant& other) const noexcept
+{
+    return CompareForOrdering(other) <= 0;
+}
+
+bool GB_Variant::operator>=(const GB_Variant& other) const noexcept
+{
+    return CompareForOrdering(other) >= 0;
+}
+
+std::size_t GB_Variant::Hash() const noexcept
+{
+    const GB_VariantType variantType = Type();
+    std::size_t hashValue = HashValueBytes(variantType);
+    if (holder_ == nullptr)
+    {
+        return hashValue;
+    }
+
+    HashCombine(hashValue, std::hash<std::type_index>()(std::type_index(holder_->GetTypeInfo())));
+
+    std::size_t payloadHash = 0;
+    if (TryHashExactStoredValue(holder_->GetTypeInfo(), holder_->GetConstPtr(), payloadHash))
+    {
+        HashCombine(hashValue, payloadHash);
+        return hashValue;
+    }
+
+    GB_ByteBuffer payload;
+    if (holder_->SerializePayload(payload))
+    {
+        HashCombine(hashValue, HashByteBufferBytes(payload));
+        return hashValue;
+    }
+
+    HashCombine(hashValue, static_cast<std::size_t>(reinterpret_cast<std::uintptr_t>(holder_->GetConstPtr())));
+    return hashValue;
 }
 
 bool GB_Variant::IsEmpty() const noexcept
@@ -2232,18 +2658,3 @@ GB_Variant::HolderBase* GB_Variant::GetHolder() noexcept
     return holder_;
 }
 
-template bool GB_Variant::SerializeBuiltinValue<bool>(const bool& value, GB_ByteBuffer& outData) noexcept;
-template bool GB_Variant::SerializeBuiltinValue<char>(const char& value, GB_ByteBuffer& outData) noexcept;
-template bool GB_Variant::SerializeBuiltinValue<signed char>(const signed char& value, GB_ByteBuffer& outData) noexcept;
-template bool GB_Variant::SerializeBuiltinValue<unsigned char>(const unsigned char& value, GB_ByteBuffer& outData) noexcept;
-template bool GB_Variant::SerializeBuiltinValue<short>(const short& value, GB_ByteBuffer& outData) noexcept;
-template bool GB_Variant::SerializeBuiltinValue<unsigned short>(const unsigned short& value, GB_ByteBuffer& outData) noexcept;
-template bool GB_Variant::SerializeBuiltinValue<int>(const int& value, GB_ByteBuffer& outData) noexcept;
-template bool GB_Variant::SerializeBuiltinValue<unsigned int>(const unsigned int& value, GB_ByteBuffer& outData) noexcept;
-template bool GB_Variant::SerializeBuiltinValue<long>(const long& value, GB_ByteBuffer& outData) noexcept;
-template bool GB_Variant::SerializeBuiltinValue<unsigned long>(const unsigned long& value, GB_ByteBuffer& outData) noexcept;
-template bool GB_Variant::SerializeBuiltinValue<long long>(const long long& value, GB_ByteBuffer& outData) noexcept;
-template bool GB_Variant::SerializeBuiltinValue<unsigned long long>(const unsigned long long& value, GB_ByteBuffer& outData) noexcept;
-template bool GB_Variant::SerializeBuiltinValue<float>(const float& value, GB_ByteBuffer& outData) noexcept;
-template bool GB_Variant::SerializeBuiltinValue<double>(const double& value, GB_ByteBuffer& outData) noexcept;
-template bool GB_Variant::SerializeBuiltinValue<long double>(const long double& value, GB_ByteBuffer& outData) noexcept;
