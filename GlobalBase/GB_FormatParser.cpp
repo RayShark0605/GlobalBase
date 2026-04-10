@@ -1,8 +1,8 @@
 ﻿#include "GB_FormatParser.h"
 
+#include "cpl_error.h"
 #include "cpl_json.h"
 
-#include <algorithm>
 #include <climits>
 #include <cstddef>
 #include <memory>
@@ -16,6 +16,8 @@
 
 namespace
 {
+    constexpr int kMaxJsonNestingDepth = 256;
+
     using XmlOptions = GB_XmlParser::Options;
     using XmlDiagnostic = GB_XmlParser::Diagnostic;
 
@@ -135,12 +137,103 @@ namespace
         return namespacePrefixText + ":" + localNameText;
     }
 
-    bool ConvertJsonNodeToVariant(const CPLJSONObject& jsonObject, GB_Variant& outValue);
 
-    bool ConvertJsonObjectToVariantMap(const CPLJSONObject& jsonObject, GB_VariantMap& outMap)
+    std::string GetJsonTypeName(const CPLJSONObject::Type type)
     {
-        if (!jsonObject.IsValid() || jsonObject.GetType() != CPLJSONObject::Type::Object)
+        switch (type)
         {
+        case CPLJSONObject::Type::Unknown:
+            return "Unknown";
+
+        case CPLJSONObject::Type::Null:
+            return "Null";
+
+        case CPLJSONObject::Type::Object:
+            return "Object";
+
+        case CPLJSONObject::Type::Array:
+            return "Array";
+
+        case CPLJSONObject::Type::Boolean:
+            return "Boolean";
+
+        case CPLJSONObject::Type::String:
+            return "String";
+
+        case CPLJSONObject::Type::Integer:
+            return "Integer";
+
+        case CPLJSONObject::Type::Long:
+            return "Long";
+
+        case CPLJSONObject::Type::Double:
+            return "Double";
+
+        default:
+            return "Unsupported";
+        }
+    }
+
+    std::string EscapeJsonPathText(const std::string& text)
+    {
+        std::string escapedText;
+        escapedText.reserve(text.size());
+
+        for (std::size_t index = 0; index < text.size(); index++)
+        {
+            const char currentChar = text[index];
+            if (currentChar == '\\' || currentChar == '"')
+            {
+                escapedText.push_back('\\');
+            }
+
+            escapedText.push_back(currentChar);
+        }
+
+        return escapedText;
+    }
+
+    std::string BuildJsonObjectChildPath(const std::string& parentPath, const std::string& childName)
+    {
+        return parentPath + "[\"" + EscapeJsonPathText(childName) + "\"]";
+    }
+
+    std::string BuildJsonArrayItemPath(const std::string& parentPath, const int index)
+    {
+        return parentPath + "[" + std::to_string(index) + "]";
+    }
+
+    bool ConvertJsonNodeToVariant(
+        const CPLJSONObject& jsonObject,
+        GB_Variant& outValue,
+        std::string* errorMessage,
+        const std::string& jsonPath,
+        const int currentDepth);
+
+    bool ConvertJsonObjectToVariantMap(
+        const CPLJSONObject& jsonObject,
+        GB_VariantMap& outMap,
+        std::string* errorMessage,
+        const std::string& jsonPath,
+        const int currentDepth)
+    {
+        if (!jsonObject.IsValid())
+        {
+            AssignOptionalErrorMessage(errorMessage, "Invalid JSON object at " + jsonPath + ".");
+            return false;
+        }
+
+        if (jsonObject.GetType() != CPLJSONObject::Type::Object)
+        {
+            AssignOptionalErrorMessage(errorMessage,
+                "JSON node at " + jsonPath + " is not an object. Actual type: " + GetJsonTypeName(jsonObject.GetType()) + ".");
+            return false;
+        }
+
+        if (currentDepth > kMaxJsonNestingDepth)
+        {
+            AssignOptionalErrorMessage(errorMessage,
+                "JSON nesting depth exceeds the supported limit (" + std::to_string(kMaxJsonNestingDepth) + ") at " + jsonPath + ".");
             return false;
         }
 
@@ -151,30 +244,59 @@ namespace
             for (std::size_t index = 0; index < children.size(); index++)
             {
                 const CPLJSONObject& child = children[index];
+                const std::string childName = child.GetName();
+                const std::string childPath = BuildJsonObjectChildPath(jsonPath, childName);
+
                 GB_Variant childValue;
-                if (!ConvertJsonNodeToVariant(child, childValue))
+                if (!ConvertJsonNodeToVariant(child, childValue, errorMessage, childPath, currentDepth + 1))
                 {
                     return false;
                 }
 
-                InsertOrAssignVariantMapValue(newMap, child.GetName(), std::move(childValue));
+                InsertOrAssignVariantMapValue(newMap, childName, std::move(childValue));
             }
 
             outMap = std::move(newMap);
             return true;
         }
+        catch (const std::exception& exceptionObject)
+        {
+            AssignOptionalErrorMessage(errorMessage,
+                "Failed to convert JSON object at " + jsonPath + ": " + std::string(exceptionObject.what()));
+            return false;
+        }
         catch (...)
         {
+            AssignOptionalErrorMessage(errorMessage,
+                "Failed to convert JSON object at " + jsonPath + " due to an unknown exception.");
             return false;
         }
     }
 
-    bool ConvertJsonArrayToVariantList(const CPLJSONArray& jsonArray, GB_VariantList& outList)
+    bool ConvertJsonArrayToVariantList(
+        const CPLJSONArray& jsonArray,
+        GB_VariantList& outList,
+        std::string* errorMessage,
+        const std::string& jsonPath,
+        const int currentDepth)
     {
+        if (currentDepth > kMaxJsonNestingDepth)
+        {
+            AssignOptionalErrorMessage(errorMessage,
+                "JSON nesting depth exceeds the supported limit (" + std::to_string(kMaxJsonNestingDepth) + ") at " + jsonPath + ".");
+            return false;
+        }
+
         try
         {
             GB_VariantList newList;
             const int itemCount = jsonArray.Size();
+            if (itemCount < 0)
+            {
+                AssignOptionalErrorMessage(errorMessage, "Invalid JSON array size at " + jsonPath + ".");
+                return false;
+            }
+
             if (itemCount > 0)
             {
                 newList.reserve(static_cast<std::size_t>(itemCount));
@@ -183,7 +305,7 @@ namespace
             for (int index = 0; index < itemCount; index++)
             {
                 GB_Variant itemValue;
-                if (!ConvertJsonNodeToVariant(jsonArray[index], itemValue))
+                if (!ConvertJsonNodeToVariant(jsonArray[index], itemValue, errorMessage, BuildJsonArrayItemPath(jsonPath, index), currentDepth + 1))
                 {
                     return false;
                 }
@@ -194,20 +316,42 @@ namespace
             outList = std::move(newList);
             return true;
         }
+        catch (const std::exception& exceptionObject)
+        {
+            AssignOptionalErrorMessage(errorMessage,
+                "Failed to convert JSON array at " + jsonPath + ": " + std::string(exceptionObject.what()));
+            return false;
+        }
         catch (...)
         {
+            AssignOptionalErrorMessage(errorMessage,
+                "Failed to convert JSON array at " + jsonPath + " due to an unknown exception.");
             return false;
         }
     }
 
-    bool ConvertJsonNodeToVariant(const CPLJSONObject& jsonObject, GB_Variant& outValue)
+    bool ConvertJsonNodeToVariant(
+        const CPLJSONObject& jsonObject,
+        GB_Variant& outValue,
+        std::string* errorMessage,
+        const std::string& jsonPath,
+        const int currentDepth)
     {
         if (!jsonObject.IsValid())
         {
+            AssignOptionalErrorMessage(errorMessage, "Invalid JSON node at " + jsonPath + ".");
             return false;
         }
 
-        switch (jsonObject.GetType())
+        if (currentDepth > kMaxJsonNestingDepth)
+        {
+            AssignOptionalErrorMessage(errorMessage,
+                "JSON nesting depth exceeds the supported limit (" + std::to_string(kMaxJsonNestingDepth) + ") at " + jsonPath + ".");
+            return false;
+        }
+
+        const CPLJSONObject::Type jsonType = jsonObject.GetType();
+        switch (jsonType)
         {
         case CPLJSONObject::Type::Null:
             outValue.Reset();
@@ -236,7 +380,7 @@ namespace
         case CPLJSONObject::Type::Object:
         {
             GB_VariantMap objectValue;
-            if (!ConvertJsonObjectToVariantMap(jsonObject, objectValue))
+            if (!ConvertJsonObjectToVariantMap(jsonObject, objectValue, errorMessage, jsonPath, currentDepth))
             {
                 return false;
             }
@@ -248,7 +392,7 @@ namespace
         case CPLJSONObject::Type::Array:
         {
             GB_VariantList arrayValue;
-            if (!ConvertJsonArrayToVariantList(jsonObject.ToArray(), arrayValue))
+            if (!ConvertJsonArrayToVariantList(jsonObject.ToArray(), arrayValue, errorMessage, jsonPath, currentDepth))
             {
                 return false;
             }
@@ -259,9 +403,12 @@ namespace
 
         case CPLJSONObject::Type::Unknown:
         default:
+            AssignOptionalErrorMessage(errorMessage,
+                "Unsupported JSON node type at " + jsonPath + ": " + GetJsonTypeName(jsonType) + ".");
             return false;
         }
     }
+
 
 
     bool LoadJsonDocumentFromText(const std::string& jsonText, CPLJSONDocument& outDocument, std::string* errorMessage)
@@ -274,14 +421,25 @@ namespace
             return false;
         }
 
+        CPLErrorReset();
         if (!outDocument.LoadMemory(jsonText))
         {
-            AssignOptionalErrorMessage(errorMessage, "Failed to parse JSON text. Please ensure the input is valid JSON.");
+            const char* gdalErrorText = CPLGetLastErrorMsg();
+            if (gdalErrorText != nullptr && gdalErrorText[0] != '\0')
+            {
+                AssignOptionalErrorMessage(errorMessage, std::string("Failed to parse JSON text. GDAL error: ") + gdalErrorText);
+            }
+            else
+            {
+                AssignOptionalErrorMessage(errorMessage, "Failed to parse JSON text. Please ensure the input is valid JSON.");
+            }
+
             return false;
         }
 
         return true;
     }
+
 
     std::string XmlCharToString(const xmlChar* text)
     {
@@ -372,15 +530,21 @@ namespace
 
     void TrimTrailingLineBreaks(std::string& text)
     {
-        while (!text.empty())
+        std::size_t newSize = text.size();
+        while (newSize > 0)
         {
-            const char lastCharacter = text[text.size() - 1];
+            const char lastCharacter = text[newSize - 1];
             if (lastCharacter != '\r' && lastCharacter != '\n')
             {
                 break;
             }
 
-            text.erase(text.size() - 1);
+            newSize--;
+        }
+
+        if (newSize != text.size())
+        {
+            text.resize(newSize);
         }
     }
 
@@ -1367,14 +1531,21 @@ bool GB_JsonParser::ParseToVariant(const std::string& jsonText, GB_Variant& outV
         return false;
     }
 
-    GB_Variant newValue;
-    if (!ConvertJsonNodeToVariant(jsonDocument.GetRoot(), newValue))
+    const CPLJSONObject rootObject = jsonDocument.GetRoot();
+    if (!rootObject.IsValid())
     {
-        AssignOptionalErrorMessage(errorMessage, "Failed to convert JSON structure to GB_Variant. The JSON may contain unsupported types or structures.");
+        AssignOptionalErrorMessage(errorMessage, "Parsed JSON root node is invalid.");
+        return false;
+    }
+
+    GB_Variant newValue;
+    if (!ConvertJsonNodeToVariant(rootObject, newValue, errorMessage, "$", 0))
+    {
         return false;
     }
 
     outValue = std::move(newValue);
+    ClearOptionalErrorMessage(errorMessage);
     return true;
 }
 
@@ -1387,14 +1558,20 @@ bool GB_JsonParser::ParseToVariantMap(const std::string& jsonText, GB_VariantMap
     }
 
     const CPLJSONObject rootObject = jsonDocument.GetRoot();
-    GB_VariantMap newMap;
-    if (!ConvertJsonObjectToVariantMap(rootObject, newMap))
+    if (!rootObject.IsValid())
     {
-        AssignOptionalErrorMessage(errorMessage, "Failed to convert JSON structure to GB_VariantMap. The JSON root must be an object, and it may contain unsupported types or structures.");
+        AssignOptionalErrorMessage(errorMessage, "Parsed JSON root node is invalid.");
+        return false;
+    }
+
+    GB_VariantMap newMap;
+    if (!ConvertJsonObjectToVariantMap(rootObject, newMap, errorMessage, "$", 0))
+    {
         return false;
     }
 
     outMap = std::move(newMap);
+    ClearOptionalErrorMessage(errorMessage);
     return true;
 }
 

@@ -9,11 +9,27 @@
 #include <string>
 #include <vector>
 
+/**
+ * @brief JSON 解析器。
+ *
+ * 基于 GDAL 的 CPLJSONDocument / CPLJSONObject，把 JSON 文本转换为
+ * GB_Variant / GB_VariantMap / GB_VariantList 组合而成的树状结构。
+ */
 class GLOBALBASE_PORT GB_JsonParser
 {
 public:
+    /**
+     * @brief 把 JSON 文本解析为 GB_Variant。
+     *
+     * 成功时，outValue 会被赋值为 JSON 根节点对应的 Variant；失败时 outValue 保持原值。
+     */
     static bool ParseToVariant(const std::string& jsonText, GB_Variant& outValue, std::string* errorMessage = nullptr);
 
+    /**
+     * @brief 把 JSON 文本解析为 GB_VariantMap。
+     *
+     * 该接口要求 JSON 根节点必须是 object；失败时 outMap 保持原值。
+     */
     static bool ParseToVariantMap(const std::string& jsonText, GB_VariantMap& outMap, std::string* errorMessage = nullptr);
 };
 
