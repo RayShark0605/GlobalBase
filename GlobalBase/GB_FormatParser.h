@@ -10,6 +10,7 @@ class GLOBALBASE_PORT GB_JsonParser
 {
 public:
 	static bool ParseToVariant(const std::string& jsonText, GB_Variant& outValue, std::string* errorMessage = nullptr);
+	static bool ParseToVariantMap(const std::string& jsonText, GB_VariantMap& outMap, std::string* errorMessage = nullptr);
 };
 
 

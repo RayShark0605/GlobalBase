@@ -167,3 +167,40 @@ bool GB_JsonParser::ParseToVariant(const std::string& jsonText, GB_Variant& outV
     return true;
 }
 
+bool GB_JsonParser::ParseToVariantMap(const std::string& jsonText, GB_VariantMap& outMap, std::string* errorMessage)
+{
+    if (jsonText.empty())
+    {
+        if (errorMessage)
+        {
+			*errorMessage = "Input JSON text is empty.";
+        }
+        return false;
+    }
+
+    CPLJSONDocument jsonDocument;
+    if (!jsonDocument.LoadMemory(jsonText))
+    {
+        if (errorMessage)
+        {
+			*errorMessage = "Failed to parse JSON text. Please ensure the input is valid JSON.";
+        }
+        return false;
+    }
+
+    const CPLJSONObject rootObject = jsonDocument.GetRoot();
+    GB_VariantMap newMap;
+    if (!ConvertJsonObjectToVariantMap(rootObject, newMap))
+    {
+        if (errorMessage)
+        {
+			*errorMessage = "Failed to convert JSON structure to GB_VariantMap. The JSON root must be an object, and it may contain unsupported types or structures.";
+        }
+        return false;
+    }
+
+    outMap = std::move(newMap);
+    return true;
+}
+
+
