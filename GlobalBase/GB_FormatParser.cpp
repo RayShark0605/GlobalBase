@@ -65,6 +65,76 @@ namespace
             });
     }
 
+    void ClearOptionalErrorMessage(std::string* errorMessage)
+    {
+        if (errorMessage != nullptr)
+        {
+            errorMessage->clear();
+        }
+    }
+
+    void AssignOptionalErrorMessage(std::string* errorMessage, const std::string& message)
+    {
+        if (errorMessage != nullptr)
+        {
+            *errorMessage = message;
+        }
+    }
+
+    void ClearOptionalDiagnostics(std::vector<XmlDiagnostic>* diagnostics)
+    {
+        if (diagnostics != nullptr)
+        {
+            diagnostics->clear();
+        }
+    }
+
+    void InsertOrAssignVariantMapValue(GB_VariantMap& variantMap, const std::string& key, GB_Variant&& value)
+    {
+        GB_VariantMap::iterator iter = variantMap.lower_bound(key);
+        if (iter != variantMap.end() && iter->first == key)
+        {
+            iter->second = std::move(value);
+            return;
+        }
+
+        variantMap.emplace_hint(iter, key, std::move(value));
+    }
+
+    void InsertOrAssignVariantMapString(GB_VariantMap& variantMap, const std::string& key, std::string&& value)
+    {
+        GB_VariantMap::iterator iter = variantMap.lower_bound(key);
+        if (iter != variantMap.end() && iter->first == key)
+        {
+            iter->second = std::move(value);
+            return;
+        }
+
+        variantMap.emplace_hint(iter, key, GB_Variant(std::move(value)));
+    }
+
+    std::string BuildXmlQualifiedName(const xmlChar* localName, const xmlChar* namespacePrefix)
+    {
+        const std::string localNameText = localName != nullptr
+            ? reinterpret_cast<const char*>(localName)
+            : std::string();
+        const std::string namespacePrefixText = namespacePrefix != nullptr
+            ? reinterpret_cast<const char*>(namespacePrefix)
+            : std::string();
+
+        if (namespacePrefixText.empty())
+        {
+            return localNameText;
+        }
+
+        if (localNameText.empty())
+        {
+            return namespacePrefixText;
+        }
+
+        return namespacePrefixText + ":" + localNameText;
+    }
+
     bool ConvertJsonNodeToVariant(const CPLJSONObject& jsonObject, GB_Variant& outValue);
 
     bool ConvertJsonObjectToVariantMap(const CPLJSONObject& jsonObject, GB_VariantMap& outMap)
@@ -87,7 +157,7 @@ namespace
                     return false;
                 }
 
-                newMap[child.GetName()] = std::move(childValue);
+                InsertOrAssignVariantMapValue(newMap, child.GetName(), std::move(childValue));
             }
 
             outMap = std::move(newMap);
@@ -191,6 +261,26 @@ namespace
         default:
             return false;
         }
+    }
+
+
+    bool LoadJsonDocumentFromText(const std::string& jsonText, CPLJSONDocument& outDocument, std::string* errorMessage)
+    {
+        ClearOptionalErrorMessage(errorMessage);
+
+        if (jsonText.empty())
+        {
+            AssignOptionalErrorMessage(errorMessage, "Input JSON text is empty.");
+            return false;
+        }
+
+        if (!outDocument.LoadMemory(jsonText))
+        {
+            AssignOptionalErrorMessage(errorMessage, "Failed to parse JSON text. Please ensure the input is valid JSON.");
+            return false;
+        }
+
+        return true;
     }
 
     std::string XmlCharToString(const xmlChar* text)
@@ -313,7 +403,11 @@ namespace
         {
         }
 
-        static void StructuredErrorCallback(void* userData, const xmlError* error)
+#if LIBXML_VERSION >= 21200
+        static void XMLCALL StructuredErrorCallback(void* userData, const xmlError* error)
+#else
+        static void XMLCALL StructuredErrorCallback(void* userData, xmlErrorPtr error)
+#endif
         {
             if (userData == nullptr || error == nullptr)
             {
@@ -539,11 +633,17 @@ namespace
 
         if (node->name != nullptr)
         {
-            const std::string nodeName = XmlCharToString(node->name);
-            if (!nodeName.empty())
+            const std::string localName = XmlCharToString(node->name);
+            const xmlChar* const namespacePrefix = node->ns != nullptr ? node->ns->prefix : nullptr;
+            const std::string qualifiedName = BuildXmlQualifiedName(node->name, namespacePrefix);
+
+            if (!qualifiedName.empty())
             {
-                outNode["name"] = nodeName;
-                outNode["localName"] = nodeName;
+                outNode["name"] = qualifiedName;
+            }
+            if (!localName.empty())
+            {
+                outNode["localName"] = localName;
             }
         }
 
@@ -607,15 +707,8 @@ namespace
                     continue;
                 }
 
-                std::string attributeName = XmlCharToString(attribute->name);
-                if (options.includeNamespaceInfo && attribute->ns != nullptr)
-                {
-                    const std::string attributePrefix = XmlCharToString(attribute->ns->prefix);
-                    if (!attributePrefix.empty())
-                    {
-                        attributeName = attributePrefix + ":" + attributeName;
-                    }
-                }
+                const xmlChar* const attributePrefix = attribute->ns != nullptr ? attribute->ns->prefix : nullptr;
+                const std::string attributeName = BuildXmlQualifiedName(attribute->name, attributePrefix);
 
                 std::string attributeValue;
                 if (!BuildXmlAttributeValue(attribute, document, attributeValue))
@@ -625,7 +718,7 @@ namespace
 
                 if (options.attributeOutputMode == GB_XmlParser::AttributeOutputMode::ValueOnly)
                 {
-                    outAttributes[attributeName] = std::move(attributeValue);
+                    InsertOrAssignVariantMapString(outAttributes, attributeName, std::move(attributeValue));
                     continue;
                 }
 
@@ -648,7 +741,7 @@ namespace
                     }
                 }
 
-                outAttributes[attributeName] = std::move(attributeObject);
+                InsertOrAssignVariantMapValue(outAttributes, attributeName, std::move(attributeObject));
             }
         }
         catch (...)
@@ -673,8 +766,8 @@ namespace
             for (const xmlNs* namespaceNode = node->nsDef; namespaceNode != nullptr; namespaceNode = namespaceNode->next)
             {
                 const std::string prefix = XmlCharToString(namespaceNode->prefix);
-                const std::string uri = XmlCharToString(namespaceNode->href);
-                outNamespaces[prefix] = uri;
+                std::string uri = XmlCharToString(namespaceNode->href);
+                InsertOrAssignVariantMapString(outNamespaces, prefix, std::move(uri));
             }
         }
         catch (...)
@@ -1167,21 +1260,18 @@ namespace
         std::string* errorMessage,
         std::vector<XmlDiagnostic>* diagnostics)
     {
+        ClearOptionalErrorMessage(errorMessage);
+        ClearOptionalDiagnostics(diagnostics);
+
         if (xmlText.empty())
         {
-            if (errorMessage != nullptr)
-            {
-                *errorMessage = "Input XML text is empty.";
-            }
+            AssignOptionalErrorMessage(errorMessage, "Input XML text is empty.");
             return false;
         }
 
         if (xmlText.size() > static_cast<std::size_t>(INT_MAX))
         {
-            if (errorMessage != nullptr)
-            {
-                *errorMessage = "Input XML text is too large for libxml2 memory parsing.";
-            }
+            AssignOptionalErrorMessage(errorMessage, "Input XML text is too large for libxml2 memory parsing.");
             return false;
         }
 
@@ -1199,25 +1289,20 @@ namespace
         const int parserFlags = BuildXmlParserFlags(options, enableStructuredErrorHandler, unsupportedLegacySecurityCombination);
         if (unsupportedLegacySecurityCombination)
         {
-            if (errorMessage != nullptr)
-            {
-                *errorMessage = "The current libxml2 version does not provide XML_PARSE_NO_XXE, so enabling entity expansion or external DTD processing while disallowing external entities is unsupported.";
-            }
+            AssignOptionalErrorMessage(errorMessage, "The current libxml2 version does not provide XML_PARSE_NO_XXE, so enabling entity expansion or external DTD processing while disallowing external entities is unsupported.");
             return false;
         }
 
         UniqueXmlParserContext parserContext(xmlNewParserCtxt());
         if (!parserContext)
         {
-            if (errorMessage != nullptr)
-            {
-                *errorMessage = "Failed to create libxml2 parser context.";
-            }
+            AssignOptionalErrorMessage(errorMessage, "Failed to create libxml2 parser context.");
             return false;
         }
 
 #if LIBXML_VERSION >= 21300
-        xmlCtxtSetErrorHandler(parserContext.get(), XmlErrorCollector::StructuredErrorCallback, &errorCollector);
+        const xmlStructuredErrorFunc structuredErrorHandler = XmlErrorCollector::StructuredErrorCallback;
+        xmlCtxtSetErrorHandler(parserContext.get(), structuredErrorHandler, &errorCollector);
 #endif
 
         const char* const baseUrl = options.baseUrl.empty() ? nullptr : options.baseUrl.c_str();
@@ -1246,38 +1331,26 @@ namespace
 
         if (!document)
         {
-            if (errorMessage != nullptr)
-            {
-                *errorMessage = BuildXmlErrorMessage(errorCollector.diagnostics, "Failed to parse XML text.");
-            }
+            AssignOptionalErrorMessage(errorMessage, BuildXmlErrorMessage(errorCollector.diagnostics, "Failed to parse XML text."));
             return false;
         }
 
         if (!options.allowRecovery && parserContext->wellFormed == 0)
         {
-            if (errorMessage != nullptr)
-            {
-                *errorMessage = BuildXmlErrorMessage(errorCollector.diagnostics, "XML text is not well-formed.");
-            }
+            AssignOptionalErrorMessage(errorMessage, BuildXmlErrorMessage(errorCollector.diagnostics, "XML text is not well-formed."));
             return false;
         }
 
         if (options.validateDtd && parserContext->valid == 0)
         {
-            if (errorMessage != nullptr)
-            {
-                *errorMessage = BuildXmlErrorMessage(errorCollector.diagnostics, "DTD validation failed.");
-            }
+            AssignOptionalErrorMessage(errorMessage, BuildXmlErrorMessage(errorCollector.diagnostics, "DTD validation failed."));
             return false;
         }
 
         GB_Variant parsedValue;
         if (!ConvertXmlDocumentToVariant(document.get(), options, parsedValue))
         {
-            if (errorMessage != nullptr)
-            {
-                *errorMessage = BuildXmlErrorMessage(errorCollector.diagnostics, "Failed to convert parsed XML tree to GB_Variant.");
-            }
+            AssignOptionalErrorMessage(errorMessage, BuildXmlErrorMessage(errorCollector.diagnostics, "Failed to convert parsed XML tree to GB_Variant."));
             return false;
         }
 
@@ -1288,32 +1361,16 @@ namespace
 
 bool GB_JsonParser::ParseToVariant(const std::string& jsonText, GB_Variant& outValue, std::string* errorMessage)
 {
-    if (jsonText.empty())
-    {
-        if (errorMessage != nullptr)
-        {
-            *errorMessage = "Input JSON text is empty.";
-        }
-        return false;
-    }
-
     CPLJSONDocument jsonDocument;
-    if (!jsonDocument.LoadMemory(jsonText))
+    if (!LoadJsonDocumentFromText(jsonText, jsonDocument, errorMessage))
     {
-        if (errorMessage != nullptr)
-        {
-            *errorMessage = "Failed to parse JSON text. Please ensure the input is valid JSON.";
-        }
         return false;
     }
 
     GB_Variant newValue;
     if (!ConvertJsonNodeToVariant(jsonDocument.GetRoot(), newValue))
     {
-        if (errorMessage != nullptr)
-        {
-            *errorMessage = "Failed to convert JSON structure to GB_Variant. The JSON may contain unsupported types or structures.";
-        }
+        AssignOptionalErrorMessage(errorMessage, "Failed to convert JSON structure to GB_Variant. The JSON may contain unsupported types or structures.");
         return false;
     }
 
@@ -1323,22 +1380,9 @@ bool GB_JsonParser::ParseToVariant(const std::string& jsonText, GB_Variant& outV
 
 bool GB_JsonParser::ParseToVariantMap(const std::string& jsonText, GB_VariantMap& outMap, std::string* errorMessage)
 {
-    if (jsonText.empty())
-    {
-        if (errorMessage != nullptr)
-        {
-            *errorMessage = "Input JSON text is empty.";
-        }
-        return false;
-    }
-
     CPLJSONDocument jsonDocument;
-    if (!jsonDocument.LoadMemory(jsonText))
+    if (!LoadJsonDocumentFromText(jsonText, jsonDocument, errorMessage))
     {
-        if (errorMessage != nullptr)
-        {
-            *errorMessage = "Failed to parse JSON text. Please ensure the input is valid JSON.";
-        }
         return false;
     }
 
@@ -1346,10 +1390,7 @@ bool GB_JsonParser::ParseToVariantMap(const std::string& jsonText, GB_VariantMap
     GB_VariantMap newMap;
     if (!ConvertJsonObjectToVariantMap(rootObject, newMap))
     {
-        if (errorMessage != nullptr)
-        {
-            *errorMessage = "Failed to convert JSON structure to GB_VariantMap. The JSON root must be an object, and it may contain unsupported types or structures.";
-        }
+        AssignOptionalErrorMessage(errorMessage, "Failed to convert JSON structure to GB_VariantMap. The JSON root must be an object, and it may contain unsupported types or structures.");
         return false;
     }
 
@@ -1401,10 +1442,7 @@ bool GB_XmlParser::ParseToVariantMap(
     const GB_VariantMap* valueMap = value.AnyCast<GB_VariantMap>();
     if (valueMap == nullptr)
     {
-        if (errorMessage != nullptr)
-        {
-            *errorMessage = "The parsed XML result is not a GB_VariantMap.";
-        }
+        AssignOptionalErrorMessage(errorMessage, "The parsed XML result is not a GB_VariantMap.");
         return false;
     }
 
@@ -1460,10 +1498,7 @@ bool GB_XmlParser::ParseRootElementToVariantMap(
     const GB_VariantMap* valueMap = value.AnyCast<GB_VariantMap>();
     if (valueMap == nullptr)
     {
-        if (errorMessage != nullptr)
-        {
-            *errorMessage = "The parsed XML root element is not a GB_VariantMap.";
-        }
+        AssignOptionalErrorMessage(errorMessage, "The parsed XML root element is not a GB_VariantMap.");
         return false;
     }
 

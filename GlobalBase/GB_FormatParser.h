@@ -32,7 +32,7 @@ public:
  *
  * 元素节点常用字段：
  * - nodeType: 固定为 "element"
- * - name / localName
+ * - name（尽量保留前缀后的限定名）/ localName（本地名）
  * - namespacePrefix / namespaceUri（按选项决定是否输出）
  * - attributes: 属性集合
  * - namespaceDeclarations: 当前节点声明的命名空间集合（按选项决定是否输出）
