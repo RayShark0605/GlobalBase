@@ -540,7 +540,7 @@ namespace
 
                 if (xmlMemGet(&freeFunc, &mallocFunc, &reallocFunc, &strdupFunc) != 0)
                 {
-                    freeFunc = nullptr;
+                    freeFunc = reinterpret_cast<xmlFreeFunc>(free);
                 }
             });
 
@@ -578,6 +578,7 @@ namespace
 #if defined(LIBXML_VERSION) && LIBXML_VERSION >= 21300
             xmlCtxtSetErrorHandler(parserContext, XmlErrorCollector::StructuredErrorCallback, errorCollector);
 #else
+            (void)parserContext;
             previousStructuredHandler_ = xmlStructuredError;
             previousStructuredContext_ = xmlStructuredErrorContext;
             xmlSetStructuredErrorFunc(errorCollector, XmlErrorCollector::StructuredErrorCallback);
@@ -1246,7 +1247,7 @@ namespace
 
 namespace
 {
-    static char FoldAsciiCase(const char character)
+    char FoldAsciiCase(const char character)
     {
         if (character >= 'A' && character <= 'Z')
         {
@@ -1256,7 +1257,7 @@ namespace
         return character;
     }
 
-    static bool EqualsAsciiText(const std::string& leftText, const std::string& rightText, const bool caseSensitive)
+    bool EqualsAsciiText(const std::string& leftText, const std::string& rightText, const bool caseSensitive)
     {
         if (leftText.size() != rightText.size())
         {
@@ -1279,7 +1280,7 @@ namespace
         return true;
     }
 
-    static bool IsXmlNameMatched(const std::string& targetName, const std::string& fullName, const std::string& localNodeName, const bool caseSensitive)
+    bool IsXmlNameMatched(const std::string& targetName, const std::string& fullName, const std::string& localNodeName, const bool caseSensitive)
     {
         if (targetName.empty())
         {
@@ -1290,7 +1291,7 @@ namespace
             || (!localNodeName.empty() && EqualsAsciiText(targetName, localNodeName, caseSensitive));
     }
 
-    static void AppendXmlTextValue(const GB_XmlNode& node, std::string& outValue)
+    void AppendXmlTextValue(const GB_XmlNode& node, std::string& outValue)
     {
         switch (node.nodeType)
         {
