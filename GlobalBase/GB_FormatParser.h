@@ -47,6 +47,11 @@ struct GB_XmlDiagnostic
     std::string message = "";
 };
 
+#ifdef _MSC_VER
+#  pragma warning(push)
+#  pragma warning(disable: 4251)
+#endif
+
 struct GLOBALBASE_PORT GB_XmlNode
 {
     enum class Type
@@ -154,5 +159,9 @@ public:
 
     static bool ParseToRootNode(const std::string& xmlText, GB_XmlNode& outRootNode, const GB_XmlParserOptions& options = GB_XmlParserOptions(), std::string* errorMessage = nullptr);
 };
+
+#ifdef _MSC_VER
+#  pragma warning(pop)
+#endif
 
 #endif

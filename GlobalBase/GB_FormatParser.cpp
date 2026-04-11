@@ -1544,11 +1544,7 @@ std::string GB_XmlNode::GetValue() const
     return value;
 }
 
-
-bool GB_XmlParser::ParseToDocument(const std::string& xmlText,
-    GB_XmlDocument& outDocument,
-    const GB_XmlParserOptions& options,
-    std::string* errorMessage)
+bool GB_XmlParser::ParseToDocument(const std::string& xmlText, GB_XmlDocument& outDocument, const GB_XmlParserOptions& options, std::string* errorMessage)
 {
     GB_XmlDocument newDocument;
     if (!ParseXmlDocumentInternal(xmlText, newDocument, options, errorMessage))
@@ -1560,10 +1556,7 @@ bool GB_XmlParser::ParseToDocument(const std::string& xmlText,
     return true;
 }
 
-bool GB_XmlParser::ParseToRootNode(const std::string& xmlText,
-    GB_XmlNode& outRootNode,
-    const GB_XmlParserOptions& options,
-    std::string* errorMessage)
+bool GB_XmlParser::ParseToRootNode(const std::string& xmlText, GB_XmlNode& outRootNode, const GB_XmlParserOptions& options, std::string* errorMessage)
 {
     GB_XmlDocument document;
     if (!ParseXmlDocumentInternal(xmlText, document, options, errorMessage))
