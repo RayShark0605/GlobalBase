@@ -10,13 +10,13 @@
 
 #include <algorithm>
 #include <climits>
+#include <cstddef>
+#include <cstdlib>
 #include <exception>
 #include <memory>
 #include <mutex>
 #include <sstream>
 #include <utility>
-#include <string>
-#include <vector>
 
 namespace
 {
@@ -53,22 +53,31 @@ namespace
         {
         case CPLJSONObject::Type::Unknown:
             return "Unknown";
+
         case CPLJSONObject::Type::Null:
             return "Null";
+
         case CPLJSONObject::Type::Object:
             return "Object";
+
         case CPLJSONObject::Type::Array:
             return "Array";
+
         case CPLJSONObject::Type::Boolean:
             return "Boolean";
+
         case CPLJSONObject::Type::String:
             return "String";
+
         case CPLJSONObject::Type::Integer:
             return "Integer";
+
         case CPLJSONObject::Type::Long:
             return "Long";
+
         case CPLJSONObject::Type::Double:
             return "Double";
+
         default:
             return "Unsupported";
         }
@@ -86,6 +95,7 @@ namespace
             {
                 result.push_back('\\');
             }
+
             result.push_back(currentChar);
         }
 
@@ -299,6 +309,7 @@ namespace
 
         const std::string* jsonTextToLoad = &jsonText;
         std::string jsonTextWithoutBom;
+
         if (HasUtf8Bom(jsonText))
         {
             jsonTextWithoutBom.assign(jsonText.begin() + static_cast<std::ptrdiff_t>(kUtf8BomLength), jsonText.end());
@@ -312,7 +323,6 @@ namespace
         }
 
         CPLErrorReset();
-
         if (!jsonDocument.LoadMemory(*jsonTextToLoad))
         {
             const char* gdalErrorText = CPLGetLastErrorMsg();
@@ -322,8 +332,9 @@ namespace
             }
             else
             {
-                SetErrorMessage(errorMessage, "Failed to parse JSON text. Please ensure the input is valid JSON.");
+                SetErrorMessage(errorMessage, "Failed to parse JSON text.\nPlease ensure the input is valid JSON.");
             }
+
             return false;
         }
 
@@ -389,8 +400,10 @@ namespace
         {
         case XML_ERR_WARNING:
             return GB_XmlDiagnostic::Level::Warning;
+
         case XML_ERR_FATAL:
             return GB_XmlDiagnostic::Level::Fatal;
+
         case XML_ERR_ERROR:
         default:
             return GB_XmlDiagnostic::Level::Error;
@@ -407,6 +420,7 @@ namespace
             {
                 break;
             }
+
             endIndex--;
         }
 
@@ -431,6 +445,7 @@ namespace
                 diagnostic.lineNumber = error->line > 0 ? static_cast<long long>(error->line) : -1;
                 diagnostic.columnNumber = error->int2 > 0 ? error->int2 : -1;
                 diagnostic.message = NormalizeXmlDiagnosticMessage(XmlCharToString(reinterpret_cast<const xmlChar*>(error->message)));
+
                 diagnostics_.push_back(std::move(diagnostic));
             }
             catch (...)
@@ -457,6 +472,7 @@ namespace
             }
 
             const GB_XmlDiagnostic& firstDiagnostic = diagnostics_.front();
+
             std::ostringstream stream;
             stream << "Failed to parse XML";
             if (firstDiagnostic.lineNumber > 0)
@@ -467,6 +483,7 @@ namespace
                     stream << ", column " << firstDiagnostic.columnNumber;
                 }
             }
+
             stream << ": " << firstDiagnostic.message;
 
             if (diagnostics_.size() > 1)
@@ -526,13 +543,15 @@ namespace
         }
     };
 
+    using UniqueXmlParserContext = std::unique_ptr<xmlParserCtxt, XmlParserContextDeleter>;
+    using UniqueXmlDocument = std::unique_ptr<xmlDoc, XmlDocumentDeleter>;
+
     xmlFreeFunc GetLibXmlFreeFunc()
     {
         static std::once_flag initOnce;
         static xmlFreeFunc freeFunc = nullptr;
 
-        std::call_once(initOnce,
-            []()
+        std::call_once(initOnce, []()
             {
                 xmlMallocFunc mallocFunc = nullptr;
                 xmlReallocFunc reallocFunc = nullptr;
@@ -563,6 +582,8 @@ namespace
             }
         }
     };
+
+    using UniqueXmlChar = std::unique_ptr<xmlChar, XmlCharDeleter>;
 
     std::mutex& GetXmlStructuredErrorHandlerMutex()
     {
@@ -621,21 +642,27 @@ namespace
             case XML_ELEMENT_NODE:
                 currentPart = XmlCharToString(currentNode->name);
                 break;
+
             case XML_TEXT_NODE:
                 currentPart = "text()";
                 break;
+
             case XML_CDATA_SECTION_NODE:
                 currentPart = "cdata()";
                 break;
+
             case XML_COMMENT_NODE:
                 currentPart = "comment()";
                 break;
+
             case XML_PI_NODE:
                 currentPart = "processing-instruction()";
                 break;
+
             case XML_ENTITY_REF_NODE:
                 currentPart = "entity-ref(" + XmlCharToString(currentNode->name) + ")";
                 break;
+
             default:
                 currentPart = "node()";
                 break;
@@ -646,8 +673,7 @@ namespace
             {
                 if (sibling->type == currentNode->type)
                 {
-                    const bool sameElementName = currentNode->type != XML_ELEMENT_NODE
-                        || xmlStrEqual(sibling->name, currentNode->name);
+                    const bool sameElementName = currentNode->type != XML_ELEMENT_NODE || xmlStrEqual(sibling->name, currentNode->name);
                     if (sameElementName)
                     {
                         siblingIndex++;
@@ -668,6 +694,7 @@ namespace
             {
                 path += "/";
             }
+
             path += pathParts[index];
         }
 
@@ -681,10 +708,7 @@ namespace
         return false;
 #else
         return !options.allowExternalEntities
-            && (options.substituteEntities
-                || options.loadExternalDtd
-                || options.applyDefaultDtdAttributes
-                || options.validateWithDtd);
+            && (options.substituteEntities || options.loadExternalDtd || options.applyDefaultDtdAttributes || options.validateWithDtd);
 #endif
     }
 
@@ -832,7 +856,7 @@ namespace
         }
 
         const xmlDocPtr attributeDocument = GetXmlAttributeOwnerDocument(attribute);
-        std::unique_ptr<xmlChar, XmlCharDeleter> attributeValue(xmlNodeListGetString(attributeDocument, attribute->children, 1));
+        UniqueXmlChar attributeValue(xmlNodeListGetString(attributeDocument, attribute->children, 1));
         outAttribute.attributeValue = XmlCharToString(attributeValue.get());
         return true;
     }
@@ -849,6 +873,7 @@ namespace
             GB_XmlNamespaceDeclaration namespaceDeclaration;
             namespaceDeclaration.namespacePrefix = XmlCharToString(currentNamespace->prefix);
             namespaceDeclaration.namespaceUri = XmlCharToString(currentNamespace->href);
+
             outNamespaceDeclarations.push_back(std::move(namespaceDeclaration));
         }
     }
@@ -885,10 +910,7 @@ namespace
         return false;
     }
 
-    bool ConvertXmlNode(const xmlNodePtr node,
-        GB_XmlNode& outNode,
-        const GB_XmlParserOptions& options,
-        std::string* errorMessage)
+    bool ConvertXmlNode(const xmlNodePtr node, GB_XmlNode& outNode, const GB_XmlParserOptions& options, std::string* errorMessage)
     {
         if (node == nullptr)
         {
@@ -908,6 +930,7 @@ namespace
                 newNode.nodeType = GB_XmlNode::Type::Element;
                 newNode.localName = XmlCharToString(node->name);
                 newNode.nodeTag = newNode.localName;
+
                 if (node->ns != nullptr)
                 {
                     newNode.namespacePrefix = XmlCharToString(node->ns->prefix);
@@ -932,6 +955,7 @@ namespace
                         SetErrorMessage(errorMessage, "Failed to read an attribute at " + GetXmlNodePath(node) + ".");
                         return false;
                     }
+
                     newNode.attributes.push_back(std::move(newAttribute));
                 }
 
@@ -958,8 +982,10 @@ namespace
                     {
                         return false;
                     }
+
                     newNode.children.push_back(std::move(childNode));
                 }
+
                 break;
             }
 
@@ -989,6 +1015,7 @@ namespace
                 newNode.nodeType = GB_XmlNode::Type::EntityReference;
                 newNode.nodeTag = XmlCharToString(node->name);
                 newNode.localName = newNode.nodeTag;
+
                 for (xmlNodePtr child = node->children; child != nullptr; child = child->next)
                 {
                     if (ShouldSkipXmlChildNode(child, options))
@@ -1001,13 +1028,14 @@ namespace
                     {
                         return false;
                     }
+
                     newNode.children.push_back(std::move(childNode));
                 }
+
                 break;
 
             default:
-                SetErrorMessage(errorMessage,
-                    "Unsupported XML node type at " + GetXmlNodePath(node) + ". libxml2 node type: " + std::to_string(static_cast<int>(node->type)) + ".");
+                SetErrorMessage(errorMessage, "Unsupported XML node type at " + GetXmlNodePath(node) + ". libxml2 node type: " + std::to_string(static_cast<int>(node->type)) + ".");
                 return false;
             }
 
@@ -1048,14 +1076,17 @@ namespace
         if (xmlDocument->extSubset != nullptr)
         {
             outDocument.hasExternalSubset = true;
+
             if (outDocument.documentTypeName.empty())
             {
                 outDocument.documentTypeName = XmlCharToString(xmlDocument->extSubset->name);
             }
+
             if (outDocument.documentTypePublicId.empty())
             {
                 outDocument.documentTypePublicId = XmlCharToString(xmlDocument->extSubset->ExternalID);
             }
+
             if (outDocument.documentTypeSystemId.empty())
             {
                 outDocument.documentTypeSystemId = XmlCharToString(xmlDocument->extSubset->SystemID);
@@ -1063,12 +1094,7 @@ namespace
         }
     }
 
-    bool ConvertXmlDocument(const xmlDocPtr xmlDocument,
-        GB_XmlDocument& outDocument,
-        const GB_XmlParserOptions& options,
-        const XmlErrorCollector& errorCollector,
-        const bool recovered,
-        std::string* errorMessage)
+    bool ConvertXmlDocument(const xmlDocPtr xmlDocument, GB_XmlDocument& outDocument, const GB_XmlParserOptions& options, const XmlErrorCollector& errorCollector, const bool recovered, std::string* errorMessage)
     {
         if (xmlDocument == nullptr)
         {
@@ -1080,6 +1106,7 @@ namespace
         {
             GB_XmlDocument newDocument;
             LoadDocumentTypeInfo(xmlDocument, newDocument);
+
             newDocument.diagnostics = errorCollector.GetDiagnostics();
             newDocument.recovered = recovered;
 
@@ -1112,6 +1139,7 @@ namespace
                     {
                         return false;
                     }
+
                     rootElementSeen = true;
                     continue;
                 }
@@ -1168,10 +1196,7 @@ namespace
         return parserContext->wellFormed == 0;
     }
 
-    bool ParseXmlDocumentInternal(const std::string& xmlText,
-        GB_XmlDocument& outDocument,
-        const GB_XmlParserOptions& options,
-        std::string* errorMessage)
+    bool ParseXmlDocumentInternal(const std::string& xmlText, GB_XmlDocument& outDocument, const GB_XmlParserOptions& options, std::string* errorMessage)
     {
         if (xmlText.empty())
         {
@@ -1187,8 +1212,7 @@ namespace
 
         if (ShouldRejectUnsafeEntityConfiguration(options))
         {
-            SetErrorMessage(errorMessage,
-                "The requested XML parser options require external DTD/entity loading, but the current libxml2 version does not provide XML_PARSE_NO_XXE. Please either enable allowExternalEntities or disable substituteEntities / loadExternalDtd / applyDefaultDtdAttributes / validateWithDtd.");
+            SetErrorMessage(errorMessage, "The requested XML parser options require external DTD/entity loading, but the current libxml2 version does not provide XML_PARSE_NO_XXE.\nPlease either enable allowExternalEntities or disable substituteEntities / loadExternalDtd / applyDefaultDtdAttributes / validateWithDtd.");
             return false;
         }
 
@@ -1199,7 +1223,8 @@ namespace
 #endif
 
         XmlErrorCollector errorCollector;
-        std::unique_ptr<xmlParserCtxt, XmlParserContextDeleter> parserContext(xmlNewParserCtxt());
+
+        UniqueXmlParserContext parserContext(xmlNewParserCtxt());
         if (!parserContext)
         {
             SetErrorMessage(errorMessage, "Failed to create libxml2 parser context.");
@@ -1212,8 +1237,9 @@ namespace
         const char* const baseUrlText = options.baseUrl.empty() ? nullptr : options.baseUrl.c_str();
         const char* const forcedEncodingText = options.forcedEncoding.empty() ? nullptr : options.forcedEncoding.c_str();
 
-        std::unique_ptr<xmlDoc, XmlDocumentDeleter> xmlDocument(
-            xmlCtxtReadMemory(parserContext.get(),
+        UniqueXmlDocument xmlDocument(
+            xmlCtxtReadMemory(
+                parserContext.get(),
                 xmlText.data(),
                 static_cast<int>(xmlText.size()),
                 baseUrlText,
@@ -1231,6 +1257,7 @@ namespace
             {
                 SetErrorMessage(errorMessage, "Failed to parse XML text.");
             }
+
             return false;
         }
 
@@ -1404,7 +1431,16 @@ const GB_XmlAttribute* GB_XmlNode::GetAttribute(const std::string& attributeName
 
 GB_XmlAttribute* GB_XmlNode::GetAttribute(const std::string& attributeName, bool caseSensitive)
 {
-    return const_cast<GB_XmlAttribute*>(static_cast<const GB_XmlNode&>(*this).GetAttribute(attributeName, caseSensitive));
+    for (std::size_t index = 0; index < attributes.size(); index++)
+    {
+        GB_XmlAttribute& attribute = attributes[index];
+        if (IsXmlNameMatched(attributeName, attribute.attributeName, attribute.localName, caseSensitive))
+        {
+            return &attribute;
+        }
+    }
+
+    return nullptr;
 }
 
 bool GB_XmlNode::TryGetAttributeValue(const std::string& attributeName, std::string& outValue, bool caseSensitive) const
@@ -1461,13 +1497,31 @@ const GB_XmlNode* GB_XmlNode::GetChild(const std::string& childName, bool caseSe
 
 GB_XmlNode* GB_XmlNode::GetChild(const std::string& childName, bool caseSensitive)
 {
-    return const_cast<GB_XmlNode*>(static_cast<const GB_XmlNode&>(*this).GetChild(childName, caseSensitive));
+    if (childName.empty())
+    {
+        return nullptr;
+    }
+
+    for (std::size_t index = 0; index < children.size(); index++)
+    {
+        GB_XmlNode& childNode = children[index];
+        if (childNode.nodeType != Type::Element)
+        {
+            continue;
+        }
+
+        if (IsXmlNameMatched(childName, childNode.nodeTag, childNode.localName, caseSensitive))
+        {
+            return &childNode;
+        }
+    }
+
+    return nullptr;
 }
 
 std::vector<const GB_XmlNode*> GB_XmlNode::GetChildren(const std::string& childName, bool caseSensitive) const
 {
     std::vector<const GB_XmlNode*> matchedChildren;
-
     for (std::size_t index = 0; index < children.size(); index++)
     {
         const GB_XmlNode& childNode = children[index];
@@ -1490,7 +1544,6 @@ std::vector<const GB_XmlNode*> GB_XmlNode::GetChildren(const std::string& childN
 std::vector<GB_XmlNode*> GB_XmlNode::GetChildren(const std::string& childName, bool caseSensitive)
 {
     std::vector<GB_XmlNode*> matchedChildren;
-
     for (std::size_t index = 0; index < children.size(); index++)
     {
         GB_XmlNode& childNode = children[index];
