@@ -398,6 +398,204 @@ namespace
             || type == GB_VariantType::Custom;
     }
 
+
+    bool IsIntegralVariantType(const GB_VariantType type) noexcept
+    {
+        return type == GB_VariantType::Int32
+            || type == GB_VariantType::UInt32
+            || type == GB_VariantType::Int64
+            || type == GB_VariantType::UInt64;
+    }
+
+    bool IsFloatingVariantType(const GB_VariantType type) noexcept
+    {
+        return type == GB_VariantType::Float
+            || type == GB_VariantType::Double;
+    }
+
+    bool TryGetStoredFloatingValue(const GB_Variant& variantValue, long double& outValue) noexcept
+    {
+        if (const float* const floatValue = variantValue.AnyCast<float>())
+        {
+            outValue = static_cast<long double>(*floatValue);
+            return true;
+        }
+
+        if (const double* const doubleValue = variantValue.AnyCast<double>())
+        {
+            outValue = static_cast<long double>(*doubleValue);
+            return true;
+        }
+
+        if (const long double* const longDoubleValue = variantValue.AnyCast<long double>())
+        {
+            outValue = *longDoubleValue;
+            return true;
+        }
+
+        return false;
+    }
+
+    int CompareIntegralVariantValues(const GB_Variant& leftValue, const GB_Variant& rightValue) noexcept
+    {
+        const GB_VariantType leftType = leftValue.Type();
+        const GB_VariantType rightType = rightValue.Type();
+        const bool leftIsUnsigned = leftType == GB_VariantType::UInt32 || leftType == GB_VariantType::UInt64;
+        const bool rightIsUnsigned = rightType == GB_VariantType::UInt32 || rightType == GB_VariantType::UInt64;
+
+        if (!leftIsUnsigned && !rightIsUnsigned)
+        {
+            bool leftOk = false;
+            bool rightOk = false;
+            const long long leftIntegerValue = leftValue.ToInt64(&leftOk);
+            const long long rightIntegerValue = rightValue.ToInt64(&rightOk);
+            if (!leftOk || !rightOk)
+            {
+                return static_cast<int>(leftType) < static_cast<int>(rightType) ? -1 : 1;
+            }
+
+            return CompareOrderedValues(leftIntegerValue, rightIntegerValue);
+        }
+
+        if (leftIsUnsigned && rightIsUnsigned)
+        {
+            bool leftOk = false;
+            bool rightOk = false;
+            const unsigned long long leftIntegerValue = leftValue.ToUInt64(&leftOk);
+            const unsigned long long rightIntegerValue = rightValue.ToUInt64(&rightOk);
+            if (!leftOk || !rightOk)
+            {
+                return static_cast<int>(leftType) < static_cast<int>(rightType) ? -1 : 1;
+            }
+
+            return CompareOrderedValues(leftIntegerValue, rightIntegerValue);
+        }
+
+        if (!leftIsUnsigned)
+        {
+            bool leftOk = false;
+            bool rightOk = false;
+            const long long leftIntegerValue = leftValue.ToInt64(&leftOk);
+            const unsigned long long rightIntegerValue = rightValue.ToUInt64(&rightOk);
+            if (!leftOk || !rightOk)
+            {
+                return static_cast<int>(leftType) < static_cast<int>(rightType) ? -1 : 1;
+            }
+
+            if (leftIntegerValue < 0)
+            {
+                return -1;
+            }
+
+            return CompareOrderedValues(static_cast<unsigned long long>(leftIntegerValue), rightIntegerValue);
+        }
+
+        const int inverseCompareResult = CompareIntegralVariantValues(rightValue, leftValue);
+        if (inverseCompareResult < 0)
+        {
+            return 1;
+        }
+
+        if (inverseCompareResult > 0)
+        {
+            return -1;
+        }
+
+        return 0;
+    }
+
+    int CompareFloatingVariantValues(const GB_Variant& leftValue, const GB_Variant& rightValue) noexcept
+    {
+        long double leftFloatingValue = 0.0L;
+        long double rightFloatingValue = 0.0L;
+        if (!TryGetStoredFloatingValue(leftValue, leftFloatingValue)
+            || !TryGetStoredFloatingValue(rightValue, rightFloatingValue))
+        {
+            const GB_VariantType leftType = leftValue.Type();
+            const GB_VariantType rightType = rightValue.Type();
+            return static_cast<int>(leftType) < static_cast<int>(rightType) ? -1 : 1;
+        }
+
+        const bool leftIsNan = std::isnan(leftFloatingValue);
+        const bool rightIsNan = std::isnan(rightFloatingValue);
+        if (leftIsNan || rightIsNan)
+        {
+            if (leftIsNan && rightIsNan)
+            {
+                return 0;
+            }
+
+            return leftIsNan ? 1 : -1;
+        }
+
+        if (leftFloatingValue == rightFloatingValue)
+        {
+            return 0;
+        }
+
+        return leftFloatingValue < rightFloatingValue ? -1 : 1;
+    }
+
+    std::size_t HashNormalizedIntegralVariantValue(const GB_Variant& variantValue) noexcept
+    {
+        const GB_VariantType variantType = variantValue.Type();
+        const bool isUnsigned = variantType == GB_VariantType::UInt32 || variantType == GB_VariantType::UInt64;
+        if (!isUnsigned)
+        {
+            bool signedOk = false;
+            const long long signedValue = variantValue.ToInt64(&signedOk);
+            if (signedOk)
+            {
+                if (signedValue >= 0)
+                {
+                    return HashValueBytes(static_cast<unsigned long long>(signedValue));
+                }
+
+                std::size_t hashValue = static_cast<std::size_t>(0x4E454754u);
+                HashCombine(hashValue, HashValueBytes(signedValue));
+                return hashValue;
+            }
+        }
+
+        bool unsignedOk = false;
+        const unsigned long long unsignedValue = variantValue.ToUInt64(&unsignedOk);
+        if (unsignedOk)
+        {
+            return HashValueBytes(unsignedValue);
+        }
+
+        return static_cast<std::size_t>(0);
+    }
+
+    std::size_t HashNormalizedFloatingVariantValue(const GB_Variant& variantValue) noexcept
+    {
+        long double floatingValue = 0.0L;
+        if (!TryGetStoredFloatingValue(variantValue, floatingValue))
+        {
+            return static_cast<std::size_t>(0);
+        }
+
+        if (std::isnan(floatingValue))
+        {
+            return static_cast<std::size_t>(0x7FF80000u);
+        }
+
+        if (floatingValue == 0.0L)
+        {
+            floatingValue = 0.0L;
+        }
+
+        const int precision = std::numeric_limits<long double>::max_digits10;
+        char buffer[64];
+        const int length = std::snprintf(buffer, sizeof(buffer), "%.*Lg", precision, floatingValue);
+        if (length <= 0 || length >= static_cast<int>(sizeof(buffer)))
+        {
+            return static_cast<std::size_t>(0);
+        }
+
+        return HashBytes(reinterpret_cast<const unsigned char*>(buffer), static_cast<std::size_t>(length));
+    }
+
     bool IsAsciiSpace(const unsigned char ch) noexcept
     {
         return ch == ' ' || ch == '\t' || ch == '\n' || ch == '\r' || ch == '\f' || ch == '\v';
@@ -1329,21 +1527,13 @@ GB_Variant::GB_Variant(std::nullptr_t)
 }
 
 GB_Variant::GB_Variant(const char* value)
-    : holder_(nullptr)
+    : holder_(new Holder<std::string>(value != nullptr ? std::string(value) : std::string()))
 {
-    if (value != nullptr)
-    {
-        holder_ = new Holder<std::string>(std::string(value));
-    }
 }
 
 GB_Variant::GB_Variant(char* value)
-    : holder_(nullptr)
+    : holder_(new Holder<std::string>(value != nullptr ? std::string(value) : std::string()))
 {
-    if (value != nullptr)
-    {
-        holder_ = new Holder<std::string>(std::string(value));
-    }
 }
 
 GB_Variant::GB_Variant(const std::string& value)
@@ -1426,6 +1616,17 @@ int GB_Variant::CompareForOrdering(const GB_Variant& other) const noexcept
 
     const GB_VariantType leftType = Type();
     const GB_VariantType rightType = other.Type();
+
+    if (IsIntegralVariantType(leftType) && IsIntegralVariantType(rightType))
+    {
+        return CompareIntegralVariantValues(*this, other);
+    }
+
+    if (IsFloatingVariantType(leftType) && IsFloatingVariantType(rightType))
+    {
+        return CompareFloatingVariantValues(*this, other);
+    }
+
     if (leftType != rightType)
     {
         return static_cast<int>(leftType) < static_cast<int>(rightType) ? -1 : 1;
@@ -1514,12 +1715,26 @@ bool GB_Variant::operator>=(const GB_Variant& other) const noexcept
 std::size_t GB_Variant::Hash() const noexcept
 {
     const GB_VariantType variantType = Type();
-    std::size_t hashValue = HashValueBytes(variantType);
     if (holder_ == nullptr)
     {
+        return HashValueBytes(variantType);
+    }
+
+    if (IsIntegralVariantType(variantType))
+    {
+        std::size_t hashValue = static_cast<std::size_t>(0x494E5447u);
+        HashCombine(hashValue, HashNormalizedIntegralVariantValue(*this));
         return hashValue;
     }
 
+    if (IsFloatingVariantType(variantType))
+    {
+        std::size_t hashValue = static_cast<std::size_t>(0x464C5447u);
+        HashCombine(hashValue, HashNormalizedFloatingVariantValue(*this));
+        return hashValue;
+    }
+
+    std::size_t hashValue = HashValueBytes(variantType);
     HashCombine(hashValue, std::hash<std::type_index>()(std::type_index(holder_->GetTypeInfo())));
 
     std::size_t payloadHash = 0;

@@ -47,7 +47,7 @@ struct GB_XmlDiagnostic
     std::string message = "";
 };
 
-struct GB_XmlNode
+struct GLOBALBASE_PORT GB_XmlNode
 {
     enum class Type
     {
@@ -69,6 +69,34 @@ struct GB_XmlNode
     std::vector<GB_XmlAttribute> attributes;
     std::vector<GB_XmlNamespaceDeclaration> namespaceDeclarations;
     std::vector<GB_XmlNode> children;
+
+    bool IsElement(const std::string& elementName, bool caseSensitive = false) const;
+
+    bool HasAttribute(const std::string& attributeName, bool caseSensitive = false) const;
+
+    const GB_XmlAttribute* GetAttribute(const std::string& attributeName, bool caseSensitive = false) const;
+
+    GB_XmlAttribute* GetAttribute(const std::string& attributeName, bool caseSensitive = false);
+
+    bool TryGetAttributeValue(const std::string& attributeName, std::string& outValue, bool caseSensitive = false) const;
+
+    std::string GetAttributeValue(const std::string& attributeName, bool caseSensitive = false) const;
+
+    bool HasChild(const std::string& childName, bool caseSensitive = false) const;
+
+    const GB_XmlNode* GetChild(const std::string& childName, bool caseSensitive = false) const;
+
+    GB_XmlNode* GetChild(const std::string& childName, bool caseSensitive = false);
+
+    std::vector<const GB_XmlNode*> GetChildren(const std::string& childName = "", bool caseSensitive = false) const;
+
+    std::vector<GB_XmlNode*> GetChildren(const std::string& childName = "", bool caseSensitive = false);
+
+    bool TryGetChildValue(const std::string& childName, std::string& outValue, bool caseSensitive = false) const;
+
+    std::string GetChildValue(const std::string& childName, bool caseSensitive = false) const;
+
+    std::string GetValue() const;
 };
 
 struct GB_XmlDocument
@@ -99,7 +127,7 @@ struct GB_XmlDocument
 struct GB_XmlParserOptions
 {
     bool allowRecovery = false;
-    bool preserveWhitespaceOnlyTextNodes = true;
+    bool preserveWhitespaceOnlyTextNodes = false;
     bool preserveCDataSections = true;
     bool preserveComments = true;
     bool preserveProcessingInstructions = true;

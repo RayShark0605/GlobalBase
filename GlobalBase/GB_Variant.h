@@ -6,7 +6,6 @@
 #include <cstring>
 #include <functional>
 #include <map>
-#include <vector>
 #include <mutex>
 #include <string>
 #include <type_traits>
@@ -142,7 +141,7 @@ public:
         && !std::is_same<TDecayed, std::string>::value
         && !std::is_same<TDecayed, GB_ByteBuffer>::value,
         int>::type = 0>
-    GB_Variant(TValue&& value): holder_(new Holder<TDecayed>(std::forward<TValue>(value)))
+    GB_Variant(TValue&& value) : holder_(new Holder<TDecayed>(std::forward<TValue>(value)))
     {
     }
 
@@ -167,6 +166,11 @@ public:
      * @brief 判断两个 Variant 是否等价。
      *
      * 等价关系与 CompareForOrdering() 的返回值为 0 保持一致。
+     *
+     * 当前语义：
+     * - 整数家族（char / short / int / long / long long 及其无符号版本）按数值比较；
+     * - 浮点家族（float / double / long double）按数值比较，+0 与 -0 视为相等，NaN 与 NaN 视为相等；
+     * - 其它类型仍按各自语义比较。
      */
     bool operator==(const GB_Variant& other) const noexcept;
 
@@ -271,9 +275,12 @@ public:
      * @brief 尝试取得可写的实际存储对象指针。
      *
      * @return 类型匹配时返回内部对象地址，否则返回 nullptr。
+     *
+     * 说明：
+     * - 返回值始终是衰减后的实际存储类型指针，避免 TValue 为引用类型时产生非法指针类型。
      */
     template<typename TValue>
-    TValue* AnyCast() noexcept
+    typename std::decay<TValue>::type* AnyCast() noexcept
     {
         typedef typename std::decay<TValue>::type ValueType;
         if (!Is<ValueType>())
@@ -288,9 +295,12 @@ public:
      * @brief 尝试取得只读的实际存储对象指针。
      *
      * @return 类型匹配时返回内部对象地址，否则返回 nullptr。
+     *
+     * 说明：
+     * - 返回值始终是衰减后的实际存储类型指针，避免 TValue 为引用类型时产生非法指针类型。
      */
     template<typename TValue>
-    const TValue* AnyCast() const noexcept
+    const typename std::decay<TValue>::type* AnyCast() const noexcept
     {
         typedef typename std::decay<TValue>::type ValueType;
         if (!Is<ValueType>())
@@ -310,7 +320,8 @@ public:
     template<typename TValue>
     bool AnyCast(TValue& outValue) const
     {
-        const TValue* value = AnyCast<TValue>();
+        typedef typename std::decay<TValue>::type ValueType;
+        const ValueType* value = AnyCast<ValueType>();
         if (value == nullptr)
         {
             return false;
@@ -438,6 +449,11 @@ public:
             return false;
         }
 
+        if (DeduceVariantType<TValue>() != GB_VariantType::Custom)
+        {
+            return false;
+        }
+
         return RegisterCustomType(std::type_index(typeid(TValue)),
             typeName,
             [serializeFunc](const void* object, GB_ByteBuffer& outData) -> bool
@@ -506,11 +522,11 @@ private:
     {
         typedef typename std::decay<TValue>::type ValueType;
 
-        explicit Holder(const ValueType& inputValue): value(inputValue)
+        explicit Holder(const ValueType& inputValue) : value(inputValue)
         {
         }
 
-        explicit Holder(ValueType&& inputValue): value(std::move(inputValue))
+        explicit Holder(ValueType&& inputValue) : value(std::move(inputValue))
         {
         }
 
