@@ -6,6 +6,7 @@
 #include <cstring>
 #include <functional>
 #include <map>
+#include <vector>
 #include <mutex>
 #include <string>
 #include <type_traits>

@@ -3,79 +3,24 @@
 #include "cpl_error.h"
 #include "cpl_json.h"
 
-#include <climits>
-#include <cstddef>
-#include <memory>
-#include <mutex>
-#include <sstream>
-#include <utility>
-
 #include <libxml/parser.h>
 #include <libxml/tree.h>
 #include <libxml/xmlerror.h>
+
+#include <algorithm>
+#include <climits>
+#include <exception>
+#include <memory>
+#include <mutex>
+#include <sstream>
+#include <string>
+#include <vector>
 
 namespace
 {
     constexpr int kMaxJsonNestingDepth = 256;
 
-    using XmlOptions = GB_XmlParser::Options;
-    using XmlDiagnostic = GB_XmlParser::Diagnostic;
-
-    struct XmlParserCtxtDeleter
-    {
-        void operator()(xmlParserCtxtPtr parserContext) const
-        {
-            if (parserContext != nullptr)
-            {
-                xmlFreeParserCtxt(parserContext);
-            }
-        }
-    };
-
-    struct XmlDocDeleter
-    {
-        void operator()(xmlDocPtr document) const
-        {
-            if (document != nullptr)
-            {
-                xmlFreeDoc(document);
-            }
-        }
-    };
-
-    struct XmlCharDeleter
-    {
-        void operator()(xmlChar* text) const
-        {
-            if (text != nullptr)
-            {
-                xmlFree(text);
-            }
-        }
-    };
-
-    using UniqueXmlParserContext = std::unique_ptr<xmlParserCtxt, XmlParserCtxtDeleter>;
-    using UniqueXmlDocument = std::unique_ptr<xmlDoc, XmlDocDeleter>;
-    using UniqueXmlChar = std::unique_ptr<xmlChar, XmlCharDeleter>;
-
-    void EnsureXmlLibraryInitialized()
-    {
-        static std::once_flag initFlag;
-        std::call_once(initFlag, []()
-            {
-                xmlInitParser();
-            });
-    }
-
-    void ClearOptionalErrorMessage(std::string* errorMessage)
-    {
-        if (errorMessage != nullptr)
-        {
-            errorMessage->clear();
-        }
-    }
-
-    void AssignOptionalErrorMessage(std::string* errorMessage, const std::string& message)
+    void SetErrorMessage(std::string* errorMessage, const std::string& message)
     {
         if (errorMessage != nullptr)
         {
@@ -83,60 +28,13 @@ namespace
         }
     }
 
-    void ClearOptionalDiagnostics(std::vector<XmlDiagnostic>* diagnostics)
+    void ClearErrorMessage(std::string* errorMessage)
     {
-        if (diagnostics != nullptr)
+        if (errorMessage != nullptr)
         {
-            diagnostics->clear();
+            errorMessage->clear();
         }
     }
-
-    void InsertOrAssignVariantMapValue(GB_VariantMap& variantMap, const std::string& key, GB_Variant&& value)
-    {
-        GB_VariantMap::iterator iter = variantMap.lower_bound(key);
-        if (iter != variantMap.end() && iter->first == key)
-        {
-            iter->second = std::move(value);
-            return;
-        }
-
-        variantMap.emplace_hint(iter, key, std::move(value));
-    }
-
-    void InsertOrAssignVariantMapString(GB_VariantMap& variantMap, const std::string& key, std::string&& value)
-    {
-        GB_VariantMap::iterator iter = variantMap.lower_bound(key);
-        if (iter != variantMap.end() && iter->first == key)
-        {
-            iter->second = std::move(value);
-            return;
-        }
-
-        variantMap.emplace_hint(iter, key, GB_Variant(std::move(value)));
-    }
-
-    std::string BuildXmlQualifiedName(const xmlChar* localName, const xmlChar* namespacePrefix)
-    {
-        const std::string localNameText = localName != nullptr
-            ? reinterpret_cast<const char*>(localName)
-            : std::string();
-        const std::string namespacePrefixText = namespacePrefix != nullptr
-            ? reinterpret_cast<const char*>(namespacePrefix)
-            : std::string();
-
-        if (namespacePrefixText.empty())
-        {
-            return localNameText;
-        }
-
-        if (localNameText.empty())
-        {
-            return namespacePrefixText;
-        }
-
-        return namespacePrefixText + ":" + localNameText;
-    }
-
 
     std::string GetJsonTypeName(const CPLJSONObject::Type type)
     {
@@ -144,31 +42,22 @@ namespace
         {
         case CPLJSONObject::Type::Unknown:
             return "Unknown";
-
         case CPLJSONObject::Type::Null:
             return "Null";
-
         case CPLJSONObject::Type::Object:
             return "Object";
-
         case CPLJSONObject::Type::Array:
             return "Array";
-
         case CPLJSONObject::Type::Boolean:
             return "Boolean";
-
         case CPLJSONObject::Type::String:
             return "String";
-
         case CPLJSONObject::Type::Integer:
             return "Integer";
-
         case CPLJSONObject::Type::Long:
             return "Long";
-
         case CPLJSONObject::Type::Double:
             return "Double";
-
         default:
             return "Unsupported";
         }
@@ -176,64 +65,51 @@ namespace
 
     std::string EscapeJsonPathText(const std::string& text)
     {
-        std::string escapedText;
-        escapedText.reserve(text.size());
+        std::string result;
+        result.reserve(text.size());
 
         for (std::size_t index = 0; index < text.size(); index++)
         {
             const char currentChar = text[index];
             if (currentChar == '\\' || currentChar == '"')
             {
-                escapedText.push_back('\\');
+                result.push_back('\\');
             }
-
-            escapedText.push_back(currentChar);
+            result.push_back(currentChar);
         }
 
-        return escapedText;
+        return result;
     }
 
-    std::string BuildJsonObjectChildPath(const std::string& parentPath, const std::string& childName)
+    std::string GetJsonObjectChildPath(const std::string& parentPath, const std::string& childName)
     {
         return parentPath + "[\"" + EscapeJsonPathText(childName) + "\"]";
     }
 
-    std::string BuildJsonArrayItemPath(const std::string& parentPath, const int index)
+    std::string GetJsonArrayItemPath(const std::string& parentPath, const int index)
     {
         return parentPath + "[" + std::to_string(index) + "]";
     }
 
-    bool ConvertJsonNodeToVariant(
-        const CPLJSONObject& jsonObject,
-        GB_Variant& outValue,
-        std::string* errorMessage,
-        const std::string& jsonPath,
-        const int currentDepth);
+    bool ConvertJsonNodeToVariant(const CPLJSONObject& jsonObject, GB_Variant& outValue, std::string* errorMessage, const std::string& jsonPath, const int currentDepth);
 
-    bool ConvertJsonObjectToVariantMap(
-        const CPLJSONObject& jsonObject,
-        GB_VariantMap& outMap,
-        std::string* errorMessage,
-        const std::string& jsonPath,
-        const int currentDepth)
+    bool ConvertJsonObjectToVariantMap(const CPLJSONObject& jsonObject, GB_VariantMap& outMap, std::string* errorMessage, const std::string& jsonPath, const int currentDepth)
     {
         if (!jsonObject.IsValid())
         {
-            AssignOptionalErrorMessage(errorMessage, "Invalid JSON object at " + jsonPath + ".");
+            SetErrorMessage(errorMessage, "Invalid JSON object at " + jsonPath + ".");
             return false;
         }
 
         if (jsonObject.GetType() != CPLJSONObject::Type::Object)
         {
-            AssignOptionalErrorMessage(errorMessage,
-                "JSON node at " + jsonPath + " is not an object. Actual type: " + GetJsonTypeName(jsonObject.GetType()) + ".");
+            SetErrorMessage(errorMessage, "JSON node at " + jsonPath + " is not an object. Actual type: " + GetJsonTypeName(jsonObject.GetType()) + ".");
             return false;
         }
 
         if (currentDepth > kMaxJsonNestingDepth)
         {
-            AssignOptionalErrorMessage(errorMessage,
-                "JSON nesting depth exceeds the supported limit (" + std::to_string(kMaxJsonNestingDepth) + ") at " + jsonPath + ".");
+            SetErrorMessage(errorMessage, "JSON nesting depth exceeds the supported limit (" + std::to_string(kMaxJsonNestingDepth) + ") at " + jsonPath + ".");
             return false;
         }
 
@@ -241,11 +117,12 @@ namespace
         {
             GB_VariantMap newMap;
             const std::vector<CPLJSONObject> children = jsonObject.GetChildren();
+
             for (std::size_t index = 0; index < children.size(); index++)
             {
                 const CPLJSONObject& child = children[index];
                 const std::string childName = child.GetName();
-                const std::string childPath = BuildJsonObjectChildPath(jsonPath, childName);
+                const std::string childPath = GetJsonObjectChildPath(jsonPath, childName);
 
                 GB_Variant childValue;
                 if (!ConvertJsonNodeToVariant(child, childValue, errorMessage, childPath, currentDepth + 1))
@@ -253,7 +130,15 @@ namespace
                     return false;
                 }
 
-                InsertOrAssignVariantMapValue(newMap, childName, std::move(childValue));
+                const GB_VariantMap::iterator insertPosition = newMap.lower_bound(childName);
+                if (insertPosition != newMap.end() && insertPosition->first == childName)
+                {
+                    insertPosition->second = std::move(childValue);
+                }
+                else
+                {
+                    newMap.emplace_hint(insertPosition, childName, std::move(childValue));
+                }
             }
 
             outMap = std::move(newMap);
@@ -261,29 +146,21 @@ namespace
         }
         catch (const std::exception& exceptionObject)
         {
-            AssignOptionalErrorMessage(errorMessage,
-                "Failed to convert JSON object at " + jsonPath + ": " + std::string(exceptionObject.what()));
+            SetErrorMessage(errorMessage, "Failed to convert JSON object at " + jsonPath + ": " + exceptionObject.what());
             return false;
         }
         catch (...)
         {
-            AssignOptionalErrorMessage(errorMessage,
-                "Failed to convert JSON object at " + jsonPath + " due to an unknown exception.");
+            SetErrorMessage(errorMessage, "Failed to convert JSON object at " + jsonPath + " due to an unknown exception.");
             return false;
         }
     }
 
-    bool ConvertJsonArrayToVariantList(
-        const CPLJSONArray& jsonArray,
-        GB_VariantList& outList,
-        std::string* errorMessage,
-        const std::string& jsonPath,
-        const int currentDepth)
+    bool ConvertJsonArrayToVariantList(const CPLJSONArray& jsonArray, GB_VariantList& outList, std::string* errorMessage, const std::string& jsonPath, const int currentDepth)
     {
         if (currentDepth > kMaxJsonNestingDepth)
         {
-            AssignOptionalErrorMessage(errorMessage,
-                "JSON nesting depth exceeds the supported limit (" + std::to_string(kMaxJsonNestingDepth) + ") at " + jsonPath + ".");
+            SetErrorMessage(errorMessage, "JSON nesting depth exceeds the supported limit (" + std::to_string(kMaxJsonNestingDepth) + ") at " + jsonPath + ".");
             return false;
         }
 
@@ -291,9 +168,10 @@ namespace
         {
             GB_VariantList newList;
             const int itemCount = jsonArray.Size();
+
             if (itemCount < 0)
             {
-                AssignOptionalErrorMessage(errorMessage, "Invalid JSON array size at " + jsonPath + ".");
+                SetErrorMessage(errorMessage, "Invalid JSON array size at " + jsonPath + ".");
                 return false;
             }
 
@@ -305,7 +183,7 @@ namespace
             for (int index = 0; index < itemCount; index++)
             {
                 GB_Variant itemValue;
-                if (!ConvertJsonNodeToVariant(jsonArray[index], itemValue, errorMessage, BuildJsonArrayItemPath(jsonPath, index), currentDepth + 1))
+                if (!ConvertJsonNodeToVariant(jsonArray[index], itemValue, errorMessage, GetJsonArrayItemPath(jsonPath, index), currentDepth + 1))
                 {
                     return false;
                 }
@@ -318,35 +196,27 @@ namespace
         }
         catch (const std::exception& exceptionObject)
         {
-            AssignOptionalErrorMessage(errorMessage,
-                "Failed to convert JSON array at " + jsonPath + ": " + std::string(exceptionObject.what()));
+            SetErrorMessage(errorMessage, "Failed to convert JSON array at " + jsonPath + ": " + exceptionObject.what());
             return false;
         }
         catch (...)
         {
-            AssignOptionalErrorMessage(errorMessage,
-                "Failed to convert JSON array at " + jsonPath + " due to an unknown exception.");
+            SetErrorMessage(errorMessage, "Failed to convert JSON array at " + jsonPath + " due to an unknown exception.");
             return false;
         }
     }
 
-    bool ConvertJsonNodeToVariant(
-        const CPLJSONObject& jsonObject,
-        GB_Variant& outValue,
-        std::string* errorMessage,
-        const std::string& jsonPath,
-        const int currentDepth)
+    bool ConvertJsonNodeToVariant(const CPLJSONObject& jsonObject, GB_Variant& outValue, std::string* errorMessage, const std::string& jsonPath, const int currentDepth)
     {
         if (!jsonObject.IsValid())
         {
-            AssignOptionalErrorMessage(errorMessage, "Invalid JSON node at " + jsonPath + ".");
+            SetErrorMessage(errorMessage, "Invalid JSON node at " + jsonPath + ".");
             return false;
         }
 
         if (currentDepth > kMaxJsonNestingDepth)
         {
-            AssignOptionalErrorMessage(errorMessage,
-                "JSON nesting depth exceeds the supported limit (" + std::to_string(kMaxJsonNestingDepth) + ") at " + jsonPath + ".");
+            SetErrorMessage(errorMessage, "JSON nesting depth exceeds the supported limit (" + std::to_string(kMaxJsonNestingDepth) + ") at " + jsonPath + ".");
             return false;
         }
 
@@ -403,43 +273,46 @@ namespace
 
         case CPLJSONObject::Type::Unknown:
         default:
-            AssignOptionalErrorMessage(errorMessage,
-                "Unsupported JSON node type at " + jsonPath + ": " + GetJsonTypeName(jsonType) + ".");
+            SetErrorMessage(errorMessage, "Unsupported JSON node type at " + jsonPath + ": " + GetJsonTypeName(jsonType) + ".");
             return false;
         }
     }
 
-
-
-    bool LoadJsonDocumentFromText(const std::string& jsonText, CPLJSONDocument& outDocument, std::string* errorMessage)
+    bool LoadJsonDocument(const std::string& jsonText, CPLJSONDocument& jsonDocument, std::string* errorMessage)
     {
-        ClearOptionalErrorMessage(errorMessage);
-
         if (jsonText.empty())
         {
-            AssignOptionalErrorMessage(errorMessage, "Input JSON text is empty.");
+            SetErrorMessage(errorMessage, "Input JSON text is empty.");
             return false;
         }
 
         CPLErrorReset();
-        if (!outDocument.LoadMemory(jsonText))
+
+        if (!jsonDocument.LoadMemory(jsonText))
         {
             const char* gdalErrorText = CPLGetLastErrorMsg();
             if (gdalErrorText != nullptr && gdalErrorText[0] != '\0')
             {
-                AssignOptionalErrorMessage(errorMessage, std::string("Failed to parse JSON text. GDAL error: ") + gdalErrorText);
+                SetErrorMessage(errorMessage, std::string("Failed to parse JSON text. GDAL error: ") + gdalErrorText);
             }
             else
             {
-                AssignOptionalErrorMessage(errorMessage, "Failed to parse JSON text. Please ensure the input is valid JSON.");
+                SetErrorMessage(errorMessage, "Failed to parse JSON text. Please ensure the input is valid JSON.");
             }
-
             return false;
         }
 
         return true;
     }
 
+    void EnsureLibXmlInitialized()
+    {
+        static std::once_flag initOnce;
+        std::call_once(initOnce, []()
+            {
+                xmlInitParser();
+            });
+    }
 
     std::string XmlCharToString(const xmlChar* text)
     {
@@ -451,41 +324,12 @@ namespace
         return std::string(reinterpret_cast<const char*>(text));
     }
 
-    std::string TrimAsciiWhitespace(const std::string& text)
-    {
-        std::size_t beginIndex = 0;
-        while (beginIndex < text.size())
-        {
-            const char character = text[beginIndex];
-            if (character != ' ' && character != '\t' && character != '\r' && character != '\n')
-            {
-                break;
-            }
-
-            beginIndex++;
-        }
-
-        std::size_t endIndex = text.size();
-        while (endIndex > beginIndex)
-        {
-            const char character = text[endIndex - 1];
-            if (character != ' ' && character != '\t' && character != '\r' && character != '\n')
-            {
-                break;
-            }
-
-            endIndex--;
-        }
-
-        return text.substr(beginIndex, endIndex - beginIndex);
-    }
-
-    bool IsAsciiWhitespaceOnly(const std::string& text)
+    bool IsXmlWhitespaceOnlyText(const std::string& text)
     {
         for (std::size_t index = 0; index < text.size(); index++)
         {
-            const char character = text[index];
-            if (character != ' ' && character != '\t' && character != '\r' && character != '\n')
+            const char currentChar = text[index];
+            if (currentChar != ' ' && currentChar != '\t' && currentChar != '\n' && currentChar != '\r')
             {
                 return false;
             }
@@ -494,1031 +338,721 @@ namespace
         return true;
     }
 
-    std::string NormalizeXmlText(const xmlNode* textNode, const std::string& rawText, const XmlOptions& options, bool& shouldKeep)
+    GB_XmlDiagnostic::Level ConvertXmlDiagnosticLevel(const xmlErrorLevel level)
     {
-        shouldKeep = true;
-
-        std::string text = rawText;
-        if (options.trimText)
+        switch (level)
         {
-            text = TrimAsciiWhitespace(text);
-            if (text.empty() && options.skipEmptyTextAfterTrim)
-            {
-                shouldKeep = false;
-                return std::string();
-            }
+        case XML_ERR_WARNING:
+            return GB_XmlDiagnostic::Level::Warning;
+        case XML_ERR_FATAL:
+            return GB_XmlDiagnostic::Level::Fatal;
+        case XML_ERR_ERROR:
+        default:
+            return GB_XmlDiagnostic::Level::Error;
         }
-
-        if (!options.preserveBlankText && IsAsciiWhitespaceOnly(text))
-        {
-            const int xmlSpace = xmlNodeGetSpacePreserve(textNode);
-            if (xmlSpace != 1)
-            {
-                shouldKeep = false;
-                return std::string();
-            }
-        }
-
-        if (text.empty() && !options.preserveBlankText && options.skipEmptyTextAfterTrim)
-        {
-            shouldKeep = false;
-            return std::string();
-        }
-
-        return text;
     }
 
-    void TrimTrailingLineBreaks(std::string& text)
+    std::string NormalizeXmlDiagnosticMessage(const std::string& message)
     {
-        std::size_t newSize = text.size();
-        while (newSize > 0)
+        std::size_t endIndex = message.size();
+        while (endIndex > 0)
         {
-            const char lastCharacter = text[newSize - 1];
-            if (lastCharacter != '\r' && lastCharacter != '\n')
+            const char currentChar = message[endIndex - 1];
+            if (currentChar != '\r' && currentChar != '\n')
             {
                 break;
             }
-
-            newSize--;
+            endIndex--;
         }
 
-        if (newSize != text.size())
-        {
-            text.resize(newSize);
-        }
+        return message.substr(0, endIndex);
     }
 
-    XmlDiagnostic BuildDiagnosticFromXmlError(const xmlError& error)
+    class XmlErrorCollector
     {
-        XmlDiagnostic diagnostic;
-        diagnostic.level = static_cast<int>(error.level);
-        diagnostic.code = error.code;
-        diagnostic.line = error.line;
-        diagnostic.column = error.int2;
-        diagnostic.file = error.file != nullptr ? error.file : std::string();
-        diagnostic.message = error.message != nullptr ? error.message : std::string();
-        TrimTrailingLineBreaks(diagnostic.message);
-        return diagnostic;
-    }
-
-    struct XmlErrorCollector
-    {
-        explicit XmlErrorCollector(std::size_t maxCountIn) : maxCount(maxCountIn)
+    public:
+        void Add(const xmlError* error)
         {
+            if (error == nullptr)
+            {
+                return;
+            }
+
+            GB_XmlDiagnostic diagnostic;
+            diagnostic.level = ConvertXmlDiagnosticLevel(static_cast<xmlErrorLevel>(error->level));
+            diagnostic.code = error->code;
+            diagnostic.lineNumber = error->line > 0 ? static_cast<long long>(error->line) : -1;
+            diagnostic.columnNumber = error->int2 > 0 ? error->int2 : -1;
+            diagnostic.message = NormalizeXmlDiagnosticMessage(XmlCharToString(reinterpret_cast<const xmlChar*>(error->message)));
+            diagnostics_.push_back(std::move(diagnostic));
         }
 
-#if LIBXML_VERSION >= 21200
-        static void XMLCALL StructuredErrorCallback(void* userData, const xmlError* error)
+        const std::vector<GB_XmlDiagnostic>& GetDiagnostics() const
+        {
+            return diagnostics_;
+        }
+
+        bool HasErrorOrFatal() const
+        {
+            for (std::size_t index = 0; index < diagnostics_.size(); index++)
+            {
+                if (diagnostics_[index].level != GB_XmlDiagnostic::Level::Warning)
+                {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        std::string BuildSummaryMessage() const
+        {
+            if (diagnostics_.empty())
+            {
+                return std::string();
+            }
+
+            const GB_XmlDiagnostic& firstDiagnostic = diagnostics_.front();
+            std::ostringstream stream;
+            stream << "Failed to parse XML";
+            if (firstDiagnostic.lineNumber > 0)
+            {
+                stream << " at line " << firstDiagnostic.lineNumber;
+                if (firstDiagnostic.columnNumber > 0)
+                {
+                    stream << ", column " << firstDiagnostic.columnNumber;
+                }
+            }
+            stream << ": " << firstDiagnostic.message;
+
+            if (diagnostics_.size() > 1)
+            {
+                stream << " (and " << (diagnostics_.size() - 1) << " more message(s)).";
+            }
+            else if (!firstDiagnostic.message.empty() && firstDiagnostic.message.back() != '.')
+            {
+                stream << ".";
+            }
+
+            return stream.str();
+        }
+
+#if defined(LIBXML_VERSION) && LIBXML_VERSION >= 21300
+        static void StructuredErrorCallback(void* userData, const xmlError* error)
 #else
-        static void XMLCALL StructuredErrorCallback(void* userData, xmlErrorPtr error)
+        static void StructuredErrorCallback(void* userData, xmlErrorPtr error)
 #endif
         {
-            if (userData == nullptr || error == nullptr)
+            XmlErrorCollector* errorCollector = static_cast<XmlErrorCollector*>(userData);
+            if (errorCollector != nullptr)
             {
-                return;
+                errorCollector->Add(error);
             }
-
-            XmlErrorCollector* collector = static_cast<XmlErrorCollector*>(userData);
-            collector->Add(*error);
         }
 
-        void Add(const xmlError& error)
-        {
-            if (diagnostics.size() >= maxCount)
-            {
-                return;
-            }
-
-            diagnostics.push_back(BuildDiagnosticFromXmlError(error));
-        }
-
-        std::vector<XmlDiagnostic> diagnostics;
-        std::size_t maxCount = 0;
+    private:
+        std::vector<GB_XmlDiagnostic> diagnostics_;
     };
 
-    std::string BuildXmlErrorMessage(const std::vector<XmlDiagnostic>& diagnostics, const std::string& fallbackMessage)
+    struct XmlParserContextDeleter
     {
-        if (diagnostics.empty())
+        void operator()(xmlParserCtxtPtr parserContext) const
         {
-            return fallbackMessage;
-        }
-
-        const XmlDiagnostic* selectedDiagnostic = &diagnostics[0];
-        for (std::size_t index = 1; index < diagnostics.size(); index++)
-        {
-            const XmlDiagnostic& currentDiagnostic = diagnostics[index];
-            if (currentDiagnostic.level > selectedDiagnostic->level)
+            if (parserContext != nullptr)
             {
-                selectedDiagnostic = &currentDiagnostic;
-                continue;
-            }
-
-            if (currentDiagnostic.level == selectedDiagnostic->level && currentDiagnostic.code != 0 && selectedDiagnostic->code == 0)
-            {
-                selectedDiagnostic = &currentDiagnostic;
+                xmlFreeParserCtxt(parserContext);
             }
         }
+    };
 
-        std::ostringstream stream;
-        stream << selectedDiagnostic->message;
-        if (selectedDiagnostic->line > 0)
+    struct XmlDocumentDeleter
+    {
+        void operator()(xmlDocPtr document) const
         {
-            stream << " (line=" << selectedDiagnostic->line;
-            if (selectedDiagnostic->column > 0)
+            if (document != nullptr)
             {
-                stream << ", column=" << selectedDiagnostic->column;
+                xmlFreeDoc(document);
             }
-            stream << ")";
         }
+    };
 
-        if (!selectedDiagnostic->file.empty())
+    struct XmlCharDeleter
+    {
+        void operator()(xmlChar* text) const
         {
-            stream << " [" << selectedDiagnostic->file << "]";
+            if (text != nullptr)
+            {
+                xmlMemFree(text);
+            }
+        }
+    };
+
+    std::string GetXmlNodePath(const xmlNodePtr node)
+    {
+        if (node == nullptr)
+        {
+            return std::string();
         }
 
-        return stream.str();
+        if (node->type == XML_DOCUMENT_NODE)
+        {
+            return "/";
+        }
+
+        std::vector<std::string> pathParts;
+        xmlNodePtr currentNode = node;
+        while (currentNode != nullptr && currentNode->type != XML_DOCUMENT_NODE)
+        {
+            std::string currentPart;
+            switch (currentNode->type)
+            {
+            case XML_ELEMENT_NODE:
+                currentPart = XmlCharToString(currentNode->name);
+                break;
+            case XML_TEXT_NODE:
+                currentPart = "text()";
+                break;
+            case XML_CDATA_SECTION_NODE:
+                currentPart = "cdata()";
+                break;
+            case XML_COMMENT_NODE:
+                currentPart = "comment()";
+                break;
+            case XML_PI_NODE:
+                currentPart = "processing-instruction()";
+                break;
+            case XML_ENTITY_REF_NODE:
+                currentPart = "entity-ref(" + XmlCharToString(currentNode->name) + ")";
+                break;
+            default:
+                currentPart = "node()";
+                break;
+            }
+
+            int siblingIndex = 1;
+            for (xmlNodePtr sibling = currentNode->prev; sibling != nullptr; sibling = sibling->prev)
+            {
+                if (sibling->type == currentNode->type)
+                {
+                    const bool sameElementName = currentNode->type != XML_ELEMENT_NODE
+                        || xmlStrEqual(sibling->name, currentNode->name);
+                    if (sameElementName)
+                    {
+                        siblingIndex++;
+                    }
+                }
+            }
+
+            pathParts.push_back(currentPart + "[" + std::to_string(siblingIndex) + "]");
+            currentNode = currentNode->parent;
+        }
+
+        std::reverse(pathParts.begin(), pathParts.end());
+
+        std::string path = "/";
+        for (std::size_t index = 0; index < pathParts.size(); index++)
+        {
+            if (index > 0)
+            {
+                path += "/";
+            }
+            path += pathParts[index];
+        }
+
+        return path;
     }
 
-    int BuildXmlParserFlags(const XmlOptions& options, bool enableStructuredErrorHandler, bool& unsupportedLegacySecurityCombination)
+    bool ShouldRejectUnsafeEntityConfiguration(const GB_XmlParserOptions& options)
     {
-        unsupportedLegacySecurityCombination = false;
+#if defined(XML_PARSE_NO_XXE)
+        (void)options;
+        return false;
+#else
+        return !options.allowExternalEntities
+            && (options.substituteEntities
+                || options.loadExternalDtd
+                || options.applyDefaultDtdAttributes
+                || options.validateWithDtd);
+#endif
+    }
 
-        int flags = 0;
+    int BuildLibXmlParseOptions(const GB_XmlParserOptions& options)
+    {
+        int parseOptions = 0;
 
         if (options.allowRecovery)
         {
-            flags |= XML_PARSE_RECOVER;
-        }
-
-        if (!options.allowNetwork)
-        {
-            flags |= XML_PARSE_NONET;
-        }
-
-        if (options.expandEntities)
-        {
-            flags |= XML_PARSE_NOENT;
-        }
-
-        if (options.loadExternalDtd)
-        {
-            flags |= XML_PARSE_DTDLOAD;
-        }
-
-        if (options.applyDefaultDtdAttributes)
-        {
-            flags |= XML_PARSE_DTDATTR;
-        }
-
-        if (options.validateDtd)
-        {
-            flags |= XML_PARSE_DTDVALID;
-        }
-
-        if (options.pedantic)
-        {
-            flags |= XML_PARSE_PEDANTIC;
+            parseOptions |= XML_PARSE_RECOVER;
         }
 
         if (!options.preserveCDataSections)
         {
-            flags |= XML_PARSE_NOCDATA;
+            parseOptions |= XML_PARSE_NOCDATA;
         }
 
-        if (options.cleanupRedundantNamespaces)
+        if (options.cleanRedundantNamespaceDeclarations)
         {
-            flags |= XML_PARSE_NSCLEAN;
+            parseOptions |= XML_PARSE_NSCLEAN;
         }
 
+        if (options.substituteEntities)
+        {
+            parseOptions |= XML_PARSE_NOENT;
+        }
+
+        if (options.loadExternalDtd)
+        {
+            parseOptions |= XML_PARSE_DTDLOAD;
+        }
+
+        if (options.applyDefaultDtdAttributes)
+        {
+            parseOptions |= XML_PARSE_DTDATTR;
+        }
+
+        if (options.validateWithDtd)
+        {
+            parseOptions |= XML_PARSE_DTDVALID;
+        }
+
+        if (!options.allowNetworkAccess)
+        {
+            parseOptions |= XML_PARSE_NONET;
+        }
+
+        if (options.allowHugeDocuments)
+        {
+            parseOptions |= XML_PARSE_HUGE;
+        }
+
+#ifdef XML_PARSE_COMPACT
         if (options.compactMemory)
         {
-            flags |= XML_PARSE_COMPACT;
+            parseOptions |= XML_PARSE_COMPACT;
         }
-
-        if (options.useHugeMode)
-        {
-            flags |= XML_PARSE_HUGE;
-        }
-
-#ifdef XML_PARSE_BIG_LINES
-        flags |= XML_PARSE_BIG_LINES;
 #endif
 
-#ifdef XML_PARSE_IGNORE_ENC
-        if (options.ignoreEncodingDeclaration)
+#ifdef XML_PARSE_BIG_LINES
+        if (options.reportLargeLineNumbers)
         {
-            flags |= XML_PARSE_IGNORE_ENC;
+            parseOptions |= XML_PARSE_BIG_LINES;
         }
 #endif
 
 #ifdef XML_PARSE_NO_XXE
         if (!options.allowExternalEntities)
         {
-            flags |= XML_PARSE_NO_XXE;
-        }
-#else
-        if (!options.allowExternalEntities
-            && (options.expandEntities || options.loadExternalDtd || options.applyDefaultDtdAttributes || options.validateDtd))
-        {
-            unsupportedLegacySecurityCombination = true;
+            parseOptions |= XML_PARSE_NO_XXE;
         }
 #endif
 
-        if (!enableStructuredErrorHandler)
-        {
-            flags |= XML_PARSE_NOERROR;
-            flags |= XML_PARSE_NOWARNING;
-        }
-
-        return flags;
+        return parseOptions;
     }
 
-    std::string GetXmlNodeTypeName(const xmlNode* node)
-    {
-        if (node == nullptr)
-        {
-            return "unknown";
-        }
-
-        switch (node->type)
-        {
-        case XML_ELEMENT_NODE:
-            return "element";
-
-        case XML_TEXT_NODE:
-            return "text";
-
-        case XML_CDATA_SECTION_NODE:
-            return "cdata";
-
-        case XML_COMMENT_NODE:
-            return "comment";
-
-        case XML_PI_NODE:
-            return "processingInstruction";
-
-        case XML_ENTITY_REF_NODE:
-            return "entityReference";
-
-        case XML_ENTITY_NODE:
-            return "entity";
-
-        case XML_DOCUMENT_NODE:
-            return "document";
-
-        case XML_DOCUMENT_TYPE_NODE:
-            return "documentType";
-
-        case XML_DTD_NODE:
-            return "dtd";
-
-        case XML_ATTRIBUTE_NODE:
-            return "attribute";
-
-        case XML_NAMESPACE_DECL:
-            return "namespaceDeclaration";
-
-        case XML_DOCUMENT_FRAG_NODE:
-            return "documentFragment";
-
-        default:
-            return "unknown";
-        }
-    }
-
-    void AppendNodeIdentityFields(const xmlNode* node, const XmlOptions& options, GB_VariantMap& outNode)
-    {
-        if (node == nullptr)
-        {
-            return;
-        }
-
-        outNode["nodeType"] = GetXmlNodeTypeName(node);
-
-        if (node->name != nullptr)
-        {
-            const std::string localName = XmlCharToString(node->name);
-            const xmlChar* const namespacePrefix = node->ns != nullptr ? node->ns->prefix : nullptr;
-            const std::string qualifiedName = BuildXmlQualifiedName(node->name, namespacePrefix);
-
-            if (!qualifiedName.empty())
-            {
-                outNode["name"] = qualifiedName;
-            }
-            if (!localName.empty())
-            {
-                outNode["localName"] = localName;
-            }
-        }
-
-        if (options.includeNamespaceInfo && node->ns != nullptr)
-        {
-            const std::string namespacePrefix = XmlCharToString(node->ns->prefix);
-            const std::string namespaceUri = XmlCharToString(node->ns->href);
-            if (!namespacePrefix.empty())
-            {
-                outNode["namespacePrefix"] = namespacePrefix;
-            }
-            if (!namespaceUri.empty())
-            {
-                outNode["namespaceUri"] = namespaceUri;
-            }
-        }
-
-        if (options.includeNodeLineNumbers)
-        {
-            const long long lineNumber = static_cast<long long>(xmlGetLineNo(node));
-            if (lineNumber > 0)
-            {
-                outNode["line"] = lineNumber;
-            }
-        }
-    }
-
-    bool BuildXmlAttributeValue(const xmlAttr* attribute, const xmlDoc* document, std::string& outValue)
+    bool AddXmlAttribute(const xmlAttrPtr attribute, GB_XmlAttribute& outAttribute)
     {
         if (attribute == nullptr)
         {
             return false;
         }
 
-        UniqueXmlChar value(xmlNodeListGetString(const_cast<xmlDoc*>(document), attribute->children, 1));
-        if (value.get() == nullptr)
+        outAttribute.attributeName = XmlCharToString(attribute->name);
+        outAttribute.localName = outAttribute.attributeName;
+        outAttribute.namespacePrefix.clear();
+        outAttribute.namespaceUri.clear();
+
+        if (attribute->ns != nullptr)
         {
-            outValue.clear();
-            return true;
-        }
-
-        outValue = XmlCharToString(value.get());
-        return true;
-    }
-
-    bool BuildXmlAttributes(const xmlNode* node, const xmlDoc* document, const XmlOptions& options, GB_VariantMap& outAttributes)
-    {
-        outAttributes.clear();
-
-        if (node == nullptr || document == nullptr)
-        {
-            return false;
-        }
-
-        try
-        {
-            for (const xmlAttr* attribute = node->properties; attribute != nullptr; attribute = attribute->next)
+            outAttribute.namespacePrefix = XmlCharToString(attribute->ns->prefix);
+            outAttribute.namespaceUri = XmlCharToString(attribute->ns->href);
+            if (!outAttribute.namespacePrefix.empty())
             {
-                if (attribute->name == nullptr)
-                {
-                    continue;
-                }
-
-                const xmlChar* const attributePrefix = attribute->ns != nullptr ? attribute->ns->prefix : nullptr;
-                const std::string attributeName = BuildXmlQualifiedName(attribute->name, attributePrefix);
-
-                std::string attributeValue;
-                if (!BuildXmlAttributeValue(attribute, document, attributeValue))
-                {
-                    return false;
-                }
-
-                if (options.attributeOutputMode == GB_XmlParser::AttributeOutputMode::ValueOnly)
-                {
-                    InsertOrAssignVariantMapString(outAttributes, attributeName, std::move(attributeValue));
-                    continue;
-                }
-
-                GB_VariantMap attributeObject;
-                attributeObject["nodeType"] = "attribute";
-                attributeObject["name"] = attributeName;
-                attributeObject["localName"] = XmlCharToString(attribute->name);
-                attributeObject["value"] = std::move(attributeValue);
-                if (options.includeNamespaceInfo && attribute->ns != nullptr)
-                {
-                    const std::string attributePrefix = XmlCharToString(attribute->ns->prefix);
-                    const std::string attributeUri = XmlCharToString(attribute->ns->href);
-                    if (!attributePrefix.empty())
-                    {
-                        attributeObject["namespacePrefix"] = attributePrefix;
-                    }
-                    if (!attributeUri.empty())
-                    {
-                        attributeObject["namespaceUri"] = attributeUri;
-                    }
-                }
-
-                InsertOrAssignVariantMapValue(outAttributes, attributeName, std::move(attributeObject));
+                outAttribute.attributeName = outAttribute.namespacePrefix + ":" + outAttribute.localName;
             }
         }
-        catch (...)
-        {
-            outAttributes.clear();
-            return false;
-        }
 
+        std::unique_ptr<xmlChar, XmlCharDeleter> attributeValue(xmlNodeListGetString(attribute->doc, attribute->children, 1));
+        outAttribute.attributeValue = XmlCharToString(attributeValue.get());
         return true;
     }
 
-    bool BuildXmlNamespaceDeclarations(const xmlNode* node, GB_VariantMap& outNamespaces)
+    void AddNamespaceDeclarations(const xmlNodePtr node, std::vector<GB_XmlNamespaceDeclaration>& outNamespaceDeclarations)
     {
-        outNamespaces.clear();
         if (node == nullptr)
         {
+            return;
+        }
+
+        for (xmlNsPtr currentNamespace = node->nsDef; currentNamespace != nullptr; currentNamespace = currentNamespace->next)
+        {
+            GB_XmlNamespaceDeclaration namespaceDeclaration;
+            namespaceDeclaration.namespacePrefix = XmlCharToString(currentNamespace->prefix);
+            namespaceDeclaration.namespaceUri = XmlCharToString(currentNamespace->href);
+            outNamespaceDeclarations.push_back(std::move(namespaceDeclaration));
+        }
+    }
+
+    bool ConvertXmlNode(const xmlNodePtr node,
+        GB_XmlNode& outNode,
+        const GB_XmlParserOptions& options,
+        std::string* errorMessage)
+    {
+        if (node == nullptr)
+        {
+            SetErrorMessage(errorMessage, "Cannot convert a null XML node.");
             return false;
         }
 
         try
         {
-            for (const xmlNs* namespaceNode = node->nsDef; namespaceNode != nullptr; namespaceNode = namespaceNode->next)
+            GB_XmlNode newNode;
+            newNode.lineNumber = static_cast<long long>(xmlGetLineNo(node));
+
+            switch (node->type)
             {
-                const std::string prefix = XmlCharToString(namespaceNode->prefix);
-                std::string uri = XmlCharToString(namespaceNode->href);
-                InsertOrAssignVariantMapString(outNamespaces, prefix, std::move(uri));
-            }
-        }
-        catch (...)
-        {
-            outNamespaces.clear();
-            return false;
-        }
-
-        return true;
-    }
-
-    bool ConvertXmlNodeToVariant(const xmlNode* node, const xmlDoc* document, const XmlOptions& options, GB_Variant& outValue);
-
-    bool TryAppendMergedTextChild(GB_VariantList& outChildren, const std::string& nodeType, const std::string& text)
-    {
-        if (outChildren.empty())
-        {
-            return false;
-        }
-
-        GB_Variant& lastChild = outChildren.back();
-        GB_VariantMap* lastChildMap = lastChild.AnyCast<GB_VariantMap>();
-        if (lastChildMap == nullptr)
-        {
-            return false;
-        }
-
-        GB_VariantMap::iterator typeIter = lastChildMap->find("nodeType");
-        if (typeIter == lastChildMap->end())
-        {
-            return false;
-        }
-
-        const std::string* typeText = typeIter->second.AnyCast<std::string>();
-        if (typeText == nullptr || *typeText != nodeType)
-        {
-            return false;
-        }
-
-        GB_VariantMap::iterator textIter = lastChildMap->find("text");
-        if (textIter == lastChildMap->end())
-        {
-            return false;
-        }
-
-        std::string* existingText = textIter->second.AnyCast<std::string>();
-        if (existingText == nullptr)
-        {
-            return false;
-        }
-
-        existingText->append(text);
-        return true;
-    }
-
-    bool ShouldSkipXmlChildNode(const xmlNode* childNode, const XmlOptions& options)
-    {
-        if (childNode == nullptr)
-        {
-            return true;
-        }
-
-        if (childNode->type == XML_COMMENT_NODE && !options.preserveComments)
-        {
-            return true;
-        }
-
-        if (childNode->type == XML_PI_NODE && !options.preserveProcessingInstructions)
-        {
-            return true;
-        }
-
-        if (childNode->type == XML_DTD_NODE)
-        {
-            return true;
-        }
-
-        return false;
-    }
-
-    bool BuildXmlChildren(
-        const xmlNode* parentNode,
-        const xmlDoc* document,
-        const XmlOptions& options,
-        GB_VariantList& outChildren,
-        std::string& outDirectText)
-    {
-        outChildren.clear();
-        outDirectText.clear();
-
-        if (parentNode == nullptr || document == nullptr)
-        {
-            return false;
-        }
-
-        try
-        {
-            std::size_t childCount = 0;
-            for (const xmlNode* childNode = parentNode->children; childNode != nullptr; childNode = childNode->next)
-            {
-                if (ShouldSkipXmlChildNode(childNode, options))
+            case XML_ELEMENT_NODE:
+                newNode.nodeType = GB_XmlNode::Type::Element;
+                newNode.localName = XmlCharToString(node->name);
+                newNode.nodeTag = newNode.localName;
+                if (node->ns != nullptr)
                 {
-                    continue;
+                    newNode.namespacePrefix = XmlCharToString(node->ns->prefix);
+                    newNode.namespaceUri = XmlCharToString(node->ns->href);
+                    if (!newNode.namespacePrefix.empty())
+                    {
+                        newNode.nodeTag = newNode.namespacePrefix + ":" + newNode.localName;
+                    }
                 }
 
-                childCount++;
-            }
-
-            if (childCount > 0)
-            {
-                outChildren.reserve(childCount);
-            }
-
-            for (const xmlNode* childNode = parentNode->children; childNode != nullptr; childNode = childNode->next)
-            {
-                if (ShouldSkipXmlChildNode(childNode, options))
+                for (xmlAttrPtr attribute = node->properties; attribute != nullptr; attribute = attribute->next)
                 {
-                    continue;
+                    GB_XmlAttribute newAttribute;
+                    if (!AddXmlAttribute(attribute, newAttribute))
+                    {
+                        SetErrorMessage(errorMessage, "Failed to read an attribute at " + GetXmlNodePath(node) + ".");
+                        return false;
+                    }
+                    newNode.attributes.push_back(std::move(newAttribute));
                 }
 
-                if (childNode->type == XML_TEXT_NODE || childNode->type == XML_CDATA_SECTION_NODE)
+                if (options.includeNamespaceDeclarations)
                 {
-                    bool shouldKeepText = false;
-                    const std::string normalizedText = NormalizeXmlText(childNode, XmlCharToString(childNode->content), options, shouldKeepText);
-                    if (!shouldKeepText)
+                    AddNamespaceDeclarations(node, newNode.namespaceDeclarations);
+                }
+
+                for (xmlNodePtr child = node->children; child != nullptr; child = child->next)
+                {
+                    if (child->type == XML_TEXT_NODE)
+                    {
+                        const std::string childText = XmlCharToString(child->content);
+                        if (!options.preserveWhitespaceOnlyTextNodes && IsXmlWhitespaceOnlyText(childText))
+                        {
+                            continue;
+                        }
+                    }
+                    else if (child->type == XML_CDATA_SECTION_NODE)
+                    {
+                        const std::string childText = XmlCharToString(child->content);
+                        if (!options.preserveWhitespaceOnlyTextNodes && IsXmlWhitespaceOnlyText(childText))
+                        {
+                            continue;
+                        }
+                    }
+                    else if (child->type == XML_COMMENT_NODE && !options.preserveComments)
+                    {
+                        continue;
+                    }
+                    else if (child->type == XML_PI_NODE && !options.preserveProcessingInstructions)
+                    {
+                        continue;
+                    }
+                    else if (child->type == XML_ENTITY_REF_NODE && !options.preserveEntityReferences)
                     {
                         continue;
                     }
 
-                    outDirectText.append(normalizedText);
-
-                    const std::string logicalNodeType = childNode->type == XML_CDATA_SECTION_NODE ? "cdata" : "text";
-                    if (options.mergeAdjacentText && TryAppendMergedTextChild(outChildren, logicalNodeType, normalizedText))
+                    GB_XmlNode childNode;
+                    if (!ConvertXmlNode(child, childNode, options, errorMessage))
                     {
-                        continue;
+                        return false;
                     }
+                    newNode.children.push_back(std::move(childNode));
                 }
+                break;
 
-                GB_Variant childValue;
-                if (!ConvertXmlNodeToVariant(childNode, document, options, childValue))
+            case XML_TEXT_NODE:
+                newNode.nodeType = GB_XmlNode::Type::Text;
+                newNode.nodeValue = XmlCharToString(node->content);
+                break;
+
+            case XML_CDATA_SECTION_NODE:
+                newNode.nodeType = GB_XmlNode::Type::CData;
+                newNode.nodeValue = XmlCharToString(node->content);
+                break;
+
+            case XML_COMMENT_NODE:
+                newNode.nodeType = GB_XmlNode::Type::Comment;
+                newNode.nodeValue = XmlCharToString(node->content);
+                break;
+
+            case XML_PI_NODE:
+                newNode.nodeType = GB_XmlNode::Type::ProcessingInstruction;
+                newNode.nodeTag = XmlCharToString(node->name);
+                newNode.localName = newNode.nodeTag;
+                newNode.nodeValue = XmlCharToString(node->content);
+                break;
+
+            case XML_ENTITY_REF_NODE:
+                newNode.nodeType = GB_XmlNode::Type::EntityReference;
+                newNode.nodeTag = XmlCharToString(node->name);
+                newNode.localName = newNode.nodeTag;
+                for (xmlNodePtr child = node->children; child != nullptr; child = child->next)
                 {
-                    return false;
-                }
-
-                outChildren.push_back(std::move(childValue));
-            }
-        }
-        catch (...)
-        {
-            outChildren.clear();
-            outDirectText.clear();
-            return false;
-        }
-
-        return true;
-    }
-
-    bool ConvertXmlTextLikeNodeToVariant(const xmlNode* node, const XmlOptions& options, GB_Variant& outValue)
-    {
-        if (node == nullptr)
-        {
-            return false;
-        }
-
-        bool shouldKeepText = false;
-        const std::string normalizedText = NormalizeXmlText(node, XmlCharToString(node->content), options, shouldKeepText);
-        if (!shouldKeepText)
-        {
-            return false;
-        }
-
-        GB_VariantMap nodeObject;
-        AppendNodeIdentityFields(node, options, nodeObject);
-        nodeObject["text"] = normalizedText;
-        outValue = std::move(nodeObject);
-        return true;
-    }
-
-    bool ConvertXmlCommentNodeToVariant(const xmlNode* node, const XmlOptions& options, GB_Variant& outValue)
-    {
-        if (node == nullptr)
-        {
-            return false;
-        }
-
-        GB_VariantMap nodeObject;
-        AppendNodeIdentityFields(node, options, nodeObject);
-        nodeObject["text"] = XmlCharToString(node->content);
-        outValue = std::move(nodeObject);
-        return true;
-    }
-
-    bool ConvertXmlProcessingInstructionToVariant(const xmlNode* node, const XmlOptions& options, GB_Variant& outValue)
-    {
-        if (node == nullptr)
-        {
-            return false;
-        }
-
-        GB_VariantMap nodeObject;
-        AppendNodeIdentityFields(node, options, nodeObject);
-        nodeObject["text"] = XmlCharToString(node->content);
-        outValue = std::move(nodeObject);
-        return true;
-    }
-
-    bool ConvertXmlGenericNodeToVariant(const xmlNode* node, const xmlDoc* document, const XmlOptions& options, GB_Variant& outValue)
-    {
-        if (node == nullptr || document == nullptr)
-        {
-            return false;
-        }
-
-        GB_VariantMap nodeObject;
-        AppendNodeIdentityFields(node, options, nodeObject);
-
-        UniqueXmlChar content(xmlNodeGetContent(node));
-        if (content.get() != nullptr)
-        {
-            nodeObject["text"] = XmlCharToString(content.get());
-        }
-
-        GB_VariantList children;
-        std::string directText;
-        if (!BuildXmlChildren(node, document, options, children, directText))
-        {
-            return false;
-        }
-
-        if (!children.empty())
-        {
-            nodeObject["children"] = std::move(children);
-        }
-
-        if (!directText.empty())
-        {
-            nodeObject["directText"] = std::move(directText);
-        }
-
-        outValue = std::move(nodeObject);
-        return true;
-    }
-
-    bool ConvertXmlElementNodeToVariant(const xmlNode* node, const xmlDoc* document, const XmlOptions& options, GB_Variant& outValue)
-    {
-        if (node == nullptr || document == nullptr)
-        {
-            return false;
-        }
-
-        GB_VariantMap nodeObject;
-        AppendNodeIdentityFields(node, options, nodeObject);
-
-        GB_VariantMap attributes;
-        if (!BuildXmlAttributes(node, document, options, attributes))
-        {
-            return false;
-        }
-        nodeObject["attributes"] = std::move(attributes);
-
-        if (options.includeNamespaceDeclarations)
-        {
-            GB_VariantMap namespaceDeclarations;
-            if (!BuildXmlNamespaceDeclarations(node, namespaceDeclarations))
-            {
-                return false;
-            }
-            nodeObject["namespaceDeclarations"] = std::move(namespaceDeclarations);
-        }
-
-        GB_VariantList children;
-        std::string directText;
-        if (!BuildXmlChildren(node, document, options, children, directText))
-        {
-            return false;
-        }
-        nodeObject["children"] = std::move(children);
-
-        if (!directText.empty())
-        {
-            nodeObject["directText"] = std::move(directText);
-        }
-
-        outValue = std::move(nodeObject);
-        return true;
-    }
-
-    bool ConvertXmlNodeToVariant(const xmlNode* node, const xmlDoc* document, const XmlOptions& options, GB_Variant& outValue)
-    {
-        if (node == nullptr || document == nullptr)
-        {
-            return false;
-        }
-
-        switch (node->type)
-        {
-        case XML_ELEMENT_NODE:
-            return ConvertXmlElementNodeToVariant(node, document, options, outValue);
-
-        case XML_TEXT_NODE:
-            return ConvertXmlTextLikeNodeToVariant(node, options, outValue);
-
-        case XML_CDATA_SECTION_NODE:
-            return ConvertXmlTextLikeNodeToVariant(node, options, outValue);
-
-        case XML_COMMENT_NODE:
-            return ConvertXmlCommentNodeToVariant(node, options, outValue);
-
-        case XML_PI_NODE:
-            return ConvertXmlProcessingInstructionToVariant(node, options, outValue);
-
-        default:
-            return ConvertXmlGenericNodeToVariant(node, document, options, outValue);
-        }
-    }
-
-    bool BuildXmlDoctypeObject(const xmlDoc* document, GB_VariantMap& outDoctype)
-    {
-        outDoctype.clear();
-        if (document == nullptr)
-        {
-            return false;
-        }
-
-        try
-        {
-            const xmlDtd* internalSubset = document->intSubset;
-            const xmlDtd* externalSubset = document->extSubset;
-            const xmlDtd* doctype = internalSubset != nullptr ? internalSubset : externalSubset;
-            if (doctype == nullptr)
-            {
-                return true;
-            }
-
-            outDoctype["nodeType"] = "documentType";
-            if (doctype->name != nullptr)
-            {
-                outDoctype["name"] = XmlCharToString(doctype->name);
-            }
-            if (doctype->ExternalID != nullptr)
-            {
-                outDoctype["publicId"] = XmlCharToString(doctype->ExternalID);
-            }
-            if (doctype->SystemID != nullptr)
-            {
-                outDoctype["systemId"] = XmlCharToString(doctype->SystemID);
-            }
-        }
-        catch (...)
-        {
-            outDoctype.clear();
-            return false;
-        }
-
-        return true;
-    }
-
-    bool ConvertXmlDocumentToVariant(const xmlDoc* document, const XmlOptions& options, GB_Variant& outValue)
-    {
-        if (document == nullptr)
-        {
-            return false;
-        }
-
-        const xmlNode* rootElement = xmlDocGetRootElement(const_cast<xmlDoc*>(document));
-        if (rootElement == nullptr)
-        {
-            return false;
-        }
-
-        if (options.outputMode == GB_XmlParser::OutputMode::RootElement)
-        {
-            return ConvertXmlNodeToVariant(rootElement, document, options, outValue);
-        }
-
-        try
-        {
-            GB_VariantMap documentObject;
-            documentObject["nodeType"] = "document";
-
-            if (options.includeDeclaration)
-            {
-                if (document->version != nullptr)
-                {
-                    documentObject["version"] = XmlCharToString(document->version);
-                }
-                if (document->encoding != nullptr)
-                {
-                    documentObject["encoding"] = XmlCharToString(document->encoding);
-                }
-                if (document->standalone == 0 || document->standalone == 1)
-                {
-                    documentObject["standalone"] = (document->standalone == 1);
-                }
-            }
-
-            if (document->URL != nullptr)
-            {
-                documentObject["url"] = XmlCharToString(document->URL);
-            }
-
-            if (options.includeDoctype)
-            {
-                GB_VariantMap doctypeObject;
-                if (!BuildXmlDoctypeObject(document, doctypeObject))
-                {
-                    return false;
-                }
-                if (!doctypeObject.empty())
-                {
-                    documentObject["doctype"] = std::move(doctypeObject);
-                }
-            }
-
-            GB_VariantList children;
-            std::size_t rootElementIndex = static_cast<std::size_t>(-1);
-
-            std::size_t childCount = 0;
-            for (const xmlNode* childNode = document->children; childNode != nullptr; childNode = childNode->next)
-            {
-                if (ShouldSkipXmlChildNode(childNode, options))
-                {
-                    continue;
-                }
-
-                childCount++;
-            }
-            if (childCount > 0)
-            {
-                children.reserve(childCount);
-            }
-
-            for (const xmlNode* childNode = document->children; childNode != nullptr; childNode = childNode->next)
-            {
-                if (ShouldSkipXmlChildNode(childNode, options))
-                {
-                    continue;
-                }
-
-                if (childNode == rootElement)
-                {
-                    rootElementIndex = children.size();
-                }
-
-                if (childNode->type == XML_TEXT_NODE || childNode->type == XML_CDATA_SECTION_NODE)
-                {
-                    bool shouldKeepText = false;
-                    const std::string normalizedText = NormalizeXmlText(childNode, XmlCharToString(childNode->content), options, shouldKeepText);
-                    if (!shouldKeepText)
+                    GB_XmlNode childNode;
+                    if (!ConvertXmlNode(child, childNode, options, errorMessage))
                     {
-                        continue;
+                        return false;
                     }
-
-                    const std::string logicalNodeType = childNode->type == XML_CDATA_SECTION_NODE ? "cdata" : "text";
-                    if (options.mergeAdjacentText && TryAppendMergedTextChild(children, logicalNodeType, normalizedText))
-                    {
-                        continue;
-                    }
+                    newNode.children.push_back(std::move(childNode));
                 }
+                break;
 
-                GB_Variant childValue;
-                if (!ConvertXmlNodeToVariant(childNode, document, options, childValue))
-                {
-                    return false;
-                }
-
-                children.push_back(std::move(childValue));
-            }
-
-            if (rootElementIndex == static_cast<std::size_t>(-1))
-            {
+            default:
+                SetErrorMessage(errorMessage,
+                    "Unsupported XML node type at " + GetXmlNodePath(node) + ". libxml2 node type: " + std::to_string(static_cast<int>(node->type)) + ".");
                 return false;
             }
 
-            documentObject["children"] = std::move(children);
-            documentObject["rootElementIndex"] = static_cast<unsigned long long>(rootElementIndex);
-            outValue = std::move(documentObject);
+            outNode = std::move(newNode);
             return true;
+        }
+        catch (const std::exception& exceptionObject)
+        {
+            SetErrorMessage(errorMessage, "Failed to convert XML node at " + GetXmlNodePath(node) + ": " + exceptionObject.what());
+            return false;
         }
         catch (...)
         {
+            SetErrorMessage(errorMessage, "Failed to convert XML node at " + GetXmlNodePath(node) + " due to an unknown exception.");
             return false;
         }
     }
 
-    bool ParseXmlTextInternal(
-        const std::string& xmlText,
-        GB_Variant& outValue,
-        const XmlOptions& options,
-        std::string* errorMessage,
-        std::vector<XmlDiagnostic>* diagnostics)
+    void LoadDocumentTypeInfo(const xmlDocPtr xmlDocument, GB_XmlDocument& outDocument)
     {
-        ClearOptionalErrorMessage(errorMessage);
-        ClearOptionalDiagnostics(diagnostics);
+        if (xmlDocument == nullptr)
+        {
+            return;
+        }
 
+        outDocument.version = XmlCharToString(xmlDocument->version);
+        outDocument.encoding = XmlCharToString(xmlDocument->encoding);
+        outDocument.standalone = static_cast<GB_XmlDocument::StandaloneMode>(xmlDocument->standalone);
+
+        if (xmlDocument->intSubset != nullptr)
+        {
+            outDocument.hasInternalSubset = true;
+            outDocument.documentTypeName = XmlCharToString(xmlDocument->intSubset->name);
+            outDocument.documentTypePublicId = XmlCharToString(xmlDocument->intSubset->ExternalID);
+            outDocument.documentTypeSystemId = XmlCharToString(xmlDocument->intSubset->SystemID);
+        }
+
+        if (xmlDocument->extSubset != nullptr)
+        {
+            outDocument.hasExternalSubset = true;
+            if (outDocument.documentTypeName.empty())
+            {
+                outDocument.documentTypeName = XmlCharToString(xmlDocument->extSubset->name);
+            }
+            if (outDocument.documentTypePublicId.empty())
+            {
+                outDocument.documentTypePublicId = XmlCharToString(xmlDocument->extSubset->ExternalID);
+            }
+            if (outDocument.documentTypeSystemId.empty())
+            {
+                outDocument.documentTypeSystemId = XmlCharToString(xmlDocument->extSubset->SystemID);
+            }
+        }
+    }
+
+    bool ConvertXmlDocument(const xmlDocPtr xmlDocument,
+        GB_XmlDocument& outDocument,
+        const GB_XmlParserOptions& options,
+        const XmlErrorCollector& errorCollector,
+        std::string* errorMessage)
+    {
+        if (xmlDocument == nullptr)
+        {
+            SetErrorMessage(errorMessage, "Parsed XML document is null.");
+            return false;
+        }
+
+        try
+        {
+            GB_XmlDocument newDocument;
+            LoadDocumentTypeInfo(xmlDocument, newDocument);
+            newDocument.diagnostics = errorCollector.GetDiagnostics();
+            newDocument.recovered = errorCollector.HasErrorOrFatal();
+
+            xmlNodePtr documentElementNode = xmlDocGetRootElement(xmlDocument);
+            if (documentElementNode == nullptr)
+            {
+                SetErrorMessage(errorMessage, "Parsed XML document does not contain a root element.");
+                return false;
+            }
+
+            int topLevelElementCount = 0;
+            bool rootElementSeen = false;
+
+            for (xmlNodePtr child = xmlDocument->children; child != nullptr; child = child->next)
+            {
+                if (child->type == XML_DTD_NODE)
+                {
+                    continue;
+                }
+
+                if (child->type == XML_ELEMENT_NODE)
+                {
+                    topLevelElementCount++;
+                    if (topLevelElementCount > 1)
+                    {
+                        SetErrorMessage(errorMessage, "Parsed XML document contains multiple top-level element nodes, which cannot be represented by GB_XmlDocument.");
+                        return false;
+                    }
+
+                    if (!ConvertXmlNode(child, newDocument.rootNode, options, errorMessage))
+                    {
+                        return false;
+                    }
+                    rootElementSeen = true;
+                    continue;
+                }
+
+                if (child->type == XML_COMMENT_NODE && !options.preserveComments)
+                {
+                    continue;
+                }
+
+                if (child->type == XML_PI_NODE && !options.preserveProcessingInstructions)
+                {
+                    continue;
+                }
+
+                GB_XmlNode miscNode;
+                if (!ConvertXmlNode(child, miscNode, options, errorMessage))
+                {
+                    return false;
+                }
+
+                if (!rootElementSeen)
+                {
+                    newDocument.prologNodes.push_back(std::move(miscNode));
+                }
+                else
+                {
+                    newDocument.epilogNodes.push_back(std::move(miscNode));
+                }
+            }
+
+            if (topLevelElementCount != 1)
+            {
+                SetErrorMessage(errorMessage, "Parsed XML document does not contain exactly one top-level element node.");
+                return false;
+            }
+
+            outDocument = std::move(newDocument);
+            return true;
+        }
+        catch (const std::exception& exceptionObject)
+        {
+            SetErrorMessage(errorMessage, std::string("Failed to convert parsed XML document: ") + exceptionObject.what());
+            return false;
+        }
+        catch (...)
+        {
+            SetErrorMessage(errorMessage, "Failed to convert parsed XML document due to an unknown exception.");
+            return false;
+        }
+    }
+
+    bool ParseXmlDocumentInternal(const std::string& xmlText,
+        GB_XmlDocument& outDocument,
+        const GB_XmlParserOptions& options,
+        std::string* errorMessage)
+    {
         if (xmlText.empty())
         {
-            AssignOptionalErrorMessage(errorMessage, "Input XML text is empty.");
+            SetErrorMessage(errorMessage, "Input XML text is empty.");
             return false;
         }
 
         if (xmlText.size() > static_cast<std::size_t>(INT_MAX))
         {
-            AssignOptionalErrorMessage(errorMessage, "Input XML text is too large for libxml2 memory parsing.");
+            SetErrorMessage(errorMessage, "Input XML text is too large for libxml2 memory parsing.");
             return false;
         }
 
-        EnsureXmlLibraryInitialized();
-
-        XmlErrorCollector errorCollector(options.maxDiagnosticCount);
-
-#if LIBXML_VERSION >= 21300
-        const bool enableStructuredErrorHandler = true;
-#else
-        const bool enableStructuredErrorHandler = false;
-#endif
-
-        bool unsupportedLegacySecurityCombination = false;
-        const int parserFlags = BuildXmlParserFlags(options, enableStructuredErrorHandler, unsupportedLegacySecurityCombination);
-        if (unsupportedLegacySecurityCombination)
+        if (ShouldRejectUnsafeEntityConfiguration(options))
         {
-            AssignOptionalErrorMessage(errorMessage, "The current libxml2 version does not provide XML_PARSE_NO_XXE, so enabling entity expansion or external DTD processing while disallowing external entities is unsupported.");
+            SetErrorMessage(errorMessage,
+                "The requested XML parser options require external DTD/entity loading, but the current libxml2 version does not provide XML_PARSE_NO_XXE. Please either enable allowExternalEntities or disable substituteEntities / loadExternalDtd / applyDefaultDtdAttributes / validateWithDtd.");
             return false;
         }
 
-        UniqueXmlParserContext parserContext(xmlNewParserCtxt());
+        EnsureLibXmlInitialized();
+
+        XmlErrorCollector errorCollector;
+        std::unique_ptr<xmlParserCtxt, XmlParserContextDeleter> parserContext(xmlNewParserCtxt());
         if (!parserContext)
         {
-            AssignOptionalErrorMessage(errorMessage, "Failed to create libxml2 parser context.");
+            SetErrorMessage(errorMessage, "Failed to create libxml2 parser context.");
             return false;
         }
 
-#if LIBXML_VERSION >= 21300
-        const xmlStructuredErrorFunc structuredErrorHandler = XmlErrorCollector::StructuredErrorCallback;
-        xmlCtxtSetErrorHandler(parserContext.get(), structuredErrorHandler, &errorCollector);
+#if defined(LIBXML_VERSION) && LIBXML_VERSION >= 21300
+        xmlCtxtSetErrorHandler(parserContext.get(), XmlErrorCollector::StructuredErrorCallback, &errorCollector);
+#else
+        const xmlStructuredErrorFunc previousStructuredHandler = xmlStructuredError;
+        void* const previousStructuredContext = xmlStructuredErrorContext;
+        xmlSetStructuredErrorFunc(&errorCollector, XmlErrorCollector::StructuredErrorCallback);
 #endif
 
-        const char* const baseUrl = options.baseUrl.empty() ? nullptr : options.baseUrl.c_str();
-        const char* const encodingHint = options.encodingHint.empty() ? nullptr : options.encodingHint.c_str();
+        const int parseOptions = BuildLibXmlParseOptions(options);
+        const char* const baseUrlText = options.baseUrl.empty() ? nullptr : options.baseUrl.c_str();
+        const char* const forcedEncodingText = options.forcedEncoding.empty() ? nullptr : options.forcedEncoding.c_str();
 
-        UniqueXmlDocument document(xmlCtxtReadMemory(
-            parserContext.get(),
-            xmlText.data(),
-            static_cast<int>(xmlText.size()),
-            baseUrl,
-            encodingHint,
-            parserFlags));
+        std::unique_ptr<xmlDoc, XmlDocumentDeleter> xmlDocument(
+            xmlCtxtReadMemory(parserContext.get(),
+                xmlText.data(),
+                static_cast<int>(xmlText.size()),
+                baseUrlText,
+                forcedEncodingText,
+                parseOptions));
 
-#if LIBXML_VERSION < 21300
-        const xmlError* lastError = xmlCtxtGetLastError(parserContext.get());
-        if (lastError != nullptr)
-        {
-            errorCollector.Add(*lastError);
-        }
+#if !(defined(LIBXML_VERSION) && LIBXML_VERSION >= 21300)
+        xmlSetStructuredErrorFunc(previousStructuredContext, previousStructuredHandler);
 #endif
 
-        if (diagnostics != nullptr)
+        if (!xmlDocument)
         {
-            *diagnostics = errorCollector.diagnostics;
-        }
-
-        if (!document)
-        {
-            AssignOptionalErrorMessage(errorMessage, BuildXmlErrorMessage(errorCollector.diagnostics, "Failed to parse XML text."));
+            const std::string summaryMessage = errorCollector.BuildSummaryMessage();
+            if (!summaryMessage.empty())
+            {
+                SetErrorMessage(errorMessage, summaryMessage);
+            }
+            else
+            {
+                SetErrorMessage(errorMessage, "Failed to parse XML text.");
+            }
             return false;
         }
 
-        if (!options.allowRecovery && parserContext->wellFormed == 0)
+        if (!ConvertXmlDocument(xmlDocument.get(), outDocument, options, errorCollector, errorMessage))
         {
-            AssignOptionalErrorMessage(errorMessage, BuildXmlErrorMessage(errorCollector.diagnostics, "XML text is not well-formed."));
             return false;
         }
 
-        if (options.validateDtd && parserContext->valid == 0)
-        {
-            AssignOptionalErrorMessage(errorMessage, BuildXmlErrorMessage(errorCollector.diagnostics, "DTD validation failed."));
-            return false;
-        }
-
-        GB_Variant parsedValue;
-        if (!ConvertXmlDocumentToVariant(document.get(), options, parsedValue))
-        {
-            AssignOptionalErrorMessage(errorMessage, BuildXmlErrorMessage(errorCollector.diagnostics, "Failed to convert parsed XML tree to GB_Variant."));
-            return false;
-        }
-
-        outValue = std::move(parsedValue);
+        ClearErrorMessage(errorMessage);
         return true;
     }
 }
@@ -1526,7 +1060,7 @@ namespace
 bool GB_JsonParser::ParseToVariant(const std::string& jsonText, GB_Variant& outValue, std::string* errorMessage)
 {
     CPLJSONDocument jsonDocument;
-    if (!LoadJsonDocumentFromText(jsonText, jsonDocument, errorMessage))
+    if (!LoadJsonDocument(jsonText, jsonDocument, errorMessage))
     {
         return false;
     }
@@ -1534,7 +1068,7 @@ bool GB_JsonParser::ParseToVariant(const std::string& jsonText, GB_Variant& outV
     const CPLJSONObject rootObject = jsonDocument.GetRoot();
     if (!rootObject.IsValid())
     {
-        AssignOptionalErrorMessage(errorMessage, "Parsed JSON root node is invalid.");
+        SetErrorMessage(errorMessage, "Parsed JSON root node is invalid.");
         return false;
     }
 
@@ -1545,14 +1079,14 @@ bool GB_JsonParser::ParseToVariant(const std::string& jsonText, GB_Variant& outV
     }
 
     outValue = std::move(newValue);
-    ClearOptionalErrorMessage(errorMessage);
+    ClearErrorMessage(errorMessage);
     return true;
 }
 
 bool GB_JsonParser::ParseToVariantMap(const std::string& jsonText, GB_VariantMap& outMap, std::string* errorMessage)
 {
     CPLJSONDocument jsonDocument;
-    if (!LoadJsonDocumentFromText(jsonText, jsonDocument, errorMessage))
+    if (!LoadJsonDocument(jsonText, jsonDocument, errorMessage))
     {
         return false;
     }
@@ -1560,7 +1094,7 @@ bool GB_JsonParser::ParseToVariantMap(const std::string& jsonText, GB_VariantMap
     const CPLJSONObject rootObject = jsonDocument.GetRoot();
     if (!rootObject.IsValid())
     {
-        AssignOptionalErrorMessage(errorMessage, "Parsed JSON root node is invalid.");
+        SetErrorMessage(errorMessage, "Parsed JSON root node is invalid.");
         return false;
     }
 
@@ -1571,114 +1105,37 @@ bool GB_JsonParser::ParseToVariantMap(const std::string& jsonText, GB_VariantMap
     }
 
     outMap = std::move(newMap);
-    ClearOptionalErrorMessage(errorMessage);
+    ClearErrorMessage(errorMessage);
     return true;
 }
 
-bool GB_XmlParser::ParseToVariant(
-    const std::string& xmlText,
-    GB_Variant& outValue,
-    std::string* errorMessage,
-    std::vector<Diagnostic>* diagnostics)
+bool GB_XmlParser::ParseToDocument(const std::string& xmlText,
+    GB_XmlDocument& outDocument,
+    const GB_XmlParserOptions& options,
+    std::string* errorMessage)
 {
-    return ParseToVariant(xmlText, outValue, Options(), errorMessage, diagnostics);
-}
-
-bool GB_XmlParser::ParseToVariant(
-    const std::string& xmlText,
-    GB_Variant& outValue,
-    const Options& options,
-    std::string* errorMessage,
-    std::vector<Diagnostic>* diagnostics)
-{
-    return ParseXmlTextInternal(xmlText, outValue, options, errorMessage, diagnostics);
-}
-
-bool GB_XmlParser::ParseToVariantMap(
-    const std::string& xmlText,
-    GB_VariantMap& outMap,
-    std::string* errorMessage,
-    std::vector<Diagnostic>* diagnostics)
-{
-    return ParseToVariantMap(xmlText, outMap, Options(), errorMessage, diagnostics);
-}
-
-bool GB_XmlParser::ParseToVariantMap(
-    const std::string& xmlText,
-    GB_VariantMap& outMap,
-    const Options& options,
-    std::string* errorMessage,
-    std::vector<Diagnostic>* diagnostics)
-{
-    GB_Variant value;
-    if (!ParseXmlTextInternal(xmlText, value, options, errorMessage, diagnostics))
+    GB_XmlDocument newDocument;
+    if (!ParseXmlDocumentInternal(xmlText, newDocument, options, errorMessage))
     {
         return false;
     }
 
-    const GB_VariantMap* valueMap = value.AnyCast<GB_VariantMap>();
-    if (valueMap == nullptr)
-    {
-        AssignOptionalErrorMessage(errorMessage, "The parsed XML result is not a GB_VariantMap.");
-        return false;
-    }
-
-    outMap = *valueMap;
+    outDocument = std::move(newDocument);
     return true;
 }
 
-bool GB_XmlParser::ParseRootElementToVariant(
-    const std::string& xmlText,
-    GB_Variant& outValue,
-    std::string* errorMessage,
-    std::vector<Diagnostic>* diagnostics)
+bool GB_XmlParser::ParseToRootNode(const std::string& xmlText,
+    GB_XmlNode& outRootNode,
+    const GB_XmlParserOptions& options,
+    std::string* errorMessage)
 {
-    return ParseRootElementToVariant(xmlText, outValue, Options(), errorMessage, diagnostics);
-}
-
-bool GB_XmlParser::ParseRootElementToVariant(
-    const std::string& xmlText,
-    GB_Variant& outValue,
-    const Options& options,
-    std::string* errorMessage,
-    std::vector<Diagnostic>* diagnostics)
-{
-    Options rootOptions = options;
-    rootOptions.outputMode = OutputMode::RootElement;
-    return ParseXmlTextInternal(xmlText, outValue, rootOptions, errorMessage, diagnostics);
-}
-
-bool GB_XmlParser::ParseRootElementToVariantMap(
-    const std::string& xmlText,
-    GB_VariantMap& outMap,
-    std::string* errorMessage,
-    std::vector<Diagnostic>* diagnostics)
-{
-    return ParseRootElementToVariantMap(xmlText, outMap, Options(), errorMessage, diagnostics);
-}
-
-bool GB_XmlParser::ParseRootElementToVariantMap(
-    const std::string& xmlText,
-    GB_VariantMap& outMap,
-    const Options& options,
-    std::string* errorMessage,
-    std::vector<Diagnostic>* diagnostics)
-{
-    GB_Variant value;
-    Options rootOptions = options;
-    rootOptions.outputMode = OutputMode::RootElement;
-    if (!ParseXmlTextInternal(xmlText, value, rootOptions, errorMessage, diagnostics))
+    GB_XmlDocument document;
+    if (!ParseXmlDocumentInternal(xmlText, document, options, errorMessage))
     {
         return false;
     }
 
-    const GB_VariantMap* valueMap = value.AnyCast<GB_VariantMap>();
-    if (valueMap == nullptr)
-    {
-        AssignOptionalErrorMessage(errorMessage, "The parsed XML root element is not a GB_VariantMap.");
-        return false;
-    }
-
-    outMap = *valueMap;
+    outRootNode = std::move(document.rootNode);
+    ClearErrorMessage(errorMessage);
     return true;
 }
