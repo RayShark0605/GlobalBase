@@ -32,6 +32,7 @@
 #include <cstdlib>
 #include <exception>
 #include <limits>
+#include <locale.h>
 #include <memory>
 #include <mutex>
 #include <sstream>
@@ -853,6 +854,36 @@ namespace
         return normalizedText;
     }
 
+    /**
+     * @brief 与 locale 无关的 strtod 封装。
+     *
+     * 标准 std::strtod 依赖当前 C locale 的小数点字符（如法语 locale 使用逗号），
+     * 而 YAML 规范固定使用 '.' 作为小数点分隔符。此函数使用平台特定的 locale-aware
+     * strtod 变体，强制以 "C" locale 进行解析，避免 locale 导致的浮点解析错误。
+     */
+    double StrtodWithCLocale(const char* text, char** endPointer)
+    {
+#ifdef _WIN32
+        static const _locale_t cLocale = _create_locale(LC_NUMERIC, "C");
+        if (cLocale != nullptr)
+        {
+            return _strtod_l(text, endPointer, cLocale);
+        }
+
+        return std::strtod(text, endPointer);
+#elif defined(__GLIBC__) || defined(__APPLE__) || defined(__FreeBSD__) || defined(__OpenBSD__) || defined(__NetBSD__)
+        static const locale_t cLocale = newlocale(LC_NUMERIC_MASK, "C", static_cast<locale_t>(0));
+        if (cLocale != static_cast<locale_t>(0))
+        {
+            return strtod_l(text, endPointer, cLocale);
+        }
+
+        return std::strtod(text, endPointer);
+#else
+        return std::strtod(text, endPointer);
+#endif
+    }
+
     bool TryParseYamlDouble(const std::string& text, double& outValue)
     {
         const std::string trimmedText = TrimAsciiText(text);
@@ -888,7 +919,7 @@ namespace
 
         errno = 0;
         char* endPointer = nullptr;
-        const double parsedValue = std::strtod(normalizedText.c_str(), &endPointer);
+        const double parsedValue = StrtodWithCLocale(normalizedText.c_str(), &endPointer);
         if (errno == ERANGE || endPointer == normalizedText.c_str() || endPointer == nullptr || *endPointer != '\0')
         {
             return false;
