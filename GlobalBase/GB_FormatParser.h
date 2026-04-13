@@ -2,11 +2,8 @@
 #define GLOBALBASE_FORMAT_PARSER_H_H
 
 #include "GlobalBasePort.h"
-
 #include "GB_BaseTypes.h"
-
 #include "GB_Variant.h"
-
 #include <string>
 #include <vector>
 
@@ -317,11 +314,17 @@ struct GB_XmlDocument
 {
     /**
      * @brief XML 声明中的 standalone 状态。
+     *
+     * 说明：
+     * - NoDeclaration：输入文本中没有 XML 声明（例如没有 `<?xml ...?>`）
+     * - Omitted：存在 XML 声明，但未显式写出 standalone 属性
+     * - No：显式写为 standalone="no"
+     * - Yes：显式写为 standalone="yes"
      */
     enum class StandaloneMode
     {
-        NoDeclaration = -1,
         Omitted = -2,
+        NoDeclaration = -1,
         No = 0,
         Yes = 1
     };
@@ -500,6 +503,190 @@ public:
      */
     static bool ParseToRootNode(const std::string& xmlText, GB_XmlNode& outRootNode, const GB_XmlParserOptions& options = GB_XmlParserOptions(), std::string* errorMessage = nullptr);
 };
+
+/**
+ * @brief YAML 诊断信息。
+ */
+struct GB_YamlDiagnostic
+{
+    /**
+     * @brief 诊断级别。
+     */
+    enum class Level
+    {
+        Warning,
+        Error,
+        Fatal
+    };
+
+    Level level = Level::Error;
+    long long lineNumber = -1;
+    int columnNumber = -1;
+    std::string message = "";
+};
+
+/**
+ * @brief YAML 文档。
+ *
+ * 出于工程实用主义考虑，当前使用 GB_Variant 表达 YAML 文档主体：
+ * - null -> 空的 GB_Variant
+ * - scalar -> 默认输出为 std::string；若开启 autoConvertScalarValues，则可按规则尝试转为 bool / 整型 / double；显式标准 tag 会优先按对应语义处理
+ * - sequence -> GB_VariantList
+ * - mapping -> GB_VariantMap（因此 key 最终必须能稳定表示为 std::string）
+ *
+ * 说明：
+ * - rootTag 为根节点的 tag 文本；若无可用 tag，则为空字符串。
+ * - rootLineNumber / rootColumnNumber 为根节点起始位置，采用 1-based；未知时为 -1。
+ * - diagnostics 当前主要用于承载解析失败时的错误信息；成功解析时通常为空。
+ */
+struct GB_YamlDocument
+{
+    std::string rootTag = "";
+    long long rootLineNumber = -1;
+    int rootColumnNumber = -1;
+    GB_Variant rootValue;
+    std::vector<GB_YamlDiagnostic> diagnostics;
+};
+
+/**
+ * @brief YAML 文档流。
+ *
+ * YAML 支持由多个文档组成的 stream（例如使用 `---` 分隔）。
+ * 当需要完整保留文档流边界时，可使用该结构作为输出。
+ */
+struct GB_YamlStream
+{
+    std::vector<GB_YamlDocument> documents;
+};
+
+/**
+ * @brief YAML 解析选项。
+ */
+struct GB_YamlParserOptions
+{
+    /**
+     * @brief 是否自动把标量文本转换为更具体的值类型。
+     *
+     * 默认 false，以优先保证 YAML 标量语义不被误判：
+     * - false：未显式标注标准标量 tag 的 scalar 默认按 std::string 输出；
+     * - true：会尝试把未显式标注类型的部分标量识别为 null / bool / 整型 / double；
+     * - 无论该选项是否开启，显式的 `!!str` / `!!null` / `!!bool` / `!!int` / `!!float`
+     *   都会按对应语义处理；若显式 tag 与内容不匹配，则返回失败。
+     */
+    bool autoConvertScalarValues = false;
+
+    /**
+     * @brief 是否允许把非标量映射 key 序列化为 YAML 文本后再作为字符串 key。
+     *
+     * 由于 GB_VariantMap 的 key 类型固定为 std::string，因此：
+     * - false：遇到 sequence / mapping 这类复杂 key 时直接报错；
+     * - true：会使用 YAML 文本形式（例如 `[1, 2]`）作为 key。
+     */
+    bool stringifyNonScalarMapKeys = false;
+
+    /**
+     * @brief 是否允许重复 key。
+     *
+     * 这里的判定基于最终转换后的字符串 key。
+     * 默认 false；若转换后出现重复 key，则直接返回失败。
+     */
+    bool allowDuplicateMapKeys = false;
+
+    /**
+     * @brief 允许的最大嵌套深度。
+     *
+     * 用于限制极端深层 YAML 文档带来的栈深与资源消耗风险。
+     */
+    int maxNestingDepth = 256;
+};
+
+/**
+ * @brief YAML 解析器。
+ *
+ * 设计目标：
+ * - 与现有 GB_FormatParser 风格保持一致；
+ * - 基于 yaml-cpp 解析 YAML 文本；
+ * - 对单文档与多文档流都提供直接接口；
+ * - 在 GB_Variant 能够稳定表达的前提下，尽量保留工程可用性与错误可诊断性。
+ */
+class GLOBALBASE_PORT GB_YamlParser
+{
+public:
+    /**
+     * @brief 将 YAML 文本解析为 GB_Variant。
+     *
+     * 该接口要求输入文本中最终只能得到一个 YAML 文档。
+     * 若输入包含多个 YAML 文档，请改用 ParseToStream()。
+     *
+     * @param yamlText 输入 YAML 文本。
+     * @param[out] outValue 解析成功后输出的结果。
+     * @param options 解析选项。
+     * @param[out] errorMessage 可选的错误信息输出；成功时会被清空。
+     * @return true 表示解析成功；false 表示失败。
+     */
+    static bool ParseToVariant(const std::string& yamlText, GB_Variant& outValue, const GB_YamlParserOptions& options = GB_YamlParserOptions(), std::string* errorMessage = nullptr);
+
+    /**
+     * @brief 将 YAML 文本解析为 GB_VariantMap。
+     *
+     * 与 ParseToVariant() 的区别在于：该接口要求根节点最终必须能转换为 mapping。
+     *
+     * @param yamlText 输入 YAML 文本。
+     * @param[out] outMap 解析成功后输出的映射结果。
+     * @param options 解析选项。
+     * @param[out] errorMessage 可选的错误信息输出；成功时会被清空。
+     * @return true 表示解析成功且根节点为 mapping；false 表示失败。
+     */
+    static bool ParseToVariantMap(const std::string& yamlText, GB_VariantMap& outMap, const GB_YamlParserOptions& options = GB_YamlParserOptions(), std::string* errorMessage = nullptr);
+
+    /**
+     * @brief 将 YAML 文本解析为单个 YAML 文档对象。
+     *
+     * 该接口除返回根值外，还会返回根节点 tag、根节点位置等文档级信息。
+     * 若输入包含多个文档，则返回 false。
+     *
+     * @param yamlText 输入 YAML 文本。
+     * @param[out] outDocument 解析成功后输出的 YAML 文档结构。
+     * @param options 解析选项。
+     * @param[out] errorMessage 可选的错误信息输出；成功时会被清空。
+     * @return true 表示解析成功；false 表示失败。
+     */
+    static bool ParseToDocument(const std::string& yamlText, GB_YamlDocument& outDocument, const GB_YamlParserOptions& options = GB_YamlParserOptions(), std::string* errorMessage = nullptr);
+
+    /**
+     * @brief 将 YAML 文本解析为 YAML 文档流。
+     *
+     * 该接口支持多文档 YAML stream；若输入仅包含单个文档，也会输出一个长度为 1 的 documents 数组。
+     *
+     * @param yamlText 输入 YAML 文本。
+     * @param[out] outStream 解析成功后输出的文档流。
+     * @param options 解析选项。
+     * @param[out] errorMessage 可选的错误信息输出；成功时会被清空。
+     * @return true 表示解析成功；false 表示失败。
+     */
+    static bool ParseToStream(const std::string& yamlText, GB_YamlStream& outStream, const GB_YamlParserOptions& options = GB_YamlParserOptions(), std::string* errorMessage = nullptr);
+
+    /**
+     * @brief 从 YAML 文件解析为 GB_Variant。
+     */
+    static bool ParseFileToVariant(const std::string& yamlFilePath, GB_Variant& outValue, const GB_YamlParserOptions& options = GB_YamlParserOptions(), std::string* errorMessage = nullptr);
+
+    /**
+     * @brief 从 YAML 文件解析为 GB_VariantMap。
+     */
+    static bool ParseFileToVariantMap(const std::string& yamlFilePath, GB_VariantMap& outMap, const GB_YamlParserOptions& options = GB_YamlParserOptions(), std::string* errorMessage = nullptr);
+
+    /**
+     * @brief 从 YAML 文件解析为单个 YAML 文档对象。
+     */
+    static bool ParseFileToDocument(const std::string& yamlFilePath, GB_YamlDocument& outDocument, const GB_YamlParserOptions& options = GB_YamlParserOptions(), std::string* errorMessage = nullptr);
+
+    /**
+     * @brief 从 YAML 文件解析为 YAML 文档流。
+     */
+    static bool ParseFileToStream(const std::string& yamlFilePath, GB_YamlStream& outStream, const GB_YamlParserOptions& options = GB_YamlParserOptions(), std::string* errorMessage = nullptr);
+};
+
 
 #ifdef _MSC_VER
 # pragma warning(pop)

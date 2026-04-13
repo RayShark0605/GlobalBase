@@ -199,8 +199,8 @@
       <SubSystem>Windows</SubSystem>
       <GenerateDebugInformation>true</GenerateDebugInformation>
       <EnableUAC>false</EnableUAC>
-      <AdditionalDependencies>libcurl-d.lib;libcrypto.lib;zlibd.lib;opencv_core4d.lib;opencv_imgcodecs4d.lib;opencv_imgproc4d.lib;gdald.lib;libxml2.lib;%(AdditionalDependencies)</AdditionalDependencies>
-      <DelayLoadDLLs>zlibd1.dll;libcurl-d.dll;libcrypto-3-x64.dll;opencv_core4d.dll;opencv_imgcodecs4d.dll;opencv_imgproc4d.dll;gdald.dll;libxml2.dll;%(DelayLoadDLLs)</DelayLoadDLLs>
+      <AdditionalDependencies>libcurl-d.lib;libcrypto.lib;zlibd.lib;opencv_core4d.lib;opencv_imgcodecs4d.lib;opencv_imgproc4d.lib;gdald.lib;libxml2.lib;yaml-cppd.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <DelayLoadDLLs>zlibd1.dll;libcurl-d.dll;libcrypto-3-x64.dll;opencv_core4d.dll;opencv_imgcodecs4d.dll;opencv_imgproc4d.dll;gdald.dll;libxml2.dll;yaml-cppd.dll;%(DelayLoadDLLs)</DelayLoadDLLs>
     </Link>
     <PostBuildEvent>
       <Command>

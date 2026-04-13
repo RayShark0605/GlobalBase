@@ -1,7 +1,22 @@
 ﻿#include "GB_FormatParser.h"
 
+#include "GB_FileSystem.h"
+#include "GB_IO.h"
+
 #include "cpl_error.h"
 #include "cpl_json.h"
+
+#ifdef _MSC_VER
+# pragma warning(push)
+# pragma warning(disable: 4251)
+# pragma warning(push)
+# pragma warning(disable: 4275)
+#endif
+#include <yaml-cpp/yaml.h>
+#ifdef _MSC_VER
+# pragma warning(pop)
+# pragma warning(pop)
+#endif
 
 #include <libxml/parser.h>
 #include <libxml/tree.h>
@@ -9,14 +24,31 @@
 #include <libxml/xmlmemory.h>
 
 #include <algorithm>
+#include <cerrno>
+#include <cmath>
 #include <climits>
 #include <cstddef>
+#include <cstdint>
 #include <cstdlib>
 #include <exception>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <sstream>
 #include <utility>
+
+#ifdef _WIN32
+# include <windows.h>
+#else
+# include <sys/stat.h>
+#endif
+
+#ifdef min
+#undef min
+#endif
+#ifdef max
+#undef max
+#endif
 
 namespace
 {
@@ -29,6 +61,109 @@ namespace
             && static_cast<unsigned char>(text[0]) == 0xEF
             && static_cast<unsigned char>(text[1]) == 0xBB
             && static_cast<unsigned char>(text[2]) == 0xBF;
+    }
+
+    std::size_t GetUtf8BomLength(const std::string& text)
+    {
+        return HasUtf8Bom(text) ? kUtf8BomLength : 0;
+    }
+
+    bool StartsWithXmlDeclaration(const std::string& text)
+    {
+        const std::size_t bomLength = GetUtf8BomLength(text);
+        return text.size() >= bomLength + 5
+            && text.compare(bomLength, 5, "<?xml") == 0;
+    }
+
+#ifdef _WIN32
+    bool TryConvertUtf8ToWideString(const std::string& text, std::wstring& outWideText)
+    {
+        outWideText.clear();
+
+        if (text.empty())
+        {
+            return true;
+        }
+
+        const int requiredLength = MultiByteToWideChar(CP_UTF8,
+            MB_ERR_INVALID_CHARS,
+            text.c_str(),
+            static_cast<int>(text.size()),
+            nullptr,
+            0);
+        if (requiredLength <= 0)
+        {
+            return false;
+        }
+
+        try
+        {
+            outWideText.resize(static_cast<std::size_t>(requiredLength));
+        }
+        catch (...)
+        {
+            outWideText.clear();
+            return false;
+        }
+
+        const int convertedLength = MultiByteToWideChar(CP_UTF8,
+            MB_ERR_INVALID_CHARS,
+            text.c_str(),
+            static_cast<int>(text.size()),
+            &outWideText[0],
+            requiredLength);
+        if (convertedLength != requiredLength)
+        {
+            outWideText.clear();
+            return false;
+        }
+
+        return true;
+    }
+#endif
+
+    bool TryGetRegularFileSize(const std::string& filePath, std::uint64_t& outFileSize)
+    {
+        outFileSize = 0;
+
+#ifdef _WIN32
+        std::wstring wideFilePath;
+        if (!TryConvertUtf8ToWideString(filePath, wideFilePath) || wideFilePath.empty())
+        {
+            return false;
+        }
+
+        WIN32_FILE_ATTRIBUTE_DATA fileAttributeData;
+        if (!GetFileAttributesExW(wideFilePath.c_str(), GetFileExInfoStandard, &fileAttributeData))
+        {
+            return false;
+        }
+
+        if ((fileAttributeData.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0)
+        {
+            return false;
+        }
+
+        ULARGE_INTEGER fileSize;
+        fileSize.LowPart = fileAttributeData.nFileSizeLow;
+        fileSize.HighPart = fileAttributeData.nFileSizeHigh;
+        outFileSize = static_cast<std::uint64_t>(fileSize.QuadPart);
+        return true;
+#else
+        struct stat fileStatus;
+        if (stat(filePath.c_str(), &fileStatus) != 0)
+        {
+            return false;
+        }
+
+        if (!S_ISREG(fileStatus.st_mode))
+        {
+            return false;
+        }
+
+        outFileSize = static_cast<std::uint64_t>(fileStatus.st_size);
+        return true;
+#endif
     }
 
     void SetErrorMessage(std::string* errorMessage, const std::string& message)
@@ -339,6 +474,1138 @@ namespace
         }
 
         return true;
+    }
+
+    bool ReadTextFile(const std::string& filePath, std::string& outText, std::string* errorMessage)
+    {
+        if (filePath.empty())
+        {
+            SetErrorMessage(errorMessage, "Input file path is empty.");
+            return false;
+        }
+
+        try
+        {
+            if (!GB_IsFileExists(filePath))
+            {
+                SetErrorMessage(errorMessage, "Failed to open file: " + filePath + ".");
+                return false;
+            }
+
+            std::uint64_t fileSize = 0;
+            const bool hasKnownFileSize = TryGetRegularFileSize(filePath, fileSize);
+
+            GB_ByteBuffer fileData = GB_ReadFileToBinary(filePath);
+            if (fileData.empty())
+            {
+                if (hasKnownFileSize && fileSize == 0)
+                {
+                    outText.clear();
+                    return true;
+                }
+
+                SetErrorMessage(errorMessage, "Failed to read file: " + filePath + ".");
+                return false;
+            }
+
+            outText = GB_ByteBufferToString(std::move(fileData));
+            return true;
+        }
+        catch (const std::exception& exceptionObject)
+        {
+            SetErrorMessage(errorMessage, "Failed to read file " + filePath + ": " + exceptionObject.what());
+            return false;
+        }
+        catch (...)
+        {
+            SetErrorMessage(errorMessage, "Failed to read file " + filePath + " due to an unknown exception.");
+            return false;
+        }
+    }
+
+    std::string GetYamlNodeTypeName(const YAML::NodeType::value type)
+    {
+        switch (type)
+        {
+        case YAML::NodeType::Undefined:
+            return "Undefined";
+
+        case YAML::NodeType::Null:
+            return "Null";
+
+        case YAML::NodeType::Scalar:
+            return "Scalar";
+
+        case YAML::NodeType::Sequence:
+            return "Sequence";
+
+        case YAML::NodeType::Map:
+            return "Map";
+
+        default:
+            return "Unknown";
+        }
+    }
+
+    bool IsAsciiWhitespace(const unsigned char character)
+    {
+        return character == ' '
+            || character == '\t'
+            || character == '\n'
+            || character == '\r'
+            || character == '\f'
+            || character == '\v';
+    }
+
+    std::string TrimAsciiText(const std::string& text)
+    {
+        std::size_t beginIndex = 0;
+        std::size_t endIndex = text.size();
+
+        while (beginIndex < endIndex && IsAsciiWhitespace(static_cast<unsigned char>(text[beginIndex])))
+        {
+            beginIndex++;
+        }
+
+        while (endIndex > beginIndex && IsAsciiWhitespace(static_cast<unsigned char>(text[endIndex - 1])))
+        {
+            endIndex--;
+        }
+
+        return text.substr(beginIndex, endIndex - beginIndex);
+    }
+
+    std::string ToLowerAsciiText(std::string text)
+    {
+        for (std::size_t index = 0; index < text.size(); index++)
+        {
+            char& currentChar = text[index];
+            if (currentChar >= 'A' && currentChar <= 'Z')
+            {
+                currentChar = static_cast<char>(currentChar - 'A' + 'a');
+            }
+        }
+
+        return text;
+    }
+
+    int GetYamlDigitValue(const char character)
+    {
+        if (character >= '0' && character <= '9')
+        {
+            return character - '0';
+        }
+
+        if (character >= 'a' && character <= 'z')
+        {
+            return character - 'a' + 10;
+        }
+
+        if (character >= 'A' && character <= 'Z')
+        {
+            return character - 'A' + 10;
+        }
+
+        return -1;
+    }
+
+    bool IsValidYamlDigitForBase(const char character, const unsigned int numericBase)
+    {
+        const int digitValue = GetYamlDigitValue(character);
+        return digitValue >= 0 && static_cast<unsigned int>(digitValue) < numericBase;
+    }
+
+    bool TryNormalizeYamlIntegerText(const std::string& text,
+        bool& isNegative,
+        unsigned int& numericBase,
+        std::string& outDigits)
+    {
+        const std::string trimmedText = TrimAsciiText(text);
+        if (trimmedText.empty())
+        {
+            return false;
+        }
+
+        std::size_t digitBeginIndex = 0;
+        isNegative = false;
+        if (trimmedText[0] == '+' || trimmedText[0] == '-')
+        {
+            if (trimmedText.size() == 1)
+            {
+                return false;
+            }
+
+            isNegative = trimmedText[0] == '-';
+            digitBeginIndex = 1;
+        }
+
+        numericBase = 10;
+        if (trimmedText.size() >= digitBeginIndex + 2 && trimmedText[digitBeginIndex] == '0')
+        {
+            const char prefixChar = trimmedText[digitBeginIndex + 1];
+            if (prefixChar == 'x' || prefixChar == 'X')
+            {
+                numericBase = 16;
+                digitBeginIndex += 2;
+            }
+            else if (prefixChar == 'o' || prefixChar == 'O')
+            {
+                numericBase = 8;
+                digitBeginIndex += 2;
+            }
+            else if (prefixChar == 'b' || prefixChar == 'B')
+            {
+                numericBase = 2;
+                digitBeginIndex += 2;
+            }
+        }
+
+        if (digitBeginIndex >= trimmedText.size())
+        {
+            return false;
+        }
+
+        outDigits.clear();
+        outDigits.reserve(trimmedText.size() - digitBeginIndex);
+
+        bool previousWasSeparator = false;
+        for (std::size_t index = digitBeginIndex; index < trimmedText.size(); index++)
+        {
+            const char currentChar = trimmedText[index];
+            if (currentChar == '_')
+            {
+                if (outDigits.empty() || previousWasSeparator)
+                {
+                    return false;
+                }
+
+                previousWasSeparator = true;
+                continue;
+            }
+
+            if (!IsValidYamlDigitForBase(currentChar, numericBase))
+            {
+                return false;
+            }
+
+            outDigits.push_back(currentChar);
+            previousWasSeparator = false;
+        }
+
+        if (outDigits.empty() || previousWasSeparator)
+        {
+            return false;
+        }
+
+        return true;
+    }
+
+    bool TryAccumulateYamlUnsignedInteger(const unsigned long long currentValue,
+        const unsigned int numericBase,
+        const unsigned int digitValue,
+        unsigned long long& outValue)
+    {
+        if (currentValue > (std::numeric_limits<unsigned long long>::max() - digitValue) / numericBase)
+        {
+            return false;
+        }
+
+        outValue = currentValue * numericBase + digitValue;
+        return true;
+    }
+
+    bool TryParseYamlUnsignedMagnitude(const std::string& digits,
+        const unsigned int numericBase,
+        unsigned long long& outValue)
+    {
+        if (digits.empty())
+        {
+            return false;
+        }
+
+        unsigned long long currentValue = 0;
+        for (std::size_t index = 0; index < digits.size(); index++)
+        {
+            const int digitValue = GetYamlDigitValue(digits[index]);
+            if (digitValue < 0 || static_cast<unsigned int>(digitValue) >= numericBase)
+            {
+                return false;
+            }
+
+            if (!TryAccumulateYamlUnsignedInteger(currentValue,
+                numericBase,
+                static_cast<unsigned int>(digitValue),
+                currentValue))
+            {
+                return false;
+            }
+        }
+
+        outValue = currentValue;
+        return true;
+    }
+
+    bool TryParseYamlSignedInteger(const std::string& text, long long& outValue)
+    {
+        bool isNegative = false;
+        unsigned int numericBase = 10;
+        std::string digits;
+        if (!TryNormalizeYamlIntegerText(text, isNegative, numericBase, digits))
+        {
+            return false;
+        }
+
+        unsigned long long magnitudeValue = 0;
+        if (!TryParseYamlUnsignedMagnitude(digits, numericBase, magnitudeValue))
+        {
+            return false;
+        }
+
+        if (isNegative)
+        {
+            const unsigned long long minSignedMagnitude = static_cast<unsigned long long>(std::numeric_limits<long long>::max()) + 1ULL;
+            if (magnitudeValue > minSignedMagnitude)
+            {
+                return false;
+            }
+
+            if (magnitudeValue == minSignedMagnitude)
+            {
+                outValue = std::numeric_limits<long long>::min();
+            }
+            else
+            {
+                outValue = -static_cast<long long>(magnitudeValue);
+            }
+
+            return true;
+        }
+
+        if (magnitudeValue > static_cast<unsigned long long>(std::numeric_limits<long long>::max()))
+        {
+            return false;
+        }
+
+        outValue = static_cast<long long>(magnitudeValue);
+        return true;
+    }
+
+    bool TryParseYamlUnsignedInteger(const std::string& text, unsigned long long& outValue)
+    {
+        bool isNegative = false;
+        unsigned int numericBase = 10;
+        std::string digits;
+        if (!TryNormalizeYamlIntegerText(text, isNegative, numericBase, digits) || isNegative)
+        {
+            return false;
+        }
+
+        return TryParseYamlUnsignedMagnitude(digits, numericBase, outValue);
+    }
+
+    bool LooksLikeYamlFloatingPoint(const std::string& text)
+    {
+        const std::string lowerText = ToLowerAsciiText(TrimAsciiText(text));
+        if (lowerText.empty())
+        {
+            return false;
+        }
+
+        if (lowerText == ".nan" || lowerText == "+.nan" || lowerText == "-.nan"
+            || lowerText == ".inf" || lowerText == "+.inf" || lowerText == "-.inf")
+        {
+            return true;
+        }
+
+        return lowerText.find('.') != std::string::npos
+            || lowerText.find('e') != std::string::npos;
+    }
+
+    std::string RemoveYamlNumericSeparators(const std::string& text)
+    {
+        std::string normalizedText;
+        normalizedText.reserve(text.size());
+
+        for (std::size_t index = 0; index < text.size(); index++)
+        {
+            const char currentChar = text[index];
+            if (currentChar == '_')
+            {
+                if (index == 0 || index + 1 >= text.size())
+                {
+                    return std::string();
+                }
+
+                const char previousChar = text[index - 1];
+                const char nextChar = text[index + 1];
+                if ((previousChar < '0' || previousChar > '9')
+                    || (nextChar < '0' || nextChar > '9'))
+                {
+                    return std::string();
+                }
+
+                continue;
+            }
+
+            normalizedText.push_back(currentChar);
+        }
+
+        return normalizedText;
+    }
+
+    bool TryParseYamlDouble(const std::string& text, double& outValue)
+    {
+        const std::string trimmedText = TrimAsciiText(text);
+        if (trimmedText.empty())
+        {
+            return false;
+        }
+
+        const std::string lowerText = ToLowerAsciiText(trimmedText);
+        if (lowerText == ".nan" || lowerText == "+.nan" || lowerText == "-.nan")
+        {
+            outValue = std::numeric_limits<double>::quiet_NaN();
+            return true;
+        }
+
+        if (lowerText == ".inf" || lowerText == "+.inf")
+        {
+            outValue = std::numeric_limits<double>::infinity();
+            return true;
+        }
+
+        if (lowerText == "-.inf")
+        {
+            outValue = -std::numeric_limits<double>::infinity();
+            return true;
+        }
+
+        const std::string normalizedText = RemoveYamlNumericSeparators(trimmedText);
+        if (normalizedText.empty())
+        {
+            return false;
+        }
+
+        errno = 0;
+        char* endPointer = nullptr;
+        const double parsedValue = std::strtod(normalizedText.c_str(), &endPointer);
+        if (errno == ERANGE || endPointer == normalizedText.c_str() || endPointer == nullptr || *endPointer != '\0')
+        {
+            return false;
+        }
+
+        outValue = parsedValue;
+        return true;
+    }
+
+    bool TryParseYamlBoolean(const std::string& text, bool& outValue)
+    {
+        const std::string lowerText = ToLowerAsciiText(TrimAsciiText(text));
+        if (lowerText.empty())
+        {
+            return false;
+        }
+
+        if (lowerText == "true"
+            || lowerText == "yes"
+            || lowerText == "y"
+            || lowerText == "on")
+        {
+            outValue = true;
+            return true;
+        }
+
+        if (lowerText == "false"
+            || lowerText == "no"
+            || lowerText == "n"
+            || lowerText == "off")
+        {
+            outValue = false;
+            return true;
+        }
+
+        return false;
+    }
+
+    bool IsYamlExplicitStringTag(const std::string& tagText)
+    {
+        return tagText == "!!str"
+            || tagText == "!<tag:yaml.org,2002:str>"
+            || tagText == "tag:yaml.org,2002:str";
+    }
+
+    bool IsYamlExplicitNullTag(const std::string& tagText)
+    {
+        return tagText == "!!null"
+            || tagText == "!<tag:yaml.org,2002:null>"
+            || tagText == "tag:yaml.org,2002:null";
+    }
+
+    bool IsYamlExplicitBoolTag(const std::string& tagText)
+    {
+        return tagText == "!!bool"
+            || tagText == "!<tag:yaml.org,2002:bool>"
+            || tagText == "tag:yaml.org,2002:bool";
+    }
+
+    bool IsYamlExplicitIntTag(const std::string& tagText)
+    {
+        return tagText == "!!int"
+            || tagText == "!<tag:yaml.org,2002:int>"
+            || tagText == "tag:yaml.org,2002:int";
+    }
+
+    bool IsYamlExplicitFloatTag(const std::string& tagText)
+    {
+        return tagText == "!!float"
+            || tagText == "!<tag:yaml.org,2002:float>"
+            || tagText == "tag:yaml.org,2002:float";
+    }
+
+    long long GetYamlLineNumber(const YAML::Mark& mark)
+    {
+        return mark.is_null() || mark.line < 0 ? -1 : static_cast<long long>(mark.line) + 1;
+    }
+
+    int GetYamlColumnNumber(const YAML::Mark& mark)
+    {
+        return mark.is_null() || mark.column < 0 ? -1 : mark.column + 1;
+    }
+
+    std::string BuildYamlExceptionSummary(const YAML::Exception& exceptionObject)
+    {
+        std::ostringstream stream;
+        stream << "Failed to parse YAML";
+
+        const long long lineNumber = GetYamlLineNumber(exceptionObject.mark);
+        const int columnNumber = GetYamlColumnNumber(exceptionObject.mark);
+        if (lineNumber > 0)
+        {
+            stream << " at line " << lineNumber;
+            if (columnNumber > 0)
+            {
+                stream << ", column " << columnNumber;
+            }
+        }
+
+        if (!exceptionObject.msg.empty())
+        {
+            stream << ": " << exceptionObject.msg;
+        }
+        else
+        {
+            stream << ".";
+        }
+
+        return stream.str();
+    }
+
+    std::string GetYamlMapChildPath(const std::string& parentPath, const std::string& childName)
+    {
+        return parentPath + "[\"" + EscapeJsonPathText(childName) + "\"]";
+    }
+
+    std::string GetYamlSequenceItemPath(const std::string& parentPath, const std::size_t index)
+    {
+        return parentPath + "[" + std::to_string(index) + "]";
+    }
+
+    bool TryGetYamlNodeTag(const YAML::Node& node, std::string& outTag)
+    {
+        try
+        {
+            outTag = node.Tag();
+            return true;
+        }
+        catch (...)
+        {
+            outTag.clear();
+            return false;
+        }
+    }
+
+    bool IsYamlCanonicalNullText(const std::string& trimmedText)
+    {
+        const std::string lowerText = ToLowerAsciiText(trimmedText);
+        return trimmedText.empty()
+            || lowerText == "null"
+            || lowerText == "~";
+    }
+
+    bool HasYamlExplicitTag(const std::string& tagText)
+    {
+        return !tagText.empty() && tagText != "!" && tagText != "?";
+    }
+
+    bool AssignYamlIntegerVariant(const long long signedIntegerValue,
+        const unsigned long long unsignedIntegerValue,
+        const bool useUnsignedValue,
+        GB_Variant& outValue)
+    {
+        if (useUnsignedValue)
+        {
+            if (unsignedIntegerValue <= static_cast<unsigned long long>(std::numeric_limits<unsigned int>::max()))
+            {
+                outValue = static_cast<unsigned int>(unsignedIntegerValue);
+            }
+            else if (unsignedIntegerValue <= static_cast<unsigned long long>(std::numeric_limits<long long>::max()))
+            {
+                outValue = static_cast<long long>(unsignedIntegerValue);
+            }
+            else
+            {
+                outValue = unsignedIntegerValue;
+            }
+
+            return true;
+        }
+
+        if (signedIntegerValue >= static_cast<long long>(std::numeric_limits<int>::min())
+            && signedIntegerValue <= static_cast<long long>(std::numeric_limits<int>::max()))
+        {
+            outValue = static_cast<int>(signedIntegerValue);
+        }
+        else
+        {
+            outValue = signedIntegerValue;
+        }
+
+        return true;
+    }
+
+    bool TryConvertYamlScalarTextToVariant(const std::string& scalarText,
+        const std::string& tagText,
+        const GB_YamlParserOptions& options,
+        GB_Variant& outValue,
+        std::string* errorMessage,
+        const std::string& yamlPath)
+    {
+        if (IsYamlExplicitStringTag(tagText))
+        {
+            outValue = scalarText;
+            return true;
+        }
+
+        const std::string trimmedText = TrimAsciiText(scalarText);
+        const std::string lowerText = ToLowerAsciiText(trimmedText);
+        const bool isExplicitNullTag = IsYamlExplicitNullTag(tagText);
+        const bool isExplicitBoolTag = IsYamlExplicitBoolTag(tagText);
+        const bool isExplicitIntTag = IsYamlExplicitIntTag(tagText);
+        const bool isExplicitFloatTag = IsYamlExplicitFloatTag(tagText);
+
+        if (isExplicitNullTag)
+        {
+            if (!IsYamlCanonicalNullText(trimmedText))
+            {
+                SetErrorMessage(errorMessage, "YAML scalar at " + yamlPath + " is tagged as !!null but contains non-null text.");
+                return false;
+            }
+
+            outValue.Reset();
+            return true;
+        }
+
+        if (isExplicitBoolTag)
+        {
+            bool boolValue = false;
+            if (!TryParseYamlBoolean(trimmedText, boolValue))
+            {
+                SetErrorMessage(errorMessage, "YAML scalar at " + yamlPath + " is tagged as !!bool but cannot be parsed as a boolean.");
+                return false;
+            }
+
+            outValue = boolValue;
+            return true;
+        }
+
+        if (isExplicitIntTag)
+        {
+            long long signedIntegerValue = 0;
+            if (TryParseYamlSignedInteger(trimmedText, signedIntegerValue))
+            {
+                return AssignYamlIntegerVariant(signedIntegerValue, 0ULL, false, outValue);
+            }
+
+            unsigned long long unsignedIntegerValue = 0;
+            if (TryParseYamlUnsignedInteger(trimmedText, unsignedIntegerValue))
+            {
+                return AssignYamlIntegerVariant(0LL, unsignedIntegerValue, true, outValue);
+            }
+
+            SetErrorMessage(errorMessage, "YAML scalar at " + yamlPath + " is tagged as !!int but cannot be parsed as an integer.");
+            return false;
+        }
+
+        if (isExplicitFloatTag)
+        {
+            double doubleValue = 0.0;
+            if (!TryParseYamlDouble(trimmedText, doubleValue))
+            {
+                SetErrorMessage(errorMessage, "YAML scalar at " + yamlPath + " is tagged as !!float but cannot be parsed as a floating-point value.");
+                return false;
+            }
+
+            outValue = doubleValue;
+            return true;
+        }
+
+        if (HasYamlExplicitTag(tagText))
+        {
+            outValue = scalarText;
+            return true;
+        }
+
+        if (!options.autoConvertScalarValues)
+        {
+            outValue = scalarText;
+            return true;
+        }
+
+        if (lowerText == "null" || lowerText == "~")
+        {
+            outValue.Reset();
+            return true;
+        }
+
+        bool boolValue = false;
+        if (TryParseYamlBoolean(trimmedText, boolValue))
+        {
+            outValue = boolValue;
+            return true;
+        }
+
+        if (!trimmedText.empty())
+        {
+            long long signedIntegerValue = 0;
+            if (TryParseYamlSignedInteger(trimmedText, signedIntegerValue))
+            {
+                return AssignYamlIntegerVariant(signedIntegerValue, 0ULL, false, outValue);
+            }
+
+            unsigned long long unsignedIntegerValue = 0;
+            if (TryParseYamlUnsignedInteger(trimmedText, unsignedIntegerValue))
+            {
+                return AssignYamlIntegerVariant(0LL, unsignedIntegerValue, true, outValue);
+            }
+        }
+
+        if (LooksLikeYamlFloatingPoint(trimmedText))
+        {
+            double doubleValue = 0.0;
+            if (TryParseYamlDouble(trimmedText, doubleValue))
+            {
+                outValue = doubleValue;
+                return true;
+            }
+        }
+
+        outValue = scalarText;
+        return true;
+    }
+
+    bool IsYamlNodeOnActivePath(const YAML::Node& node, const std::vector<YAML::Node>& activeNodes)
+    {
+        for (std::size_t index = 0; index < activeNodes.size(); index++)
+        {
+            if (node.is(activeNodes[index]))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    class YamlActiveNodeScope
+    {
+    public:
+        YamlActiveNodeScope(std::vector<YAML::Node>* activeNodes, const YAML::Node& node, const bool enabled)
+            : activeNodes_(activeNodes), enabled_(enabled)
+        {
+            if (enabled_ && activeNodes_ != nullptr)
+            {
+                activeNodes_->push_back(node);
+            }
+        }
+
+        ~YamlActiveNodeScope()
+        {
+            if (enabled_ && activeNodes_ != nullptr)
+            {
+                activeNodes_->pop_back();
+            }
+        }
+
+    private:
+        std::vector<YAML::Node>* activeNodes_ = nullptr;
+        bool enabled_ = false;
+    };
+
+    bool ConvertYamlNodeToVariant(const YAML::Node& yamlNode,
+        GB_Variant& outValue,
+        const GB_YamlParserOptions& options,
+        std::string* errorMessage,
+        const std::string& yamlPath,
+        const int currentDepth,
+        std::vector<YAML::Node>& activeNodes);
+
+    bool ConvertYamlMapToVariantMap(const YAML::Node& yamlNode,
+        GB_VariantMap& outMap,
+        const GB_YamlParserOptions& options,
+        std::string* errorMessage,
+        const std::string& yamlPath,
+        const int currentDepth,
+        std::vector<YAML::Node>& activeNodes)
+    {
+        if (!yamlNode.IsMap())
+        {
+            SetErrorMessage(errorMessage, "YAML node at " + yamlPath + " is not a mapping. Actual type: " + GetYamlNodeTypeName(yamlNode.Type()) + ".");
+            return false;
+        }
+
+        if (currentDepth > options.maxNestingDepth)
+        {
+            SetErrorMessage(errorMessage, "YAML nesting depth exceeds the supported limit (" + std::to_string(options.maxNestingDepth) + ") at " + yamlPath + ".");
+            return false;
+        }
+
+        if (IsYamlNodeOnActivePath(yamlNode, activeNodes))
+        {
+            SetErrorMessage(errorMessage, "Detected a cyclic YAML alias/reference at " + yamlPath + ". The current GB_Variant-based conversion does not support cyclic graphs.");
+            return false;
+        }
+
+        try
+        {
+            YamlActiveNodeScope activeNodeScope(&activeNodes, yamlNode, true);
+
+            GB_VariantMap newMap;
+            for (YAML::const_iterator iterator = yamlNode.begin(); iterator != yamlNode.end(); ++iterator)
+            {
+                const YAML::Node keyNode = iterator->first;
+                const YAML::Node valueNode = iterator->second;
+
+                std::string keyText;
+                if (keyNode.IsScalar())
+                {
+                    keyText = keyNode.Scalar();
+                }
+                else if (options.stringifyNonScalarMapKeys)
+                {
+                    keyText = YAML::Dump(keyNode);
+                }
+                else
+                {
+                    SetErrorMessage(errorMessage, "YAML mapping key at " + yamlPath + " is not a scalar. GB_VariantMap only supports std::string keys. Enable stringifyNonScalarMapKeys to serialize complex keys into YAML text.");
+                    return false;
+                }
+
+                const std::string childPath = GetYamlMapChildPath(yamlPath, keyText);
+                GB_Variant childValue;
+                if (!ConvertYamlNodeToVariant(valueNode, childValue, options, errorMessage, childPath, currentDepth + 1, activeNodes))
+                {
+                    return false;
+                }
+
+                const GB_VariantMap::iterator insertPosition = newMap.lower_bound(keyText);
+                if (insertPosition != newMap.end() && insertPosition->first == keyText)
+                {
+                    if (!options.allowDuplicateMapKeys)
+                    {
+                        SetErrorMessage(errorMessage, "Duplicate YAML mapping key encountered after conversion at " + childPath + ".");
+                        return false;
+                    }
+
+                    insertPosition->second = std::move(childValue);
+                }
+                else
+                {
+                    newMap.emplace_hint(insertPosition, keyText, std::move(childValue));
+                }
+            }
+
+            outMap = std::move(newMap);
+            return true;
+        }
+        catch (const YAML::Exception& exceptionObject)
+        {
+            SetErrorMessage(errorMessage, BuildYamlExceptionSummary(exceptionObject));
+            return false;
+        }
+        catch (const std::exception& exceptionObject)
+        {
+            SetErrorMessage(errorMessage, "Failed to convert YAML mapping at " + yamlPath + ": " + exceptionObject.what());
+            return false;
+        }
+        catch (...)
+        {
+            SetErrorMessage(errorMessage, "Failed to convert YAML mapping at " + yamlPath + " due to an unknown exception.");
+            return false;
+        }
+    }
+
+    bool ConvertYamlSequenceToVariantList(const YAML::Node& yamlNode,
+        GB_VariantList& outList,
+        const GB_YamlParserOptions& options,
+        std::string* errorMessage,
+        const std::string& yamlPath,
+        const int currentDepth,
+        std::vector<YAML::Node>& activeNodes)
+    {
+        if (!yamlNode.IsSequence())
+        {
+            SetErrorMessage(errorMessage, "YAML node at " + yamlPath + " is not a sequence. Actual type: " + GetYamlNodeTypeName(yamlNode.Type()) + ".");
+            return false;
+        }
+
+        if (currentDepth > options.maxNestingDepth)
+        {
+            SetErrorMessage(errorMessage, "YAML nesting depth exceeds the supported limit (" + std::to_string(options.maxNestingDepth) + ") at " + yamlPath + ".");
+            return false;
+        }
+
+        if (IsYamlNodeOnActivePath(yamlNode, activeNodes))
+        {
+            SetErrorMessage(errorMessage, "Detected a cyclic YAML alias/reference at " + yamlPath + ". The current GB_Variant-based conversion does not support cyclic graphs.");
+            return false;
+        }
+
+        try
+        {
+            YamlActiveNodeScope activeNodeScope(&activeNodes, yamlNode, true);
+
+            GB_VariantList newList;
+            const std::size_t itemCount = yamlNode.size();
+            if (itemCount > 0)
+            {
+                newList.reserve(itemCount);
+            }
+
+            std::size_t itemIndex = 0;
+            for (YAML::const_iterator iterator = yamlNode.begin(); iterator != yamlNode.end(); ++iterator, itemIndex++)
+            {
+                GB_Variant itemValue;
+                if (!ConvertYamlNodeToVariant(*iterator, itemValue, options, errorMessage, GetYamlSequenceItemPath(yamlPath, itemIndex), currentDepth + 1, activeNodes))
+                {
+                    return false;
+                }
+
+                newList.push_back(std::move(itemValue));
+            }
+
+            outList = std::move(newList);
+            return true;
+        }
+        catch (const YAML::Exception& exceptionObject)
+        {
+            SetErrorMessage(errorMessage, BuildYamlExceptionSummary(exceptionObject));
+            return false;
+        }
+        catch (const std::exception& exceptionObject)
+        {
+            SetErrorMessage(errorMessage, "Failed to convert YAML sequence at " + yamlPath + ": " + exceptionObject.what());
+            return false;
+        }
+        catch (...)
+        {
+            SetErrorMessage(errorMessage, "Failed to convert YAML sequence at " + yamlPath + " due to an unknown exception.");
+            return false;
+        }
+    }
+
+    bool ConvertYamlNodeToVariant(const YAML::Node& yamlNode,
+        GB_Variant& outValue,
+        const GB_YamlParserOptions& options,
+        std::string* errorMessage,
+        const std::string& yamlPath,
+        const int currentDepth,
+        std::vector<YAML::Node>& activeNodes)
+    {
+        if (currentDepth > options.maxNestingDepth)
+        {
+            SetErrorMessage(errorMessage, "YAML nesting depth exceeds the supported limit (" + std::to_string(options.maxNestingDepth) + ") at " + yamlPath + ".");
+            return false;
+        }
+
+        try
+        {
+            if (!yamlNode.IsDefined() || yamlNode.Type() == YAML::NodeType::Undefined)
+            {
+                outValue.Reset();
+                return true;
+            }
+
+            switch (yamlNode.Type())
+            {
+            case YAML::NodeType::Null:
+                outValue.Reset();
+                return true;
+
+            case YAML::NodeType::Scalar:
+            {
+                std::string tagText;
+                TryGetYamlNodeTag(yamlNode, tagText);
+                return TryConvertYamlScalarTextToVariant(yamlNode.Scalar(), tagText, options, outValue, errorMessage, yamlPath);
+            }
+
+            case YAML::NodeType::Sequence:
+            {
+                GB_VariantList listValue;
+                if (!ConvertYamlSequenceToVariantList(yamlNode, listValue, options, errorMessage, yamlPath, currentDepth, activeNodes))
+                {
+                    return false;
+                }
+
+                outValue = std::move(listValue);
+                return true;
+            }
+
+            case YAML::NodeType::Map:
+            {
+                GB_VariantMap mapValue;
+                if (!ConvertYamlMapToVariantMap(yamlNode, mapValue, options, errorMessage, yamlPath, currentDepth, activeNodes))
+                {
+                    return false;
+                }
+
+                outValue = std::move(mapValue);
+                return true;
+            }
+
+            case YAML::NodeType::Undefined:
+                outValue.Reset();
+                return true;
+
+            default:
+                SetErrorMessage(errorMessage, "Unsupported YAML node type at " + yamlPath + ": " + GetYamlNodeTypeName(yamlNode.Type()) + ".");
+                return false;
+            }
+        }
+        catch (const YAML::Exception& exceptionObject)
+        {
+            SetErrorMessage(errorMessage, BuildYamlExceptionSummary(exceptionObject));
+            return false;
+        }
+        catch (const std::exception& exceptionObject)
+        {
+            SetErrorMessage(errorMessage, "Failed to convert YAML node at " + yamlPath + ": " + exceptionObject.what());
+            return false;
+        }
+        catch (...)
+        {
+            SetErrorMessage(errorMessage, "Failed to convert YAML node at " + yamlPath + " due to an unknown exception.");
+            return false;
+        }
+    }
+
+    bool ConvertYamlDocumentNode(const YAML::Node& yamlNode,
+        GB_YamlDocument& outDocument,
+        const GB_YamlParserOptions& options,
+        std::string* errorMessage)
+    {
+        try
+        {
+            GB_YamlDocument newDocument;
+            const YAML::Mark rootMark = yamlNode.Mark();
+            newDocument.rootLineNumber = GetYamlLineNumber(rootMark);
+            newDocument.rootColumnNumber = GetYamlColumnNumber(rootMark);
+            TryGetYamlNodeTag(yamlNode, newDocument.rootTag);
+
+            std::vector<YAML::Node> activeNodes;
+            if (!ConvertYamlNodeToVariant(yamlNode, newDocument.rootValue, options, errorMessage, "$", 0, activeNodes))
+            {
+                return false;
+            }
+
+            outDocument = std::move(newDocument);
+            return true;
+        }
+        catch (const YAML::Exception& exceptionObject)
+        {
+            SetErrorMessage(errorMessage, BuildYamlExceptionSummary(exceptionObject));
+            return false;
+        }
+        catch (const std::exception& exceptionObject)
+        {
+            SetErrorMessage(errorMessage, "Failed to convert parsed YAML document: " + std::string(exceptionObject.what()));
+            return false;
+        }
+        catch (...)
+        {
+            SetErrorMessage(errorMessage, "Failed to convert parsed YAML document due to an unknown exception.");
+            return false;
+        }
+    }
+
+    bool ParseYamlStreamInternal(const std::string& yamlText, GB_YamlStream& outStream, const GB_YamlParserOptions& options, std::string* errorMessage)
+    {
+        if (yamlText.empty())
+        {
+            SetErrorMessage(errorMessage, "Input YAML text is empty.");
+            return false;
+        }
+
+        if (options.maxNestingDepth < 0)
+        {
+            SetErrorMessage(errorMessage, "maxNestingDepth cannot be negative.");
+            return false;
+        }
+
+        const std::string* yamlTextToLoad = &yamlText;
+        std::string yamlTextWithoutBom;
+        if (HasUtf8Bom(yamlText))
+        {
+            yamlTextWithoutBom.assign(yamlText.begin() + static_cast<std::ptrdiff_t>(kUtf8BomLength), yamlText.end());
+            yamlTextToLoad = &yamlTextWithoutBom;
+        }
+
+        if (yamlTextToLoad->empty())
+        {
+            SetErrorMessage(errorMessage, "Input YAML text is empty.");
+            return false;
+        }
+
+        try
+        {
+            const std::vector<YAML::Node> yamlDocuments = YAML::LoadAll(*yamlTextToLoad);
+            if (yamlDocuments.empty())
+            {
+                SetErrorMessage(errorMessage, "Input YAML text does not contain any document.");
+                return false;
+            }
+
+            GB_YamlStream newStream;
+            newStream.documents.reserve(yamlDocuments.size());
+            for (std::size_t index = 0; index < yamlDocuments.size(); index++)
+            {
+                GB_YamlDocument document;
+                if (!ConvertYamlDocumentNode(yamlDocuments[index], document, options, errorMessage))
+                {
+                    return false;
+                }
+
+                newStream.documents.push_back(std::move(document));
+            }
+
+            outStream = std::move(newStream);
+            ClearErrorMessage(errorMessage);
+            return true;
+        }
+        catch (const YAML::Exception& exceptionObject)
+        {
+            SetErrorMessage(errorMessage, BuildYamlExceptionSummary(exceptionObject));
+            return false;
+        }
+        catch (const std::exception& exceptionObject)
+        {
+            SetErrorMessage(errorMessage, "Failed to parse YAML text: " + std::string(exceptionObject.what()));
+            return false;
+        }
+        catch (...)
+        {
+            SetErrorMessage(errorMessage, "Failed to parse YAML text due to an unknown exception.");
+            return false;
+        }
     }
 
     void EnsureLibXmlInitialized()
@@ -910,6 +2177,31 @@ namespace
         return false;
     }
 
+    std::size_t GetXmlPreservedChildNodeCount(const xmlNodePtr parentNode, const GB_XmlParserOptions& options)
+    {
+        std::size_t preservedChildNodeCount = 0;
+        for (xmlNodePtr child = parentNode != nullptr ? parentNode->children : nullptr; child != nullptr; child = child->next)
+        {
+            if (!ShouldSkipXmlChildNode(child, options))
+            {
+                preservedChildNodeCount++;
+            }
+        }
+
+        return preservedChildNodeCount;
+    }
+
+    long long GetXmlLineNumber(const xmlNodePtr node)
+    {
+        if (node == nullptr)
+        {
+            return -1;
+        }
+
+        const long lineNumber = xmlGetLineNo(node);
+        return lineNumber > 0 ? static_cast<long long>(lineNumber) : -1;
+    }
+
     bool ConvertXmlNode(const xmlNodePtr node, GB_XmlNode& outNode, const GB_XmlParserOptions& options, std::string* errorMessage)
     {
         if (node == nullptr)
@@ -921,7 +2213,7 @@ namespace
         try
         {
             GB_XmlNode newNode;
-            newNode.lineNumber = static_cast<long long>(xmlGetLineNo(node));
+            newNode.lineNumber = GetXmlLineNumber(node);
 
             switch (node->type)
             {
@@ -970,6 +2262,12 @@ namespace
                     AddNamespaceDeclarations(node, newNode.namespaceDeclarations);
                 }
 
+                const std::size_t preservedChildNodeCount = GetXmlPreservedChildNodeCount(node, options);
+                if (preservedChildNodeCount > 0)
+                {
+                    newNode.children.reserve(preservedChildNodeCount);
+                }
+
                 for (xmlNodePtr child = node->children; child != nullptr; child = child->next)
                 {
                     if (ShouldSkipXmlChildNode(child, options))
@@ -1012,9 +2310,16 @@ namespace
                 break;
 
             case XML_ENTITY_REF_NODE:
+            {
                 newNode.nodeType = GB_XmlNode::Type::EntityReference;
                 newNode.nodeTag = XmlCharToString(node->name);
                 newNode.localName = newNode.nodeTag;
+
+                const std::size_t preservedChildNodeCount = GetXmlPreservedChildNodeCount(node, options);
+                if (preservedChildNodeCount > 0)
+                {
+                    newNode.children.reserve(preservedChildNodeCount);
+                }
 
                 for (xmlNodePtr child = node->children; child != nullptr; child = child->next)
                 {
@@ -1033,7 +2338,7 @@ namespace
                 }
 
                 break;
-
+            }
             default:
                 SetErrorMessage(errorMessage, "Unsupported XML node type at " + GetXmlNodePath(node) + ". libxml2 node type: " + std::to_string(static_cast<int>(node->type)) + ".");
                 return false;
@@ -1054,7 +2359,7 @@ namespace
         }
     }
 
-    void LoadDocumentTypeInfo(const xmlDocPtr xmlDocument, GB_XmlDocument& outDocument)
+    void LoadDocumentTypeInfo(const xmlDocPtr xmlDocument, const bool hasXmlDeclaration, GB_XmlDocument& outDocument)
     {
         if (xmlDocument == nullptr)
         {
@@ -1063,7 +2368,23 @@ namespace
 
         outDocument.version = XmlCharToString(xmlDocument->version);
         outDocument.encoding = XmlCharToString(xmlDocument->encoding);
-        outDocument.standalone = static_cast<GB_XmlDocument::StandaloneMode>(xmlDocument->standalone);
+
+        if (!hasXmlDeclaration)
+        {
+            outDocument.standalone = GB_XmlDocument::StandaloneMode::NoDeclaration;
+        }
+        else if (xmlDocument->standalone < 0)
+        {
+            outDocument.standalone = GB_XmlDocument::StandaloneMode::Omitted;
+        }
+        else if (xmlDocument->standalone == 0)
+        {
+            outDocument.standalone = GB_XmlDocument::StandaloneMode::No;
+        }
+        else
+        {
+            outDocument.standalone = GB_XmlDocument::StandaloneMode::Yes;
+        }
 
         if (xmlDocument->intSubset != nullptr)
         {
@@ -1094,7 +2415,7 @@ namespace
         }
     }
 
-    bool ConvertXmlDocument(const xmlDocPtr xmlDocument, GB_XmlDocument& outDocument, const GB_XmlParserOptions& options, const XmlErrorCollector& errorCollector, const bool recovered, std::string* errorMessage)
+    bool ConvertXmlDocument(const xmlDocPtr xmlDocument, GB_XmlDocument& outDocument, const GB_XmlParserOptions& options, const XmlErrorCollector& errorCollector, const bool recovered, const bool hasXmlDeclaration, std::string* errorMessage)
     {
         if (xmlDocument == nullptr)
         {
@@ -1105,7 +2426,7 @@ namespace
         try
         {
             GB_XmlDocument newDocument;
-            LoadDocumentTypeInfo(xmlDocument, newDocument);
+            LoadDocumentTypeInfo(xmlDocument, hasXmlDeclaration, newDocument);
 
             newDocument.diagnostics = errorCollector.GetDiagnostics();
             newDocument.recovered = recovered;
@@ -1262,7 +2583,8 @@ namespace
         }
 
         const bool recovered = DidXmlParseRecover(parserContext.get(), options);
-        if (!ConvertXmlDocument(xmlDocument.get(), outDocument, options, errorCollector, recovered, errorMessage))
+        const bool hasXmlDeclaration = StartsWithXmlDeclaration(xmlText);
+        if (!ConvertXmlDocument(xmlDocument.get(), outDocument, options, errorCollector, recovered, hasXmlDeclaration, errorMessage))
         {
             return false;
         }
@@ -1316,6 +2638,33 @@ namespace
 
         return EqualsAsciiText(targetName, fullName, caseSensitive)
             || (!localNodeName.empty() && EqualsAsciiText(targetName, localNodeName, caseSensitive));
+    }
+
+    std::size_t GetXmlTextValueLength(const GB_XmlNode& node)
+    {
+        switch (node.nodeType)
+        {
+        case GB_XmlNode::Type::Text:
+        case GB_XmlNode::Type::CData:
+            return node.nodeValue.size();
+
+        case GB_XmlNode::Type::Element:
+        case GB_XmlNode::Type::EntityReference:
+        {
+            std::size_t totalLength = 0;
+            for (std::size_t index = 0; index < node.children.size(); index++)
+            {
+                totalLength += GetXmlTextValueLength(node.children[index]);
+            }
+
+            return totalLength;
+        }
+
+        case GB_XmlNode::Type::Comment:
+        case GB_XmlNode::Type::ProcessingInstruction:
+        default:
+            return 0;
+        }
     }
 
     void AppendXmlTextValue(const GB_XmlNode& node, std::string& outValue)
@@ -1431,6 +2780,11 @@ const GB_XmlAttribute* GB_XmlNode::GetAttribute(const std::string& attributeName
 
 GB_XmlAttribute* GB_XmlNode::GetAttribute(const std::string& attributeName, bool caseSensitive)
 {
+    if (attributeName.empty())
+    {
+        return nullptr;
+    }
+
     for (std::size_t index = 0; index < attributes.size(); index++)
     {
         GB_XmlAttribute& attribute = attributes[index];
@@ -1522,6 +2876,10 @@ GB_XmlNode* GB_XmlNode::GetChild(const std::string& childName, bool caseSensitiv
 std::vector<const GB_XmlNode*> GB_XmlNode::GetChildren(const std::string& childName, bool caseSensitive) const
 {
     std::vector<const GB_XmlNode*> matchedChildren;
+    if (!children.empty())
+    {
+        matchedChildren.reserve(children.size());
+    }
     for (std::size_t index = 0; index < children.size(); index++)
     {
         const GB_XmlNode& childNode = children[index];
@@ -1544,6 +2902,10 @@ std::vector<const GB_XmlNode*> GB_XmlNode::GetChildren(const std::string& childN
 std::vector<GB_XmlNode*> GB_XmlNode::GetChildren(const std::string& childName, bool caseSensitive)
 {
     std::vector<GB_XmlNode*> matchedChildren;
+    if (!children.empty())
+    {
+        matchedChildren.reserve(children.size());
+    }
     for (std::size_t index = 0; index < children.size(); index++)
     {
         GB_XmlNode& childNode = children[index];
@@ -1594,6 +2956,7 @@ std::string GB_XmlNode::GetValue() const
     }
 
     std::string value;
+    value.reserve(GetXmlTextValueLength(*this));
     AppendXmlTextValue(*this, value);
     return value;
 }
@@ -1621,4 +2984,187 @@ bool GB_XmlParser::ParseToRootNode(const std::string& xmlText, GB_XmlNode& outRo
     outRootNode = std::move(document.rootNode);
     ClearErrorMessage(errorMessage);
     return true;
+}
+
+bool GB_YamlParser::ParseToVariant(const std::string& yamlText, GB_Variant& outValue, const GB_YamlParserOptions& options, std::string* errorMessage)
+{
+    GB_YamlStream stream;
+    if (!ParseYamlStreamInternal(yamlText, stream, options, errorMessage))
+    {
+        return false;
+    }
+
+    if (stream.documents.size() != 1)
+    {
+        SetErrorMessage(errorMessage, "ParseToVariant requires exactly one YAML document, but " + std::to_string(stream.documents.size()) + " documents were parsed. Use ParseToStream() for multi-document YAML input.");
+        return false;
+    }
+
+    outValue = std::move(stream.documents[0].rootValue);
+    ClearErrorMessage(errorMessage);
+    return true;
+}
+
+bool GB_YamlParser::ParseToVariantMap(const std::string& yamlText, GB_VariantMap& outMap, const GB_YamlParserOptions& options, std::string* errorMessage)
+{
+    GB_Variant value;
+    if (!ParseToVariant(yamlText, value, options, errorMessage))
+    {
+        return false;
+    }
+
+    GB_VariantMap* mapValue = value.AnyCast<GB_VariantMap>();
+    if (mapValue == nullptr)
+    {
+        SetErrorMessage(errorMessage, "Parsed YAML root node is not a mapping.");
+        return false;
+    }
+
+    outMap = std::move(*mapValue);
+    ClearErrorMessage(errorMessage);
+    return true;
+}
+
+bool GB_YamlParser::ParseToDocument(const std::string& yamlText, GB_YamlDocument& outDocument, const GB_YamlParserOptions& options, std::string* errorMessage)
+{
+    GB_YamlStream stream;
+    if (!ParseYamlStreamInternal(yamlText, stream, options, errorMessage))
+    {
+        return false;
+    }
+
+    if (stream.documents.size() != 1)
+    {
+        SetErrorMessage(errorMessage, "ParseToDocument requires exactly one YAML document, but " + std::to_string(stream.documents.size()) + " documents were parsed. Use ParseToStream() for multi-document YAML input.");
+        return false;
+    }
+
+    outDocument = std::move(stream.documents[0]);
+    ClearErrorMessage(errorMessage);
+    return true;
+}
+
+bool GB_YamlParser::ParseToStream(const std::string& yamlText, GB_YamlStream& outStream, const GB_YamlParserOptions& options, std::string* errorMessage)
+{
+    GB_YamlStream newStream;
+    if (!ParseYamlStreamInternal(yamlText, newStream, options, errorMessage))
+    {
+        return false;
+    }
+
+    outStream = std::move(newStream);
+    ClearErrorMessage(errorMessage);
+    return true;
+}
+
+bool GB_YamlParser::ParseFileToVariant(const std::string& yamlFilePath, GB_Variant& outValue, const GB_YamlParserOptions& options, std::string* errorMessage)
+{
+    std::string yamlText;
+    if (!ReadTextFile(yamlFilePath, yamlText, errorMessage))
+    {
+        return false;
+    }
+
+    if (ParseToVariant(yamlText, outValue, options, errorMessage))
+    {
+        return true;
+    }
+
+    if (errorMessage != nullptr)
+    {
+        if (errorMessage->empty())
+        {
+            *errorMessage = "Failed to parse YAML file: " + yamlFilePath + ".";
+        }
+        else
+        {
+            *errorMessage = "Failed to parse YAML file " + yamlFilePath + ": " + *errorMessage;
+        }
+    }
+
+    return false;
+}
+
+bool GB_YamlParser::ParseFileToVariantMap(const std::string& yamlFilePath, GB_VariantMap& outMap, const GB_YamlParserOptions& options, std::string* errorMessage)
+{
+    std::string yamlText;
+    if (!ReadTextFile(yamlFilePath, yamlText, errorMessage))
+    {
+        return false;
+    }
+
+    if (ParseToVariantMap(yamlText, outMap, options, errorMessage))
+    {
+        return true;
+    }
+
+    if (errorMessage != nullptr)
+    {
+        if (errorMessage->empty())
+        {
+            *errorMessage = "Failed to parse YAML file: " + yamlFilePath + ".";
+        }
+        else
+        {
+            *errorMessage = "Failed to parse YAML file " + yamlFilePath + ": " + *errorMessage;
+        }
+    }
+
+    return false;
+}
+
+bool GB_YamlParser::ParseFileToDocument(const std::string& yamlFilePath, GB_YamlDocument& outDocument, const GB_YamlParserOptions& options, std::string* errorMessage)
+{
+    std::string yamlText;
+    if (!ReadTextFile(yamlFilePath, yamlText, errorMessage))
+    {
+        return false;
+    }
+
+    if (ParseToDocument(yamlText, outDocument, options, errorMessage))
+    {
+        return true;
+    }
+
+    if (errorMessage != nullptr)
+    {
+        if (errorMessage->empty())
+        {
+            *errorMessage = "Failed to parse YAML file: " + yamlFilePath + ".";
+        }
+        else
+        {
+            *errorMessage = "Failed to parse YAML file " + yamlFilePath + ": " + *errorMessage;
+        }
+    }
+
+    return false;
+}
+
+bool GB_YamlParser::ParseFileToStream(const std::string& yamlFilePath, GB_YamlStream& outStream, const GB_YamlParserOptions& options, std::string* errorMessage)
+{
+    std::string yamlText;
+    if (!ReadTextFile(yamlFilePath, yamlText, errorMessage))
+    {
+        return false;
+    }
+
+    if (ParseToStream(yamlText, outStream, options, errorMessage))
+    {
+        return true;
+    }
+
+    if (errorMessage != nullptr)
+    {
+        if (errorMessage->empty())
+        {
+            *errorMessage = "Failed to parse YAML file: " + yamlFilePath + ".";
+        }
+        else
+        {
+            *errorMessage = "Failed to parse YAML file " + yamlFilePath + ": " + *errorMessage;
+        }
+    }
+
+    return false;
 }
