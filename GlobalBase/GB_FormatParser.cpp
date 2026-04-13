@@ -18,12 +18,17 @@
 # pragma warning(pop)
 #endif
 
+#include <boost/algorithm/string.hpp>
+#include <boost/property_tree/ini_parser.hpp>
+#include <boost/property_tree/ptree.hpp>
+
 #include <libxml/parser.h>
 #include <libxml/tree.h>
 #include <libxml/xmlerror.h>
 #include <libxml/xmlmemory.h>
 
 #include <algorithm>
+#include <cctype>
 #include <cerrno>
 #include <cmath>
 #include <climits>
@@ -36,6 +41,7 @@
 #include <memory>
 #include <mutex>
 #include <sstream>
+#include <unordered_map>
 #include <utility>
 
 #ifdef _WIN32
@@ -2589,14 +2595,7 @@ namespace
         const char* const baseUrlText = options.baseUrl.empty() ? nullptr : options.baseUrl.c_str();
         const char* const forcedEncodingText = options.forcedEncoding.empty() ? nullptr : options.forcedEncoding.c_str();
 
-        UniqueXmlDocument xmlDocument(
-            xmlCtxtReadMemory(
-                parserContext.get(),
-                xmlText.data(),
-                static_cast<int>(xmlText.size()),
-                baseUrlText,
-                forcedEncodingText,
-                parseOptions));
+        UniqueXmlDocument xmlDocument(xmlCtxtReadMemory(parserContext.get(), xmlText.data(), static_cast<int>(xmlText.size()), baseUrlText, forcedEncodingText, parseOptions));
 
         if (!xmlDocument)
         {
@@ -3199,3 +3198,576 @@ bool GB_YamlParser::ParseFileToStream(const std::string& yamlFilePath, GB_YamlSt
 
     return false;
 }
+
+namespace
+{
+    bool AreIniNamesEqual(const std::string& leftName, const std::string& rightName, const bool caseSensitive)
+    {
+        if (caseSensitive)
+        {
+            return leftName == rightName;
+        }
+
+        return boost::iequals(leftName, rightName);
+    }
+
+    std::string TrimIniTextCopy(const std::string& text)
+    {
+        std::size_t beginIndex = 0;
+        while (beginIndex < text.size() && std::isspace(static_cast<unsigned char>(text[beginIndex])) != 0)
+        {
+            beginIndex++;
+        }
+
+        std::size_t endIndex = text.size();
+        while (endIndex > beginIndex && std::isspace(static_cast<unsigned char>(text[endIndex - 1])) != 0)
+        {
+            endIndex--;
+        }
+
+        return text.substr(beginIndex, endIndex - beginIndex);
+    }
+
+    struct IniLineNumberSectionInfo
+    {
+        long long lineNumber = -1;
+        std::unordered_map<std::string, long long> itemLineNumbers;
+    };
+
+    struct IniLineNumberCache
+    {
+        std::unordered_map<std::string, long long> globalItemLineNumbers;
+        std::unordered_map<std::string, IniLineNumberSectionInfo> sectionInfos;
+    };
+
+    void AddIniDiagnostic(GB_IniDocument& document, const GB_IniDiagnostic::Level level, const long long lineNumber, const int columnNumber, const std::string& message)
+    {
+        GB_IniDiagnostic diagnostic;
+        diagnostic.level = level;
+        diagnostic.lineNumber = lineNumber;
+        diagnostic.columnNumber = columnNumber;
+        diagnostic.message = message;
+        document.diagnostics.push_back(std::move(diagnostic));
+    }
+
+    bool FailIniParse(GB_IniDocument& document, std::string* errorMessage, const long long lineNumber, const int columnNumber, const std::string& message)
+    {
+        AddIniDiagnostic(document, GB_IniDiagnostic::Level::Error, lineNumber, columnNumber, message);
+
+        std::ostringstream stream;
+        stream << message;
+        if (lineNumber > 0)
+        {
+            stream << " [line " << lineNumber;
+            if (columnNumber > 0)
+            {
+                stream << ", column " << columnNumber;
+            }
+            stream << "]";
+        }
+
+        SetErrorMessage(errorMessage, stream.str());
+        return false;
+    }
+
+    bool ConvertIniPropertyTreeToDocument(const boost::property_tree::ptree& propertyTree, GB_IniDocument& outDocument, std::string* errorMessage)
+    {
+        ClearErrorMessage(errorMessage);
+
+        outDocument.globalItems.clear();
+        outDocument.sections.clear();
+
+        outDocument.globalItems.reserve(propertyTree.size());
+        outDocument.sections.reserve(propertyTree.size());
+
+        for (boost::property_tree::ptree::const_iterator rootIterator = propertyTree.begin(); rootIterator != propertyTree.end(); ++rootIterator)
+        {
+            const std::string& entryName = rootIterator->first;
+            const boost::property_tree::ptree& entryNode = rootIterator->second;
+
+            if (entryNode.empty())
+            {
+                GB_IniItem newItem;
+                newItem.key = entryName;
+                newItem.value = entryNode.data();
+                outDocument.globalItems.push_back(std::move(newItem));
+                continue;
+            }
+
+            if (!entryNode.data().empty())
+            {
+                SetErrorMessage(errorMessage, "Failed to convert INI data: a root entry contains both child nodes and a value.");
+                return false;
+            }
+
+            GB_IniSection newSection;
+            newSection.sectionName = entryName;
+            newSection.items.reserve(entryNode.size());
+
+            for (boost::property_tree::ptree::const_iterator itemIterator = entryNode.begin(); itemIterator != entryNode.end(); ++itemIterator)
+            {
+                const std::string& itemName = itemIterator->first;
+                const boost::property_tree::ptree& itemNode = itemIterator->second;
+
+                if (!itemNode.empty())
+                {
+                    SetErrorMessage(errorMessage, "Failed to convert INI data: section [" + entryName + "] contains nested child nodes.");
+                    return false;
+                }
+
+                GB_IniItem newItem;
+                newItem.key = itemName;
+                newItem.value = itemNode.data();
+                newSection.items.push_back(std::move(newItem));
+            }
+
+            outDocument.sections.push_back(std::move(newSection));
+        }
+
+        return true;
+    }
+
+    void BuildIniLineNumberCache(const std::string& iniText, IniLineNumberCache& outCache)
+    {
+        outCache.globalItemLineNumbers.clear();
+        outCache.sectionInfos.clear();
+
+        std::string currentSectionName;
+        long long currentSectionLineNumber = -1;
+
+        std::size_t lineStartIndex = 0;
+        long long lineNumber = 1;
+
+        while (lineStartIndex < iniText.size())
+        {
+            std::size_t lineEndIndex = lineStartIndex;
+            while (lineEndIndex < iniText.size() && iniText[lineEndIndex] != '\r' && iniText[lineEndIndex] != '\n')
+            {
+                lineEndIndex++;
+            }
+
+            const std::string rawLine = iniText.substr(lineStartIndex, lineEndIndex - lineStartIndex);
+            const std::string trimmedLine = TrimIniTextCopy(rawLine);
+            if (!trimmedLine.empty())
+            {
+                const char firstCharacter = trimmedLine[0];
+                if (firstCharacter != ';' && firstCharacter != '#')
+                {
+                    if (firstCharacter == '[')
+                    {
+                        const std::size_t closeBracketPosition = trimmedLine.find(']');
+                        if (closeBracketPosition != std::string::npos)
+                        {
+                            currentSectionName = TrimIniTextCopy(trimmedLine.substr(1, closeBracketPosition - 1));
+                            currentSectionLineNumber = lineNumber;
+                        }
+                    }
+                    else
+                    {
+                        const std::size_t equalSignPosition = trimmedLine.find('=');
+                        if (equalSignPosition != std::string::npos && equalSignPosition > 0)
+                        {
+                            const std::string key = TrimIniTextCopy(trimmedLine.substr(0, equalSignPosition));
+                            if (currentSectionName.empty())
+                            {
+                                outCache.globalItemLineNumbers.emplace(key, lineNumber);
+                            }
+                            else
+                            {
+                                IniLineNumberSectionInfo& sectionInfo = outCache.sectionInfos[currentSectionName];
+                                if (sectionInfo.lineNumber <= 0)
+                                {
+                                    sectionInfo.lineNumber = currentSectionLineNumber;
+                                }
+                                sectionInfo.itemLineNumbers.emplace(key, lineNumber);
+                            }
+                        }
+                    }
+                }
+            }
+
+            if (lineEndIndex >= iniText.size())
+            {
+                break;
+            }
+
+            if (iniText[lineEndIndex] == '\r'
+                && lineEndIndex + 1 < iniText.size()
+                && iniText[lineEndIndex + 1] == '\n')
+            {
+                lineStartIndex = lineEndIndex + 2;
+            }
+            else
+            {
+                lineStartIndex = lineEndIndex + 1;
+            }
+
+            lineNumber++;
+        }
+    }
+
+    void ApplyIniLineNumbers(const IniLineNumberCache& lineNumberCache, GB_IniDocument& document)
+    {
+        for (std::size_t index = 0; index < document.globalItems.size(); index++)
+        {
+            GB_IniItem& currentItem = document.globalItems[index];
+            const std::unordered_map<std::string, long long>::const_iterator itemIterator = lineNumberCache.globalItemLineNumbers.find(currentItem.key);
+            if (itemIterator != lineNumberCache.globalItemLineNumbers.end())
+            {
+                currentItem.lineNumber = itemIterator->second;
+            }
+        }
+
+        for (std::size_t sectionIndex = 0; sectionIndex < document.sections.size(); sectionIndex++)
+        {
+            GB_IniSection& currentSection = document.sections[sectionIndex];
+            const std::unordered_map<std::string, IniLineNumberSectionInfo>::const_iterator sectionIterator = lineNumberCache.sectionInfos.find(currentSection.sectionName);
+            if (sectionIterator == lineNumberCache.sectionInfos.end())
+            {
+                continue;
+            }
+
+            currentSection.lineNumber = sectionIterator->second.lineNumber;
+            const std::unordered_map<std::string, long long>& itemLineNumbers = sectionIterator->second.itemLineNumbers;
+            for (std::size_t itemIndex = 0; itemIndex < currentSection.items.size(); itemIndex++)
+            {
+                GB_IniItem& currentItem = currentSection.items[itemIndex];
+                const std::unordered_map<std::string, long long>::const_iterator itemIterator = itemLineNumbers.find(currentItem.key);
+                if (itemIterator != itemLineNumbers.end())
+                {
+                    currentItem.lineNumber = itemIterator->second;
+                }
+            }
+        }
+    }
+
+    bool ParseIniTextToDocument(const std::string& iniText, GB_IniDocument& outDocument, const GB_IniParserOptions& options, std::string* errorMessage)
+    {
+        ClearErrorMessage(errorMessage);
+
+        GB_IniDocument newDocument;
+        newDocument.hasUtf8Bom = HasUtf8Bom(iniText);
+
+        const std::string* iniTextToParse = &iniText;
+        std::string iniTextWithoutBom;
+        if (newDocument.hasUtf8Bom && options.removeUtf8Bom)
+        {
+            iniTextWithoutBom.assign(iniText.begin() + static_cast<std::ptrdiff_t>(kUtf8BomLength), iniText.end());
+            iniTextToParse = &iniTextWithoutBom;
+        }
+
+        boost::property_tree::ptree propertyTree;
+        try
+        {
+            std::istringstream iniStream(*iniTextToParse);
+            if (options.useClassicLocale)
+            {
+                iniStream.imbue(std::locale::classic());
+            }
+
+            boost::property_tree::ini_parser::read_ini(iniStream, propertyTree);
+        }
+        catch (const boost::property_tree::ini_parser::ini_parser_error& exceptionObject)
+        {
+            const char* exceptionText = exceptionObject.what();
+            const std::string message = exceptionText != nullptr && exceptionText[0] != '\0'
+                ? std::string("Failed to parse INI text: ") + exceptionText
+                : std::string("Failed to parse INI text.");
+            return FailIniParse(newDocument, errorMessage, static_cast<long long>(exceptionObject.line()), -1, message);
+        }
+        catch (const std::exception& exceptionObject)
+        {
+            return FailIniParse(newDocument, errorMessage, -1, -1, std::string("Failed to parse INI text due to an unexpected exception: ") + exceptionObject.what());
+        }
+        catch (...)
+        {
+            return FailIniParse(newDocument, errorMessage, -1, -1, "Failed to parse INI text due to an unknown exception.");
+        }
+
+        if (!ConvertIniPropertyTreeToDocument(propertyTree, newDocument, errorMessage))
+        {
+            AddIniDiagnostic(newDocument, GB_IniDiagnostic::Level::Error, -1, -1, errorMessage != nullptr ? *errorMessage : "Failed to convert INI parse result.");
+            return false;
+        }
+
+        if (options.recordLineNumbers)
+        {
+            IniLineNumberCache lineNumberCache;
+            BuildIniLineNumberCache(*iniTextToParse, lineNumberCache);
+            ApplyIniLineNumbers(lineNumberCache, newDocument);
+        }
+
+        outDocument = std::move(newDocument);
+        ClearErrorMessage(errorMessage);
+        return true;
+    }
+}
+
+bool GB_IniSection::HasKey(const std::string& key, bool caseSensitive) const
+{
+    return GetItem(key, caseSensitive) != nullptr;
+}
+
+const GB_IniItem* GB_IniSection::GetItem(const std::string& key, bool caseSensitive) const
+{
+    for (std::size_t index = 0; index < items.size(); index++)
+    {
+        const GB_IniItem& currentItem = items[index];
+        if (AreIniNamesEqual(currentItem.key, key, caseSensitive))
+        {
+            return &currentItem;
+        }
+    }
+
+    return nullptr;
+}
+
+GB_IniItem* GB_IniSection::GetItem(const std::string& key, bool caseSensitive)
+{
+    for (std::size_t index = 0; index < items.size(); index++)
+    {
+        GB_IniItem& currentItem = items[index];
+        if (AreIniNamesEqual(currentItem.key, key, caseSensitive))
+        {
+            return &currentItem;
+        }
+    }
+
+    return nullptr;
+}
+
+std::vector<const GB_IniItem*> GB_IniSection::GetItems(const std::string& key, bool caseSensitive) const
+{
+    std::vector<const GB_IniItem*> matchedItems;
+    matchedItems.reserve(items.size());
+
+    for (std::size_t index = 0; index < items.size(); index++)
+    {
+        const GB_IniItem& currentItem = items[index];
+        if (key.empty() || AreIniNamesEqual(currentItem.key, key, caseSensitive))
+        {
+            matchedItems.push_back(&currentItem);
+        }
+    }
+
+    return matchedItems;
+}
+
+std::vector<GB_IniItem*> GB_IniSection::GetItems(const std::string& key, bool caseSensitive)
+{
+    std::vector<GB_IniItem*> matchedItems;
+    matchedItems.reserve(items.size());
+
+    for (std::size_t index = 0; index < items.size(); index++)
+    {
+        GB_IniItem& currentItem = items[index];
+        if (key.empty() || AreIniNamesEqual(currentItem.key, key, caseSensitive))
+        {
+            matchedItems.push_back(&currentItem);
+        }
+    }
+
+    return matchedItems;
+}
+
+bool GB_IniSection::TryGetValue(const std::string& key, std::string& outValue, bool caseSensitive) const
+{
+    const GB_IniItem* item = GetItem(key, caseSensitive);
+    if (item == nullptr)
+    {
+        return false;
+    }
+
+    outValue = item->value;
+    return true;
+}
+
+std::string GB_IniSection::GetValue(const std::string& key, bool caseSensitive) const
+{
+    std::string value;
+    if (!TryGetValue(key, value, caseSensitive))
+    {
+        return "";
+    }
+
+    return value;
+}
+
+bool GB_IniDocument::HasSection(const std::string& sectionName, bool caseSensitive) const
+{
+    return GetSection(sectionName, caseSensitive) != nullptr;
+}
+
+const GB_IniSection* GB_IniDocument::GetSection(const std::string& sectionName, bool caseSensitive) const
+{
+    for (std::size_t index = 0; index < sections.size(); index++)
+    {
+        const GB_IniSection& currentSection = sections[index];
+        if (AreIniNamesEqual(currentSection.sectionName, sectionName, caseSensitive))
+        {
+            return &currentSection;
+        }
+    }
+
+    return nullptr;
+}
+
+GB_IniSection* GB_IniDocument::GetSection(const std::string& sectionName, bool caseSensitive)
+{
+    for (std::size_t index = 0; index < sections.size(); index++)
+    {
+        GB_IniSection& currentSection = sections[index];
+        if (AreIniNamesEqual(currentSection.sectionName, sectionName, caseSensitive))
+        {
+            return &currentSection;
+        }
+    }
+
+    return nullptr;
+}
+
+std::vector<const GB_IniSection*> GB_IniDocument::GetSections(const std::string& sectionName, bool caseSensitive) const
+{
+    std::vector<const GB_IniSection*> matchedSections;
+    matchedSections.reserve(sections.size());
+
+    for (std::size_t index = 0; index < sections.size(); index++)
+    {
+        const GB_IniSection& currentSection = sections[index];
+        if (sectionName.empty() || AreIniNamesEqual(currentSection.sectionName, sectionName, caseSensitive))
+        {
+            matchedSections.push_back(&currentSection);
+        }
+    }
+
+    return matchedSections;
+}
+
+std::vector<GB_IniSection*> GB_IniDocument::GetSections(const std::string& sectionName, bool caseSensitive)
+{
+    std::vector<GB_IniSection*> matchedSections;
+    matchedSections.reserve(sections.size());
+
+    for (std::size_t index = 0; index < sections.size(); index++)
+    {
+        GB_IniSection& currentSection = sections[index];
+        if (sectionName.empty() || AreIniNamesEqual(currentSection.sectionName, sectionName, caseSensitive))
+        {
+            matchedSections.push_back(&currentSection);
+        }
+    }
+
+    return matchedSections;
+}
+
+bool GB_IniDocument::HasGlobalKey(const std::string& key, bool caseSensitive) const
+{
+    return GetGlobalItem(key, caseSensitive) != nullptr;
+}
+
+const GB_IniItem* GB_IniDocument::GetGlobalItem(const std::string& key, bool caseSensitive) const
+{
+    for (std::size_t index = 0; index < globalItems.size(); index++)
+    {
+        const GB_IniItem& currentItem = globalItems[index];
+        if (AreIniNamesEqual(currentItem.key, key, caseSensitive))
+        {
+            return &currentItem;
+        }
+    }
+
+    return nullptr;
+}
+
+GB_IniItem* GB_IniDocument::GetGlobalItem(const std::string& key, bool caseSensitive)
+{
+    for (std::size_t index = 0; index < globalItems.size(); index++)
+    {
+        GB_IniItem& currentItem = globalItems[index];
+        if (AreIniNamesEqual(currentItem.key, key, caseSensitive))
+        {
+            return &currentItem;
+        }
+    }
+
+    return nullptr;
+}
+
+bool GB_IniDocument::TryGetGlobalValue(const std::string& key, std::string& outValue, bool caseSensitive) const
+{
+    const GB_IniItem* item = GetGlobalItem(key, caseSensitive);
+    if (item == nullptr)
+    {
+        return false;
+    }
+
+    outValue = item->value;
+    return true;
+}
+
+std::string GB_IniDocument::GetGlobalValue(const std::string& key, bool caseSensitive) const
+{
+    std::string value;
+    if (!TryGetGlobalValue(key, value, caseSensitive))
+    {
+        return "";
+    }
+
+    return value;
+}
+
+bool GB_IniDocument::TryGetValue(const std::string& sectionName, const std::string& key, std::string& outValue, bool caseSensitiveSectionNames, bool caseSensitiveKeyNames) const
+{
+    const GB_IniSection* section = GetSection(sectionName, caseSensitiveSectionNames);
+    if (section == nullptr)
+    {
+        return false;
+    }
+
+    return section->TryGetValue(key, outValue, caseSensitiveKeyNames);
+}
+
+std::string GB_IniDocument::GetValue(const std::string& sectionName, const std::string& key, bool caseSensitiveSectionNames, bool caseSensitiveKeyNames) const
+{
+    std::string value;
+    if (!TryGetValue(sectionName, key, value, caseSensitiveSectionNames, caseSensitiveKeyNames))
+    {
+        return "";
+    }
+
+    return value;
+}
+
+bool GB_IniParser::ParseToDocument(const std::string& iniText, GB_IniDocument& outDocument, const GB_IniParserOptions& options, std::string* errorMessage)
+{
+    return ParseIniTextToDocument(iniText, outDocument, options, errorMessage);
+}
+
+bool GB_IniParser::ParseFileToDocument(const std::string& iniFilePath, GB_IniDocument& outDocument, const GB_IniParserOptions& options, std::string* errorMessage)
+{
+    std::string iniText;
+    if (!ReadTextFile(iniFilePath, iniText, errorMessage))
+    {
+        return false;
+    }
+
+    if (ParseToDocument(iniText, outDocument, options, errorMessage))
+    {
+        return true;
+    }
+
+    if (errorMessage != nullptr)
+    {
+        if (errorMessage->empty())
+        {
+            *errorMessage = "Failed to parse INI file: " + iniFilePath + ".";
+        }
+        else
+        {
+            *errorMessage = "Failed to parse INI file " + iniFilePath + ": " + *errorMessage;
+        }
+    }
+
+    return false;
+}
+

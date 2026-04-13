@@ -687,6 +687,320 @@ public:
     static bool ParseFileToStream(const std::string& yamlFilePath, GB_YamlStream& outStream, const GB_YamlParserOptions& options = GB_YamlParserOptions(), std::string* errorMessage = nullptr);
 };
 
+/**
+ * @brief INI 诊断信息。
+ */
+struct GB_IniDiagnostic
+{
+    /**
+     * @brief 诊断级别。
+     */
+    enum class Level
+    {
+        Warning,
+        Error,
+        Fatal
+    };
+
+    Level level = Level::Error;
+    long long lineNumber = -1;
+    int columnNumber = -1;
+    std::string message = "";
+};
+
+/**
+ * @brief INI 键值项。
+ */
+struct GB_IniItem
+{
+    std::string key = "";
+    std::string value = "";
+    long long lineNumber = -1;
+};
+
+/**
+ * @brief INI 段。
+ *
+ * 说明：
+ * - sectionName 为段名，不包含方括号；
+ * - items 保存该段下的全部键值项；
+ * - 不会出现重复 key；
+ * - 空段会被底层解析器忽略，因此不会出现在 items 为空的段对象中。
+ */
+struct GLOBALBASE_PORT GB_IniSection
+{
+    std::string sectionName = "";
+    long long lineNumber = -1;
+    std::vector<GB_IniItem> items;
+
+    /**
+     * @brief 判断当前段中是否存在指定 key。
+     *
+     * @param key 键名称。
+     * @param caseSensitive 是否区分大小写；默认 false。
+     * @return true 表示存在；否则返回 false。
+     */
+    bool HasKey(const std::string& key, bool caseSensitive = false) const;
+
+    /**
+     * @brief 获取第一个匹配 key 的键值项（只读）。
+     *
+     * @param key 键名称。
+     * @param caseSensitive 是否区分大小写；默认 false。
+     * @return 找到时返回键值项指针；否则返回 nullptr。
+     */
+    const GB_IniItem* GetItem(const std::string& key, bool caseSensitive = false) const;
+
+    /**
+     * @brief 获取第一个匹配 key 的键值项（可写）。
+     *
+     * @param key 键名称。
+     * @param caseSensitive 是否区分大小写；默认 false。
+     * @return 找到时返回键值项指针；否则返回 nullptr。
+     */
+    GB_IniItem* GetItem(const std::string& key, bool caseSensitive = false);
+
+    /**
+     * @brief 获取所有匹配 key 的键值项（只读）。
+     *
+     * 当 key 为空时，返回当前段中的全部键值项。
+     *
+     * @param key 键名称；为空时表示不过滤名称。
+     * @param caseSensitive 是否区分大小写；默认 false。
+     * @return 匹配到的键值项指针数组。
+     */
+    std::vector<const GB_IniItem*> GetItems(const std::string& key = "", bool caseSensitive = false) const;
+
+    /**
+     * @brief 获取所有匹配 key 的键值项（可写）。
+     *
+     * 当 key 为空时，返回当前段中的全部键值项。
+     *
+     * @param key 键名称；为空时表示不过滤名称。
+     * @param caseSensitive 是否区分大小写；默认 false。
+     * @return 匹配到的键值项指针数组。
+     */
+    std::vector<GB_IniItem*> GetItems(const std::string& key = "", bool caseSensitive = false);
+
+    /**
+     * @brief 尝试获取指定 key 的值。
+     *
+     * @param key 键名称。
+     * @param[out] outValue 输出的键值。
+     * @param caseSensitive 是否区分大小写；默认 false。
+     * @return true 表示成功获取；false 表示未找到。
+     */
+    bool TryGetValue(const std::string& key, std::string& outValue, bool caseSensitive = false) const;
+
+    /**
+     * @brief 获取指定 key 的值。
+     *
+     * 若不存在匹配的 key，则返回空字符串。
+     *
+     * @param key 键名称。
+     * @param caseSensitive 是否区分大小写；默认 false。
+     * @return 第一个匹配项的值；若未找到则返回空字符串。
+     */
+    std::string GetValue(const std::string& key, bool caseSensitive = false) const;
+};
+
+/**
+ * @brief INI 文档。
+ *
+ * 说明：
+ * - globalItems 保存所有未归属于任何段的全局键值项；
+ * - sections 保存全部非空段；
+ * - diagnostics 主要用于记录解析失败时的诊断信息；
+ * - hasUtf8Bom 用于反映输入文本/文件是否带 UTF-8 BOM；
+ */
+struct GLOBALBASE_PORT GB_IniDocument
+{
+    bool hasUtf8Bom = false;
+    std::vector<GB_IniDiagnostic> diagnostics;
+    std::vector<GB_IniItem> globalItems;
+    std::vector<GB_IniSection> sections;
+
+    /**
+     * @brief 判断是否存在指定段。
+     *
+     * @param sectionName 段名称。
+     * @param caseSensitive 是否区分大小写；默认 false。
+     * @return true 表示存在；否则返回 false。
+     */
+    bool HasSection(const std::string& sectionName, bool caseSensitive = false) const;
+
+    /**
+     * @brief 获取第一个匹配名称的段（只读）。
+     *
+     * @param sectionName 段名称。
+     * @param caseSensitive 是否区分大小写；默认 false。
+     * @return 找到时返回段指针；否则返回 nullptr。
+     */
+    const GB_IniSection* GetSection(const std::string& sectionName, bool caseSensitive = false) const;
+
+    /**
+     * @brief 获取第一个匹配名称的段（可写）。
+     *
+     * @param sectionName 段名称。
+     * @param caseSensitive 是否区分大小写；默认 false。
+     * @return 找到时返回段指针；否则返回 nullptr。
+     */
+    GB_IniSection* GetSection(const std::string& sectionName, bool caseSensitive = false);
+
+    /**
+     * @brief 获取所有匹配名称的段（只读）。
+     *
+     * 当 sectionName 为空时，返回全部段。
+     *
+     * @param sectionName 段名称；为空时表示不过滤名称。
+     * @param caseSensitive 是否区分大小写；默认 false。
+     * @return 匹配到的段指针数组。
+     */
+    std::vector<const GB_IniSection*> GetSections(const std::string& sectionName = "", bool caseSensitive = false) const;
+
+    /**
+     * @brief 获取所有匹配名称的段（可写）。
+     *
+     * 当 sectionName 为空时，返回全部段。
+     *
+     * @param sectionName 段名称；为空时表示不过滤名称。
+     * @param caseSensitive 是否区分大小写；默认 false。
+     * @return 匹配到的段指针数组。
+     */
+    std::vector<GB_IniSection*> GetSections(const std::string& sectionName = "", bool caseSensitive = false);
+
+    /**
+     * @brief 判断全局区域中是否存在指定 key。
+     *
+     * @param key 键名称。
+     * @param caseSensitive 是否区分大小写；默认 false。
+     * @return true 表示存在；否则返回 false。
+     */
+    bool HasGlobalKey(const std::string& key, bool caseSensitive = false) const;
+
+    /**
+     * @brief 获取全局区域中的第一个匹配键值项（只读）。
+     *
+     * @param key 键名称。
+     * @param caseSensitive 是否区分大小写；默认 false。
+     * @return 找到时返回键值项指针；否则返回 nullptr。
+     */
+    const GB_IniItem* GetGlobalItem(const std::string& key, bool caseSensitive = false) const;
+
+    /**
+     * @brief 获取全局区域中的第一个匹配键值项（可写）。
+     *
+     * @param key 键名称。
+     * @param caseSensitive 是否区分大小写；默认 false。
+     * @return 找到时返回键值项指针；否则返回 nullptr。
+     */
+    GB_IniItem* GetGlobalItem(const std::string& key, bool caseSensitive = false);
+
+    /**
+     * @brief 尝试获取全局区域中的指定值。
+     *
+     * @param key 键名称。
+     * @param[out] outValue 输出值。
+     * @param caseSensitive 是否区分大小写；默认 false。
+     * @return true 表示成功获取；false 表示未找到。
+     */
+    bool TryGetGlobalValue(const std::string& key, std::string& outValue, bool caseSensitive = false) const;
+
+    /**
+     * @brief 获取全局区域中的指定值。
+     *
+     * 若未找到，则返回空字符串。
+     *
+     * @param key 键名称。
+     * @param caseSensitive 是否区分大小写；默认 false。
+     * @return 对应的键值；若未找到则返回空字符串。
+     */
+    std::string GetGlobalValue(const std::string& key, bool caseSensitive = false) const;
+
+    /**
+     * @brief 尝试获取指定段中的指定值。
+     *
+     * @param sectionName 段名称。
+     * @param key 键名称。
+     * @param[out] outValue 输出值。
+     * @param caseSensitiveSectionNames 段名比较是否区分大小写；默认 false。
+     * @param caseSensitiveKeyNames 键名比较是否区分大小写；默认 false。
+     * @return true 表示成功获取；false 表示未找到。
+     */
+    bool TryGetValue(const std::string& sectionName, const std::string& key, std::string& outValue, bool caseSensitiveSectionNames = false, bool caseSensitiveKeyNames = false) const;
+
+    /**
+     * @brief 获取指定段中的指定值。
+     *
+     * 若未找到，则返回空字符串。
+     *
+     * @param sectionName 段名称。
+     * @param key 键名称。
+     * @param caseSensitiveSectionNames 段名比较是否区分大小写；默认 false。
+     * @param caseSensitiveKeyNames 键名比较是否区分大小写；默认 false。
+     * @return 对应的键值；若未找到则返回空字符串。
+     */
+    std::string GetValue(const std::string& sectionName, const std::string& key, bool caseSensitiveSectionNames = false, bool caseSensitiveKeyNames = false) const;
+};
+
+/**
+ * @brief INI 解析选项。
+ */
+struct GB_IniParserOptions
+{
+    /**
+     * @brief 是否在解析前移除 UTF-8 BOM。
+     *
+     * 默认 true，用于兼容常见带 BOM 的 UTF-8 INI 文件。
+     */
+    bool removeUtf8Bom = true;
+
+    /**
+     * @brief 是否记录段和键值项所在的行号。
+     *
+     * 为 true 时，会在成功解析后对原始文本做一次轻量级扫描，
+     * 为 GB_IniSection::lineNumber 和 GB_IniItem::lineNumber 赋值。
+     */
+    bool recordLineNumbers = true;
+
+    /**
+     * @brief 是否使用 classic locale 进行解析。
+     *
+     * 该选项为 true 时，会对内部字符串流显式设置 std::locale::classic()。
+     */
+    bool useClassicLocale = false;
+};
+
+/**
+ * @brief INI 解析器。
+ */
+class GLOBALBASE_PORT GB_IniParser
+{
+public:
+    /**
+     * @brief 将 INI 文本解析为文档对象。
+     *
+     * @param iniText 输入的 INI 文本。
+     * @param[out] outDocument 解析成功后输出的文档结构。
+     * @param options 解析选项。
+     * @param[out] errorMessage 可选的错误信息输出；成功时会被清空。
+     * @return true 表示解析成功；false 表示失败。
+     */
+    static bool ParseToDocument(const std::string& iniText, GB_IniDocument& outDocument, const GB_IniParserOptions& options = GB_IniParserOptions(), std::string* errorMessage = nullptr);
+
+    /**
+     * @brief 从 INI 文件解析为文档对象。
+     *
+     * @param iniFilePath 输入的 INI 文件路径（UTF-8）。
+     * @param[out] outDocument 解析成功后输出的文档结构。
+     * @param options 解析选项。
+     * @param[out] errorMessage 可选的错误信息输出；成功时会被清空。
+     * @return true 表示解析成功；false 表示失败。
+     */
+    static bool ParseFileToDocument(const std::string& iniFilePath, GB_IniDocument& outDocument, const GB_IniParserOptions& options = GB_IniParserOptions(), std::string* errorMessage = nullptr);
+};
+
+
 
 #ifdef _MSC_VER
 # pragma warning(pop)
