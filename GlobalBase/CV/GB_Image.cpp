@@ -1684,7 +1684,7 @@ bool GB_Image::Create(size_t rows, size_t cols, GB_ImageDepth depth, int channel
  */
 bool GB_Image::LoadFromFile(const std::string& filePathUtf8, const GB_ImageLoadOptions& loadOptions)
 {
-    const GB_ByteBuffer encodedBytes = GB_ReadFileToBinary(filePathUtf8);
+    const GB_ByteBuffer encodedBytes = GB_ReadBinaryFromFile(filePathUtf8);
     if (encodedBytes.empty())
     {
         return false;

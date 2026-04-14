@@ -228,7 +228,7 @@ namespace
 
 std::string GB_ReadFromFile(const std::string& filePathUtf8)
 {
-    const GB_ByteBuffer fileBytes = GB_ReadFileToBinary(filePathUtf8);
+    const GB_ByteBuffer fileBytes = GB_ReadBinaryFromFile(filePathUtf8);
     if (fileBytes.empty())
     {
         return std::string();
@@ -242,47 +242,24 @@ std::string GB_ReadFromFile(const std::string& filePathUtf8)
     return std::string(reinterpret_cast<const char*>(fileBytes.data()), fileBytes.size());
 }
 
-std::string GB_ReadUtf8FromFile(const std::string& filePathUtf8)
+std::string GB_ReadUtf8FromFile(const std::string& filePathUtf8, const std::string& fileEncodingName)
 {
     const std::string fileData = GB_ReadFromFile(filePathUtf8);
     if (fileData.empty())
     {
         return std::string();
     }
-
     try
     {
-        switch (DetectTextEncodingByBom(fileData))
-        {
-        case GB_TextEncodingByBom::Utf8:
-            return GB_BytesToUtf8(fileData, "utf-8-sig");
-        case GB_TextEncodingByBom::Utf16Le:
-            return GB_BytesToUtf8(fileData, "utf-16le");
-        case GB_TextEncodingByBom::Utf16Be:
-            return GB_BytesToUtf8(fileData, "utf-16be");
-        case GB_TextEncodingByBom::Utf32Le:
-            return GB_BytesToUtf8(fileData, "utf-32le");
-        case GB_TextEncodingByBom::Utf32Be:
-            return GB_BytesToUtf8(fileData, "utf-32be");
-        case GB_TextEncodingByBom::Unknown:
-        default:
-            break;
-        }
-
-        if (GB_IsUtf8(fileData))
-        {
-            return fileData;
-        }
-
-        return GB_BytesToUtf8(fileData, "ansi");
+        return GB_BytesToUtf8(fileData, fileEncodingName);
     }
     catch (...)
     {
-        return std::string();
+        return fileData;
     }
 }
 
-std::vector<unsigned char> GB_ReadFileToBinary(const std::string& filePathUtf8)
+std::vector<unsigned char> GB_ReadBinaryFromFile(const std::string& filePathUtf8)
 {
     if (filePathUtf8.empty())
     {

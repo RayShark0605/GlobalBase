@@ -503,7 +503,7 @@ namespace
             std::uint64_t fileSize = 0;
             const bool hasKnownFileSize = TryGetRegularFileSize(filePath, fileSize);
 
-            GB_ByteBuffer fileData = GB_ReadFileToBinary(filePath);
+            GB_ByteBuffer fileData = GB_ReadBinaryFromFile(filePath);
             if (fileData.empty())
             {
                 if (hasKnownFileSize && fileSize == 0)
