@@ -570,6 +570,8 @@ struct GB_YamlParserOptions
      * 默认 false，以优先保证 YAML 标量语义不被误判：
      * - false：未显式标注标准标量 tag 的 scalar 默认按 std::string 输出；
      * - true：会尝试把未显式标注类型的部分标量识别为 null / bool / 整型 / double；
+     *   其中布尔与数字文本的自动识别遵循 YAML 1.2 风格，不会把 yes/no/on/off/y/n 当成布尔值，
+     *   也不会接受带下划线分隔符的数字文本；
      * - 无论该选项是否开启，显式的 `!!str` / `!!null` / `!!bool` / `!!int` / `!!float`
      *   都会按对应语义处理；若显式 tag 与内容不匹配，则返回失败。
      */
@@ -952,14 +954,16 @@ struct GB_IniParserOptions
      * @brief 是否在解析前移除 UTF-8 BOM。
      *
      * 默认 true，用于兼容常见带 BOM 的 UTF-8 INI 文件。
+     * 若输入带 BOM 且该值为 false，则会直接返回失败，避免把 BOM 错误地并入首个 section / key 名称。
      */
     bool removeUtf8Bom = true;
 
     /**
      * @brief 是否记录段和键值项所在的行号。
      *
-     * 为 true 时，会在成功解析后对原始文本做一次轻量级扫描，
-     * 为 GB_IniSection::lineNumber 和 GB_IniItem::lineNumber 赋值。
+     * 为 true 时，会在成功解析后按 Boost.PropertyTree 所支持的 INI 子集
+     * 对原始文本做一次轻量级词法扫描，并为 GB_IniSection::lineNumber
+     * 和 GB_IniItem::lineNumber 赋值。
      */
     bool recordLineNumbers = true;
 

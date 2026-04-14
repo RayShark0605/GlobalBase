@@ -41,6 +41,7 @@
 #include <memory>
 #include <mutex>
 #include <sstream>
+#include <string_view>
 #include <unordered_map>
 #include <utility>
 
@@ -622,6 +623,8 @@ namespace
         return digitValue >= 0 && static_cast<unsigned int>(digitValue) < numericBase;
     }
 
+    bool ContainsYamlNumericSeparator(const std::string& text);
+
     bool TryNormalizeYamlIntegerText(const std::string& text,
         bool& isNegative,
         unsigned int& numericBase,
@@ -629,6 +632,11 @@ namespace
     {
         const std::string trimmedText = TrimAsciiText(text);
         if (trimmedText.empty())
+        {
+            return false;
+        }
+
+        if (ContainsYamlNumericSeparator(trimmedText))
         {
             return false;
         }
@@ -660,11 +668,6 @@ namespace
                 numericBase = 8;
                 digitBeginIndex += 2;
             }
-            else if (prefixChar == 'b' || prefixChar == 'B')
-            {
-                numericBase = 2;
-                digitBeginIndex += 2;
-            }
         }
 
         if (digitBeginIndex >= trimmedText.size())
@@ -675,36 +678,18 @@ namespace
         outDigits.clear();
         outDigits.reserve(trimmedText.size() - digitBeginIndex);
 
-        bool previousWasSeparator = false;
         for (std::size_t index = digitBeginIndex; index < trimmedText.size(); index++)
         {
             const char currentChar = trimmedText[index];
-            if (currentChar == '_')
-            {
-                if (outDigits.empty() || previousWasSeparator)
-                {
-                    return false;
-                }
-
-                previousWasSeparator = true;
-                continue;
-            }
-
             if (!IsValidYamlDigitForBase(currentChar, numericBase))
             {
                 return false;
             }
 
             outDigits.push_back(currentChar);
-            previousWasSeparator = false;
         }
 
-        if (outDigits.empty() || previousWasSeparator)
-        {
-            return false;
-        }
-
-        return true;
+        return !outDigits.empty();
     }
 
     bool TryAccumulateYamlUnsignedInteger(const unsigned long long currentValue,
@@ -828,36 +813,9 @@ namespace
             || lowerText.find('e') != std::string::npos;
     }
 
-    std::string RemoveYamlNumericSeparators(const std::string& text)
+    bool ContainsYamlNumericSeparator(const std::string& text)
     {
-        std::string normalizedText;
-        normalizedText.reserve(text.size());
-
-        for (std::size_t index = 0; index < text.size(); index++)
-        {
-            const char currentChar = text[index];
-            if (currentChar == '_')
-            {
-                if (index == 0 || index + 1 >= text.size())
-                {
-                    return std::string();
-                }
-
-                const char previousChar = text[index - 1];
-                const char nextChar = text[index + 1];
-                if ((previousChar < '0' || previousChar > '9')
-                    || (nextChar < '0' || nextChar > '9'))
-                {
-                    return std::string();
-                }
-
-                continue;
-            }
-
-            normalizedText.push_back(currentChar);
-        }
-
-        return normalizedText;
+        return text.find('_') != std::string::npos;
     }
 
     /**
@@ -917,16 +875,15 @@ namespace
             return true;
         }
 
-        const std::string normalizedText = RemoveYamlNumericSeparators(trimmedText);
-        if (normalizedText.empty())
+        if (ContainsYamlNumericSeparator(trimmedText))
         {
             return false;
         }
 
         errno = 0;
         char* endPointer = nullptr;
-        const double parsedValue = StrtodWithCLocale(normalizedText.c_str(), &endPointer);
-        if (errno == ERANGE || endPointer == normalizedText.c_str() || endPointer == nullptr || *endPointer != '\0')
+        const double parsedValue = StrtodWithCLocale(trimmedText.c_str(), &endPointer);
+        if (errno == ERANGE || endPointer == trimmedText.c_str() || endPointer == nullptr || *endPointer != '\0')
         {
             return false;
         }
@@ -943,19 +900,13 @@ namespace
             return false;
         }
 
-        if (lowerText == "true"
-            || lowerText == "yes"
-            || lowerText == "y"
-            || lowerText == "on")
+        if (lowerText == "true")
         {
             outValue = true;
             return true;
         }
 
-        if (lowerText == "false"
-            || lowerText == "no"
-            || lowerText == "n"
-            || lowerText == "off")
+        if (lowerText == "false")
         {
             outValue = false;
             return true;
@@ -3211,16 +3162,28 @@ namespace
         return boost::iequals(leftName, rightName);
     }
 
-    std::string TrimIniTextCopy(const std::string& text)
+    bool IsIniAsciiWhitespace(const char character)
+    {
+        const unsigned char unsignedCharacter = static_cast<unsigned char>(character);
+        return unsignedCharacter == ' '
+            || unsignedCharacter == '\t'
+            || unsignedCharacter == '\n'
+            || unsignedCharacter == '\r'
+            || unsignedCharacter == '\f'
+            || unsignedCharacter == '\v';
+    }
+
+    std::string_view TrimIniTextView(const std::string_view text)
     {
         std::size_t beginIndex = 0;
-        while (beginIndex < text.size() && std::isspace(static_cast<unsigned char>(text[beginIndex])) != 0)
+        std::size_t endIndex = text.size();
+
+        while (beginIndex < endIndex && IsIniAsciiWhitespace(text[beginIndex]))
         {
             beginIndex++;
         }
 
-        std::size_t endIndex = text.size();
-        while (endIndex > beginIndex && std::isspace(static_cast<unsigned char>(text[endIndex - 1])) != 0)
+        while (endIndex > beginIndex && IsIniAsciiWhitespace(text[endIndex - 1]))
         {
             endIndex--;
         }
@@ -3228,17 +3191,76 @@ namespace
         return text.substr(beginIndex, endIndex - beginIndex);
     }
 
+    std::string TrimIniTextCopy(const std::string& text)
+    {
+        const std::string_view trimmedText = TrimIniTextView(std::string_view(text));
+        return std::string(trimmedText.data(), trimmedText.size());
+    }
+
+    struct IniLineNumberItemInfo
+    {
+        std::string key = "";
+        long long lineNumber = -1;
+    };
+
     struct IniLineNumberSectionInfo
     {
+        std::string sectionName = "";
         long long lineNumber = -1;
-        std::unordered_map<std::string, long long> itemLineNumbers;
+        std::vector<IniLineNumberItemInfo> items;
     };
 
     struct IniLineNumberCache
     {
-        std::unordered_map<std::string, long long> globalItemLineNumbers;
-        std::unordered_map<std::string, IniLineNumberSectionInfo> sectionInfos;
+        std::vector<IniLineNumberItemInfo> globalItems;
+        std::vector<IniLineNumberSectionInfo> sections;
     };
+
+    bool TryParseIniSectionHeader(const std::string_view trimmedLine, std::string& outSectionName)
+    {
+        outSectionName.clear();
+
+        if (trimmedLine.size() < 2 || trimmedLine[0] != '[')
+        {
+            return false;
+        }
+
+        const std::size_t closeBracketPosition = trimmedLine.find(']');
+        if (closeBracketPosition == std::string_view::npos)
+        {
+            return false;
+        }
+
+        const std::string_view trailingText = TrimIniTextView(trimmedLine.substr(closeBracketPosition + 1));
+        if (!trailingText.empty() && trailingText[0] != ';' && trailingText[0] != '#')
+        {
+            return false;
+        }
+
+        const std::string_view sectionNameText = TrimIniTextView(trimmedLine.substr(1, closeBracketPosition - 1));
+        outSectionName.assign(sectionNameText.data(), sectionNameText.size());
+        return true;
+    }
+
+    bool TryParseIniKeyName(const std::string_view trimmedLine, std::string& outKey)
+    {
+        outKey.clear();
+
+        const std::size_t equalSignPosition = trimmedLine.find('=');
+        if (equalSignPosition == std::string_view::npos || equalSignPosition == 0)
+        {
+            return false;
+        }
+
+        const std::string_view keyText = TrimIniTextView(trimmedLine.substr(0, equalSignPosition));
+        if (keyText.empty())
+        {
+            return false;
+        }
+
+        outKey.assign(keyText.data(), keyText.size());
+        return true;
+    }
 
     void AddIniDiagnostic(GB_IniDocument& document, const GB_IniDiagnostic::Level level, const long long lineNumber, const int columnNumber, const std::string& message)
     {
@@ -3329,12 +3351,10 @@ namespace
 
     void BuildIniLineNumberCache(const std::string& iniText, IniLineNumberCache& outCache)
     {
-        outCache.globalItemLineNumbers.clear();
-        outCache.sectionInfos.clear();
+        outCache.globalItems.clear();
+        outCache.sections.clear();
 
-        std::string currentSectionName;
-        long long currentSectionLineNumber = -1;
-
+        std::size_t currentSectionIndex = static_cast<std::size_t>(-1);
         std::size_t lineStartIndex = 0;
         long long lineNumber = 1;
 
@@ -3346,40 +3366,38 @@ namespace
                 lineEndIndex++;
             }
 
-            const std::string rawLine = iniText.substr(lineStartIndex, lineEndIndex - lineStartIndex);
-            const std::string trimmedLine = TrimIniTextCopy(rawLine);
+            const std::string_view rawLine(iniText.data() + lineStartIndex, lineEndIndex - lineStartIndex);
+            const std::string_view trimmedLine = TrimIniTextView(rawLine);
             if (!trimmedLine.empty())
             {
                 const char firstCharacter = trimmedLine[0];
                 if (firstCharacter != ';' && firstCharacter != '#')
                 {
-                    if (firstCharacter == '[')
+                    std::string parsedSectionName;
+                    if (TryParseIniSectionHeader(trimmedLine, parsedSectionName))
                     {
-                        const std::size_t closeBracketPosition = trimmedLine.find(']');
-                        if (closeBracketPosition != std::string::npos)
-                        {
-                            currentSectionName = TrimIniTextCopy(trimmedLine.substr(1, closeBracketPosition - 1));
-                            currentSectionLineNumber = lineNumber;
-                        }
+                        IniLineNumberSectionInfo newSectionInfo;
+                        newSectionInfo.sectionName = std::move(parsedSectionName);
+                        newSectionInfo.lineNumber = lineNumber;
+                        outCache.sections.push_back(std::move(newSectionInfo));
+                        currentSectionIndex = outCache.sections.size() - 1;
                     }
                     else
                     {
-                        const std::size_t equalSignPosition = trimmedLine.find('=');
-                        if (equalSignPosition != std::string::npos && equalSignPosition > 0)
+                        std::string parsedKey;
+                        if (TryParseIniKeyName(trimmedLine, parsedKey))
                         {
-                            const std::string key = TrimIniTextCopy(trimmedLine.substr(0, equalSignPosition));
-                            if (currentSectionName.empty())
+                            IniLineNumberItemInfo newItemInfo;
+                            newItemInfo.key = std::move(parsedKey);
+                            newItemInfo.lineNumber = lineNumber;
+
+                            if (currentSectionIndex == static_cast<std::size_t>(-1))
                             {
-                                outCache.globalItemLineNumbers.emplace(key, lineNumber);
+                                outCache.globalItems.push_back(std::move(newItemInfo));
                             }
                             else
                             {
-                                IniLineNumberSectionInfo& sectionInfo = outCache.sectionInfos[currentSectionName];
-                                if (sectionInfo.lineNumber <= 0)
-                                {
-                                    sectionInfo.lineNumber = currentSectionLineNumber;
-                                }
-                                sectionInfo.itemLineNumbers.emplace(key, lineNumber);
+                                outCache.sections[currentSectionIndex].items.push_back(std::move(newItemInfo));
                             }
                         }
                     }
@@ -3406,36 +3424,79 @@ namespace
         }
     }
 
-    void ApplyIniLineNumbers(const IniLineNumberCache& lineNumberCache, GB_IniDocument& document)
+    const IniLineNumberItemInfo* FindNextIniItemLineInfo(const std::vector<IniLineNumberItemInfo>& itemInfos,
+        std::size_t& nextIndex,
+        const std::string& key)
     {
-        for (std::size_t index = 0; index < document.globalItems.size(); index++)
+        while (nextIndex < itemInfos.size())
         {
-            GB_IniItem& currentItem = document.globalItems[index];
-            const std::unordered_map<std::string, long long>::const_iterator itemIterator = lineNumberCache.globalItemLineNumbers.find(currentItem.key);
-            if (itemIterator != lineNumberCache.globalItemLineNumbers.end())
+            const IniLineNumberItemInfo& currentItemInfo = itemInfos[nextIndex];
+            nextIndex++;
+            if (currentItemInfo.key == key)
             {
-                currentItem.lineNumber = itemIterator->second;
+                return &currentItemInfo;
             }
         }
 
+        return nullptr;
+    }
+
+    const IniLineNumberSectionInfo* FindNextIniSectionLineInfo(const std::vector<IniLineNumberSectionInfo>& sectionInfos,
+        std::size_t& nextIndex,
+        const std::string& sectionName)
+    {
+        while (nextIndex < sectionInfos.size())
+        {
+            const IniLineNumberSectionInfo& currentSectionInfo = sectionInfos[nextIndex];
+            nextIndex++;
+            if (currentSectionInfo.sectionName == sectionName)
+            {
+                return &currentSectionInfo;
+            }
+        }
+
+        return nullptr;
+    }
+
+    void ApplyIniLineNumbers(const IniLineNumberCache& lineNumberCache, GB_IniDocument& document)
+    {
+        std::size_t nextGlobalItemIndex = 0;
+        for (std::size_t index = 0; index < document.globalItems.size(); index++)
+        {
+            GB_IniItem& currentItem = document.globalItems[index];
+            const IniLineNumberItemInfo* itemInfo = FindNextIniItemLineInfo(lineNumberCache.globalItems,
+                nextGlobalItemIndex,
+                currentItem.key);
+            if (itemInfo != nullptr)
+            {
+                currentItem.lineNumber = itemInfo->lineNumber;
+            }
+        }
+
+        std::size_t nextSectionIndex = 0;
         for (std::size_t sectionIndex = 0; sectionIndex < document.sections.size(); sectionIndex++)
         {
             GB_IniSection& currentSection = document.sections[sectionIndex];
-            const std::unordered_map<std::string, IniLineNumberSectionInfo>::const_iterator sectionIterator = lineNumberCache.sectionInfos.find(currentSection.sectionName);
-            if (sectionIterator == lineNumberCache.sectionInfos.end())
+            const IniLineNumberSectionInfo* sectionInfo = FindNextIniSectionLineInfo(lineNumberCache.sections,
+                nextSectionIndex,
+                currentSection.sectionName);
+            if (sectionInfo == nullptr)
             {
                 continue;
             }
 
-            currentSection.lineNumber = sectionIterator->second.lineNumber;
-            const std::unordered_map<std::string, long long>& itemLineNumbers = sectionIterator->second.itemLineNumbers;
+            currentSection.lineNumber = sectionInfo->lineNumber;
+
+            std::size_t nextItemIndex = 0;
             for (std::size_t itemIndex = 0; itemIndex < currentSection.items.size(); itemIndex++)
             {
                 GB_IniItem& currentItem = currentSection.items[itemIndex];
-                const std::unordered_map<std::string, long long>::const_iterator itemIterator = itemLineNumbers.find(currentItem.key);
-                if (itemIterator != itemLineNumbers.end())
+                const IniLineNumberItemInfo* itemInfo = FindNextIniItemLineInfo(sectionInfo->items,
+                    nextItemIndex,
+                    currentItem.key);
+                if (itemInfo != nullptr)
                 {
-                    currentItem.lineNumber = itemIterator->second;
+                    currentItem.lineNumber = itemInfo->lineNumber;
                 }
             }
         }
@@ -3450,8 +3511,17 @@ namespace
 
         const std::string* iniTextToParse = &iniText;
         std::string iniTextWithoutBom;
-        if (newDocument.hasUtf8Bom && options.removeUtf8Bom)
+        if (newDocument.hasUtf8Bom)
         {
+            if (!options.removeUtf8Bom)
+            {
+                return FailIniParse(newDocument,
+                    errorMessage,
+                    1,
+                    1,
+                    "Input INI text contains a UTF-8 BOM, but removeUtf8Bom is false. Boost.PropertyTree ini_parser cannot safely preserve a leading UTF-8 BOM. Please enable removeUtf8Bom.");
+            }
+
             iniTextWithoutBom.assign(iniText.begin() + static_cast<std::ptrdiff_t>(kUtf8BomLength), iniText.end());
             iniTextToParse = &iniTextWithoutBom;
         }
