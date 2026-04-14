@@ -1,5 +1,6 @@
 ﻿#include "GB_IO.h"
 #include "GB_FileSystem.h"
+#include "GB_Utf8String.h"
 #include <fstream>
 #include <limits>
 #include <cstring>
@@ -159,6 +160,126 @@ bool GB_WriteUtf8ToFile(const std::string& filePathUtf8, const std::string& utf8
     ofs.close();
     return ok;
 #endif
+}
+
+namespace
+{
+    enum class GB_TextEncodingByBom
+    {
+        Unknown = 0,
+        Utf8,
+        Utf16Le,
+        Utf16Be,
+        Utf32Le,
+        Utf32Be
+    };
+
+    GB_TextEncodingByBom DetectTextEncodingByBom(const std::string& fileData)
+    {
+        if (fileData.size() >= 4)
+        {
+            const unsigned char byte0 = static_cast<unsigned char>(fileData[0]);
+            const unsigned char byte1 = static_cast<unsigned char>(fileData[1]);
+            const unsigned char byte2 = static_cast<unsigned char>(fileData[2]);
+            const unsigned char byte3 = static_cast<unsigned char>(fileData[3]);
+
+            if (byte0 == 0xFF && byte1 == 0xFE && byte2 == 0x00 && byte3 == 0x00)
+            {
+                return GB_TextEncodingByBom::Utf32Le;
+            }
+
+            if (byte0 == 0x00 && byte1 == 0x00 && byte2 == 0xFE && byte3 == 0xFF)
+            {
+                return GB_TextEncodingByBom::Utf32Be;
+            }
+        }
+
+        if (fileData.size() >= 3)
+        {
+            const unsigned char byte0 = static_cast<unsigned char>(fileData[0]);
+            const unsigned char byte1 = static_cast<unsigned char>(fileData[1]);
+            const unsigned char byte2 = static_cast<unsigned char>(fileData[2]);
+
+            if (byte0 == 0xEF && byte1 == 0xBB && byte2 == 0xBF)
+            {
+                return GB_TextEncodingByBom::Utf8;
+            }
+        }
+
+        if (fileData.size() >= 2)
+        {
+            const unsigned char byte0 = static_cast<unsigned char>(fileData[0]);
+            const unsigned char byte1 = static_cast<unsigned char>(fileData[1]);
+
+            if (byte0 == 0xFF && byte1 == 0xFE)
+            {
+                return GB_TextEncodingByBom::Utf16Le;
+            }
+
+            if (byte0 == 0xFE && byte1 == 0xFF)
+            {
+                return GB_TextEncodingByBom::Utf16Be;
+            }
+        }
+
+        return GB_TextEncodingByBom::Unknown;
+    }
+}
+
+std::string GB_ReadFromFile(const std::string& filePathUtf8)
+{
+    const GB_ByteBuffer fileBytes = GB_ReadFileToBinary(filePathUtf8);
+    if (fileBytes.empty())
+    {
+        return std::string();
+    }
+
+    if (fileBytes.size() > std::string().max_size())
+    {
+        return std::string();
+    }
+
+    return std::string(reinterpret_cast<const char*>(fileBytes.data()), fileBytes.size());
+}
+
+std::string GB_ReadUtf8FromFile(const std::string& filePathUtf8)
+{
+    const std::string fileData = GB_ReadFromFile(filePathUtf8);
+    if (fileData.empty())
+    {
+        return std::string();
+    }
+
+    try
+    {
+        switch (DetectTextEncodingByBom(fileData))
+        {
+        case GB_TextEncodingByBom::Utf8:
+            return GB_BytesToUtf8(fileData, "utf-8-sig");
+        case GB_TextEncodingByBom::Utf16Le:
+            return GB_BytesToUtf8(fileData, "utf-16le");
+        case GB_TextEncodingByBom::Utf16Be:
+            return GB_BytesToUtf8(fileData, "utf-16be");
+        case GB_TextEncodingByBom::Utf32Le:
+            return GB_BytesToUtf8(fileData, "utf-32le");
+        case GB_TextEncodingByBom::Utf32Be:
+            return GB_BytesToUtf8(fileData, "utf-32be");
+        case GB_TextEncodingByBom::Unknown:
+        default:
+            break;
+        }
+
+        if (GB_IsUtf8(fileData))
+        {
+            return fileData;
+        }
+
+        return GB_BytesToUtf8(fileData, "ansi");
+    }
+    catch (...)
+    {
+        return std::string();
+    }
 }
 
 std::vector<unsigned char> GB_ReadFileToBinary(const std::string& filePathUtf8)
