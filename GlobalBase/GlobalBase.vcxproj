@@ -21,6 +21,7 @@
   <ItemGroup>
     <ClInclude Include="CV\GB_ColorRGBA.h" />
     <ClInclude Include="CV\GB_Image.h" />
+    <ClInclude Include="Desktop\GB_Screen.h" />
     <ClInclude Include="GB_Config.h" />
     <ClInclude Include="GB_Crypto.h" />
     <ClInclude Include="GB_DataCache.h" />
@@ -54,6 +55,7 @@
   <ItemGroup>
     <ClCompile Include="CV\GB_ColorRGBA.cpp" />
     <ClCompile Include="CV\GB_Image.cpp" />
+    <ClCompile Include="Desktop\GB_Screen.cpp" />
     <ClCompile Include="GB_Config.cpp" />
     <ClCompile Include="GB_Crypto.cpp" />
     <ClCompile Include="GB_DataCache.cpp" />

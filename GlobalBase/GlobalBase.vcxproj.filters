@@ -25,6 +25,12 @@
     <Filter Include="源文件\CV">
       <UniqueIdentifier>{59fbc03a-5560-4280-9d2d-1bb7fcf4c3e7}</UniqueIdentifier>
     </Filter>
+    <Filter Include="头文件\Desktop">
+      <UniqueIdentifier>{395ce85a-ad0d-429f-9534-7380f5dcb16a}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="源文件\Desktop">
+      <UniqueIdentifier>{9ab71077-78ef-4c64-8c9a-c83244157f45}</UniqueIdentifier>
+    </Filter>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="GB_BaseTypes.h">
@@ -120,6 +126,9 @@
     <ClInclude Include="GB_FormatParser.h">
       <Filter>头文件</Filter>
     </ClInclude>
+    <ClInclude Include="Desktop\GB_Screen.h">
+      <Filter>头文件\Desktop</Filter>
+    </ClInclude>
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="GB_Utf8String.cpp">
@@ -208,6 +217,9 @@
     </ClCompile>
     <ClCompile Include="GB_FormatParser.cpp">
       <Filter>源文件</Filter>
+    </ClCompile>
+    <ClCompile Include="Desktop\GB_Screen.cpp">
+      <Filter>源文件\Desktop</Filter>
     </ClCompile>
   </ItemGroup>
 </Project>
