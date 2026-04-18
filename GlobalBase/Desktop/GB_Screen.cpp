@@ -1376,6 +1376,234 @@ namespace internal
 
         return screenImage.SetFromCvMat(capturedMat, GB_ImageCopyMode::DeepCopy);
     }
+
+    static bool IsFinitePoint(const GB_Point2d& point)
+    {
+        return std::isfinite(point.x) && std::isfinite(point.y);
+    }
+
+    static bool IsPointInHalfOpenRectangle(const GB_Point2d& point, const GB_Rectangle& rectangle)
+    {
+        if (!IsFinitePoint(point) || !rectangle.IsValid())
+        {
+            return false;
+        }
+
+        return point.x >= rectangle.minX && point.x < rectangle.maxX && point.y >= rectangle.minY && point.y < rectangle.maxY;
+    }
+
+    static bool TryGetPrimaryScreenInfo(const std::vector<GB_ScreenInfo>& screenInfos, GB_ScreenInfo& screenInfo)
+    {
+        for (size_t i = 0; i < screenInfos.size(); i++)
+        {
+            if (screenInfos[i].isPrimary)
+            {
+                screenInfo = screenInfos[i];
+                return true;
+            }
+        }
+
+        if (!screenInfos.empty())
+        {
+            screenInfo = screenInfos[0];
+            return true;
+        }
+
+        screenInfo = GB_ScreenInfo();
+        return false;
+    }
+
+    static bool TryGetScreenInfoByIndex(const std::vector<GB_ScreenInfo>& screenInfos, const int screenIndex, GB_ScreenInfo& screenInfo)
+    {
+        if (screenIndex < 0 || static_cast<size_t>(screenIndex) >= screenInfos.size())
+        {
+            screenInfo = GB_ScreenInfo();
+            return false;
+        }
+
+        screenInfo = screenInfos[static_cast<size_t>(screenIndex)];
+        return true;
+    }
+
+    static bool TryGetScreenInfoByDeviceName(const std::vector<GB_ScreenInfo>& screenInfos, const std::string& gdiDeviceName, GB_ScreenInfo& screenInfo)
+    {
+        const std::string normalizedTargetName = ToLowerAsciiString(TrimString(gdiDeviceName));
+        if (normalizedTargetName.empty())
+        {
+            screenInfo = GB_ScreenInfo();
+            return false;
+        }
+
+        for (size_t i = 0; i < screenInfos.size(); i++)
+        {
+            if (ToLowerAsciiString(TrimString(screenInfos[i].gdiDeviceName)) == normalizedTargetName)
+            {
+                screenInfo = screenInfos[i];
+                return true;
+            }
+        }
+
+        screenInfo = GB_ScreenInfo();
+        return false;
+    }
+
+    static bool TryFindContainingScreenIndex(const std::vector<GB_ScreenInfo>& screenInfos, const GB_Point2d& point, int& screenIndex)
+    {
+        screenIndex = -1;
+
+        int firstMatchedScreenIndex = -1;
+        for (size_t i = 0; i < screenInfos.size(); i++)
+        {
+            if (!IsPointInHalfOpenRectangle(point, screenInfos[i].virtualScreenRectangle))
+            {
+                continue;
+            }
+
+            if (screenInfos[i].isPrimary)
+            {
+                screenIndex = static_cast<int>(i);
+                return true;
+            }
+
+            if (firstMatchedScreenIndex < 0)
+            {
+                firstMatchedScreenIndex = static_cast<int>(i);
+            }
+        }
+
+        if (firstMatchedScreenIndex >= 0)
+        {
+            screenIndex = firstMatchedScreenIndex;
+            return true;
+        }
+
+        return false;
+    }
+
+    static bool TryBuildScreenCaptureRectangle(const GB_ScreenInfo& screenInfo, const GB_Rectangle* screenLocalRectangle, RECT& captureRectangle)
+    {
+        captureRectangle.left = 0;
+        captureRectangle.top = 0;
+        captureRectangle.right = 0;
+        captureRectangle.bottom = 0;
+
+        if (!screenInfo.virtualScreenRectangle.IsValid())
+        {
+            return false;
+        }
+
+        GB_Rectangle physicalCaptureRectangle = screenInfo.virtualScreenRectangle;
+        if (screenLocalRectangle != nullptr)
+        {
+            if (!screenLocalRectangle->IsValid())
+            {
+                return false;
+            }
+
+            physicalCaptureRectangle = GB_Rectangle(screenInfo.virtualScreenRectangle.minX + screenLocalRectangle->minX, screenInfo.virtualScreenRectangle.minY + screenLocalRectangle->minY, screenInfo.virtualScreenRectangle.minX + screenLocalRectangle->maxX, screenInfo.virtualScreenRectangle.minY + screenLocalRectangle->maxY);
+            physicalCaptureRectangle = physicalCaptureRectangle.Intersected(screenInfo.virtualScreenRectangle);
+        }
+
+        if (!physicalCaptureRectangle.IsValid())
+        {
+            return false;
+        }
+
+        long left = 0;
+        long top = 0;
+        long right = 0;
+        long bottom = 0;
+        if (!TryConvertFloorToLong(physicalCaptureRectangle.minX, left) ||
+            !TryConvertFloorToLong(physicalCaptureRectangle.minY, top) ||
+            !TryConvertCeilToLong(physicalCaptureRectangle.maxX, right) ||
+            !TryConvertCeilToLong(physicalCaptureRectangle.maxY, bottom))
+        {
+            return false;
+        }
+
+        if (right <= left || bottom <= top)
+        {
+            return false;
+        }
+
+        captureRectangle.left = left;
+        captureRectangle.top = top;
+        captureRectangle.right = right;
+        captureRectangle.bottom = bottom;
+        return true;
+    }
+
+    static bool TryCaptureScreenImage(const GB_ScreenInfo& screenInfo, const GB_Rectangle* screenLocalRectangle, GB_Image& screenImage)
+    {
+        RECT captureRectangle = { 0, 0, 0, 0 };
+        if (!TryBuildScreenCaptureRectangle(screenInfo, screenLocalRectangle, captureRectangle))
+        {
+            screenImage.Clear();
+            return false;
+        }
+
+        GB_Image capturedImage;
+        if (!CaptureRectangleToImage(captureRectangle, capturedImage))
+        {
+            screenImage.Clear();
+            return false;
+        }
+
+        screenImage = std::move(capturedImage);
+        return !screenImage.IsEmpty();
+    }
+
+    static bool TryGetSystemLogicalScale(double& scaleFactorX, double& scaleFactorY)
+    {
+        scaleFactorX = 1.0;
+        scaleFactorY = 1.0;
+
+        const HMODULE user32Module = ::GetModuleHandleW(L"user32.dll");
+        if (user32Module != nullptr)
+        {
+            using GetDpiForSystemFunction = UINT(WINAPI*)();
+            const auto getDpiForSystemFunction = reinterpret_cast<GetDpiForSystemFunction>(::GetProcAddress(user32Module, "GetDpiForSystem"));
+            if (getDpiForSystemFunction != nullptr)
+            {
+                const UINT systemDpi = getDpiForSystemFunction();
+                if (systemDpi > 0)
+                {
+                    const double scaleFactor = static_cast<double>(systemDpi) / 96.0;
+                    scaleFactorX = scaleFactor;
+                    scaleFactorY = scaleFactor;
+                    return true;
+                }
+            }
+        }
+
+        const std::vector<GB_ScreenInfo> screenInfos = GB_Screen::GetAllScreens();
+        GB_ScreenInfo primaryScreenInfo;
+        if (!TryGetPrimaryScreenInfo(screenInfos, primaryScreenInfo))
+        {
+            return true;
+        }
+
+        if (primaryScreenInfo.effectiveDpiX > 0.0)
+        {
+            scaleFactorX = primaryScreenInfo.effectiveDpiX / 96.0;
+        }
+        if (primaryScreenInfo.effectiveDpiY > 0.0)
+        {
+            scaleFactorY = primaryScreenInfo.effectiveDpiY / 96.0;
+        }
+
+        if (scaleFactorX <= 0.0)
+        {
+            scaleFactorX = 1.0;
+        }
+        if (scaleFactorY <= 0.0)
+        {
+            scaleFactorY = 1.0;
+        }
+
+        return true;
+    }
+
 #endif
 }
 
@@ -1545,5 +1773,228 @@ bool GB_Screen::CaptureVirtualScreen(const GB_Rectangle& virtualScreenRectangle,
 
     screenImage = std::move(capturedImage);
     return !screenImage.IsEmpty();
+#endif
+}
+
+
+GB_ScreenInfo GB_Screen::GetScreenFromPoint(const GB_Point2d& point)
+{
+#if !defined(_WIN32)
+    (void)point;
+    return GB_ScreenInfo();
+#else
+    if (!internal::IsFinitePoint(point))
+    {
+        return GB_ScreenInfo();
+    }
+
+    internal::DpiAwarenessScope dpiAwarenessScope;
+
+    const std::vector<GB_ScreenInfo> screenInfos = GetAllScreens();
+    int screenIndex = -1;
+    if (!internal::TryFindContainingScreenIndex(screenInfos, point, screenIndex))
+    {
+        return GB_ScreenInfo();
+    }
+
+    return screenInfos[static_cast<size_t>(screenIndex)];
+#endif
+}
+
+GB_ScreenInfo GB_Screen::GetPrimaryScreen()
+{
+#if !defined(_WIN32)
+    return GB_ScreenInfo();
+#else
+    internal::DpiAwarenessScope dpiAwarenessScope;
+
+    const std::vector<GB_ScreenInfo> screenInfos = GetAllScreens();
+    GB_ScreenInfo primaryScreenInfo;
+    if (!internal::TryGetPrimaryScreenInfo(screenInfos, primaryScreenInfo))
+    {
+        return GB_ScreenInfo();
+    }
+
+    return primaryScreenInfo;
+#endif
+}
+
+bool GB_Screen::CaptureScreen(const int screenIndex, GB_Image& screenImage)
+{
+#if !defined(_WIN32)
+    (void)screenIndex;
+    screenImage.Clear();
+    return false;
+#else
+    internal::DpiAwarenessScope dpiAwarenessScope;
+
+    const std::vector<GB_ScreenInfo> screenInfos = GetAllScreens();
+    GB_ScreenInfo screenInfo;
+    if (!internal::TryGetScreenInfoByIndex(screenInfos, screenIndex, screenInfo))
+    {
+        screenImage.Clear();
+        return false;
+    }
+
+    return internal::TryCaptureScreenImage(screenInfo, nullptr, screenImage);
+#endif
+}
+
+bool GB_Screen::CaptureScreen(const int screenIndex, const GB_Rectangle& screenLocalRectangle, GB_Image& screenImage)
+{
+#if !defined(_WIN32)
+    (void)screenIndex;
+    (void)screenLocalRectangle;
+    screenImage.Clear();
+    return false;
+#else
+    if (!screenLocalRectangle.IsValid())
+    {
+        screenImage.Clear();
+        return false;
+    }
+
+    internal::DpiAwarenessScope dpiAwarenessScope;
+
+    const std::vector<GB_ScreenInfo> screenInfos = GetAllScreens();
+    GB_ScreenInfo screenInfo;
+    if (!internal::TryGetScreenInfoByIndex(screenInfos, screenIndex, screenInfo))
+    {
+        screenImage.Clear();
+        return false;
+    }
+
+    return internal::TryCaptureScreenImage(screenInfo, &screenLocalRectangle, screenImage);
+#endif
+}
+
+bool GB_Screen::CaptureScreen(const std::string& gdiDeviceName, GB_Image& screenImage)
+{
+#if !defined(_WIN32)
+    (void)gdiDeviceName;
+    screenImage.Clear();
+    return false;
+#else
+    internal::DpiAwarenessScope dpiAwarenessScope;
+
+    const std::vector<GB_ScreenInfo> screenInfos = GetAllScreens();
+    GB_ScreenInfo screenInfo;
+    if (!internal::TryGetScreenInfoByDeviceName(screenInfos, gdiDeviceName, screenInfo))
+    {
+        screenImage.Clear();
+        return false;
+    }
+
+    return internal::TryCaptureScreenImage(screenInfo, nullptr, screenImage);
+#endif
+}
+
+bool GB_Screen::CaptureScreen(const std::string& gdiDeviceName, const GB_Rectangle& screenLocalRectangle, GB_Image& screenImage)
+{
+#if !defined(_WIN32)
+    (void)gdiDeviceName;
+    (void)screenLocalRectangle;
+    screenImage.Clear();
+    return false;
+#else
+    if (!screenLocalRectangle.IsValid())
+    {
+        screenImage.Clear();
+        return false;
+    }
+
+    internal::DpiAwarenessScope dpiAwarenessScope;
+
+    const std::vector<GB_ScreenInfo> screenInfos = GetAllScreens();
+    GB_ScreenInfo screenInfo;
+    if (!internal::TryGetScreenInfoByDeviceName(screenInfos, gdiDeviceName, screenInfo))
+    {
+        screenImage.Clear();
+        return false;
+    }
+
+    return internal::TryCaptureScreenImage(screenInfo, &screenLocalRectangle, screenImage);
+#endif
+}
+
+bool GB_Screen::LogicalPixelToPhysicalPixel(const GB_Point2d& logicalPixelPoint, int& screenIndex, GB_Point2d& physicalPixelPointOnScreen)
+{
+    screenIndex = -1;
+    physicalPixelPointOnScreen = GB_Point2d();
+
+#if !defined(_WIN32)
+    (void)logicalPixelPoint;
+    return false;
+#else
+    if (!internal::IsFinitePoint(logicalPixelPoint))
+    {
+        return false;
+    }
+
+    internal::DpiAwarenessScope dpiAwarenessScope;
+
+    double systemScaleFactorX = 1.0;
+    double systemScaleFactorY = 1.0;
+    if (!internal::TryGetSystemLogicalScale(systemScaleFactorX, systemScaleFactorY))
+    {
+        return false;
+    }
+
+    const GB_Point2d physicalPixelPoint(logicalPixelPoint.x * systemScaleFactorX, logicalPixelPoint.y * systemScaleFactorY);
+
+    const std::vector<GB_ScreenInfo> screenInfos = GetAllScreens();
+    if (!internal::TryFindContainingScreenIndex(screenInfos, physicalPixelPoint, screenIndex))
+    {
+        screenIndex = -1;
+        return false;
+    }
+
+    const GB_ScreenInfo& screenInfo = screenInfos[static_cast<size_t>(screenIndex)];
+    physicalPixelPointOnScreen.Set(physicalPixelPoint.x - screenInfo.virtualScreenRectangle.minX, physicalPixelPoint.y - screenInfo.virtualScreenRectangle.minY);
+    return true;
+#endif
+}
+
+bool GB_Screen::PhysicalPixelToLogicalPixel(const int screenIndex, const GB_Point2d& physicalPixelPointOnScreen, GB_Point2d& logicalPixelPoint)
+{
+    logicalPixelPoint = GB_Point2d();
+
+#if !defined(_WIN32)
+    (void)screenIndex;
+    (void)physicalPixelPointOnScreen;
+    return false;
+#else
+    if (!internal::IsFinitePoint(physicalPixelPointOnScreen))
+    {
+        return false;
+    }
+
+    internal::DpiAwarenessScope dpiAwarenessScope;
+
+    const std::vector<GB_ScreenInfo> screenInfos = GetAllScreens();
+    GB_ScreenInfo screenInfo;
+    if (!internal::TryGetScreenInfoByIndex(screenInfos, screenIndex, screenInfo) || !screenInfo.virtualScreenRectangle.IsValid())
+    {
+        return false;
+    }
+
+    const double screenWidth = screenInfo.virtualScreenRectangle.Width();
+    const double screenHeight = screenInfo.virtualScreenRectangle.Height();
+    if (!(physicalPixelPointOnScreen.x >= 0.0 && physicalPixelPointOnScreen.x < screenWidth && physicalPixelPointOnScreen.y >= 0.0 && physicalPixelPointOnScreen.y < screenHeight))
+    {
+        return false;
+    }
+
+    double systemScaleFactorX = 1.0;
+    double systemScaleFactorY = 1.0;
+    if (!internal::TryGetSystemLogicalScale(systemScaleFactorX, systemScaleFactorY))
+    {
+        return false;
+    }
+
+    const double physicalX = screenInfo.virtualScreenRectangle.minX + physicalPixelPointOnScreen.x;
+    const double physicalY = screenInfo.virtualScreenRectangle.minY + physicalPixelPointOnScreen.y;
+    logicalPixelPoint.Set(physicalX / systemScaleFactorX, physicalY / systemScaleFactorY);
+    return true;
 #endif
 }

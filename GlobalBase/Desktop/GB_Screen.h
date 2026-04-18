@@ -2,6 +2,7 @@
 #define GLOBALBASE_SCREEN_H_H
 
 #include "../GlobalBasePort.h"
+#include "../Geometry/GB_Point2d.h"
 #include "../Geometry/GB_Rectangle.h"
 #include "../CV/GB_Image.h"
 
@@ -239,6 +240,26 @@ public:
     static GB_Rectangle GetVirtualScreenRectangle();
 
     /**
+     * @brief 根据虚拟桌面坐标系中的点，获取包含该点的显示屏信息。
+     *
+     * @param point 虚拟桌面坐标系中的点，单位为物理像素。
+     * @return 命中时返回对应显示屏信息；未命中时返回默认构造的 GB_ScreenInfo。
+     *
+     * 说明：
+     * - point 使用虚拟桌面坐标系；
+     * - 判定边界采用左闭右开、上闭下开的半开区间语义；
+     * - 在复制显示等多个物理显示屏共享同一区域的场景下，返回当前枚举结果中的首个命中项。
+     */
+    static GB_ScreenInfo GetScreenFromPoint(const GB_Point2d& point);
+
+    /**
+     * @brief 获取当前主显示屏信息。
+     *
+     * 若当前能够识别到主显示屏，则返回其信息；否则返回默认构造的 GB_ScreenInfo。
+     */
+    static GB_ScreenInfo GetPrimaryScreen();
+
+    /**
      * @brief 截取整个虚拟桌面。
      *
      * 截图成功时，输出图像为 8 位 4 通道 BGRA 图像，Alpha 会被统一置为 255。
@@ -258,6 +279,78 @@ public:
      * - 若求交后为空，则返回 false。
      */
     static bool CaptureVirtualScreen(const GB_Rectangle& virtualScreenRectangle, GB_Image& screenImage);
+
+    /**
+     * @brief 截取第 screenIndex 个显示屏的完整画面。
+     *
+     * @param screenIndex 显示屏编号，0 基，对应 GetAllScreens() 返回顺序。
+     * @param screenImage [out] 截得的图像。
+     * @return true=成功；false=失败。
+     */
+    static bool CaptureScreen(int screenIndex, GB_Image& screenImage);
+
+    /**
+     * @brief 截取第 screenIndex 个显示屏局部区域的画面。
+     *
+     * @param screenIndex          显示屏编号，0 基，对应 GetAllScreens() 返回顺序。
+     * @param screenLocalRectangle 该显示屏局部坐标系中的矩形，左上角为 (0, 0)，单位为物理像素。
+     * @param screenImage          [out] 截得的图像。
+     * @return true=成功；false=失败。
+     *
+     * 说明：
+     * - 输入矩形允许越界，内部会自动与该显示屏范围求交；
+     * - 输入无效矩形时直接返回 false；
+     * - 若求交后为空，则返回 false。
+     */
+    static bool CaptureScreen(int screenIndex, const GB_Rectangle& screenLocalRectangle, GB_Image& screenImage);
+
+    /**
+     * @brief 根据 GDI 设备名截取指定显示屏的完整画面。
+     *
+     * @param gdiDeviceName 显示屏设备名，典型值如 "\\.\DISPLAY1"。
+     * @param screenImage   [out] 截得的图像。
+     * @return true=成功；false=失败。
+     */
+    static bool CaptureScreen(const std::string& gdiDeviceName, GB_Image& screenImage);
+
+    /**
+     * @brief 根据 GDI 设备名截取指定显示屏局部区域的画面。
+     *
+     * @param gdiDeviceName       显示屏设备名，典型值如 "\\.\DISPLAY1"。
+     * @param screenLocalRectangle 该显示屏局部坐标系中的矩形，左上角为 (0, 0)，单位为物理像素。
+     * @param screenImage          [out] 截得的图像。
+     * @return true=成功；false=失败。
+     */
+    static bool CaptureScreen(const std::string& gdiDeviceName, const GB_Rectangle& screenLocalRectangle, GB_Image& screenImage);
+
+    /**
+     * @brief 将系统逻辑像素坐标转换为所在显示屏编号及该屏上的物理像素坐标。
+     *
+     * @param logicalPixelPoint         系统逻辑像素坐标。
+     * @param screenIndex               [out] 命中的显示屏编号，0 基，对应 GetAllScreens() 返回顺序。
+     * @param physicalPixelPointOnScreen[out] 该点在命中显示屏局部坐标系中的物理像素坐标，左上角为 (0, 0)。
+     * @return true=成功；false=失败。
+     *
+     * 说明：
+     * - 这里的“逻辑像素”统一采用系统 DPI（通常等于主显示屏 DPI）下的虚拟桌面坐标；
+     * - 该接口用于在一个稳定、可复现的坐标定义下完成逻辑 / 物理坐标换算；
+     * - 若输入点不落在任何显示屏范围内，则返回 false。
+     */
+    static bool LogicalPixelToPhysicalPixel(const GB_Point2d& logicalPixelPoint, int& screenIndex, GB_Point2d& physicalPixelPointOnScreen);
+
+    /**
+     * @brief 将指定显示屏局部坐标系中的物理像素坐标转换为系统逻辑像素坐标。
+     *
+     * @param screenIndex                显示屏编号，0 基，对应 GetAllScreens() 返回顺序。
+     * @param physicalPixelPointOnScreen 该显示屏局部坐标系中的物理像素坐标，左上角为 (0, 0)。
+     * @param logicalPixelPoint          [out] 转换得到的系统逻辑像素坐标。
+     * @return true=成功；false=失败。
+     *
+     * 说明：
+     * - 这里的“逻辑像素”定义与 LogicalPixelToPhysicalPixel() 完全一致；
+     * - 若 screenIndex 非法，或输入点不在该显示屏有效范围内，则返回 false。
+     */
+    static bool PhysicalPixelToLogicalPixel(int screenIndex, const GB_Point2d& physicalPixelPointOnScreen, GB_Point2d& logicalPixelPoint);
 };
 
 #endif
