@@ -1,4 +1,5 @@
-﻿#include "GB_Utf8String.h"
+﻿#include "GB_RunTests.h"
+#include "GB_Utf8String.h"
 
 #include <cstdint>
 #include <cstdlib>
@@ -319,7 +320,7 @@ namespace
     }
 }
 
-int main(int argc, char* argv[])
+int RunGB_Utf8StringTests()
 {
     try
     {
