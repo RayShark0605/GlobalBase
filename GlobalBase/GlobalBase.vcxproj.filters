@@ -129,6 +129,9 @@
     <ClInclude Include="Desktop\GB_Screen.h">
       <Filter>头文件\Desktop</Filter>
     </ClInclude>
+    <ClInclude Include="Desktop\GB_Mouse.h">
+      <Filter>头文件\Desktop</Filter>
+    </ClInclude>
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="GB_Utf8String.cpp">
@@ -219,6 +222,9 @@
       <Filter>源文件</Filter>
     </ClCompile>
     <ClCompile Include="Desktop\GB_Screen.cpp">
+      <Filter>源文件\Desktop</Filter>
+    </ClCompile>
+    <ClCompile Include="Desktop\GB_Mouse.cpp">
       <Filter>源文件\Desktop</Filter>
     </ClCompile>
   </ItemGroup>
