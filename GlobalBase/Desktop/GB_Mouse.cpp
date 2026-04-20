@@ -843,6 +843,239 @@ namespace
             return true;
         }
 
+        static bool TryGetImagePixelBrightness(const GB_Image& image, const int x, const int y, double& brightness)
+        {
+            brightness = 0.0;
+
+            if (image.IsEmpty() || image.GetDepth() != GB_ImageDepth::UInt8 || x < 0 || y < 0)
+            {
+                return false;
+            }
+
+            if (image.GetWidth() > static_cast<size_t>(std::numeric_limits<int>::max()) || image.GetHeight() > static_cast<size_t>(std::numeric_limits<int>::max()))
+            {
+                return false;
+            }
+
+            if (x >= static_cast<int>(image.GetWidth()) || y >= static_cast<int>(image.GetHeight()))
+            {
+                return false;
+            }
+
+            const size_t channelCount = image.GetChannels();
+            if (channelCount == 0)
+            {
+                return false;
+            }
+
+            const unsigned char* rowData = image.GetRowData(static_cast<size_t>(y));
+            if (rowData == nullptr)
+            {
+                return false;
+            }
+
+            const unsigned char* pixelData = rowData + static_cast<size_t>(x) * channelCount;
+            if (channelCount == 1)
+            {
+                brightness = static_cast<double>(pixelData[0]);
+                return true;
+            }
+
+            const double blueValue = static_cast<double>(pixelData[0]);
+            const double greenValue = static_cast<double>(channelCount >= 2 ? pixelData[1] : pixelData[0]);
+            const double redValue = static_cast<double>(channelCount >= 3 ? pixelData[2] : pixelData[0]);
+            brightness = redValue * 0.299 + greenValue * 0.587 + blueValue * 0.114;
+            return true;
+        }
+
+        static bool TryCaptureCursorBackgroundImage(const POINT& physicalCursorPoint, const ICONINFO& iconInfo, const int cursorWidth, const int cursorHeight, GB_Image& backgroundImage, int& backgroundOffsetX, int& backgroundOffsetY)
+        {
+            backgroundImage.Clear();
+            backgroundOffsetX = 0;
+            backgroundOffsetY = 0;
+
+            if (cursorWidth <= 0 || cursorHeight <= 0)
+            {
+                return false;
+            }
+
+            const double cursorLeft = static_cast<double>(physicalCursorPoint.x) - static_cast<double>(iconInfo.xHotspot);
+            const double cursorTop = static_cast<double>(physicalCursorPoint.y) - static_cast<double>(iconInfo.yHotspot);
+            const GB_Rectangle cursorRectangle(cursorLeft, cursorTop, cursorLeft + static_cast<double>(cursorWidth), cursorTop + static_cast<double>(cursorHeight));
+
+            const GB_Rectangle virtualScreenRectangle = GB_Screen::GetVirtualScreenRectangle();
+            if (!virtualScreenRectangle.IsValid())
+            {
+                return false;
+            }
+
+            const GB_Rectangle clippedRectangle = cursorRectangle.Intersected(virtualScreenRectangle);
+            if (!clippedRectangle.IsValid() || clippedRectangle.Width() <= 0.0 || clippedRectangle.Height() <= 0.0)
+            {
+                return false;
+            }
+
+            if (!GB_Screen::CaptureVirtualScreen(clippedRectangle, backgroundImage) || backgroundImage.IsEmpty())
+            {
+                backgroundImage.Clear();
+                return false;
+            }
+
+            const double offsetX = clippedRectangle.minX - cursorRectangle.minX;
+            const double offsetY = clippedRectangle.minY - cursorRectangle.minY;
+            int64_t roundedOffsetX = 0;
+            int64_t roundedOffsetY = 0;
+            if (!TryRoundDoubleToInt64(offsetX, roundedOffsetX) || !TryRoundDoubleToInt64(offsetY, roundedOffsetY))
+            {
+                backgroundImage.Clear();
+                return false;
+            }
+
+            if (roundedOffsetX < static_cast<int64_t>(std::numeric_limits<int>::min()) || roundedOffsetX > static_cast<int64_t>(std::numeric_limits<int>::max()) ||
+                roundedOffsetY < static_cast<int64_t>(std::numeric_limits<int>::min()) || roundedOffsetY > static_cast<int64_t>(std::numeric_limits<int>::max()))
+            {
+                backgroundImage.Clear();
+                return false;
+            }
+
+            backgroundOffsetX = static_cast<int>(roundedOffsetX);
+            backgroundOffsetY = static_cast<int>(roundedOffsetY);
+            return true;
+        }
+
+        static uint8_t ResolveMonochromeCursorReverseScreenGrayValueFromBrightness(const double brightness)
+        {
+            return brightness >= 128.0 ? 0u : 255u;
+        }
+
+        static bool TryResolveMonochromeCursorReverseScreenDefaultGrayValue(const std::vector<uint8_t>& maskBitmapBits, const size_t rowStrideBytes, const int cursorWidth, const int cursorHeight, const GB_Image* backgroundImage, const int backgroundOffsetX, const int backgroundOffsetY, uint8_t& grayValue)
+        {
+            grayValue = 255;
+
+            if (rowStrideBytes == 0 || cursorWidth <= 0 || cursorHeight <= 0)
+            {
+                return false;
+            }
+
+            bool hasReverseScreenPixel = false;
+            uint64_t brightSampleCount = 0;
+            uint64_t darkSampleCount = 0;
+            double brightnessSum = 0.0;
+            uint64_t brightnessSampleCount = 0;
+
+            for (int rowIndex = 0; rowIndex < cursorHeight; rowIndex++)
+            {
+                for (int colIndex = 0; colIndex < cursorWidth; colIndex++)
+                {
+                    bool andMaskBit = false;
+                    bool xorMaskBit = false;
+                    if (!TryGetMonochromeBitmapPixel(maskBitmapBits, rowStrideBytes, cursorWidth, cursorHeight * 2, colIndex, rowIndex, andMaskBit) ||
+                        !TryGetMonochromeBitmapPixel(maskBitmapBits, rowStrideBytes, cursorWidth, cursorHeight * 2, colIndex, rowIndex + cursorHeight, xorMaskBit))
+                    {
+                        return false;
+                    }
+
+                    if (!(andMaskBit && xorMaskBit))
+                    {
+                        continue;
+                    }
+
+                    hasReverseScreenPixel = true;
+                    if (backgroundImage == nullptr)
+                    {
+                        continue;
+                    }
+
+                    const int backgroundX = colIndex - backgroundOffsetX;
+                    const int backgroundY = rowIndex - backgroundOffsetY;
+                    double brightness = 0.0;
+                    if (!TryGetImagePixelBrightness(*backgroundImage, backgroundX, backgroundY, brightness))
+                    {
+                        continue;
+                    }
+
+                    brightnessSum += brightness;
+                    brightnessSampleCount++;
+                    if (brightness >= 128.0)
+                    {
+                        brightSampleCount++;
+                    }
+                    else
+                    {
+                        darkSampleCount++;
+                    }
+                }
+            }
+
+            if (!hasReverseScreenPixel)
+            {
+                return true;
+            }
+
+            if (brightnessSampleCount == 0 && backgroundImage != nullptr && !backgroundImage->IsEmpty())
+            {
+                const int backgroundWidth = static_cast<int>(backgroundImage->GetWidth());
+                const int backgroundHeight = static_cast<int>(backgroundImage->GetHeight());
+                for (int rowIndex = 0; rowIndex < backgroundHeight; rowIndex++)
+                {
+                    for (int colIndex = 0; colIndex < backgroundWidth; colIndex++)
+                    {
+                        double brightness = 0.0;
+                        if (!TryGetImagePixelBrightness(*backgroundImage, colIndex, rowIndex, brightness))
+                        {
+                            continue;
+                        }
+
+                        brightnessSum += brightness;
+                        brightnessSampleCount++;
+                        if (brightness >= 128.0)
+                        {
+                            brightSampleCount++;
+                        }
+                        else
+                        {
+                            darkSampleCount++;
+                        }
+                    }
+                }
+            }
+
+            if (brightnessSampleCount == 0)
+            {
+                grayValue = 255;
+                return true;
+            }
+
+            if (brightSampleCount > darkSampleCount)
+            {
+                grayValue = 0;
+                return true;
+            }
+
+            if (darkSampleCount > brightSampleCount)
+            {
+                grayValue = 255;
+                return true;
+            }
+
+            grayValue = ResolveMonochromeCursorReverseScreenGrayValueFromBrightness(brightnessSum / static_cast<double>(brightnessSampleCount));
+            return true;
+        }
+
+        static uint8_t ResolveMonochromeCursorReverseScreenGrayValueAtPixel(const GB_Image* backgroundImage, const int backgroundX, const int backgroundY, const uint8_t defaultGrayValue)
+        {
+            if (backgroundImage != nullptr)
+            {
+                double brightness = 0.0;
+                if (TryGetImagePixelBrightness(*backgroundImage, backgroundX, backgroundY, brightness))
+                {
+                    return ResolveMonochromeCursorReverseScreenGrayValueFromBrightness(brightness);
+                }
+            }
+
+            return defaultGrayValue;
+        }
+
         static bool TryTrimTransparentBorder(GB_Image& image, GB_Point2d* hotSpot)
         {
             if (image.IsEmpty() || image.GetDepth() != GB_ImageDepth::UInt8 || image.GetChannels() != 4)
@@ -938,7 +1171,7 @@ namespace
             return true;
         }
 
-        static bool TryBuildMonochromeCursorImageFromMaskBitmap(const ICONINFO& iconInfo, const int cursorWidth, const int cursorHeight, GB_Image& cursorImage)
+        static bool TryBuildMonochromeCursorImageFromMaskBitmap(const ICONINFO& iconInfo, const int cursorWidth, const int cursorHeight, const GB_Image* backgroundImage, const int backgroundOffsetX, const int backgroundOffsetY, GB_Image& cursorImage)
         {
             cursorImage.Clear();
 
@@ -955,6 +1188,12 @@ namespace
 
             const size_t rowStrideBytes = GetMonochromeBitmapRowStrideBytes(cursorWidth);
             if (rowStrideBytes == 0)
+            {
+                return false;
+            }
+
+            uint8_t defaultReverseScreenGrayValue = 255;
+            if (!TryResolveMonochromeCursorReverseScreenDefaultGrayValue(maskBitmapBits, rowStrideBytes, cursorWidth, cursorHeight, backgroundImage, backgroundOffsetX, backgroundOffsetY, defaultReverseScreenGrayValue))
             {
                 return false;
             }
@@ -996,10 +1235,13 @@ namespace
                         {
                             // AND=1 XOR=1 表示 Reverse screen。
                             // 该像素依赖背景，无法还原为唯一的背景无关 RGBA 值。
-                            // 这里将其规范化为不透明白色，以得到一张“纯光标图”。
-                            blueValue = 255;
-                            greenValue = 255;
-                            redValue = 255;
+                            // 这里优先根据当前像素位置的局部背景亮度进行规范化；若局部背景不可获取，则退化为整体背景亮度对应的默认颜色。
+                            const int backgroundX = colIndex - backgroundOffsetX;
+                            const int backgroundY = rowIndex - backgroundOffsetY;
+                            const uint8_t reverseScreenGrayValue = ResolveMonochromeCursorReverseScreenGrayValueAtPixel(backgroundImage, backgroundX, backgroundY, defaultReverseScreenGrayValue);
+                            blueValue = reverseScreenGrayValue;
+                            greenValue = reverseScreenGrayValue;
+                            redValue = reverseScreenGrayValue;
                             alphaValue = 255;
                         }
                         else
@@ -1431,7 +1673,38 @@ namespace
             return t;
         }
 
-        static bool ExecuteCursorMove(const POINT& startPoint, const POINT& targetPoint, const GB_MouseMoveOptions& moveOptions)
+        static int ResolveMoveStepCount(const double distancePixel, const double durationMs, const GB_MouseMoveOptions& moveOptions)
+        {
+            const double samplingIntervalMs = GetPositiveOptionOrDefault(moveOptions.samplingIntervalMs, 4.0);
+            const double maxStepPixelDistance = GetPositiveOptionOrDefault(moveOptions.maxStepPixelDistance, 8.0);
+
+            int64_t stepCountByDuration = 1;
+            int64_t stepCountByDistance = 1;
+
+            if (durationMs > 0.0 && std::isfinite(durationMs))
+            {
+                const double rawStepCountByDuration = std::ceil(durationMs / samplingIntervalMs);
+                if (std::isfinite(rawStepCountByDuration) && rawStepCountByDuration > 1.0)
+                {
+                    stepCountByDuration = static_cast<int64_t>(std::min(rawStepCountByDuration, static_cast<double>(std::numeric_limits<int64_t>::max())));
+                }
+            }
+
+            if (distancePixel > 0.0 && std::isfinite(distancePixel))
+            {
+                const double rawStepCountByDistance = std::ceil(distancePixel / maxStepPixelDistance);
+                if (std::isfinite(rawStepCountByDistance) && rawStepCountByDistance > 1.0)
+                {
+                    stepCountByDistance = static_cast<int64_t>(std::min(rawStepCountByDistance, static_cast<double>(std::numeric_limits<int64_t>::max())));
+                }
+            }
+
+            const int64_t maxReasonableStepCount = 100000;
+            const int64_t stepCount = std::max<int64_t>(1, std::min<int64_t>(maxReasonableStepCount, std::max(stepCountByDuration, stepCountByDistance)));
+            return static_cast<int>(stepCount);
+        }
+
+        static bool ExecuteCursorMove(const POINT& startPoint, const POINT& targetPoint, const std::vector<GB_ScreenInfo>& screenInfos, const GB_MouseMoveOptions& moveOptions)
         {
             if (moveOptions.moveMode == GB_MouseMoveMode::Teleport)
             {
@@ -1447,14 +1720,8 @@ namespace
             }
 
             const double durationMs = ResolveMoveDurationMs(distancePixel, moveOptions);
-            const double samplingIntervalMs = GetPositiveOptionOrDefault(moveOptions.samplingIntervalMs, 4.0);
-            const double maxStepPixelDistance = GetPositiveOptionOrDefault(moveOptions.maxStepPixelDistance, 8.0);
+            const int stepCount = ResolveMoveStepCount(distancePixel, durationMs, moveOptions);
 
-            const int stepCountByDuration = durationMs > 0.0 ? std::max(1, static_cast<int>(std::ceil(durationMs / samplingIntervalMs))) : 1;
-            const int stepCountByDistance = std::max(1, static_cast<int>(std::ceil(distancePixel / maxStepPixelDistance)));
-            const int stepCount = std::max(stepCountByDuration, stepCountByDistance);
-
-            const std::vector<GB_ScreenInfo> screenInfos = GB_Screen::GetAllScreens();
             if (screenInfos.empty())
             {
                 return false;
@@ -1596,12 +1863,14 @@ namespace
 #else
         internal::DpiAwarenessScope dpiAwarenessScope;
 
-        HCURSOR cursorHandle = nullptr;
-        if (!internal::TryGetCurrentVisibleCursorHandle(cursorHandle))
+        CURSORINFO cursorInfo = {};
+        if (!internal::TryGetCurrentVisibleCursorInfo(cursorInfo))
         {
             cursorImage.Clear();
             return false;
         }
+
+        const HCURSOR cursorHandle = cursorInfo.hCursor;
 
         int cursorWidth = 0;
         int cursorHeight = 0;
@@ -1617,7 +1886,12 @@ namespace
 
         if (iconInfo.hbmColor == nullptr)
         {
-            if (internal::TryBuildMonochromeCursorImageFromMaskBitmap(iconInfo, cursorWidth, cursorHeight, cursorImage))
+            GB_Image backgroundImage;
+            int backgroundOffsetX = 0;
+            int backgroundOffsetY = 0;
+            const bool hasBackgroundImage = internal::TryCaptureCursorBackgroundImage(cursorInfo.ptScreenPos, iconInfo, cursorWidth, cursorHeight, backgroundImage, backgroundOffsetX, backgroundOffsetY);
+
+            if (internal::TryBuildMonochromeCursorImageFromMaskBitmap(iconInfo, cursorWidth, cursorHeight, hasBackgroundImage ? &backgroundImage : nullptr, backgroundOffsetX, backgroundOffsetY, cursorImage))
             {
                 hotSpot.Set(static_cast<double>(iconInfo.xHotspot), static_cast<double>(iconInfo.yHotspot));
                 if (!internal::TryTrimTransparentBorder(cursorImage, &hotSpot))
@@ -1759,7 +2033,7 @@ bool GB_Mouse::MoveTo(const GB_Point2d& physicalPixelPoint, const GB_MouseMoveCo
         }
         (void)projectedScreenIndex;
 
-        return internal::ExecuteCursorMove(startPoint, targetPoint, moveOptions);
+        return internal::ExecuteCursorMove(startPoint, targetPoint, screenInfos, moveOptions);
     }
 
     case GB_MouseMoveCoordinateType::CurrentScreenPhysicalPixel:
@@ -1778,7 +2052,7 @@ bool GB_Mouse::MoveTo(const GB_Point2d& physicalPixelPoint, const GB_MouseMoveCo
             return false;
         }
 
-        return internal::ExecuteCursorMove(startPoint, targetPoint, moveOptions);
+        return internal::ExecuteCursorMove(startPoint, targetPoint, screenInfos, moveOptions);
     }
 
     default:
@@ -1812,7 +2086,7 @@ bool GB_Mouse::MoveTo(const int screenIndex, const GB_Point2d& physicalPixelPoin
         return false;
     }
 
-    return internal::ExecuteCursorMove(startPoint, targetPoint, moveOptions);
+    return internal::ExecuteCursorMove(startPoint, targetPoint, screenInfos, moveOptions);
 #endif
 }
 
@@ -1855,7 +2129,7 @@ bool GB_Mouse::Move(const GB_Vector2d& physicalPixelOffset, const bool allowMove
         }
         (void)projectedScreenIndex;
 
-        return internal::ExecuteCursorMove(startPoint, targetPoint, moveOptions);
+        return internal::ExecuteCursorMove(startPoint, targetPoint, screenInfos, moveOptions);
     }
 
     int currentScreenIndex = -1;
@@ -1878,6 +2152,6 @@ bool GB_Mouse::Move(const GB_Vector2d& physicalPixelOffset, const bool allowMove
         return false;
     }
 
-    return internal::ExecuteCursorMove(startPoint, targetPoint, moveOptions);
+    return internal::ExecuteCursorMove(startPoint, targetPoint, screenInfos, moveOptions);
 #endif
 }
