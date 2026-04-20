@@ -3,7 +3,109 @@
 
 #include "../GlobalBasePort.h"
 #include "../Geometry/GB_Point2d.h"
+#include "../Geometry/GB_Vector2d.h"
 #include "../CV/GB_Image.h"
+
+/**
+ * @brief 鼠标移动方式。
+ *
+ * 说明：
+ * - Teleport 表示直接瞬移到目标位置；
+ * - Linear 表示沿直线路径匀速样式移动；
+ * - HumanLike 表示沿直线路径以更接近人工移动节奏的缓入缓出方式移动。
+ */
+enum class GB_MouseMoveMode
+{
+    Teleport = 0,
+    Linear = 1,
+    HumanLike = 2
+};
+
+/**
+ * @brief MoveTo 单点输入时所采用的坐标解释方式。
+ *
+ * 说明：
+ * - VirtualScreenPhysicalPixel：输入点表示虚拟桌面坐标系中的物理像素坐标；
+ * - CurrentScreenPhysicalPixel：输入点表示“当前鼠标所在显示屏”局部坐标系中的物理像素坐标。
+ */
+enum class GB_MouseMoveCoordinateType
+{
+    VirtualScreenPhysicalPixel = 0,
+    CurrentScreenPhysicalPixel = 1
+};
+
+/**
+ * @brief 鼠标移动选项。
+ *
+ * 说明：
+ * - 所有速度单位均为“物理像素 / 秒”；
+ * - 所有时长单位均为毫秒；
+ * - 当 moveMode 为 Teleport 时，耗时 / 速度 / 采样相关参数通常不会生效；
+ * - 当同时设置多个约束时，内部会尽量求得一个合理的移动时长；若约束彼此冲突，则会退化为选择一个尽量接近默认值的可执行方案。
+ */
+struct GB_MouseMoveOptions
+{
+    /**
+     * @brief 移动方式。
+     */
+    GB_MouseMoveMode moveMode = GB_MouseMoveMode::HumanLike;
+
+    /**
+     * @brief 是否指定最小移动耗时。
+     */
+    bool specifyMinDurationMs = false;
+
+    /**
+     * @brief 最小移动耗时，单位为毫秒。
+     */
+    double minDurationMs = 0;
+
+    /**
+     * @brief 是否指定最大移动耗时。
+     */
+    bool specifyMaxDurationMs = false;
+
+    /**
+     * @brief 最大移动耗时，单位为毫秒。
+     */
+    double maxDurationMs = 0;
+
+    /**
+     * @brief 是否指定最小移动速度。
+     */
+    bool specifyMinSpeedPixelPerSecond = false;
+
+    /**
+     * @brief 最小移动速度，单位为物理像素 / 秒。
+     */
+    double minSpeedPixelPerSecond = 0;
+
+    /**
+     * @brief 是否指定最大移动速度。
+     */
+    bool specifyMaxSpeedPixelPerSecond = false;
+
+    /**
+     * @brief 最大移动速度，单位为物理像素 / 秒。
+     */
+    double maxSpeedPixelPerSecond = 0;
+
+    /**
+     * @brief 相邻采样点的目标时间间隔，单位为毫秒。
+     *
+     * 仅当 moveMode 为 Linear 或 HumanLike 时参与计算。
+     * 该值越小，移动轨迹越细腻，但调用开销也会更高。
+     */
+    double samplingIntervalMs = 4;
+
+    /**
+     * @brief 相邻采样点之间允许的最大像素距离，单位为物理像素。
+     *
+     * 仅当 moveMode 为 Linear 或 HumanLike 时参与计算。
+     * 该值越小，路径越平滑。
+     */
+    double maxStepPixelDistance = 8;
+};
 
 /**
  * @brief 与鼠标 / 光标相关的 Windows 工具类。
@@ -21,7 +123,7 @@ public:
      * 说明：
      * - 本接口会优先获取“透明背景的纯光标图像”；
      * - 若当前没有可获取的系统光标，或当前光标无法可靠还原为普通 RGBA 图像，则会退化为围绕鼠标热点截取一个局部屏幕区域；
-     * - 因此，本接口在回退模式下得到的结果不再是“纯光标精灵图”，而是“当前实际显示出来的鼠标附近画面”；
+     * - 因此，本接口在回退模式下得到的结果不再是“纯光标精灵图”，而是“当前实际显示出来的鼠标附近画面”。
      */
     static bool GetCursorImage(GB_Image& cursorImage, int fallbackCaptureRadius = 32);
 
@@ -64,6 +166,49 @@ public:
      * @return true=成功；false=失败。
      */
     static bool GetMousePhysicalPosition(int& screenIndex, GB_Point2d& physicalPixelPointOnScreen);
+
+    /**
+     * @brief 将鼠标移动到目标位置。
+     *
+     * @param physicalPixelPoint 目标点。
+     * @param coordinateType 输入点的坐标解释方式。
+     * @param moveOptions 移动选项。
+     * @return true=成功；false=失败。
+     *
+     * 说明：
+     * - 当 coordinateType 为 VirtualScreenPhysicalPixel 时，physicalPixelPoint 表示虚拟桌面坐标系中的物理像素坐标；
+     * - 当 coordinateType 为 CurrentScreenPhysicalPixel 时，physicalPixelPoint 表示当前鼠标所在显示屏局部坐标系中的物理像素坐标；
+     * - 若目标点越出可达范围，内部会自动裁剪到最近的可达像素位置。
+     */
+    static bool MoveTo(const GB_Point2d& physicalPixelPoint, GB_MouseMoveCoordinateType coordinateType = GB_MouseMoveCoordinateType::CurrentScreenPhysicalPixel, const GB_MouseMoveOptions& moveOptions = GB_MouseMoveOptions());
+
+    /**
+     * @brief 将鼠标移动到指定显示屏局部坐标系中的目标位置。
+     *
+     * @param screenIndex 显示屏编号，0 基，对应 GB_Screen::GetAllScreens() 返回顺序。
+     * @param physicalPixelPointOnScreen 目标点在该显示屏局部坐标系中的物理像素坐标，左上角为 (0, 0)。
+     * @param moveOptions 移动选项。
+     * @return true=成功；false=失败。
+     *
+     * 说明：
+     * - 若输入点越出该显示屏范围，内部会自动裁剪到该显示屏内最近的可达像素位置；
+     * - 本接口不会把目标解释为虚拟桌面坐标。
+     */
+    static bool MoveTo(int screenIndex, const GB_Point2d& physicalPixelPointOnScreen, const GB_MouseMoveOptions& moveOptions = GB_MouseMoveOptions());
+
+    /**
+     * @brief 以当前鼠标位置为基础，按物理像素偏移量进行移动。
+     *
+     * @param physicalPixelOffset 偏移量，单位为物理像素。
+     * @param allowMoveToOtherScreens 是否允许移动到其它显示屏。true=允许；false=限制在当前显示屏内。
+     * @param moveOptions 移动选项。
+     * @return true=成功；false=失败。
+     *
+     * 说明：
+     * - 当 allowMoveToOtherScreens=false 时，本次移动的最终位置不会移出当前显示屏；
+     * - 当 allowMoveToOtherScreens=true 时，目标点按虚拟桌面物理像素坐标解释，若偏移后落在不可达区域，则会自动裁剪到最近的可达像素位置。
+     */
+    static bool Move(const GB_Vector2d& physicalPixelOffset, bool allowMoveToOtherScreens = true, const GB_MouseMoveOptions& moveOptions = GB_MouseMoveOptions());
 };
 
 #endif
