@@ -4,13 +4,21 @@
 #include "../Geometry/GB_Rectangle.h"
 
 #include <algorithm>
+#include <array>
+#include <atomic>
 #include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <cstdint>
 #include <cstring>
+#include <deque>
 #include <limits>
-#include <utility>
+#include <memory>
+#include <mutex>
+#include <new>
 #include <thread>
+#include <unordered_map>
+#include <utility>
 #include <vector>
 
 #if defined(_WIN32)
@@ -2675,3 +2683,1361 @@ bool GB_Mouse::ScrollHorizontalWheel(const int wheelDelta)
 }
 
 #endif
+
+#if defined(_WIN32)
+namespace
+{
+    namespace internal
+    {
+        static constexpr size_t globalMouseEventTypeCount = 11;
+        static constexpr size_t globalMouseEventQueueCapacity = 256;
+
+        static uint64_t GetSteadyTickCountMs()
+        {
+            const auto now = std::chrono::steady_clock::now();
+            return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count());
+        }
+
+        static size_t GetGlobalMouseEventTypeIndex(const GB_GlobalMouseEventType eventType)
+        {
+            switch (eventType)
+            {
+            case GB_GlobalMouseEventType::Move:
+                return 0;
+            case GB_GlobalMouseEventType::LeftButtonDown:
+                return 1;
+            case GB_GlobalMouseEventType::LeftButtonUp:
+                return 2;
+            case GB_GlobalMouseEventType::RightButtonDown:
+                return 3;
+            case GB_GlobalMouseEventType::RightButtonUp:
+                return 4;
+            case GB_GlobalMouseEventType::MiddleButtonDown:
+                return 5;
+            case GB_GlobalMouseEventType::MiddleButtonUp:
+                return 6;
+            case GB_GlobalMouseEventType::XButtonDown:
+                return 7;
+            case GB_GlobalMouseEventType::XButtonUp:
+                return 8;
+            case GB_GlobalMouseEventType::VerticalWheel:
+                return 9;
+            case GB_GlobalMouseEventType::HorizontalWheel:
+                return 10;
+            }
+
+            return globalMouseEventTypeCount;
+        }
+
+        static GB_GlobalMouseEventMask GetGlobalMouseEventMask(const GB_GlobalMouseEventType eventType)
+        {
+            switch (eventType)
+            {
+            case GB_GlobalMouseEventType::Move:
+                return GB_GlobalMouseEventMask::Move;
+            case GB_GlobalMouseEventType::LeftButtonDown:
+                return GB_GlobalMouseEventMask::LeftButtonDown;
+            case GB_GlobalMouseEventType::LeftButtonUp:
+                return GB_GlobalMouseEventMask::LeftButtonUp;
+            case GB_GlobalMouseEventType::RightButtonDown:
+                return GB_GlobalMouseEventMask::RightButtonDown;
+            case GB_GlobalMouseEventType::RightButtonUp:
+                return GB_GlobalMouseEventMask::RightButtonUp;
+            case GB_GlobalMouseEventType::MiddleButtonDown:
+                return GB_GlobalMouseEventMask::MiddleButtonDown;
+            case GB_GlobalMouseEventType::MiddleButtonUp:
+                return GB_GlobalMouseEventMask::MiddleButtonUp;
+            case GB_GlobalMouseEventType::XButtonDown:
+                return GB_GlobalMouseEventMask::XButtonDown;
+            case GB_GlobalMouseEventType::XButtonUp:
+                return GB_GlobalMouseEventMask::XButtonUp;
+            case GB_GlobalMouseEventType::VerticalWheel:
+                return GB_GlobalMouseEventMask::VerticalWheel;
+            case GB_GlobalMouseEventType::HorizontalWheel:
+                return GB_GlobalMouseEventMask::HorizontalWheel;
+            }
+
+            return GB_GlobalMouseEventMask::None;
+        }
+
+        static uint32_t GetGlobalMouseEventMaskBits(const GB_GlobalMouseEventMask eventMask)
+        {
+            return static_cast<uint32_t>(eventMask);
+        }
+
+        static bool IsMoveEventType(const GB_GlobalMouseEventType eventType)
+        {
+            return eventType == GB_GlobalMouseEventType::Move;
+        }
+
+
+        static void FillGlobalMouseEventCommonFields(GB_GlobalMouseEvent& mouseEvent, const uint32_t messageTimeMs)
+        {
+            mouseEvent.physicalPixelPoint.Set(0.0, 0.0);
+            POINT cursorPoint = {};
+            if (TryGetCurrentPhysicalCursorPosition(cursorPoint))
+            {
+                mouseEvent.physicalPixelPoint.Set(static_cast<double>(cursorPoint.x), static_cast<double>(cursorPoint.y));
+            }
+
+            mouseEvent.wheelDelta = 0;
+            mouseEvent.xButtonType = GB_GlobalMouseXButtonType::None;
+            mouseEvent.isInjected = false;
+            mouseEvent.isLowerIntegrityInjected = false;
+            mouseEvent.messageTimeMs = messageTimeMs;
+            mouseEvent.receiveTickCountMs = GetSteadyTickCountMs();
+        }
+
+        struct GlobalMouseCallbackEntry
+        {
+            GB_GlobalMouseEventCallback callback;
+            GB_GlobalMouseCallbackOptions callbackOptions;
+        };
+
+        class GlobalMouseListenerState : public std::enable_shared_from_this<GlobalMouseListenerState>
+        {
+        public:
+            void SetInterestedEvents(const GB_GlobalMouseEventMask eventMask)
+            {
+                interestedEventMaskBits.store(GetGlobalMouseEventMaskBits(eventMask));
+            }
+
+            GB_GlobalMouseEventMask GetInterestedEvents() const
+            {
+                return static_cast<GB_GlobalMouseEventMask>(interestedEventMaskBits.load());
+            }
+
+            void AddInterestedEvent(const GB_GlobalMouseEventType eventType)
+            {
+                interestedEventMaskBits.fetch_or(GetGlobalMouseEventMaskBits(GetGlobalMouseEventMask(eventType)));
+            }
+
+            void RemoveInterestedEvent(const GB_GlobalMouseEventType eventType)
+            {
+                const uint32_t eventMaskBits = GetGlobalMouseEventMaskBits(GetGlobalMouseEventMask(eventType));
+                interestedEventMaskBits.fetch_and(~eventMaskBits);
+            }
+
+            bool IsInterestedIn(const GB_GlobalMouseEventType eventType) const
+            {
+                const uint32_t eventMaskBits = GetGlobalMouseEventMaskBits(GetGlobalMouseEventMask(eventType));
+                return (interestedEventMaskBits.load() & eventMaskBits) != 0;
+            }
+
+            void SetUnifiedCallback(const GB_GlobalMouseEventCallback& callback, const GB_GlobalMouseCallbackOptions& callbackOptions)
+            {
+                {
+                    std::lock_guard<std::mutex> callbackLock(callbackMutex);
+                    unifiedCallbackEntry.callback = callback;
+                    unifiedCallbackEntry.callbackOptions = callbackOptions;
+                    if (!callback)
+                    {
+                        lastUnifiedMoveCallbackTickMs = 0;
+                    }
+                }
+
+                hasUnifiedCallback.store(static_cast<bool>(callback));
+                UpdateMoveEnqueueMinTriggerIntervalMs();
+            }
+
+            void ClearUnifiedCallback()
+            {
+                SetUnifiedCallback(GB_GlobalMouseEventCallback(), GB_GlobalMouseCallbackOptions());
+            }
+
+            void SetEventCallback(const GB_GlobalMouseEventType eventType, const GB_GlobalMouseEventCallback& callback, const GB_GlobalMouseCallbackOptions& callbackOptions)
+            {
+                const size_t eventTypeIndex = GetGlobalMouseEventTypeIndex(eventType);
+                if (eventTypeIndex >= globalMouseEventTypeCount)
+                {
+                    return;
+                }
+
+                {
+                    std::lock_guard<std::mutex> callbackLock(callbackMutex);
+                    perEventCallbackEntries[eventTypeIndex].callback = callback;
+                    perEventCallbackEntries[eventTypeIndex].callbackOptions = callbackOptions;
+                    if (!callback)
+                    {
+                        lastPerEventMoveCallbackTickMs[eventTypeIndex] = 0;
+                    }
+                }
+
+                const uint32_t eventMaskBits = GetGlobalMouseEventMaskBits(GetGlobalMouseEventMask(eventType));
+                if (callback)
+                {
+                    activePerEventCallbackMaskBits.fetch_or(eventMaskBits);
+                    AddInterestedEvent(eventType);
+                }
+                else
+                {
+                    activePerEventCallbackMaskBits.fetch_and(~eventMaskBits);
+                }
+
+                UpdateMoveEnqueueMinTriggerIntervalMs();
+            }
+
+            void ClearEventCallback(const GB_GlobalMouseEventType eventType)
+            {
+                SetEventCallback(eventType, GB_GlobalMouseEventCallback(), GB_GlobalMouseCallbackOptions());
+            }
+
+            void ClearAllCallbacks()
+            {
+                {
+                    std::lock_guard<std::mutex> callbackLock(callbackMutex);
+                    unifiedCallbackEntry.callback = GB_GlobalMouseEventCallback();
+                    unifiedCallbackEntry.callbackOptions = GB_GlobalMouseCallbackOptions();
+                    lastUnifiedMoveCallbackTickMs = 0;
+                    for (size_t index = 0; index < globalMouseEventTypeCount; index++)
+                    {
+                        perEventCallbackEntries[index].callback = GB_GlobalMouseEventCallback();
+                        perEventCallbackEntries[index].callbackOptions = GB_GlobalMouseCallbackOptions();
+                        lastPerEventMoveCallbackTickMs[index] = 0;
+                    }
+                }
+
+                hasUnifiedCallback.store(false);
+                activePerEventCallbackMaskBits.store(0);
+                moveEnqueueMinTriggerIntervalMs.store(0);
+                lastMoveEnqueueTickMs.store(0);
+            }
+
+            bool StartWorker()
+            {
+                std::lock_guard<std::mutex> lifecycleLock(lifecycleMutex);
+                if (workerThread.joinable())
+                {
+                    return true;
+                }
+
+                stopWorker.store(false);
+                lastMoveEnqueueTickMs.store(0);
+                try
+                {
+                    const auto self = shared_from_this();
+                    workerThread = std::thread([self]()
+                        {
+                            self->WorkerThreadMain();
+                        });
+                }
+                catch (...)
+                {
+                    stopWorker.store(true);
+                    return false;
+                }
+
+                return true;
+            }
+
+            void StopWorker()
+            {
+                std::unique_lock<std::mutex> lifecycleLock(lifecycleMutex);
+                if (!workerThread.joinable())
+                {
+                    return;
+                }
+
+                stopWorker.store(true);
+                {
+                    std::lock_guard<std::mutex> queueLock(queueMutex);
+                    eventQueue.clear();
+                }
+                queueConditionVariable.notify_all();
+
+                if (workerThread.get_id() == std::this_thread::get_id())
+                {
+                    workerThread.detach();
+                    return;
+                }
+
+                std::thread workerThreadToJoin = std::move(workerThread);
+                lifecycleLock.unlock();
+                workerThreadToJoin.join();
+            }
+
+            bool TryEnqueueEvent(const GB_GlobalMouseEvent& mouseEvent)
+            {
+                if (!isListening.load())
+                {
+                    return false;
+                }
+
+                const uint32_t eventMaskBits = GetGlobalMouseEventMaskBits(GetGlobalMouseEventMask(mouseEvent.eventType));
+                if ((interestedEventMaskBits.load() & eventMaskBits) == 0)
+                {
+                    return false;
+                }
+
+                if (!hasUnifiedCallback.load() && (activePerEventCallbackMaskBits.load() & eventMaskBits) == 0)
+                {
+                    return false;
+                }
+
+                if (IsMoveEventType(mouseEvent.eventType))
+                {
+                    const uint32_t moveMinTriggerIntervalMs = moveEnqueueMinTriggerIntervalMs.load();
+                    if (moveMinTriggerIntervalMs > 0)
+                    {
+                        const uint64_t lastMoveTickMs = lastMoveEnqueueTickMs.load();
+                        if (lastMoveTickMs > 0 && mouseEvent.receiveTickCountMs < lastMoveTickMs + moveMinTriggerIntervalMs)
+                        {
+                            return false;
+                        }
+                    }
+                }
+
+                {
+                    std::lock_guard<std::mutex> queueLock(queueMutex);
+                    if (stopWorker.load())
+                    {
+                        return false;
+                    }
+
+                    if (IsMoveEventType(mouseEvent.eventType))
+                    {
+                        if (!eventQueue.empty() && IsMoveEventType(eventQueue.back().eventType))
+                        {
+                            eventQueue.back() = mouseEvent;
+                            lastMoveEnqueueTickMs.store(mouseEvent.receiveTickCountMs);
+                            queueConditionVariable.notify_one();
+                            return true;
+                        }
+                    }
+
+                    if (eventQueue.size() >= globalMouseEventQueueCapacity)
+                    {
+                        if (IsMoveEventType(mouseEvent.eventType))
+                        {
+                            return false;
+                        }
+
+                        const auto moveEventIter = std::find_if(eventQueue.begin(), eventQueue.end(), [](const GB_GlobalMouseEvent& queuedEvent)
+                            {
+                                return IsMoveEventType(queuedEvent.eventType);
+                            });
+                        if (moveEventIter != eventQueue.end())
+                        {
+                            eventQueue.erase(moveEventIter);
+                        }
+                        else
+                        {
+                            eventQueue.pop_front();
+                        }
+                    }
+
+                    eventQueue.push_back(mouseEvent);
+                }
+
+                if (IsMoveEventType(mouseEvent.eventType))
+                {
+                    lastMoveEnqueueTickMs.store(mouseEvent.receiveTickCountMs);
+                }
+
+                queueConditionVariable.notify_one();
+                return true;
+            }
+
+            void SetListening(const bool listening)
+            {
+                isListening.store(listening);
+                if (!listening)
+                {
+                    lastMoveEnqueueTickMs.store(0);
+                }
+            }
+
+            bool IsListening() const
+            {
+                return isListening.load();
+            }
+
+        private:
+            static bool ShouldInvokeMoveCallback(const uint64_t currentTickMs, const uint32_t minTriggerIntervalMs, uint64_t& lastInvokeTickMs)
+            {
+                if (minTriggerIntervalMs == 0)
+                {
+                    lastInvokeTickMs = currentTickMs;
+                    return true;
+                }
+
+                if (lastInvokeTickMs > 0 && currentTickMs < lastInvokeTickMs + minTriggerIntervalMs)
+                {
+                    return false;
+                }
+
+                lastInvokeTickMs = currentTickMs;
+                return true;
+            }
+
+            void UpdateMoveEnqueueMinTriggerIntervalMs()
+            {
+                uint32_t resolvedIntervalMs = 0;
+                bool hasMoveCallback = false;
+
+                std::lock_guard<std::mutex> callbackLock(callbackMutex);
+                if (unifiedCallbackEntry.callback)
+                {
+                    resolvedIntervalMs = unifiedCallbackEntry.callbackOptions.mouseMoveMinTriggerIntervalMs;
+                    hasMoveCallback = true;
+                }
+
+                const size_t moveEventTypeIndex = GetGlobalMouseEventTypeIndex(GB_GlobalMouseEventType::Move);
+                if (moveEventTypeIndex < globalMouseEventTypeCount && perEventCallbackEntries[moveEventTypeIndex].callback)
+                {
+                    const uint32_t moveCallbackIntervalMs = perEventCallbackEntries[moveEventTypeIndex].callbackOptions.mouseMoveMinTriggerIntervalMs;
+                    if (!hasMoveCallback || moveCallbackIntervalMs < resolvedIntervalMs)
+                    {
+                        resolvedIntervalMs = moveCallbackIntervalMs;
+                    }
+                    hasMoveCallback = true;
+                }
+
+                moveEnqueueMinTriggerIntervalMs.store((hasMoveCallback ? resolvedIntervalMs : 0));
+            }
+
+            void DispatchOneEvent(const GB_GlobalMouseEvent& mouseEvent)
+            {
+                GB_GlobalMouseEventCallback unifiedCallback;
+                GB_GlobalMouseEventCallback eventCallback;
+                const uint32_t eventMaskBits = GetGlobalMouseEventMaskBits(GetGlobalMouseEventMask(mouseEvent.eventType));
+                const size_t eventTypeIndex = GetGlobalMouseEventTypeIndex(mouseEvent.eventType);
+
+                {
+                    std::lock_guard<std::mutex> callbackLock(callbackMutex);
+                    if ((interestedEventMaskBits.load() & eventMaskBits) == 0)
+                    {
+                        return;
+                    }
+
+                    if (unifiedCallbackEntry.callback)
+                    {
+                        bool shouldInvokeUnifiedCallback = true;
+                        if (IsMoveEventType(mouseEvent.eventType))
+                        {
+                            shouldInvokeUnifiedCallback = ShouldInvokeMoveCallback(mouseEvent.receiveTickCountMs, unifiedCallbackEntry.callbackOptions.mouseMoveMinTriggerIntervalMs, lastUnifiedMoveCallbackTickMs);
+                        }
+
+                        if (shouldInvokeUnifiedCallback)
+                        {
+                            unifiedCallback = unifiedCallbackEntry.callback;
+                        }
+                    }
+
+                    if (eventTypeIndex < globalMouseEventTypeCount && perEventCallbackEntries[eventTypeIndex].callback)
+                    {
+                        bool shouldInvokeEventCallback = true;
+                        if (IsMoveEventType(mouseEvent.eventType))
+                        {
+                            shouldInvokeEventCallback = ShouldInvokeMoveCallback(mouseEvent.receiveTickCountMs, perEventCallbackEntries[eventTypeIndex].callbackOptions.mouseMoveMinTriggerIntervalMs, lastPerEventMoveCallbackTickMs[eventTypeIndex]);
+                        }
+
+                        if (shouldInvokeEventCallback)
+                        {
+                            eventCallback = perEventCallbackEntries[eventTypeIndex].callback;
+                        }
+                    }
+                }
+
+                if (unifiedCallback)
+                {
+                    unifiedCallback(mouseEvent);
+                }
+
+                if (eventCallback)
+                {
+                    eventCallback(mouseEvent);
+                }
+            }
+
+            void WorkerThreadMain()
+            {
+                while (true)
+                {
+                    GB_GlobalMouseEvent mouseEvent;
+                    {
+                        std::unique_lock<std::mutex> queueLock(queueMutex);
+                        queueConditionVariable.wait(queueLock, [this]()
+                            {
+                                return stopWorker.load() || !eventQueue.empty();
+                            });
+
+                        if (stopWorker.load() && eventQueue.empty())
+                        {
+                            break;
+                        }
+
+                        mouseEvent = eventQueue.front();
+                        eventQueue.pop_front();
+                    }
+
+                    DispatchOneEvent(mouseEvent);
+                }
+            }
+
+        private:
+            std::atomic<bool> isListening = false;
+            std::atomic<bool> stopWorker = false;
+            std::atomic<uint32_t> interestedEventMaskBits = 0;
+            std::atomic<uint32_t> activePerEventCallbackMaskBits = 0;
+            std::atomic<uint32_t> moveEnqueueMinTriggerIntervalMs = 0;
+            std::atomic<uint64_t> lastMoveEnqueueTickMs = 0;
+            std::atomic<bool> hasUnifiedCallback = false;
+
+            mutable std::mutex callbackMutex;
+            GlobalMouseCallbackEntry unifiedCallbackEntry;
+            std::array<GlobalMouseCallbackEntry, globalMouseEventTypeCount> perEventCallbackEntries = {};
+            uint64_t lastUnifiedMoveCallbackTickMs = 0;
+            std::array<uint64_t, globalMouseEventTypeCount> lastPerEventMoveCallbackTickMs = {};
+
+            std::mutex queueMutex;
+            std::condition_variable queueConditionVariable;
+            std::deque<GB_GlobalMouseEvent> eventQueue;
+
+            std::mutex lifecycleMutex;
+            std::thread workerThread;
+        };
+
+        class GlobalMouseRawInputManager
+        {
+        public:
+            static GlobalMouseRawInputManager& GetInstance()
+            {
+                static GlobalMouseRawInputManager* globalMouseRawInputManager = new GlobalMouseRawInputManager();
+                return *globalMouseRawInputManager;
+            }
+
+            bool RegisterListener(const std::shared_ptr<GlobalMouseListenerState>& listenerState, uint64_t& listenerId)
+            {
+                if (!listenerState)
+                {
+                    return false;
+                }
+
+                std::unique_lock<std::mutex> managerLock(managerMutex);
+                if (shuttingDown)
+                {
+                    return false;
+                }
+
+                if (!EnsureMessageThreadStarted(managerLock))
+                {
+                    return false;
+                }
+
+                listenerId = nextListenerId++;
+                listeners[listenerId] = listenerState;
+                return true;
+            }
+
+            void UnregisterListener(const uint64_t listenerId)
+            {
+                if (listenerId == 0)
+                {
+                    return;
+                }
+
+                std::unique_lock<std::mutex> managerLock(managerMutex);
+                listeners.erase(listenerId);
+                RemoveExpiredListenersLocked();
+                StopMessageThreadIfIdle(managerLock);
+            }
+
+            void DispatchEvent(const GB_GlobalMouseEvent& mouseEvent)
+            {
+                std::vector<std::shared_ptr<GlobalMouseListenerState>> activeListeners;
+                {
+                    std::lock_guard<std::mutex> managerLock(managerMutex);
+                    if (shuttingDown)
+                    {
+                        return;
+                    }
+
+                    activeListeners.reserve(listeners.size());
+                    for (auto listenerIter = listeners.begin(); listenerIter != listeners.end(); )
+                    {
+                        const auto listenerState = listenerIter->second.lock();
+                        if (!listenerState)
+                        {
+                            listenerIter = listeners.erase(listenerIter);
+                            continue;
+                        }
+
+                        activeListeners.push_back(listenerState);
+                        ++listenerIter;
+                    }
+                }
+
+                for (const auto& listenerState : activeListeners)
+                {
+                    listenerState->TryEnqueueEvent(mouseEvent);
+                }
+            }
+
+            void DispatchRawMousePacket(const RAWMOUSE& rawMouse, const uint32_t messageTimeMs)
+            {
+                const bool hasMove = ((rawMouse.usFlags & MOUSE_MOVE_ABSOLUTE) != 0) || rawMouse.lLastX != 0 || rawMouse.lLastY != 0;
+                if (hasMove)
+                {
+                    GB_GlobalMouseEvent mouseEvent;
+                    FillGlobalMouseEventCommonFields(mouseEvent, messageTimeMs);
+                    mouseEvent.eventType = GB_GlobalMouseEventType::Move;
+                    DispatchEvent(mouseEvent);
+                }
+
+                const USHORT buttonFlags = rawMouse.usButtonFlags;
+
+                if ((buttonFlags & RI_MOUSE_LEFT_BUTTON_DOWN) != 0)
+                {
+                    GB_GlobalMouseEvent mouseEvent;
+                    FillGlobalMouseEventCommonFields(mouseEvent, messageTimeMs);
+                    mouseEvent.eventType = GB_GlobalMouseEventType::LeftButtonDown;
+                    DispatchEvent(mouseEvent);
+                }
+
+                if ((buttonFlags & RI_MOUSE_LEFT_BUTTON_UP) != 0)
+                {
+                    GB_GlobalMouseEvent mouseEvent;
+                    FillGlobalMouseEventCommonFields(mouseEvent, messageTimeMs);
+                    mouseEvent.eventType = GB_GlobalMouseEventType::LeftButtonUp;
+                    DispatchEvent(mouseEvent);
+                }
+
+                if ((buttonFlags & RI_MOUSE_RIGHT_BUTTON_DOWN) != 0)
+                {
+                    GB_GlobalMouseEvent mouseEvent;
+                    FillGlobalMouseEventCommonFields(mouseEvent, messageTimeMs);
+                    mouseEvent.eventType = GB_GlobalMouseEventType::RightButtonDown;
+                    DispatchEvent(mouseEvent);
+                }
+
+                if ((buttonFlags & RI_MOUSE_RIGHT_BUTTON_UP) != 0)
+                {
+                    GB_GlobalMouseEvent mouseEvent;
+                    FillGlobalMouseEventCommonFields(mouseEvent, messageTimeMs);
+                    mouseEvent.eventType = GB_GlobalMouseEventType::RightButtonUp;
+                    DispatchEvent(mouseEvent);
+                }
+
+                if ((buttonFlags & RI_MOUSE_MIDDLE_BUTTON_DOWN) != 0)
+                {
+                    GB_GlobalMouseEvent mouseEvent;
+                    FillGlobalMouseEventCommonFields(mouseEvent, messageTimeMs);
+                    mouseEvent.eventType = GB_GlobalMouseEventType::MiddleButtonDown;
+                    DispatchEvent(mouseEvent);
+                }
+
+                if ((buttonFlags & RI_MOUSE_MIDDLE_BUTTON_UP) != 0)
+                {
+                    GB_GlobalMouseEvent mouseEvent;
+                    FillGlobalMouseEventCommonFields(mouseEvent, messageTimeMs);
+                    mouseEvent.eventType = GB_GlobalMouseEventType::MiddleButtonUp;
+                    DispatchEvent(mouseEvent);
+                }
+
+                if ((buttonFlags & RI_MOUSE_BUTTON_4_DOWN) != 0)
+                {
+                    GB_GlobalMouseEvent mouseEvent;
+                    FillGlobalMouseEventCommonFields(mouseEvent, messageTimeMs);
+                    mouseEvent.eventType = GB_GlobalMouseEventType::XButtonDown;
+                    mouseEvent.xButtonType = GB_GlobalMouseXButtonType::XButton1;
+                    DispatchEvent(mouseEvent);
+                }
+
+                if ((buttonFlags & RI_MOUSE_BUTTON_4_UP) != 0)
+                {
+                    GB_GlobalMouseEvent mouseEvent;
+                    FillGlobalMouseEventCommonFields(mouseEvent, messageTimeMs);
+                    mouseEvent.eventType = GB_GlobalMouseEventType::XButtonUp;
+                    mouseEvent.xButtonType = GB_GlobalMouseXButtonType::XButton1;
+                    DispatchEvent(mouseEvent);
+                }
+
+                if ((buttonFlags & RI_MOUSE_BUTTON_5_DOWN) != 0)
+                {
+                    GB_GlobalMouseEvent mouseEvent;
+                    FillGlobalMouseEventCommonFields(mouseEvent, messageTimeMs);
+                    mouseEvent.eventType = GB_GlobalMouseEventType::XButtonDown;
+                    mouseEvent.xButtonType = GB_GlobalMouseXButtonType::XButton2;
+                    DispatchEvent(mouseEvent);
+                }
+
+                if ((buttonFlags & RI_MOUSE_BUTTON_5_UP) != 0)
+                {
+                    GB_GlobalMouseEvent mouseEvent;
+                    FillGlobalMouseEventCommonFields(mouseEvent, messageTimeMs);
+                    mouseEvent.eventType = GB_GlobalMouseEventType::XButtonUp;
+                    mouseEvent.xButtonType = GB_GlobalMouseXButtonType::XButton2;
+                    DispatchEvent(mouseEvent);
+                }
+
+                if ((buttonFlags & RI_MOUSE_WHEEL) != 0)
+                {
+                    GB_GlobalMouseEvent mouseEvent;
+                    FillGlobalMouseEventCommonFields(mouseEvent, messageTimeMs);
+                    mouseEvent.eventType = GB_GlobalMouseEventType::VerticalWheel;
+                    mouseEvent.wheelDelta = static_cast<short>(rawMouse.usButtonData);
+                    DispatchEvent(mouseEvent);
+                }
+
+                if ((buttonFlags & RI_MOUSE_HWHEEL) != 0)
+                {
+                    GB_GlobalMouseEvent mouseEvent;
+                    FillGlobalMouseEventCommonFields(mouseEvent, messageTimeMs);
+                    mouseEvent.eventType = GB_GlobalMouseEventType::HorizontalWheel;
+                    mouseEvent.wheelDelta = static_cast<short>(rawMouse.usButtonData);
+                    DispatchEvent(mouseEvent);
+                }
+            }
+
+        private:
+            static constexpr UINT shutdownWindowMessage = WM_CLOSE;
+
+            static const wchar_t* GetRawInputWindowClassName()
+            {
+                return L"GlobalBase_GB_Mouse_RawInputWindow";
+            }
+
+            GlobalMouseRawInputManager() = default;
+            GlobalMouseRawInputManager(const GlobalMouseRawInputManager&) = delete;
+            GlobalMouseRawInputManager& operator=(const GlobalMouseRawInputManager&) = delete;
+
+            static HINSTANCE GetCurrentModuleHandle()
+            {
+                HMODULE moduleHandle = nullptr;
+                const BOOL succeeded = ::GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                    reinterpret_cast<LPCWSTR>(&GlobalMouseRawInputManager::StaticWindowProc), &moduleHandle);
+                return succeeded != FALSE ? moduleHandle : ::GetModuleHandleW(nullptr);
+            }
+
+            static LRESULT CALLBACK StaticWindowProc(HWND windowHandle, UINT message, WPARAM wParam, LPARAM lParam)
+            {
+                return GetInstance().WindowProc(windowHandle, message, wParam, lParam);
+            }
+
+            LRESULT WindowProc(HWND windowHandle, UINT message, WPARAM wParam, LPARAM lParam)
+            {
+                switch (message)
+                {
+                case WM_INPUT:
+                {
+                    HandleRawInputMessage(windowHandle, wParam, lParam);
+                    if (GET_RAWINPUT_CODE_WPARAM(wParam) == RIM_INPUT)
+                    {
+                        (void)::DefWindowProcW(windowHandle, message, wParam, lParam);
+                    }
+                    return 0;
+                }
+                case WM_CLOSE:
+                    (void)::DestroyWindow(windowHandle);
+                    return 0;
+                case WM_DESTROY:
+                {
+                    {
+                        std::lock_guard<std::mutex> managerLock(managerMutex);
+                        if (rawInputWindowHandle == windowHandle)
+                        {
+                            rawInputWindowHandle = nullptr;
+                        }
+                    }
+                    ::PostQuitMessage(0);
+                    return 0;
+                }
+                default:
+                    return ::DefWindowProcW(windowHandle, message, wParam, lParam);
+                }
+            }
+
+            void HandleRawInputMessage(HWND windowHandle, WPARAM wParam, LPARAM lParam)
+            {
+                (void)windowHandle;
+                (void)wParam;
+
+                UINT rawInputSize = 0;
+                if (::GetRawInputData(reinterpret_cast<HRAWINPUT>(lParam), RID_INPUT, nullptr, &rawInputSize, sizeof(RAWINPUTHEADER)) != 0 || rawInputSize < sizeof(RAWINPUTHEADER))
+                {
+                    return;
+                }
+
+                std::unique_ptr<uint8_t[]> rawInputBuffer(new (std::nothrow) uint8_t[rawInputSize]);
+                if (!rawInputBuffer)
+                {
+                    return;
+                }
+
+                UINT copiedByteCount = rawInputSize;
+                if (::GetRawInputData(reinterpret_cast<HRAWINPUT>(lParam), RID_INPUT, rawInputBuffer.get(), &copiedByteCount, sizeof(RAWINPUTHEADER)) == static_cast<UINT>(-1) || copiedByteCount < sizeof(RAWINPUTHEADER))
+                {
+                    return;
+                }
+
+                const RAWINPUT* rawInput = reinterpret_cast<const RAWINPUT*>(rawInputBuffer.get());
+                if (rawInput == nullptr || rawInput->header.dwType != RIM_TYPEMOUSE)
+                {
+                    return;
+                }
+
+                const uint32_t messageTimeMs = static_cast<uint32_t>(::GetMessageTime());
+                DispatchRawMousePacket(rawInput->data.mouse, messageTimeMs);
+            }
+
+            static bool RegisterMouseRawInput(const HWND windowHandle)
+            {
+                RAWINPUTDEVICE rawInputDevice = {};
+                rawInputDevice.usUsagePage = 0x01;
+                rawInputDevice.usUsage = 0x02;
+                rawInputDevice.dwFlags = RIDEV_INPUTSINK;
+                rawInputDevice.hwndTarget = windowHandle;
+                return ::RegisterRawInputDevices(&rawInputDevice, 1, sizeof(rawInputDevice)) != FALSE;
+            }
+
+            bool EnsureMessageThreadStarted(std::unique_lock<std::mutex>& managerLock)
+            {
+                while (messageThreadStopInProgress)
+                {
+                    messageThreadReadyConditionVariable.wait(managerLock);
+                }
+
+                if (messageThread.joinable())
+                {
+                    while (!messageThreadStartupResolved)
+                    {
+                        messageThreadReadyConditionVariable.wait(managerLock);
+                    }
+                    return rawInputRegisteredSuccessfully;
+                }
+
+                messageThreadStartupResolved = false;
+                rawInputRegisteredSuccessfully = false;
+                rawInputThreadId = 0;
+                rawInputWindowHandle = nullptr;
+                try
+                {
+                    messageThread = std::thread(&GlobalMouseRawInputManager::MessageThreadMain, this);
+                }
+                catch (...)
+                {
+                    return false;
+                }
+
+                while (!messageThreadStartupResolved)
+                {
+                    messageThreadReadyConditionVariable.wait(managerLock);
+                }
+
+                if (!rawInputRegisteredSuccessfully)
+                {
+                    std::thread messageThreadToJoin = std::move(messageThread);
+                    managerLock.unlock();
+                    if (messageThreadToJoin.joinable())
+                    {
+                        messageThreadToJoin.join();
+                    }
+                    managerLock.lock();
+                    rawInputWindowHandle = nullptr;
+                    rawInputThreadId = 0;
+                    messageThreadStartupResolved = false;
+                    rawInputRegisteredSuccessfully = false;
+                }
+
+                return rawInputRegisteredSuccessfully;
+            }
+
+            void MessageThreadMain()
+            {
+                MSG message = {};
+                (void)::PeekMessageW(&message, nullptr, WM_USER, WM_USER, PM_NOREMOVE);
+
+                const DWORD currentThreadId = ::GetCurrentThreadId();
+                const HINSTANCE moduleHandle = GetCurrentModuleHandle();
+
+                WNDCLASSEXW windowClass = {};
+                windowClass.cbSize = sizeof(windowClass);
+                windowClass.lpfnWndProc = &GlobalMouseRawInputManager::StaticWindowProc;
+                windowClass.hInstance = moduleHandle;
+                windowClass.lpszClassName = GetRawInputWindowClassName();
+                const ATOM classAtom = ::RegisterClassExW(&windowClass);
+                const DWORD registerClassError = (classAtom == 0 ? ::GetLastError() : ERROR_SUCCESS);
+
+                HWND windowHandle = nullptr;
+                bool registerSucceeded = false;
+                if (classAtom != 0 || registerClassError == ERROR_CLASS_ALREADY_EXISTS)
+                {
+                    windowHandle = ::CreateWindowExW(0, GetRawInputWindowClassName(), L"", WS_OVERLAPPED, 0, 0, 0, 0, nullptr, nullptr, moduleHandle, nullptr);
+                    if (windowHandle != nullptr)
+                    {
+                        registerSucceeded = RegisterMouseRawInput(windowHandle);
+                    }
+                }
+
+                {
+                    std::lock_guard<std::mutex> managerLock(managerMutex);
+                    rawInputThreadId = currentThreadId;
+                    rawInputWindowHandle = windowHandle;
+                    rawInputRegisteredSuccessfully = registerSucceeded;
+                    messageThreadStartupResolved = true;
+                }
+                messageThreadReadyConditionVariable.notify_all();
+
+                if (!registerSucceeded)
+                {
+                    if (windowHandle != nullptr)
+                    {
+                        (void)::DestroyWindow(windowHandle);
+                    }
+                    if (classAtom != 0)
+                    {
+                        (void)::UnregisterClassW(GetRawInputWindowClassName(), moduleHandle);
+                    }
+                    return;
+                }
+
+                while (::GetMessageW(&message, nullptr, 0, 0) > 0)
+                {
+                    (void)::TranslateMessage(&message);
+                    (void)::DispatchMessageW(&message);
+                }
+
+                if (windowHandle != nullptr && ::IsWindow(windowHandle) != FALSE)
+                {
+                    (void)::DestroyWindow(windowHandle);
+                }
+                (void)::UnregisterClassW(GetRawInputWindowClassName(), moduleHandle);
+
+                std::lock_guard<std::mutex> managerLock(managerMutex);
+                if (rawInputWindowHandle == windowHandle)
+                {
+                    rawInputWindowHandle = nullptr;
+                }
+                if (rawInputThreadId == currentThreadId)
+                {
+                    rawInputThreadId = 0;
+                }
+            }
+
+            void RemoveExpiredListenersLocked()
+            {
+                for (auto listenerIter = listeners.begin(); listenerIter != listeners.end(); )
+                {
+                    if (listenerIter->second.expired())
+                    {
+                        listenerIter = listeners.erase(listenerIter);
+                    }
+                    else
+                    {
+                        ++listenerIter;
+                    }
+                }
+            }
+
+            void StopMessageThreadIfIdle(std::unique_lock<std::mutex>& managerLock)
+            {
+                if (!listeners.empty() || !messageThread.joinable())
+                {
+                    return;
+                }
+
+                messageThreadStopInProgress = true;
+                const HWND windowHandleToClose = rawInputWindowHandle;
+                const DWORD threadIdToQuit = rawInputThreadId;
+                std::thread messageThreadToJoin = std::move(messageThread);
+                managerLock.unlock();
+                if (windowHandleToClose != nullptr)
+                {
+                    (void)::PostMessageW(windowHandleToClose, shutdownWindowMessage, 0, 0);
+                }
+                else if (threadIdToQuit != 0)
+                {
+                    (void)::PostThreadMessageW(threadIdToQuit, WM_QUIT, 0, 0);
+                }
+                if (messageThreadToJoin.joinable())
+                {
+                    messageThreadToJoin.join();
+                }
+                managerLock.lock();
+                rawInputWindowHandle = nullptr;
+                rawInputThreadId = 0;
+                messageThreadStartupResolved = false;
+                rawInputRegisteredSuccessfully = false;
+                messageThreadStopInProgress = false;
+                messageThreadReadyConditionVariable.notify_all();
+            }
+
+        private:
+            std::mutex managerMutex;
+            std::condition_variable messageThreadReadyConditionVariable;
+            std::unordered_map<uint64_t, std::weak_ptr<GlobalMouseListenerState>> listeners;
+            std::thread messageThread;
+            HWND rawInputWindowHandle = nullptr;
+            DWORD rawInputThreadId = 0;
+            uint64_t nextListenerId = 1;
+            bool messageThreadStartupResolved = false;
+            bool rawInputRegisteredSuccessfully = false;
+            bool messageThreadStopInProgress = false;
+            bool shuttingDown = false;
+        };
+    }
+}
+#endif
+
+#if defined(_WIN32)
+class GB_GlobalMouseListener::Impl
+{
+public:
+    Impl() : listenerState(std::make_shared<internal::GlobalMouseListenerState>())
+    {
+    }
+
+    void SetInterestedEvents(const GB_GlobalMouseEventMask eventMask)
+    {
+        listenerState->SetInterestedEvents(eventMask);
+    }
+
+    GB_GlobalMouseEventMask GetInterestedEvents() const
+    {
+        return listenerState->GetInterestedEvents();
+    }
+
+    void AddInterestedEvent(const GB_GlobalMouseEventType eventType)
+    {
+        listenerState->AddInterestedEvent(eventType);
+    }
+
+    void RemoveInterestedEvent(const GB_GlobalMouseEventType eventType)
+    {
+        listenerState->RemoveInterestedEvent(eventType);
+    }
+
+    bool IsInterestedIn(const GB_GlobalMouseEventType eventType) const
+    {
+        return listenerState->IsInterestedIn(eventType);
+    }
+
+    void SetUnifiedCallback(const GB_GlobalMouseEventCallback& callback, const GB_GlobalMouseCallbackOptions& callbackOptions)
+    {
+        listenerState->SetUnifiedCallback(callback, callbackOptions);
+    }
+
+    void ClearUnifiedCallback()
+    {
+        listenerState->ClearUnifiedCallback();
+    }
+
+    void SetEventCallback(const GB_GlobalMouseEventType eventType, const GB_GlobalMouseEventCallback& callback, const GB_GlobalMouseCallbackOptions& callbackOptions)
+    {
+        listenerState->SetEventCallback(eventType, callback, callbackOptions);
+    }
+
+    void ClearEventCallback(const GB_GlobalMouseEventType eventType)
+    {
+        listenerState->ClearEventCallback(eventType);
+    }
+
+    void ClearAllCallbacks()
+    {
+        listenerState->ClearAllCallbacks();
+    }
+
+    bool Start()
+    {
+        std::lock_guard<std::mutex> lifecycleLock(lifecycleMutex);
+        if (listenerState->IsListening())
+        {
+            return true;
+        }
+
+        if (!listenerState->StartWorker())
+        {
+            return false;
+        }
+
+        listenerState->SetListening(true);
+        if (internal::GlobalMouseRawInputManager::GetInstance().RegisterListener(listenerState, listenerId))
+        {
+            return true;
+        }
+
+        listenerState->SetListening(false);
+        listenerState->StopWorker();
+        listenerId = 0;
+        return false;
+    }
+
+    void Stop()
+    {
+        std::lock_guard<std::mutex> lifecycleLock(lifecycleMutex);
+        if (!listenerState->IsListening() && listenerId == 0)
+        {
+            listenerState->StopWorker();
+            return;
+        }
+
+        listenerState->SetListening(false);
+        const uint64_t listenerIdToRemove = listenerId;
+        listenerId = 0;
+        internal::GlobalMouseRawInputManager::GetInstance().UnregisterListener(listenerIdToRemove);
+        listenerState->StopWorker();
+    }
+
+    bool IsListening() const
+    {
+        return listenerState->IsListening();
+    }
+
+private:
+    std::shared_ptr<internal::GlobalMouseListenerState> listenerState;
+    std::mutex lifecycleMutex;
+    uint64_t listenerId = 0;
+};
+#else
+class GB_GlobalMouseListener::Impl
+{
+public:
+    void SetInterestedEvents(const GB_GlobalMouseEventMask eventMask)
+    {
+        (void)eventMask;
+    }
+
+    GB_GlobalMouseEventMask GetInterestedEvents() const
+    {
+        return GB_GlobalMouseEventMask::None;
+    }
+
+    void AddInterestedEvent(const GB_GlobalMouseEventType eventType)
+    {
+        (void)eventType;
+    }
+
+    void RemoveInterestedEvent(const GB_GlobalMouseEventType eventType)
+    {
+        (void)eventType;
+    }
+
+    bool IsInterestedIn(const GB_GlobalMouseEventType eventType) const
+    {
+        (void)eventType;
+        return false;
+    }
+
+    void SetUnifiedCallback(const GB_GlobalMouseEventCallback& callback, const GB_GlobalMouseCallbackOptions& callbackOptions)
+    {
+        (void)callback;
+        (void)callbackOptions;
+    }
+
+    void ClearUnifiedCallback()
+    {
+    }
+
+    void SetEventCallback(const GB_GlobalMouseEventType eventType, const GB_GlobalMouseEventCallback& callback, const GB_GlobalMouseCallbackOptions& callbackOptions)
+    {
+        (void)eventType;
+        (void)callback;
+        (void)callbackOptions;
+    }
+
+    void ClearEventCallback(const GB_GlobalMouseEventType eventType)
+    {
+        (void)eventType;
+    }
+
+    void ClearAllCallbacks()
+    {
+    }
+
+    bool Start()
+    {
+        return false;
+    }
+
+    void Stop()
+    {
+    }
+
+    bool IsListening() const
+    {
+        return false;
+    }
+};
+#endif
+
+GB_GlobalMouseListener::GB_GlobalMouseListener() : impl_(new Impl())
+{
+}
+
+GB_GlobalMouseListener::~GB_GlobalMouseListener()
+{
+    if (impl_ != nullptr)
+    {
+        impl_->Stop();
+        delete impl_;
+        impl_ = nullptr;
+    }
+}
+
+GB_GlobalMouseListener::GB_GlobalMouseListener(GB_GlobalMouseListener&& other) noexcept : impl_(other.impl_)
+{
+    other.impl_ = nullptr;
+}
+
+GB_GlobalMouseListener& GB_GlobalMouseListener::operator=(GB_GlobalMouseListener&& other) noexcept
+{
+    if (this == &other)
+    {
+        return *this;
+    }
+
+    if (impl_ != nullptr)
+    {
+        impl_->Stop();
+        delete impl_;
+    }
+
+    impl_ = other.impl_;
+    other.impl_ = nullptr;
+    return *this;
+}
+
+bool GB_GlobalMouseListener::IsSupported()
+{
+#if defined(_WIN32)
+    return true;
+#else
+    return false;
+#endif
+}
+
+void GB_GlobalMouseListener::SetInterestedEvents(const GB_GlobalMouseEventMask eventMask)
+{
+    if (impl_ == nullptr)
+    {
+        return;
+    }
+
+    impl_->SetInterestedEvents(eventMask);
+}
+
+GB_GlobalMouseEventMask GB_GlobalMouseListener::GetInterestedEvents() const
+{
+    if (impl_ == nullptr)
+    {
+        return GB_GlobalMouseEventMask::None;
+    }
+
+    return impl_->GetInterestedEvents();
+}
+
+void GB_GlobalMouseListener::ClearInterestedEvents()
+{
+    SetInterestedEvents(GB_GlobalMouseEventMask::None);
+}
+
+void GB_GlobalMouseListener::AddInterestedEvent(const GB_GlobalMouseEventType eventType)
+{
+    if (impl_ == nullptr)
+    {
+        return;
+    }
+
+    impl_->AddInterestedEvent(eventType);
+}
+
+void GB_GlobalMouseListener::RemoveInterestedEvent(const GB_GlobalMouseEventType eventType)
+{
+    if (impl_ == nullptr)
+    {
+        return;
+    }
+
+    impl_->RemoveInterestedEvent(eventType);
+}
+
+bool GB_GlobalMouseListener::IsInterestedIn(const GB_GlobalMouseEventType eventType) const
+{
+    if (impl_ == nullptr)
+    {
+        return false;
+    }
+
+    return impl_->IsInterestedIn(eventType);
+}
+
+void GB_GlobalMouseListener::SetUnifiedCallback(const GB_GlobalMouseEventCallback& callback, const GB_GlobalMouseCallbackOptions& callbackOptions)
+{
+    if (impl_ == nullptr)
+    {
+        return;
+    }
+
+    impl_->SetUnifiedCallback(callback, callbackOptions);
+}
+
+void GB_GlobalMouseListener::ClearUnifiedCallback()
+{
+    if (impl_ == nullptr)
+    {
+        return;
+    }
+
+    impl_->ClearUnifiedCallback();
+}
+
+void GB_GlobalMouseListener::SetEventCallback(const GB_GlobalMouseEventType eventType, const GB_GlobalMouseEventCallback& callback, const GB_GlobalMouseCallbackOptions& callbackOptions)
+{
+    if (impl_ == nullptr)
+    {
+        return;
+    }
+
+    impl_->SetEventCallback(eventType, callback, callbackOptions);
+}
+
+void GB_GlobalMouseListener::ClearEventCallback(const GB_GlobalMouseEventType eventType)
+{
+    if (impl_ == nullptr)
+    {
+        return;
+    }
+
+    impl_->ClearEventCallback(eventType);
+}
+
+void GB_GlobalMouseListener::ClearAllCallbacks()
+{
+    if (impl_ == nullptr)
+    {
+        return;
+    }
+
+    impl_->ClearAllCallbacks();
+}
+
+bool GB_GlobalMouseListener::Start()
+{
+    if (impl_ == nullptr)
+    {
+        return false;
+    }
+
+    return impl_->Start();
+}
+
+void GB_GlobalMouseListener::Stop()
+{
+    if (impl_ == nullptr)
+    {
+        return;
+    }
+
+    impl_->Stop();
+}
+
+bool GB_GlobalMouseListener::IsListening() const
+{
+    if (impl_ == nullptr)
+    {
+        return false;
+    }
+
+    return impl_->IsListening();
+}

@@ -7,6 +7,9 @@
 #include "../Geometry/GB_Vector2d.h"
 #include "../CV/GB_Image.h"
 
+#include <cstdint>
+#include <functional>
+
 /**
  * @brief 鼠标移动方式。
  *
@@ -107,6 +110,170 @@ struct GB_MouseMoveOptions
      */
     double maxStepPixelDistance = 8;
 };
+
+
+/**
+ * @brief 全局鼠标事件类型。
+ *
+ * 说明：
+ * - 这些事件均基于系统级全局低级鼠标钩子抽象而来，监听范围不局限于某一个窗口；
+ * - XButtonDown / XButtonUp 事件需要结合 xButtonType 字段区分是 XBUTTON1 还是 XBUTTON2；
+ * - VerticalWheel / HorizontalWheel 事件需要结合 wheelDelta 字段读取滚动方向与滚动量。
+ */
+enum class GB_GlobalMouseEventType
+{
+    Move = 0,
+    LeftButtonDown = 1,
+    LeftButtonUp = 2,
+    RightButtonDown = 3,
+    RightButtonUp = 4,
+    MiddleButtonDown = 5,
+    MiddleButtonUp = 6,
+    XButtonDown = 7,
+    XButtonUp = 8,
+    VerticalWheel = 9,
+    HorizontalWheel = 10
+};
+
+/**
+ * @brief 全局鼠标事件掩码。
+ *
+ * 说明：
+ * - 用于批量指定“当前关心哪些事件”；
+ * - 可通过按位或组合多个事件。
+ */
+enum class GB_GlobalMouseEventMask : uint32_t
+{
+    None = 0,
+    Move = 1u << 0,
+    LeftButtonDown = 1u << 1,
+    LeftButtonUp = 1u << 2,
+    RightButtonDown = 1u << 3,
+    RightButtonUp = 1u << 4,
+    MiddleButtonDown = 1u << 5,
+    MiddleButtonUp = 1u << 6,
+    XButtonDown = 1u << 7,
+    XButtonUp = 1u << 8,
+    VerticalWheel = 1u << 9,
+    HorizontalWheel = 1u << 10,
+    All = (1u << 11) - 1u
+};
+
+inline GB_GlobalMouseEventMask operator|(const GB_GlobalMouseEventMask leftMask, const GB_GlobalMouseEventMask rightMask)
+{
+    return static_cast<GB_GlobalMouseEventMask>(static_cast<uint32_t>(leftMask) | static_cast<uint32_t>(rightMask));
+}
+
+inline GB_GlobalMouseEventMask operator&(const GB_GlobalMouseEventMask leftMask, const GB_GlobalMouseEventMask rightMask)
+{
+    return static_cast<GB_GlobalMouseEventMask>(static_cast<uint32_t>(leftMask) & static_cast<uint32_t>(rightMask));
+}
+
+inline GB_GlobalMouseEventMask operator~(const GB_GlobalMouseEventMask mask)
+{
+    return static_cast<GB_GlobalMouseEventMask>(~static_cast<uint32_t>(mask));
+}
+
+inline GB_GlobalMouseEventMask& operator|=(GB_GlobalMouseEventMask& leftMask, const GB_GlobalMouseEventMask rightMask)
+{
+    leftMask = (leftMask | rightMask);
+    return leftMask;
+}
+
+inline GB_GlobalMouseEventMask& operator&=(GB_GlobalMouseEventMask& leftMask, const GB_GlobalMouseEventMask rightMask)
+{
+    leftMask = (leftMask & rightMask);
+    return leftMask;
+}
+
+/**
+ * @brief 扩展侧键类型。
+ */
+enum class GB_GlobalMouseXButtonType
+{
+    None = 0,
+    XButton1 = 1,
+    XButton2 = 2
+};
+
+/**
+ * @brief 单个全局鼠标事件的描述信息。
+ */
+struct GB_GlobalMouseEvent
+{
+    /**
+     * @brief 事件类型。
+     */
+    GB_GlobalMouseEventType eventType = GB_GlobalMouseEventType::Move;
+
+    /**
+     * @brief 事件发生位置，单位为虚拟桌面坐标系中的物理像素。
+     *
+     * 说明：
+     * - 在 Windows 低级鼠标钩子语义下，该坐标来自系统提供的 per-monitor-aware screen coordinates；
+     * - 对多显示器与高 DPI 场景更友好。
+     */
+    GB_Point2d physicalPixelPoint;
+
+    /**
+     * @brief 滚轮增量。
+     *
+     * 说明：
+     * - 仅当 eventType 为 VerticalWheel 或 HorizontalWheel 时有意义；
+     * - 正负方向遵循 Windows 原生语义；
+     * - 一个标准刻度通常对应 120。
+     */
+    int wheelDelta = 0;
+
+    /**
+     * @brief 扩展侧键类型。
+     *
+     * 说明：
+     * - 仅当 eventType 为 XButtonDown 或 XButtonUp 时有意义。
+     */
+    GB_GlobalMouseXButtonType xButtonType = GB_GlobalMouseXButtonType::None;
+
+    /**
+     * @brief 是否为注入事件。
+     */
+    bool isInjected = false;
+
+    /**
+     * @brief 是否为来自更低完整性级别进程的注入事件。
+     */
+    bool isLowerIntegrityInjected = false;
+
+    /**
+     * @brief 系统原始消息时间戳，单位为毫秒。
+     */
+    uint32_t messageTimeMs = 0;
+
+    /**
+     * @brief 当前库接收到该事件时的单调时钟时间戳，单位为毫秒。
+     */
+    uint64_t receiveTickCountMs = 0;
+};
+
+/**
+ * @brief 全局鼠标回调选项。
+ */
+struct GB_GlobalMouseCallbackOptions
+{
+    /**
+     * @brief 鼠标移动事件的最小触发间隔，单位为毫秒。
+     *
+     * 说明：
+     * - 仅当目标事件为 Move 时生效；
+     * - 0 表示不额外限流；
+     * - 该值主要用于避免移动事件过于频繁导致外部回调压力过大。
+     */
+    uint32_t mouseMoveMinTriggerIntervalMs = 0;
+};
+
+/**
+ * @brief 全局鼠标事件回调函数类型。
+ */
+using GB_GlobalMouseEventCallback = std::function<void(const GB_GlobalMouseEvent& mouseEvent)>;
 
 /**
  * @brief 与鼠标 / 光标相关的 Windows 工具类。
@@ -329,6 +496,135 @@ public:
      * - 若 wheelDelta 为 0，则视为无操作并直接返回 true。
      */
     static bool ScrollHorizontalWheel(int wheelDelta);
+};
+
+
+/**
+ * @brief 系统级全局鼠标监听器。
+ *
+ * 说明：
+ * - Windows 下内部基于 Raw Input + 隐藏消息窗口实现，监听范围不局限于某个窗口；
+ * - 对外回调采用异步触发：底层消息线程只负责快速采集与分发，真正的用户回调在监听器自己的工作线程中执行，以尽量避免拖慢鼠标输入处理；
+ * - 该类本身不是单例，但底层 Raw Input 监听源会在进程内自动共享，因此多个模块可以各自创建自己的监听器对象；
+ * - 需要注意：Windows 规定同一进程内，同一类 Raw Input 设备最终只会把消息投递到“最后一次注册”的目标窗口，因此本库内部会统一复用同一个底层目标窗口，以避免多个监听器相互覆盖。
+ */
+class GLOBALBASE_PORT GB_GlobalMouseListener
+{
+public:
+    GB_GlobalMouseListener();
+    ~GB_GlobalMouseListener();
+
+    GB_GlobalMouseListener(const GB_GlobalMouseListener&) = delete;
+    GB_GlobalMouseListener& operator=(const GB_GlobalMouseListener&) = delete;
+
+    GB_GlobalMouseListener(GB_GlobalMouseListener&& other) noexcept;
+    GB_GlobalMouseListener& operator=(GB_GlobalMouseListener&& other) noexcept;
+
+    /**
+     * @brief 当前平台是否支持该全局监听器。
+     */
+    static bool IsSupported();
+
+    /**
+     * @brief 设置当前关心的事件集合。
+     */
+    void SetInterestedEvents(GB_GlobalMouseEventMask eventMask);
+
+    /**
+     * @brief 获取当前关心的事件集合。
+     */
+    GB_GlobalMouseEventMask GetInterestedEvents() const;
+
+    /**
+     * @brief 清空当前关心的事件集合。
+     */
+    void ClearInterestedEvents();
+
+    /**
+     * @brief 新增一个关心的事件。
+     */
+    void AddInterestedEvent(GB_GlobalMouseEventType eventType);
+
+    /**
+     * @brief 移除一个关心的事件。
+     */
+    void RemoveInterestedEvent(GB_GlobalMouseEventType eventType);
+
+    /**
+     * @brief 判断当前是否关心指定事件。
+     */
+    bool IsInterestedIn(GB_GlobalMouseEventType eventType) const;
+
+    /**
+     * @brief 设置统一回调函数。
+     *
+     * @param callback 统一回调函数。传入空回调可视为清空。
+     * @param callbackOptions 回调选项。
+     *
+     * 说明：
+     * - 统一回调会接收“当前关心的所有事件”；
+     * - 若某个事件同时设置了统一回调和单独回调，则两者都会被异步触发。
+     */
+    void SetUnifiedCallback(const GB_GlobalMouseEventCallback& callback, const GB_GlobalMouseCallbackOptions& callbackOptions = GB_GlobalMouseCallbackOptions());
+
+    /**
+     * @brief 清空统一回调函数。
+     */
+    void ClearUnifiedCallback();
+
+    /**
+     * @brief 为指定事件单独设置回调函数。
+     *
+     * @param eventType 事件类型。
+     * @param callback 单独回调函数。传入空回调可视为清空。
+     * @param callbackOptions 回调选项。
+     *
+     * 说明：
+     * - 设置单独回调时，会自动把该事件加入“当前关心的事件集合”；
+     * - 对于非 Move 事件，mouseMoveMinTriggerIntervalMs 会被忽略。
+     */
+    void SetEventCallback(GB_GlobalMouseEventType eventType, const GB_GlobalMouseEventCallback& callback, const GB_GlobalMouseCallbackOptions& callbackOptions = GB_GlobalMouseCallbackOptions());
+
+    /**
+     * @brief 清空指定事件的单独回调函数。
+     */
+    void ClearEventCallback(GB_GlobalMouseEventType eventType);
+
+    /**
+     * @brief 清空所有单独回调函数与统一回调函数。
+     */
+    void ClearAllCallbacks();
+
+    /**
+     * @brief 启动监听。
+     *
+     * @return true=启动成功；false=启动失败。
+     *
+     * 说明：
+     * - 本接口不会阻塞调用方；
+     * - 若已经处于监听状态，则直接返回 true；
+     * - 启动后，后续对“关心事件集合 / 回调函数”的修改会立即生效。
+     */
+    bool Start();
+
+    /**
+     * @brief 停止监听。
+     *
+     * 说明：
+     * - 停止后不会再接收新的系统事件；
+     * - 已经开始执行的回调不会被强行中断；
+     * - 尚未执行的排队事件会被丢弃。
+     */
+    void Stop();
+
+    /**
+     * @brief 当前是否处于监听状态。
+     */
+    bool IsListening() const;
+
+private:
+    class Impl;
+    Impl* impl_ = nullptr;
 };
 
 #endif
