@@ -242,8 +242,8 @@ namespace
                 return false;
             }
 
-            const double minValue = static_cast<double>(std::numeric_limits<int64_t>::min());
-            const double maxValue = static_cast<double>(std::numeric_limits<int64_t>::max());
+            constexpr double minValue = static_cast<double>(std::numeric_limits<int64_t>::min());
+            constexpr double maxValue = static_cast<double>(std::numeric_limits<int64_t>::max());
             if (value < minValue || value > maxValue)
             {
                 return false;
@@ -1514,7 +1514,75 @@ namespace
             return TryClampPointToRectangle(targetPhysicalPixelPoint, screenRectangle, targetPoint);
         }
 
-        static bool TryProjectPointToNearestScreenPixel(const std::vector<GB_ScreenInfo>& screenInfos, const GB_Point2d& physicalPixelPoint, POINT& projectedPoint, int& projectedScreenIndex)
+        static bool TryGetCursorClipRectangle(GB_Rectangle& clipRectangle)
+        {
+            clipRectangle = GB_Rectangle();
+
+            RECT clipRect = {};
+            if (::GetClipCursor(&clipRect) == FALSE)
+            {
+                return false;
+            }
+
+            if (clipRect.right <= clipRect.left || clipRect.bottom <= clipRect.top)
+            {
+                return false;
+            }
+
+            clipRectangle = GB_Rectangle(static_cast<double>(clipRect.left), static_cast<double>(clipRect.top), static_cast<double>(clipRect.right), static_cast<double>(clipRect.bottom));
+            return clipRectangle.IsValid() && clipRectangle.Width() > 0.0 && clipRectangle.Height() > 0.0;
+        }
+
+        static bool TryClampPointToClipCursorRectangle(const POINT& sourcePoint, POINT& clampedPoint)
+        {
+            clampedPoint = sourcePoint;
+
+            GB_Rectangle clipRectangle;
+            if (!TryGetCursorClipRectangle(clipRectangle))
+            {
+                return true;
+            }
+
+            return TryClampPointToRectangle(GB_Point2d(static_cast<double>(sourcePoint.x), static_cast<double>(sourcePoint.y)), clipRectangle, clampedPoint);
+        }
+
+        static bool TryProjectPointToSpecificScreenPixel(const std::vector<GB_ScreenInfo>& screenInfos, const GB_Point2d& physicalPixelPoint, const int screenIndex, POINT& projectedPoint, double& distanceSquared)
+        {
+            projectedPoint.x = 0;
+            projectedPoint.y = 0;
+            distanceSquared = 0.0;
+
+            if (!IsFinitePoint(physicalPixelPoint))
+            {
+                return false;
+            }
+
+            GB_Rectangle screenRectangle;
+            if (!TryGetScreenRectangle(screenInfos, screenIndex, screenRectangle))
+            {
+                return false;
+            }
+
+            GB_Rectangle clipRectangle;
+            if (TryGetCursorClipRectangle(clipRectangle))
+            {
+                screenRectangle = screenRectangle.Intersected(clipRectangle);
+                if (!screenRectangle.IsValid() || screenRectangle.Width() <= 0.0 || screenRectangle.Height() <= 0.0)
+                {
+                    return false;
+                }
+            }
+
+            const double clampedX = std::max(screenRectangle.minX, std::min(physicalPixelPoint.x, screenRectangle.maxX - 1.0));
+            const double clampedY = std::max(screenRectangle.minY, std::min(physicalPixelPoint.y, screenRectangle.maxY - 1.0));
+            const double deltaX = physicalPixelPoint.x - clampedX;
+            const double deltaY = physicalPixelPoint.y - clampedY;
+            distanceSquared = deltaX * deltaX + deltaY * deltaY;
+
+            return TryClampPointToRectangle(GB_Point2d(clampedX, clampedY), screenRectangle, projectedPoint);
+        }
+
+        static bool TryProjectPointToNearestScreenPixel(const std::vector<GB_ScreenInfo>& screenInfos, const GB_Point2d& physicalPixelPoint, POINT& projectedPoint, int& projectedScreenIndex, const int preferredScreenIndex = -1)
         {
             projectedPoint.x = 0;
             projectedPoint.y = 0;
@@ -1525,49 +1593,25 @@ namespace
                 return false;
             }
 
-            int containingScreenIndex = -1;
-            if (TryGetContainingScreenIndex(screenInfos, physicalPixelPoint, containingScreenIndex))
-            {
-                GB_Rectangle containingRectangle;
-                if (!TryGetScreenRectangle(screenInfos, containingScreenIndex, containingRectangle) || !TryClampPointToRectangle(physicalPixelPoint, containingRectangle, projectedPoint))
-                {
-                    return false;
-                }
-
-                projectedScreenIndex = containingScreenIndex;
-                return true;
-            }
-
             bool hasBestPoint = false;
-            double bestDistanceSquared = 0;
+            double bestDistanceSquared = 0.0;
             POINT bestPoint = {};
             int bestScreenIndex = -1;
 
             for (size_t i = 0; i < screenInfos.size(); i++)
             {
-                const GB_Rectangle& screenRectangle = screenInfos[i].virtualScreenRectangle;
-                if (!screenRectangle.IsValid() || screenRectangle.Width() <= 0.0 || screenRectangle.Height() <= 0.0)
+                POINT candidatePoint = {};
+                double candidateDistanceSquared = 0.0;
+                if (!TryProjectPointToSpecificScreenPixel(screenInfos, physicalPixelPoint, static_cast<int>(i), candidatePoint, candidateDistanceSquared))
                 {
                     continue;
                 }
 
-                const double clampedX = std::max(screenRectangle.minX, std::min(physicalPixelPoint.x, screenRectangle.maxX - 1.0));
-                const double clampedY = std::max(screenRectangle.minY, std::min(physicalPixelPoint.y, screenRectangle.maxY - 1.0));
-                const double deltaX = physicalPixelPoint.x - clampedX;
-                const double deltaY = physicalPixelPoint.y - clampedY;
-                const double distanceSquared = deltaX * deltaX + deltaY * deltaY;
-
-                POINT clampedPoint = {};
-                if (!TryClampPointToRectangle(GB_Point2d(clampedX, clampedY), screenRectangle, clampedPoint))
-                {
-                    continue;
-                }
-
-                if (!hasBestPoint || distanceSquared < bestDistanceSquared || (distanceSquared == bestDistanceSquared && screenInfos[i].isPrimary))
+                if (!hasBestPoint || candidateDistanceSquared < bestDistanceSquared || (candidateDistanceSquared == bestDistanceSquared && screenInfos[i].isPrimary))
                 {
                     hasBestPoint = true;
-                    bestDistanceSquared = distanceSquared;
-                    bestPoint = clampedPoint;
+                    bestDistanceSquared = candidateDistanceSquared;
+                    bestPoint = candidatePoint;
                     bestScreenIndex = static_cast<int>(i);
                 }
             }
@@ -1575,6 +1619,22 @@ namespace
             if (!hasBestPoint)
             {
                 return false;
+            }
+
+            if (preferredScreenIndex >= 0 && static_cast<size_t>(preferredScreenIndex) < screenInfos.size() && preferredScreenIndex != bestScreenIndex)
+            {
+                POINT preferredPoint = {};
+                double preferredDistanceSquared = 0.0;
+                if (TryProjectPointToSpecificScreenPixel(screenInfos, physicalPixelPoint, preferredScreenIndex, preferredPoint, preferredDistanceSquared))
+                {
+                    constexpr double screenSwitchHysteresisDistanceSquared = 64.0;
+                    if (preferredDistanceSquared <= bestDistanceSquared + screenSwitchHysteresisDistanceSquared)
+                    {
+                        projectedPoint = preferredPoint;
+                        projectedScreenIndex = preferredScreenIndex;
+                        return true;
+                    }
+                }
             }
 
             projectedPoint = bestPoint;
@@ -1605,6 +1665,16 @@ namespace
             return std::numeric_limits<double>::infinity();
         }
 
+        static double GetHumanLikeMinimumDurationMs(const double distancePixel)
+        {
+            if (!(distancePixel > 0.0) || !std::isfinite(distancePixel))
+            {
+                return 0.0;
+            }
+
+            return 18.0 + std::sqrt(distancePixel) * 6.5;
+        }
+
         static double ResolveMoveDurationMs(const double distancePixel, const GB_MouseMoveOptions& moveOptions)
         {
             if (!(distancePixel > 0.0))
@@ -1617,6 +1687,11 @@ namespace
             if (std::isfinite(defaultSpeedPixelPerSecond) && defaultSpeedPixelPerSecond > 0.0)
             {
                 baseDurationMs = distancePixel * 1000.0 / defaultSpeedPixelPerSecond;
+            }
+
+            if (moveOptions.moveMode == GB_MouseMoveMode::HumanLike)
+            {
+                baseDurationMs = std::max(baseDurationMs, GetHumanLikeMinimumDurationMs(distancePixel));
             }
 
             double lowerBoundMs = 0.0;
@@ -1673,6 +1748,101 @@ namespace
             return t;
         }
 
+        static uint64_t MixUint64(uint64_t value)
+        {
+            value ^= value >> 30;
+            value *= 0xbf58476d1ce4e5b9ull;
+            value ^= value >> 27;
+            value *= 0x94d049bb133111ebull;
+            value ^= value >> 31;
+            return value;
+        }
+
+        static double GetDeterministicUnitValueForMove(const POINT& startPoint, const POINT& targetPoint)
+        {
+            uint64_t mixedValue = 0x9e3779b97f4a7c15ull;
+            mixedValue ^= static_cast<uint64_t>(static_cast<uint32_t>(startPoint.x)) + 0x9e3779b97f4a7c15ull + (mixedValue << 6) + (mixedValue >> 2);
+            mixedValue ^= static_cast<uint64_t>(static_cast<uint32_t>(startPoint.y)) + 0x9e3779b97f4a7c15ull + (mixedValue << 6) + (mixedValue >> 2);
+            mixedValue ^= static_cast<uint64_t>(static_cast<uint32_t>(targetPoint.x)) + 0x9e3779b97f4a7c15ull + (mixedValue << 6) + (mixedValue >> 2);
+            mixedValue ^= static_cast<uint64_t>(static_cast<uint32_t>(targetPoint.y)) + 0x9e3779b97f4a7c15ull + (mixedValue << 6) + (mixedValue >> 2);
+            const uint64_t mixedResult = MixUint64(mixedValue);
+            return static_cast<double>(mixedResult) / static_cast<double>((std::numeric_limits<uint64_t>::max)());
+        }
+
+        static GB_Point2d EvaluateCubicBezierPoint(const GB_Point2d& startPoint, const GB_Point2d& controlPoint1, const GB_Point2d& controlPoint2, const GB_Point2d& endPoint, const double progress)
+        {
+            const double t = std::max(0.0, std::min(1.0, progress));
+            const double u = 1.0 - t;
+            const double uu = u * u;
+            const double tt = t * t;
+            const double uuu = uu * u;
+            const double ttt = tt * t;
+
+            return GB_Point2d(
+                uuu * startPoint.x + 3.0 * uu * t * controlPoint1.x + 3.0 * u * tt * controlPoint2.x + ttt * endPoint.x,
+                uuu * startPoint.y + 3.0 * uu * t * controlPoint1.y + 3.0 * u * tt * controlPoint2.y + ttt * endPoint.y);
+        }
+
+        static bool TryBuildHumanLikeBezierControlPoints(const POINT& startPoint, const POINT& targetPoint, GB_Point2d& controlPoint1, GB_Point2d& controlPoint2)
+        {
+            controlPoint1 = GB_Point2d();
+            controlPoint2 = GB_Point2d();
+
+            const double deltaX = static_cast<double>(targetPoint.x) - static_cast<double>(startPoint.x);
+            const double deltaY = static_cast<double>(targetPoint.y) - static_cast<double>(startPoint.y);
+            const double distancePixel = std::sqrt(deltaX * deltaX + deltaY * deltaY);
+            if (!(distancePixel > 12.0) || !std::isfinite(distancePixel))
+            {
+                return false;
+            }
+
+            const double inverseDistance = 1.0 / distancePixel;
+            const double directionX = deltaX * inverseDistance;
+            const double directionY = deltaY * inverseDistance;
+            const double normalX = -directionY;
+            const double normalY = directionX;
+
+            const double unitValue = GetDeterministicUnitValueForMove(startPoint, targetPoint);
+            const double sideSign = unitValue >= 0.5 ? 1.0 : -1.0;
+            const double curvatureScale = 0.75 + unitValue * 0.5;
+            const double lateralOffsetPixel = std::min(36.0, std::max(2.0, distancePixel * 0.12 * curvatureScale));
+            const double firstControlAlongDistance = distancePixel * (0.24 + unitValue * 0.06);
+            const double secondControlAlongDistance = distancePixel * (0.70 + unitValue * 0.06);
+
+            controlPoint1.Set(
+                static_cast<double>(startPoint.x) + directionX * firstControlAlongDistance + normalX * sideSign * lateralOffsetPixel,
+                static_cast<double>(startPoint.y) + directionY * firstControlAlongDistance + normalY * sideSign * lateralOffsetPixel);
+            controlPoint2.Set(
+                static_cast<double>(startPoint.x) + directionX * secondControlAlongDistance + normalX * sideSign * lateralOffsetPixel * 0.45,
+                static_cast<double>(startPoint.y) + directionY * secondControlAlongDistance + normalY * sideSign * lateralOffsetPixel * 0.45);
+            return true;
+        }
+
+        static GB_Point2d EvaluateMovePathPoint(const POINT& startPoint, const POINT& targetPoint, const GB_MouseMoveMode moveMode, const double linearProgress)
+        {
+            const double sampledProgress = SampleMoveProgress(moveMode, linearProgress);
+            const GB_Point2d startPhysicalPixelPoint(static_cast<double>(startPoint.x), static_cast<double>(startPoint.y));
+            const GB_Point2d targetPhysicalPixelPoint(static_cast<double>(targetPoint.x), static_cast<double>(targetPoint.y));
+
+            if (moveMode != GB_MouseMoveMode::HumanLike)
+            {
+                return GB_Point2d(
+                    startPhysicalPixelPoint.x + (targetPhysicalPixelPoint.x - startPhysicalPixelPoint.x) * sampledProgress,
+                    startPhysicalPixelPoint.y + (targetPhysicalPixelPoint.y - startPhysicalPixelPoint.y) * sampledProgress);
+            }
+
+            GB_Point2d controlPoint1;
+            GB_Point2d controlPoint2;
+            if (!TryBuildHumanLikeBezierControlPoints(startPoint, targetPoint, controlPoint1, controlPoint2))
+            {
+                return GB_Point2d(
+                    startPhysicalPixelPoint.x + (targetPhysicalPixelPoint.x - startPhysicalPixelPoint.x) * sampledProgress,
+                    startPhysicalPixelPoint.y + (targetPhysicalPixelPoint.y - startPhysicalPixelPoint.y) * sampledProgress);
+            }
+
+            return EvaluateCubicBezierPoint(startPhysicalPixelPoint, controlPoint1, controlPoint2, targetPhysicalPixelPoint, sampledProgress);
+        }
+
         static int ResolveMoveStepCount(const double distancePixel, const double durationMs, const GB_MouseMoveOptions& moveOptions)
         {
             const double samplingIntervalMs = GetPositiveOptionOrDefault(moveOptions.samplingIntervalMs, 4.0);
@@ -1706,52 +1876,140 @@ namespace
 
         static bool ExecuteCursorMove(const POINT& startPoint, const POINT& targetPoint, const std::vector<GB_ScreenInfo>& screenInfos, const GB_MouseMoveOptions& moveOptions)
         {
-            if (moveOptions.moveMode == GB_MouseMoveMode::Teleport)
-            {
-                return TrySetCurrentPhysicalCursorPosition(targetPoint);
-            }
-
-            const double deltaX = static_cast<double>(targetPoint.x) - static_cast<double>(startPoint.x);
-            const double deltaY = static_cast<double>(targetPoint.y) - static_cast<double>(startPoint.y);
-            const double distancePixel = std::sqrt(deltaX * deltaX + deltaY * deltaY);
-            if (!(distancePixel > 0.0))
-            {
-                return TrySetCurrentPhysicalCursorPosition(targetPoint);
-            }
-
-            const double durationMs = ResolveMoveDurationMs(distancePixel, moveOptions);
-            const int stepCount = ResolveMoveStepCount(distancePixel, durationMs, moveOptions);
-
             if (screenInfos.empty())
             {
                 return false;
             }
 
-            const auto moveStartTime = std::chrono::steady_clock::now();
-            for (int stepIndex = 1; stepIndex <= stepCount; stepIndex++)
+            POINT clipAdjustedTargetPoint = {};
+            if (!TryClampPointToClipCursorRectangle(targetPoint, clipAdjustedTargetPoint))
             {
-                const double linearProgress = static_cast<double>(stepIndex) / static_cast<double>(stepCount);
-                const double sampledProgress = SampleMoveProgress(moveOptions.moveMode, linearProgress);
+                return false;
+            }
 
-                const GB_Point2d rawSamplePoint(static_cast<double>(startPoint.x) + deltaX * sampledProgress, static_cast<double>(startPoint.y) + deltaY * sampledProgress);
-                POINT sampledPoint = {};
-                int sampledScreenIndex = -1;
-                if (!TryProjectPointToNearestScreenPixel(screenInfos, rawSamplePoint, sampledPoint, sampledScreenIndex) || !TrySetCurrentPhysicalCursorPosition(sampledPoint))
+            POINT effectiveTargetPoint = {};
+            int targetScreenIndex = -1;
+            if (!TryProjectPointToNearestScreenPixel(screenInfos, GB_Point2d(static_cast<double>(clipAdjustedTargetPoint.x), static_cast<double>(clipAdjustedTargetPoint.y)), effectiveTargetPoint, targetScreenIndex))
+            {
+                return false;
+            }
+
+            if (moveOptions.moveMode == GB_MouseMoveMode::Teleport)
+            {
+                if (!TrySetCurrentPhysicalCursorPosition(effectiveTargetPoint))
                 {
                     return false;
                 }
-                (void)sampledScreenIndex;
 
-                if (stepIndex >= stepCount || !(durationMs > 0.0))
+                POINT actualPoint = {};
+                if (TryGetCurrentPhysicalCursorPosition(actualPoint))
+                {
+                    return actualPoint.x == effectiveTargetPoint.x && actualPoint.y == effectiveTargetPoint.y;
+                }
+
+                return true;
+            }
+
+            const double deltaX = static_cast<double>(effectiveTargetPoint.x) - static_cast<double>(startPoint.x);
+            const double deltaY = static_cast<double>(effectiveTargetPoint.y) - static_cast<double>(startPoint.y);
+            const double distancePixel = std::sqrt(deltaX * deltaX + deltaY * deltaY);
+            if (!(distancePixel > 0.0))
+            {
+                if (!TrySetCurrentPhysicalCursorPosition(effectiveTargetPoint))
+                {
+                    return false;
+                }
+
+                POINT actualPoint = {};
+                if (TryGetCurrentPhysicalCursorPosition(actualPoint))
+                {
+                    return actualPoint.x == effectiveTargetPoint.x && actualPoint.y == effectiveTargetPoint.y;
+                }
+
+                return true;
+            }
+
+            int startScreenIndex = -1;
+            (void)TryGetContainingScreenIndex(screenInfos, GB_Point2d(static_cast<double>(startPoint.x), static_cast<double>(startPoint.y)), startScreenIndex);
+
+            const bool useCurvedHumanLikePath = (moveOptions.moveMode == GB_MouseMoveMode::HumanLike && startScreenIndex >= 0 && targetScreenIndex >= 0 && startScreenIndex == targetScreenIndex);
+            const GB_MouseMoveMode pathMoveMode = useCurvedHumanLikePath ? moveOptions.moveMode : (moveOptions.moveMode == GB_MouseMoveMode::HumanLike ? GB_MouseMoveMode::Linear : moveOptions.moveMode);
+
+            const double durationMs = ResolveMoveDurationMs(distancePixel, moveOptions);
+            const int stepCount = ResolveMoveStepCount(distancePixel, durationMs, moveOptions);
+
+            struct MoveStepSample
+            {
+                POINT cursorPoint = {};
+                double linearProgress = 0.0;
+            };
+
+            std::vector<MoveStepSample> moveStepSamples;
+            try
+            {
+                moveStepSamples.reserve(static_cast<size_t>(stepCount));
+            }
+            catch (...)
+            {
+                return false;
+            }
+
+            int preferredScreenIndex = startScreenIndex;
+            for (int stepIndex = 1; stepIndex <= stepCount; stepIndex++)
+            {
+                const double linearProgress = static_cast<double>(stepIndex) / static_cast<double>(stepCount);
+                const GB_Point2d rawSamplePoint = EvaluateMovePathPoint(startPoint, effectiveTargetPoint, pathMoveMode, linearProgress);
+
+                POINT sampledPoint = {};
+                int sampledScreenIndex = -1;
+                if (!TryProjectPointToNearestScreenPixel(screenInfos, rawSamplePoint, sampledPoint, sampledScreenIndex, preferredScreenIndex))
+                {
+                    return false;
+                }
+
+                preferredScreenIndex = sampledScreenIndex;
+
+                if (!moveStepSamples.empty() && moveStepSamples.back().cursorPoint.x == sampledPoint.x && moveStepSamples.back().cursorPoint.y == sampledPoint.y)
+                {
+                    moveStepSamples.back().linearProgress = linearProgress;
+                    continue;
+                }
+
+                MoveStepSample sample;
+                sample.cursorPoint = sampledPoint;
+                sample.linearProgress = linearProgress;
+                moveStepSamples.push_back(sample);
+            }
+
+            const auto moveStartTime = std::chrono::steady_clock::now();
+            for (size_t stepIndex = 0; stepIndex < moveStepSamples.size(); stepIndex++)
+            {
+                if (!TrySetCurrentPhysicalCursorPosition(moveStepSamples[stepIndex].cursorPoint))
+                {
+                    return false;
+                }
+
+                if (stepIndex + 1 >= moveStepSamples.size() || !(durationMs > 0.0))
                 {
                     continue;
                 }
 
-                const auto expectedTime = moveStartTime + std::chrono::duration_cast<std::chrono::steady_clock::duration>(std::chrono::duration<double, std::milli>(durationMs * linearProgress));
+                const auto expectedTime = moveStartTime + std::chrono::duration_cast<std::chrono::steady_clock::duration>(std::chrono::duration<double, std::milli>(durationMs * moveStepSamples[stepIndex].linearProgress));
                 std::this_thread::sleep_until(expectedTime);
             }
 
-            return TrySetCurrentPhysicalCursorPosition(targetPoint);
+            if (!TrySetCurrentPhysicalCursorPosition(effectiveTargetPoint))
+            {
+                return false;
+            }
+
+            POINT actualPoint = {};
+            if (TryGetCurrentPhysicalCursorPosition(actualPoint))
+            {
+                return actualPoint.x == effectiveTargetPoint.x && actualPoint.y == effectiveTargetPoint.y;
+            }
+
+            return true;
         }
 
         static bool TryGetMousePhysicalPixelPointOnScreen(int& screenIndex, GB_Point2d& physicalPixelPointOnScreen)
@@ -2155,3 +2413,265 @@ bool GB_Mouse::Move(const GB_Vector2d& physicalPixelOffset, const bool allowMove
     return internal::ExecuteCursorMove(startPoint, targetPoint, screenInfos, moveOptions);
 #endif
 }
+
+#if defined(_WIN32)
+namespace
+{
+    namespace internal
+    {
+        static bool TrySendMouseInput(const DWORD mouseFlags, const DWORD mouseData = 0)
+        {
+            INPUT input = {};
+            input.type = INPUT_MOUSE;
+            input.mi.dx = 0;
+            input.mi.dy = 0;
+            input.mi.mouseData = mouseData;
+            input.mi.dwFlags = mouseFlags;
+            input.mi.time = 0;
+            input.mi.dwExtraInfo = static_cast<ULONG_PTR>(::GetMessageExtraInfo());
+            return ::SendInput(1, &input, sizeof(INPUT)) == 1;
+        }
+
+        static int ClampNonNegativeDelayMs(const int delayMs)
+        {
+            return std::max(delayMs, 0);
+        }
+
+        static void SleepForDelayMs(const int delayMs)
+        {
+            const int clampedDelayMs = ClampNonNegativeDelayMs(delayMs);
+            if (clampedDelayMs <= 0)
+            {
+                return;
+            }
+
+            std::this_thread::sleep_for(std::chrono::milliseconds(clampedDelayMs));
+        }
+
+        static bool TrySendMouseInputWithRetry(const DWORD mouseFlags, const DWORD mouseData = 0, const int maxAttemptCount = 2, const int retryDelayMs = 1)
+        {
+            const int attemptCount = std::max(maxAttemptCount, 1);
+            for (int attemptIndex = 0; attemptIndex < attemptCount; attemptIndex++)
+            {
+                if (TrySendMouseInput(mouseFlags, mouseData))
+                {
+                    return true;
+                }
+
+                if (attemptIndex + 1 < attemptCount)
+                {
+                    SleepForDelayMs(retryDelayMs);
+                }
+            }
+
+            return false;
+        }
+
+        static int GetSafeSystemDoubleClickTimeMs()
+        {
+            const UINT systemDoubleClickTimeMs = ::GetDoubleClickTime();
+            const UINT safeSystemDoubleClickTimeMs = (systemDoubleClickTimeMs > 0 ? systemDoubleClickTimeMs : 500u);
+            return static_cast<int>(safeSystemDoubleClickTimeMs);
+        }
+
+        static int ResolveSafeDoubleClickPressDurationMs(const int downUpIntervalMs)
+        {
+            const int normalizedDownUpIntervalMs = ClampNonNegativeDelayMs(downUpIntervalMs);
+            const int safetyMarginMs = 8;
+            const int safeSystemDoubleClickTimeMs = GetSafeSystemDoubleClickTimeMs();
+            const int maxPressDurationMs = std::max(0, (safeSystemDoubleClickTimeMs - safetyMarginMs) / 2);
+            return std::min(normalizedDownUpIntervalMs, maxPressDurationMs);
+        }
+
+        static int ResolveHumanLikeDoubleClickIntervalMs(const int interClickIntervalMs, const int downUpIntervalMs)
+        {
+            const int safeSystemDoubleClickTimeMs = GetSafeSystemDoubleClickTimeMs();
+            int resolvedIntervalMs = 0;
+            if (interClickIntervalMs >= 0)
+            {
+                resolvedIntervalMs = interClickIntervalMs;
+            }
+            else
+            {
+                resolvedIntervalMs = std::max(40, std::min(120, safeSystemDoubleClickTimeMs / 5));
+            }
+
+            const int safetyMarginMs = 8;
+            const int maxInterClickIntervalMs = std::max(0, safeSystemDoubleClickTimeMs - safetyMarginMs - downUpIntervalMs * 2);
+            return std::min(resolvedIntervalMs, maxInterClickIntervalMs);
+        }
+
+        static bool TryClickMouseButton(const DWORD downFlags, const DWORD upFlags, const int downUpIntervalMs)
+        {
+            if (!TrySendMouseInputWithRetry(downFlags))
+            {
+                return false;
+            }
+
+            SleepForDelayMs(downUpIntervalMs);
+
+            if (TrySendMouseInputWithRetry(upFlags))
+            {
+                return true;
+            }
+
+            SleepForDelayMs(1);
+            (void)TrySendMouseInputWithRetry(upFlags);
+            return false;
+        }
+
+        static bool TryDoubleClickMouseButton(const DWORD downFlags, const DWORD upFlags, const int downUpIntervalMs, const int interClickIntervalMs)
+        {
+            const int normalizedDownUpIntervalMs = ResolveSafeDoubleClickPressDurationMs(downUpIntervalMs);
+            const int normalizedInterClickIntervalMs = ResolveHumanLikeDoubleClickIntervalMs(interClickIntervalMs, normalizedDownUpIntervalMs);
+            if (!TryClickMouseButton(downFlags, upFlags, normalizedDownUpIntervalMs))
+            {
+                return false;
+            }
+
+            SleepForDelayMs(normalizedInterClickIntervalMs);
+            return TryClickMouseButton(downFlags, upFlags, normalizedDownUpIntervalMs);
+        }
+    }
+}
+
+bool GB_Mouse::PressLeftButton()
+{
+    return internal::TrySendMouseInputWithRetry(MOUSEEVENTF_LEFTDOWN);
+}
+
+bool GB_Mouse::ReleaseLeftButton()
+{
+    return internal::TrySendMouseInputWithRetry(MOUSEEVENTF_LEFTUP);
+}
+
+bool GB_Mouse::ClickLeftButton(const int downUpIntervalMs)
+{
+    return internal::TryClickMouseButton(MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, downUpIntervalMs);
+}
+
+bool GB_Mouse::DoubleClickLeftButton(const int downUpIntervalMs, const int interClickIntervalMs)
+{
+    return internal::TryDoubleClickMouseButton(MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, downUpIntervalMs, interClickIntervalMs);
+}
+
+bool GB_Mouse::PressRightButton()
+{
+    return internal::TrySendMouseInputWithRetry(MOUSEEVENTF_RIGHTDOWN);
+}
+
+bool GB_Mouse::ReleaseRightButton()
+{
+    return internal::TrySendMouseInputWithRetry(MOUSEEVENTF_RIGHTUP);
+}
+
+bool GB_Mouse::ClickRightButton(const int downUpIntervalMs)
+{
+    return internal::TryClickMouseButton(MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, downUpIntervalMs);
+}
+
+bool GB_Mouse::PressMiddleButton()
+{
+    return internal::TrySendMouseInputWithRetry(MOUSEEVENTF_MIDDLEDOWN);
+}
+
+bool GB_Mouse::ReleaseMiddleButton()
+{
+    return internal::TrySendMouseInputWithRetry(MOUSEEVENTF_MIDDLEUP);
+}
+
+bool GB_Mouse::ClickMiddleButton(const int downUpIntervalMs)
+{
+    return internal::TryClickMouseButton(MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP, downUpIntervalMs);
+}
+
+bool GB_Mouse::ScrollVerticalWheel(const int wheelDelta)
+{
+    if (wheelDelta == 0)
+    {
+        return true;
+    }
+
+    return internal::TrySendMouseInputWithRetry(MOUSEEVENTF_WHEEL, static_cast<DWORD>(wheelDelta));
+}
+
+bool GB_Mouse::ScrollHorizontalWheel(const int wheelDelta)
+{
+    if (wheelDelta == 0)
+    {
+        return true;
+    }
+
+    return internal::TrySendMouseInputWithRetry(MOUSEEVENTF_HWHEEL, static_cast<DWORD>(wheelDelta));
+}
+
+#else
+
+bool GB_Mouse::PressLeftButton()
+{
+    return false;
+}
+
+bool GB_Mouse::ReleaseLeftButton()
+{
+    return false;
+}
+
+bool GB_Mouse::ClickLeftButton(const int downUpIntervalMs)
+{
+    (void)downUpIntervalMs;
+    return false;
+}
+
+bool GB_Mouse::DoubleClickLeftButton(const int downUpIntervalMs, const int interClickIntervalMs)
+{
+    (void)downUpIntervalMs;
+    (void)interClickIntervalMs;
+    return false;
+}
+
+bool GB_Mouse::PressRightButton()
+{
+    return false;
+}
+
+bool GB_Mouse::ReleaseRightButton()
+{
+    return false;
+}
+
+bool GB_Mouse::ClickRightButton(const int downUpIntervalMs)
+{
+    (void)downUpIntervalMs;
+    return false;
+}
+
+bool GB_Mouse::PressMiddleButton()
+{
+    return false;
+}
+
+bool GB_Mouse::ReleaseMiddleButton()
+{
+    return false;
+}
+
+bool GB_Mouse::ClickMiddleButton(const int downUpIntervalMs)
+{
+    (void)downUpIntervalMs;
+    return false;
+}
+
+bool GB_Mouse::ScrollVerticalWheel(const int wheelDelta)
+{
+    (void)wheelDelta;
+    return false;
+}
+
+bool GB_Mouse::ScrollHorizontalWheel(const int wheelDelta)
+{
+    (void)wheelDelta;
+    return false;
+}
+
+#endif

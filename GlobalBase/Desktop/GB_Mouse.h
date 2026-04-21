@@ -2,6 +2,7 @@
 #define GLOBALBASE_MOUSE_H_H
 
 #include "../GlobalBasePort.h"
+
 #include "../Geometry/GB_Point2d.h"
 #include "../Geometry/GB_Vector2d.h"
 #include "../CV/GB_Image.h"
@@ -12,7 +13,7 @@
  * 说明：
  * - Teleport 表示直接瞬移到目标位置；
  * - Linear 表示沿直线路径匀速样式移动；
- * - HumanLike 表示沿直线路径以更接近人工移动节奏的缓入缓出方式移动。
+ * - HumanLike 表示以更接近人工操作的方式移动：速度具备缓入缓出特征，并会优先采用轻微弧线而非绝对笔直的路径。
  */
 enum class GB_MouseMoveMode
 {
@@ -211,6 +212,123 @@ public:
      * - 当 allowMoveToOtherScreens=true 时，目标点按虚拟桌面物理像素坐标解释，若偏移后落在不可达区域，则会自动裁剪到最近的可达像素位置。
      */
     static bool Move(const GB_Vector2d& physicalPixelOffset, bool allowMoveToOtherScreens = true, const GB_MouseMoveOptions& moveOptions = GB_MouseMoveOptions());
+
+    /**
+     * @brief 在当前鼠标位置按下左键。
+     *
+     * @return true=成功；false=失败。
+     */
+    static bool PressLeftButton();
+
+    /**
+     * @brief 在当前鼠标位置抬起左键。
+     *
+     * @return true=成功；false=失败。
+     */
+    static bool ReleaseLeftButton();
+
+    /**
+     * @brief 在当前鼠标位置单击左键。
+     *
+     * @param downUpIntervalMs 按下与抬起之间的间隔耗时，单位为毫秒。
+     * @return true=成功；false=失败。
+     *
+     * 说明：
+     * - 该间隔越短，越接近“极快点击”；越长，则越接近有意停顿后再抬起；
+     * - 若 downUpIntervalMs 小于 0，则按 0 处理；
+     */
+    static bool ClickLeftButton(int downUpIntervalMs = 80);
+
+    /**
+     * @brief 在当前鼠标位置尽最大可能模拟人工双击左键。
+     *
+     * @param downUpIntervalMs 每一次单击内部“按下与抬起之间”的间隔耗时，单位为毫秒。
+     * @param interClickIntervalMs 第一次抬起到第二次按下之间的间隔耗时，单位为毫秒。
+     * @return true=成功；false=失败。
+     *
+     * 说明：
+     * - 若 downUpIntervalMs 小于 0，则按 0 处理；
+     * - 若 interClickIntervalMs 小于 0，则内部会结合当前系统双击时间阈值自动选择一个更稳妥的默认间隔；
+     * - 若调用方给出的按下/抬起间隔与两次点击间隔之和过大，内部会尽量自动压缩到更容易被系统识别为双击的范围；
+     * - 默认参数分别为 80ms 与 -1。
+     */
+    static bool DoubleClickLeftButton(int downUpIntervalMs = 80, int interClickIntervalMs = -1);
+
+    /**
+     * @brief 在当前鼠标位置按下右键。
+     *
+     * @return true=成功；false=失败。
+     */
+    static bool PressRightButton();
+
+    /**
+     * @brief 在当前鼠标位置抬起右键。
+     *
+     * @return true=成功；false=失败。
+     */
+    static bool ReleaseRightButton();
+
+    /**
+     * @brief 在当前鼠标位置单击右键。
+     *
+     * @param downUpIntervalMs 按下与抬起之间的间隔耗时，单位为毫秒。
+     * @return true=成功；false=失败。
+     *
+     * 说明：
+     * - 若 downUpIntervalMs 小于 0，则按 0 处理；
+     * - 默认值取 80ms。
+     */
+    static bool ClickRightButton(int downUpIntervalMs = 80);
+
+    /**
+     * @brief 在当前鼠标位置按下滚轮键。
+     *
+     * @return true=成功；false=失败。
+     */
+    static bool PressMiddleButton();
+
+    /**
+     * @brief 在当前鼠标位置抬起滚轮键。
+     *
+     * @return true=成功；false=失败。
+     */
+    static bool ReleaseMiddleButton();
+
+    /**
+     * @brief 在当前鼠标位置单击滚轮键。
+     *
+     * @param downUpIntervalMs 按下与抬起之间的间隔耗时，单位为毫秒。
+     * @return true=成功；false=失败。
+     *
+     * 说明：
+     * - 若 downUpIntervalMs 小于 0，则按 0 处理；
+     * - 默认值取 80ms。
+     */
+    static bool ClickMiddleButton(int downUpIntervalMs = 80);
+
+    /**
+     * @brief 在当前鼠标位置滚动垂直滚轮。
+     *
+     * @param wheelDelta 滚动增量。正值表示向前滚动，负值表示向后滚动。
+     * @return true=成功；false=失败。
+     *
+     * 说明：
+     * - Windows 约定一个标准滚轮刻度通常为 120；
+     * - 若 wheelDelta 为 0，则视为无操作并直接返回 true。
+     */
+    static bool ScrollVerticalWheel(int wheelDelta);
+
+    /**
+     * @brief 在当前鼠标位置滚动水平滚轮。
+     *
+     * @param wheelDelta 滚动增量。正值表示向右滚动，负值表示向左滚动。
+     * @return true=成功；false=失败。
+     *
+     * 说明：
+     * - Windows 约定一个标准滚轮刻度通常为 120；
+     * - 若 wheelDelta 为 0，则视为无操作并直接返回 true。
+     */
+    static bool ScrollHorizontalWheel(int wheelDelta);
 };
 
 #endif
