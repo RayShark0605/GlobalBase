@@ -263,14 +263,18 @@ public:
      * @brief 截取整个虚拟桌面。
      *
      * 截图成功时，输出图像为 8 位 4 通道 BGRA 图像，Alpha 会被统一置为 255。
+     *
+     * @param screenImage [out] 截得的图像。
+     * @param withCursor  是否将当前系统光标叠加到截图结果中。true=带光标；false=不带光标。
      */
-    static bool CaptureVirtualScreen(GB_Image& screenImage);
+    static bool CaptureVirtualScreen(GB_Image& screenImage, bool withCursor = false);
 
     /**
      * @brief 截取虚拟桌面中的指定矩形区域。
      *
      * @param virtualScreenRectangle 虚拟桌面坐标系中的矩形，单位为物理像素。
      * @param screenImage            [out] 截得的图像。
+     * @param withCursor             是否将当前系统光标叠加到截图结果中。true=带光标；false=不带光标。
      * @return true=成功；false=失败。
      *
      * 说明：
@@ -278,16 +282,17 @@ public:
      * - 输入无效矩形时直接返回 false；
      * - 若求交后为空，则返回 false。
      */
-    static bool CaptureVirtualScreen(const GB_Rectangle& virtualScreenRectangle, GB_Image& screenImage);
+    static bool CaptureVirtualScreen(const GB_Rectangle& virtualScreenRectangle, GB_Image& screenImage, bool withCursor = false);
 
     /**
      * @brief 截取第 screenIndex 个显示屏的完整画面。
      *
      * @param screenIndex 显示屏编号，0 基，对应 GetAllScreens() 返回顺序。
      * @param screenImage [out] 截得的图像。
+     * @param withCursor  是否将当前系统光标叠加到截图结果中。true=带光标；false=不带光标。
      * @return true=成功；false=失败。
      */
-    static bool CaptureScreen(int screenIndex, GB_Image& screenImage);
+    static bool CaptureScreen(int screenIndex, GB_Image& screenImage, bool withCursor = false);
 
     /**
      * @brief 截取第 screenIndex 个显示屏局部区域的画面。
@@ -295,6 +300,7 @@ public:
      * @param screenIndex          显示屏编号，0 基，对应 GetAllScreens() 返回顺序。
      * @param screenLocalRectangle 该显示屏局部坐标系中的矩形，左上角为 (0, 0)，单位为物理像素。
      * @param screenImage          [out] 截得的图像。
+     * @param withCursor           是否将当前系统光标叠加到截图结果中。true=带光标；false=不带光标。
      * @return true=成功；false=失败。
      *
      * 说明：
@@ -302,16 +308,17 @@ public:
      * - 输入无效矩形时直接返回 false；
      * - 若求交后为空，则返回 false。
      */
-    static bool CaptureScreen(int screenIndex, const GB_Rectangle& screenLocalRectangle, GB_Image& screenImage);
+    static bool CaptureScreen(int screenIndex, const GB_Rectangle& screenLocalRectangle, GB_Image& screenImage, bool withCursor = false);
 
     /**
      * @brief 根据 GDI 设备名截取指定显示屏的完整画面。
      *
      * @param gdiDeviceName 显示屏设备名，典型值如 "\\.\DISPLAY1"。
      * @param screenImage   [out] 截得的图像。
+     * @param withCursor    是否将当前系统光标叠加到截图结果中。true=带光标；false=不带光标。
      * @return true=成功；false=失败。
      */
-    static bool CaptureScreen(const std::string& gdiDeviceName, GB_Image& screenImage);
+    static bool CaptureScreen(const std::string& gdiDeviceName, GB_Image& screenImage, bool withCursor = false);
 
     /**
      * @brief 根据 GDI 设备名截取指定显示屏局部区域的画面。
@@ -319,9 +326,10 @@ public:
      * @param gdiDeviceName       显示屏设备名，典型值如 "\\.\DISPLAY1"。
      * @param screenLocalRectangle 该显示屏局部坐标系中的矩形，左上角为 (0, 0)，单位为物理像素。
      * @param screenImage          [out] 截得的图像。
+     * @param withCursor           是否将当前系统光标叠加到截图结果中。true=带光标；false=不带光标。
      * @return true=成功；false=失败。
      */
-    static bool CaptureScreen(const std::string& gdiDeviceName, const GB_Rectangle& screenLocalRectangle, GB_Image& screenImage);
+    static bool CaptureScreen(const std::string& gdiDeviceName, const GB_Rectangle& screenLocalRectangle, GB_Image& screenImage, bool withCursor = false);
 
     /**
      * @brief 将系统逻辑像素坐标转换为所在显示屏编号及该屏上的物理像素坐标。

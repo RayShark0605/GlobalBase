@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cwctype>
+#include <cstring>
 #include <cstdint>
 #include <limits>
 #include <map>
@@ -217,6 +218,32 @@ namespace internal
     private:
         HBITMAP bitmapHandle = nullptr;
     };
+
+    class IconBitmapScope
+    {
+    public:
+        explicit IconBitmapScope(HBITMAP bitmapHandle) : bitmapHandle(bitmapHandle)
+        {
+        }
+
+        ~IconBitmapScope()
+        {
+            if (bitmapHandle != nullptr)
+            {
+                ::DeleteObject(bitmapHandle);
+                bitmapHandle = nullptr;
+            }
+        }
+
+        HBITMAP Get() const
+        {
+            return bitmapHandle;
+        }
+
+    private:
+        HBITMAP bitmapHandle = nullptr;
+    };
+
 
     class SelectObjectScope
     {
@@ -1377,6 +1404,230 @@ namespace internal
         return screenImage.SetFromCvMat(capturedMat, GB_ImageCopyMode::DeepCopy);
     }
 
+
+    static bool TryGetCurrentCursorInfo(CURSORINFO& cursorInfo)
+    {
+        std::memset(&cursorInfo, 0, sizeof(cursorInfo));
+        cursorInfo.cbSize = sizeof(cursorInfo);
+        return ::GetCursorInfo(&cursorInfo) != FALSE;
+    }
+
+    static bool TryGetCurrentVisibleCursorInfo(CURSORINFO& cursorInfo)
+    {
+        if (!TryGetCurrentCursorInfo(cursorInfo))
+        {
+            return false;
+        }
+
+        if ((cursorInfo.flags & CURSOR_SHOWING) == 0 || cursorInfo.hCursor == nullptr)
+        {
+            std::memset(&cursorInfo, 0, sizeof(cursorInfo));
+            cursorInfo.cbSize = sizeof(cursorInfo);
+            return false;
+        }
+
+        return true;
+    }
+
+    static bool TryGetCursorBitmapSize(const HCURSOR cursorHandle, int& cursorWidth, int& cursorHeight, ICONINFO& iconInfo)
+    {
+        cursorWidth = 0;
+        cursorHeight = 0;
+        std::memset(&iconInfo, 0, sizeof(iconInfo));
+
+        if (cursorHandle == nullptr)
+        {
+            return false;
+        }
+
+        if (::GetIconInfo(cursorHandle, &iconInfo) == FALSE)
+        {
+            return false;
+        }
+
+        BITMAP bitmapInfo = {};
+        if (iconInfo.hbmColor != nullptr)
+        {
+            if (::GetObjectW(iconInfo.hbmColor, sizeof(bitmapInfo), &bitmapInfo) <= 0)
+            {
+                return false;
+            }
+
+            cursorWidth = bitmapInfo.bmWidth;
+            cursorHeight = std::abs(bitmapInfo.bmHeight);
+            return cursorWidth > 0 && cursorHeight > 0;
+        }
+
+        if (iconInfo.hbmMask == nullptr)
+        {
+            return false;
+        }
+
+        if (::GetObjectW(iconInfo.hbmMask, sizeof(bitmapInfo), &bitmapInfo) <= 0)
+        {
+            return false;
+        }
+
+        const int maskBitmapHeight = std::abs(bitmapInfo.bmHeight);
+        if (bitmapInfo.bmWidth <= 0 || maskBitmapHeight <= 0 || (maskBitmapHeight % 2) != 0)
+        {
+            return false;
+        }
+
+        cursorWidth = bitmapInfo.bmWidth;
+        cursorHeight = maskBitmapHeight / 2;
+        return cursorWidth > 0 && cursorHeight > 0;
+    }
+
+    static bool TryOverlayCursorOnBgraImage(const HCURSOR cursorHandle, const int cursorLeftOnImage, const int cursorTopOnImage, const int cursorWidth, const int cursorHeight, GB_Image& backgroundImage)
+    {
+        if (cursorHandle == nullptr || cursorWidth <= 0 || cursorHeight <= 0 || backgroundImage.IsEmpty() || backgroundImage.GetDepth() != GB_ImageDepth::UInt8 || backgroundImage.GetChannels() != 4)
+        {
+            return false;
+        }
+
+        if (backgroundImage.GetWidth() > static_cast<size_t>(std::numeric_limits<int>::max()) || backgroundImage.GetHeight() > static_cast<size_t>(std::numeric_limits<int>::max()))
+        {
+            return false;
+        }
+
+        const int imageWidth = static_cast<int>(backgroundImage.GetWidth());
+        const int imageHeight = static_cast<int>(backgroundImage.GetHeight());
+        const size_t sourceRowStrideBytes = backgroundImage.GetRowStrideBytes();
+        const size_t rowByteCount = static_cast<size_t>(imageWidth) * 4u;
+        if (sourceRowStrideBytes < rowByteCount)
+        {
+            return false;
+        }
+
+        const uint64_t pixelByteCount64 = static_cast<uint64_t>(imageWidth) * static_cast<uint64_t>(imageHeight) * 4ull;
+        if (pixelByteCount64 > static_cast<uint64_t>(std::numeric_limits<size_t>::max()))
+        {
+            return false;
+        }
+
+        std::vector<uint8_t> bgraBuffer;
+        try
+        {
+            bgraBuffer.resize(static_cast<size_t>(pixelByteCount64));
+        }
+        catch (...)
+        {
+            return false;
+        }
+
+        for (int rowIndex = 0; rowIndex < imageHeight; rowIndex++)
+        {
+            const unsigned char* rowData = backgroundImage.GetRowData(static_cast<size_t>(rowIndex));
+            if (rowData == nullptr)
+            {
+                return false;
+            }
+
+            std::memcpy(bgraBuffer.data() + static_cast<size_t>(rowIndex) * rowByteCount, rowData, rowByteCount);
+        }
+
+        for (size_t pixelOffset = 3; pixelOffset < bgraBuffer.size(); pixelOffset += 4)
+        {
+            bgraBuffer[pixelOffset] = 255;
+        }
+
+        ScreenDcScope screenDc;
+        if (!screenDc.IsValid())
+        {
+            return false;
+        }
+
+        CompatibleDcScope memoryDc(screenDc.Get());
+        if (!memoryDc.IsValid())
+        {
+            return false;
+        }
+
+        BITMAPINFO bitmapInfo = {};
+        bitmapInfo.bmiHeader.biSize = sizeof(bitmapInfo.bmiHeader);
+        bitmapInfo.bmiHeader.biWidth = imageWidth;
+        bitmapInfo.bmiHeader.biHeight = -imageHeight;
+        bitmapInfo.bmiHeader.biPlanes = 1;
+        bitmapInfo.bmiHeader.biBitCount = 32;
+        bitmapInfo.bmiHeader.biCompression = BI_RGB;
+
+        void* bitmapBits = nullptr;
+        BitmapScope bitmap(::CreateDIBSection(screenDc.Get(), &bitmapInfo, DIB_RGB_COLORS, &bitmapBits, nullptr, 0));
+        if (!bitmap.IsValid() || bitmapBits == nullptr)
+        {
+            return false;
+        }
+
+        std::memcpy(bitmapBits, bgraBuffer.data(), bgraBuffer.size());
+
+        SelectObjectScope selectedBitmap(memoryDc.Get(), bitmap.Get());
+        if (!selectedBitmap.IsValid())
+        {
+            return false;
+        }
+
+        if (::DrawIconEx(memoryDc.Get(), cursorLeftOnImage, cursorTopOnImage, cursorHandle, cursorWidth, cursorHeight, 0, nullptr, DI_NORMAL) == FALSE)
+        {
+            return false;
+        }
+
+        ::GdiFlush();
+        std::memcpy(bgraBuffer.data(), bitmapBits, bgraBuffer.size());
+
+        for (size_t pixelOffset = 3; pixelOffset < bgraBuffer.size(); pixelOffset += 4)
+        {
+            bgraBuffer[pixelOffset] = 255;
+        }
+
+        for (int rowIndex = 0; rowIndex < imageHeight; rowIndex++)
+        {
+            unsigned char* rowData = backgroundImage.GetRowData(static_cast<size_t>(rowIndex));
+            if (rowData == nullptr)
+            {
+                return false;
+            }
+
+            std::memcpy(rowData, bgraBuffer.data() + static_cast<size_t>(rowIndex) * rowByteCount, rowByteCount);
+        }
+
+        return true;
+    }
+
+    static bool TryOverlayCurrentCursorOnImage(const RECT& captureRectangle, GB_Image& screenImage)
+    {
+        CURSORINFO cursorInfo = {};
+        if (!TryGetCurrentVisibleCursorInfo(cursorInfo))
+        {
+            return true;
+        }
+
+        int cursorWidth = 0;
+        int cursorHeight = 0;
+        ICONINFO iconInfo = {};
+        if (!TryGetCursorBitmapSize(cursorInfo.hCursor, cursorWidth, cursorHeight, iconInfo))
+        {
+            return false;
+        }
+
+        IconBitmapScope maskBitmapScope(iconInfo.hbmMask);
+        IconBitmapScope colorBitmapScope(iconInfo.hbmColor);
+
+        const long cursorLeft = cursorInfo.ptScreenPos.x - static_cast<long>(iconInfo.xHotspot);
+        const long cursorTop = cursorInfo.ptScreenPos.y - static_cast<long>(iconInfo.yHotspot);
+        const long cursorRight = cursorLeft + static_cast<long>(cursorWidth);
+        const long cursorBottom = cursorTop + static_cast<long>(cursorHeight);
+
+        if (cursorRight <= captureRectangle.left || cursorBottom <= captureRectangle.top || cursorLeft >= captureRectangle.right || cursorTop >= captureRectangle.bottom)
+        {
+            return true;
+        }
+
+        const int cursorLeftOnImage = static_cast<int>(cursorLeft - captureRectangle.left);
+        const int cursorTopOnImage = static_cast<int>(cursorTop - captureRectangle.top);
+        return TryOverlayCursorOnBgraImage(cursorInfo.hCursor, cursorLeftOnImage, cursorTopOnImage, cursorWidth, cursorHeight, screenImage);
+    }
+
     static bool IsFinitePoint(const GB_Point2d& point)
     {
         return std::isfinite(point.x) && std::isfinite(point.y);
@@ -1533,7 +1784,7 @@ namespace internal
         return true;
     }
 
-    static bool TryCaptureScreenImage(const GB_ScreenInfo& screenInfo, const GB_Rectangle* screenLocalRectangle, GB_Image& screenImage)
+    static bool TryCaptureScreenImage(const GB_ScreenInfo& screenInfo, const GB_Rectangle* screenLocalRectangle, GB_Image& screenImage, const bool withCursor)
     {
         RECT captureRectangle = { 0, 0, 0, 0 };
         if (!TryBuildScreenCaptureRectangle(screenInfo, screenLocalRectangle, captureRectangle))
@@ -1544,6 +1795,12 @@ namespace internal
 
         GB_Image capturedImage;
         if (!CaptureRectangleToImage(captureRectangle, capturedImage))
+        {
+            screenImage.Clear();
+            return false;
+        }
+
+        if (withCursor && !TryOverlayCurrentCursorOnImage(captureRectangle, capturedImage))
         {
             screenImage.Clear();
             return false;
@@ -1732,20 +1989,22 @@ GB_Rectangle GB_Screen::GetVirtualScreenRectangle()
 #endif
 }
 
-bool GB_Screen::CaptureVirtualScreen(GB_Image& screenImage)
+bool GB_Screen::CaptureVirtualScreen(GB_Image& screenImage, const bool withCursor)
 {
 #if !defined(_WIN32)
+    (void)withCursor;
     screenImage.Clear();
     return false;
 #else
-    return CaptureVirtualScreen(GetVirtualScreenRectangle(), screenImage);
+    return CaptureVirtualScreen(GetVirtualScreenRectangle(), screenImage, withCursor);
 #endif
 }
 
-bool GB_Screen::CaptureVirtualScreen(const GB_Rectangle& virtualScreenRectangle, GB_Image& screenImage)
+bool GB_Screen::CaptureVirtualScreen(const GB_Rectangle& virtualScreenRectangle, GB_Image& screenImage, const bool withCursor)
 {
 #if !defined(_WIN32)
     (void)virtualScreenRectangle;
+    (void)withCursor;
     screenImage.Clear();
     return false;
 #else
@@ -1766,6 +2025,12 @@ bool GB_Screen::CaptureVirtualScreen(const GB_Rectangle& virtualScreenRectangle,
 
     GB_Image capturedImage;
     if (!internal::CaptureRectangleToImage(captureRectangle, capturedImage))
+    {
+        screenImage.Clear();
+        return false;
+    }
+
+    if (withCursor && !internal::TryOverlayCurrentCursorOnImage(captureRectangle, capturedImage))
     {
         screenImage.Clear();
         return false;
@@ -1819,10 +2084,11 @@ GB_ScreenInfo GB_Screen::GetPrimaryScreen()
 #endif
 }
 
-bool GB_Screen::CaptureScreen(const int screenIndex, GB_Image& screenImage)
+bool GB_Screen::CaptureScreen(const int screenIndex, GB_Image& screenImage, const bool withCursor)
 {
 #if !defined(_WIN32)
     (void)screenIndex;
+    (void)withCursor;
     screenImage.Clear();
     return false;
 #else
@@ -1836,15 +2102,16 @@ bool GB_Screen::CaptureScreen(const int screenIndex, GB_Image& screenImage)
         return false;
     }
 
-    return internal::TryCaptureScreenImage(screenInfo, nullptr, screenImage);
+    return internal::TryCaptureScreenImage(screenInfo, nullptr, screenImage, withCursor);
 #endif
 }
 
-bool GB_Screen::CaptureScreen(const int screenIndex, const GB_Rectangle& screenLocalRectangle, GB_Image& screenImage)
+bool GB_Screen::CaptureScreen(const int screenIndex, const GB_Rectangle& screenLocalRectangle, GB_Image& screenImage, const bool withCursor)
 {
 #if !defined(_WIN32)
     (void)screenIndex;
     (void)screenLocalRectangle;
+    (void)withCursor;
     screenImage.Clear();
     return false;
 #else
@@ -1864,14 +2131,15 @@ bool GB_Screen::CaptureScreen(const int screenIndex, const GB_Rectangle& screenL
         return false;
     }
 
-    return internal::TryCaptureScreenImage(screenInfo, &screenLocalRectangle, screenImage);
+    return internal::TryCaptureScreenImage(screenInfo, &screenLocalRectangle, screenImage, withCursor);
 #endif
 }
 
-bool GB_Screen::CaptureScreen(const std::string& gdiDeviceName, GB_Image& screenImage)
+bool GB_Screen::CaptureScreen(const std::string& gdiDeviceName, GB_Image& screenImage, const bool withCursor)
 {
 #if !defined(_WIN32)
     (void)gdiDeviceName;
+    (void)withCursor;
     screenImage.Clear();
     return false;
 #else
@@ -1885,15 +2153,16 @@ bool GB_Screen::CaptureScreen(const std::string& gdiDeviceName, GB_Image& screen
         return false;
     }
 
-    return internal::TryCaptureScreenImage(screenInfo, nullptr, screenImage);
+    return internal::TryCaptureScreenImage(screenInfo, nullptr, screenImage, withCursor);
 #endif
 }
 
-bool GB_Screen::CaptureScreen(const std::string& gdiDeviceName, const GB_Rectangle& screenLocalRectangle, GB_Image& screenImage)
+bool GB_Screen::CaptureScreen(const std::string& gdiDeviceName, const GB_Rectangle& screenLocalRectangle, GB_Image& screenImage, const bool withCursor)
 {
 #if !defined(_WIN32)
     (void)gdiDeviceName;
     (void)screenLocalRectangle;
+    (void)withCursor;
     screenImage.Clear();
     return false;
 #else
@@ -1913,7 +2182,7 @@ bool GB_Screen::CaptureScreen(const std::string& gdiDeviceName, const GB_Rectang
         return false;
     }
 
-    return internal::TryCaptureScreenImage(screenInfo, &screenLocalRectangle, screenImage);
+    return internal::TryCaptureScreenImage(screenInfo, &screenLocalRectangle, screenImage, withCursor);
 #endif
 }
 
