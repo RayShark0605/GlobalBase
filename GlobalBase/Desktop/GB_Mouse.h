@@ -116,7 +116,7 @@ struct GB_MouseMoveOptions
  * @brief 全局鼠标事件类型。
  *
  * 说明：
- * - 这些事件均基于系统级全局低级鼠标钩子抽象而来，监听范围不局限于某一个窗口；
+ * - 这些事件均基于系统级全局鼠标输入监听抽象而来；在 Windows 当前实现中，底层使用 Raw Input + 隐藏消息窗口完成全局监听；
  * - XButtonDown / XButtonUp 事件需要结合 xButtonType 字段区分是 XBUTTON1 还是 XBUTTON2；
  * - VerticalWheel / HorizontalWheel 事件需要结合 wheelDelta 字段读取滚动方向与滚动量。
  */
@@ -232,16 +232,6 @@ struct GB_GlobalMouseEvent
      * - 仅当 eventType 为 XButtonDown 或 XButtonUp 时有意义。
      */
     GB_GlobalMouseXButtonType xButtonType = GB_GlobalMouseXButtonType::None;
-
-    /**
-     * @brief 是否为注入事件。
-     */
-    bool isInjected = false;
-
-    /**
-     * @brief 是否为来自更低完整性级别进程的注入事件。
-     */
-    bool isLowerIntegrityInjected = false;
 
     /**
      * @brief 系统原始消息时间戳，单位为毫秒。

@@ -1142,6 +1142,22 @@ namespace
                 return false;
             }
 
+            if (hotSpot != nullptr && std::isfinite(hotSpot->x) && std::isfinite(hotSpot->y))
+            {
+                int64_t hotSpotPixelX = 0;
+                int64_t hotSpotPixelY = 0;
+                if (TryRoundDoubleToInt64(hotSpot->x, hotSpotPixelX) && TryRoundDoubleToInt64(hotSpot->y, hotSpotPixelY) &&
+                    hotSpotPixelX >= 0 && hotSpotPixelY >= 0 && hotSpotPixelX < static_cast<int64_t>(imageWidth) && hotSpotPixelY < static_cast<int64_t>(imageHeight))
+                {
+                    const size_t hotSpotX = static_cast<size_t>(hotSpotPixelX);
+                    const size_t hotSpotY = static_cast<size_t>(hotSpotPixelY);
+                    minVisibleX = (std::min)(minVisibleX, hotSpotX);
+                    minVisibleY = (std::min)(minVisibleY, hotSpotY);
+                    maxVisibleX = (std::max)(maxVisibleX, hotSpotX);
+                    maxVisibleY = (std::max)(maxVisibleY, hotSpotY);
+                }
+            }
+
             if (minVisibleX == 0 && minVisibleY == 0 && maxVisibleX + 1 == imageWidth && maxVisibleY + 1 == imageHeight)
             {
                 return true;
@@ -2773,6 +2789,8 @@ namespace
 
         static void FillGlobalMouseEventCommonFields(GB_GlobalMouseEvent& mouseEvent, const uint32_t messageTimeMs)
         {
+            DpiAwarenessScope dpiAwarenessScope;
+
             mouseEvent.physicalPixelPoint.Set(0.0, 0.0);
             POINT cursorPoint = {};
             if (TryGetCurrentPhysicalCursorPosition(cursorPoint))
@@ -2782,8 +2800,6 @@ namespace
 
             mouseEvent.wheelDelta = 0;
             mouseEvent.xButtonType = GB_GlobalMouseXButtonType::None;
-            mouseEvent.isInjected = false;
-            mouseEvent.isLowerIntegrityInjected = false;
             mouseEvent.messageTimeMs = messageTimeMs;
             mouseEvent.receiveTickCountMs = GetSteadyTickCountMs();
         }
@@ -3141,12 +3157,24 @@ namespace
 
                 if (unifiedCallback)
                 {
-                    unifiedCallback(mouseEvent);
+                    try
+                    {
+                        unifiedCallback(mouseEvent);
+                    }
+                    catch (...)
+                    {
+                    }
                 }
 
                 if (eventCallback)
                 {
-                    eventCallback(mouseEvent);
+                    try
+                    {
+                        eventCallback(mouseEvent);
+                    }
+                    catch (...)
+                    {
+                    }
                 }
             }
 
@@ -3171,7 +3199,13 @@ namespace
                         eventQueue.pop_front();
                     }
 
-                    DispatchOneEvent(mouseEvent);
+                    try
+                    {
+                        DispatchOneEvent(mouseEvent);
+                    }
+                    catch (...)
+                    {
+                    }
                 }
             }
 
