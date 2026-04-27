@@ -9,6 +9,7 @@
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <unordered_map>
 
 #ifdef _WIN32
 #  ifndef WIN32_LEAN_AND_MEAN
@@ -789,9 +790,8 @@ namespace
 
     static std::string PickProxyFromProtocolList(const std::string& proxyListUtf8, const std::string& schemeLower)
     {
-        std::string selected;
-        std::string fallback;
-        bool foundSchemeSpecific = false;
+        std::string fallbackProxy;
+        bool hasFallbackProxy = false;
 
         size_t begin = 0;
         while (begin < proxyListUtf8.size())
@@ -808,21 +808,20 @@ namespace
                 const size_t eqPos = token.find('=');
                 if (eqPos == std::string::npos)
                 {
-                    const std::string normalized = NormalizeProxyToken(token);
-                    if (!normalized.empty())
+                    // PAC 结果通常类似 "PROXY 127.0.0.1:7890; DIRECT" 或 "DIRECT; PROXY 127.0.0.1:7890"。
+                    // 应优先尊重列表中的第一个可用结果，不能因为后续存在 PROXY 就覆盖前面的 DIRECT。
+                    if (!hasFallbackProxy)
                     {
-                        fallback = normalized;
+                        fallbackProxy = NormalizeProxyToken(token);
+                        hasFallbackProxy = true;
                     }
                 }
                 else
                 {
                     const std::string keyLower = ToLowerCopy(TrimCopy(token.substr(0, eqPos)));
-                    const std::string value = NormalizeProxyToken(token.substr(eqPos + 1));
                     if (keyLower == schemeLower)
                     {
-                        selected = value; // 可能为空（DIRECT）
-                        foundSchemeSpecific = true;
-                        break;
+                        return NormalizeProxyToken(token.substr(eqPos + 1)); // 可能为空（DIRECT）
                     }
                 }
             }
@@ -830,11 +829,11 @@ namespace
             begin = end + 1;
         }
 
-        if (foundSchemeSpecific)
+        if (hasFallbackProxy)
         {
-            return selected;
+            return fallbackProxy;
         }
-        return fallback;
+        return std::string();
     }
 
 #endif
@@ -854,7 +853,156 @@ namespace
     };
 
 
-    static bool GetWindowsSystemProxyForUrlUtf8(const std::string& urlUtf8, std::string& proxyUtf8, std::string& bypassUtf8)
+    static const unsigned int DefaultWindowsSystemProxyResolveTimeoutMs = 2000;
+    static const size_t MaxWindowsSystemProxyCacheSize = 4096;
+
+    struct WindowsSystemProxyCacheItem
+    {
+        bool querySucceeded = false;
+        std::string proxyUtf8 = "";
+        std::string bypassUtf8 = "";
+        unsigned long long expireTickMs = 0;
+    };
+
+    struct WindowsAutoProxySessionState
+    {
+        std::mutex mutex;
+        HINTERNET session = nullptr;
+
+        ~WindowsAutoProxySessionState()
+        {
+            if (session != nullptr)
+            {
+                ::WinHttpCloseHandle(session);
+                session = nullptr;
+            }
+        }
+    };
+
+    static unsigned long long GetSteadyClockMilliseconds()
+    {
+        const auto now = std::chrono::steady_clock::now().time_since_epoch();
+        return static_cast<unsigned long long>(std::chrono::duration_cast<std::chrono::milliseconds>(now).count());
+    }
+
+    static int GetWinHttpTimeoutValue(unsigned int timeoutMs)
+    {
+        if (timeoutMs == 0)
+        {
+            timeoutMs = DefaultWindowsSystemProxyResolveTimeoutMs;
+        }
+
+        const unsigned int maxIntValue = static_cast<unsigned int>(std::numeric_limits<int>::max());
+        if (timeoutMs > maxIntValue)
+        {
+            timeoutMs = maxIntValue;
+        }
+
+        return static_cast<int>(timeoutMs);
+    }
+
+    static std::mutex& GetWindowsSystemProxyCacheMutex()
+    {
+        static std::mutex cacheMutex;
+        return cacheMutex;
+    }
+
+    static std::unordered_map<std::string, WindowsSystemProxyCacheItem>& GetWindowsSystemProxyCache()
+    {
+        static std::unordered_map<std::string, WindowsSystemProxyCacheItem> cache;
+        return cache;
+    }
+
+    static WindowsAutoProxySessionState& GetWindowsAutoProxySessionState()
+    {
+        static WindowsAutoProxySessionState sessionState;
+        return sessionState;
+    }
+
+    static void ClearWindowsSystemProxyCache()
+    {
+        std::lock_guard<std::mutex> lock(GetWindowsSystemProxyCacheMutex());
+        GetWindowsSystemProxyCache().clear();
+    }
+
+    static std::string BuildWindowsSystemProxyCacheKey(const std::string& urlUtf8, const GB_NetworkProxySettings& proxySettings)
+    {
+        std::string key;
+        if (proxySettings.systemProxyCacheByHost)
+        {
+            GB_UrlOperator::UrlComponents components;
+            if (GB_UrlOperator::TryParseUrl(urlUtf8, components))
+            {
+                key.reserve(128);
+                key += ToLowerCopy(components.schemeLower);
+                key += "://";
+                key += ToLowerCopy(components.hostUtf8);
+                if (components.hasPort)
+                {
+                    key += ":";
+                    key += std::to_string(static_cast<unsigned int>(components.port));
+                }
+            }
+        }
+
+        if (key.empty())
+        {
+            key = urlUtf8;
+        }
+
+        key += "|autoDetect=";
+        key += proxySettings.enableSystemProxyAutoDetect ? "1" : "0";
+        return key;
+    }
+
+    static bool TryGetWindowsSystemProxyFromCache(const std::string& cacheKey, std::string& proxyUtf8, std::string& bypassUtf8, bool& querySucceeded)
+    {
+        const unsigned long long nowTickMs = GetSteadyClockMilliseconds();
+
+        std::lock_guard<std::mutex> lock(GetWindowsSystemProxyCacheMutex());
+        std::unordered_map<std::string, WindowsSystemProxyCacheItem>& cache = GetWindowsSystemProxyCache();
+
+        const auto iter = cache.find(cacheKey);
+        if (iter == cache.end())
+        {
+            return false;
+        }
+
+        if (iter->second.expireTickMs <= nowTickMs)
+        {
+            cache.erase(iter);
+            return false;
+        }
+
+        querySucceeded = iter->second.querySucceeded;
+        proxyUtf8 = iter->second.proxyUtf8;
+        bypassUtf8 = iter->second.bypassUtf8;
+        return true;
+    }
+
+    static void PutWindowsSystemProxyToCache(const std::string& cacheKey, bool querySucceeded, const std::string& proxyUtf8, const std::string& bypassUtf8, unsigned int cacheTtlMs)
+    {
+        if (cacheKey.empty() || cacheTtlMs == 0)
+        {
+            return;
+        }
+
+        WindowsSystemProxyCacheItem item;
+        item.querySucceeded = querySucceeded;
+        item.proxyUtf8 = proxyUtf8;
+        item.bypassUtf8 = bypassUtf8;
+        item.expireTickMs = GetSteadyClockMilliseconds() + static_cast<unsigned long long>(cacheTtlMs);
+
+        std::lock_guard<std::mutex> lock(GetWindowsSystemProxyCacheMutex());
+        std::unordered_map<std::string, WindowsSystemProxyCacheItem>& cache = GetWindowsSystemProxyCache();
+        if (cache.size() >= MaxWindowsSystemProxyCacheSize)
+        {
+            cache.clear();
+        }
+        cache[cacheKey] = item;
+    }
+
+    static bool QueryWindowsSystemProxyForUrlUtf8(const std::string& urlUtf8, const GB_NetworkProxySettings& proxySettings, std::string& proxyUtf8, std::string& bypassUtf8)
     {
         proxyUtf8.clear();
         bypassUtf8.clear();
@@ -920,25 +1068,30 @@ namespace
             bypassUtf8 = GB_WStringToUtf8(ieProxyConfig.lpszProxyBypass);
         }
 
-        const bool needsAuto = (ieProxyConfig.fAutoDetect != FALSE) || (ieProxyConfig.lpszAutoConfigUrl != nullptr);
+        const bool needsAuto = proxySettings.enableSystemProxyAutoDetect && ((ieProxyConfig.fAutoDetect != FALSE) || (ieProxyConfig.lpszAutoConfigUrl != nullptr));
         if (!needsAuto)
         {
             // IE 配置读取成功。此时 proxyUtf8 可能为空（DIRECT），也应返回 true。
             return true;
         }
 
-        HINTERNET session = ::WinHttpOpen(L"GlobalBase/1.0", WINHTTP_ACCESS_TYPE_NO_PROXY, WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
-        if (session != nullptr)
+        WindowsAutoProxySessionState& sessionState = GetWindowsAutoProxySessionState();
+        std::lock_guard<std::mutex> sessionLock(sessionState.mutex);
+
+        if (sessionState.session == nullptr)
         {
-            // 避免 WPAD/PAC 等场景下长时间阻塞
-            ::WinHttpSetTimeouts(session, 2000, 2000, 2000, 2000);
+            sessionState.session = ::WinHttpOpen(L"GlobalBase/1.0", WINHTTP_ACCESS_TYPE_NO_PROXY, WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
         }
 
-        if (session == nullptr)
+        if (sessionState.session == nullptr)
         {
             // 自动代理需要 WinHTTP session，但创建失败时回退到“显式代理”（若有）。
             return gotExplicitProxy;
         }
+
+        // 复用同一个 WinHTTP session，既可避免频繁 Open/Close，也可让 WinHTTP 复用自身的 PAC/WPAD 缓存。
+        const int timeoutValue = GetWinHttpTimeoutValue(proxySettings.systemProxyResolveTimeoutMs);
+        ::WinHttpSetTimeouts(sessionState.session, timeoutValue, timeoutValue, timeoutValue, timeoutValue);
 
         WINHTTP_AUTOPROXY_OPTIONS autoProxyOptions;
         std::memset(&autoProxyOptions, 0, sizeof(autoProxyOptions));
@@ -963,7 +1116,7 @@ namespace
         ScopedGlobalFreeW bypassInfoFree;
 
         bool gotAutoResult = false;
-        if (::WinHttpGetProxyForUrl(session, urlW.c_str(), &autoProxyOptions, &proxyInfo))
+        if (::WinHttpGetProxyForUrl(sessionState.session, urlW.c_str(), &autoProxyOptions, &proxyInfo))
         {
             gotAutoResult = true;
             proxyInfoFree.ptr = proxyInfo.lpszProxy;
@@ -984,15 +1137,37 @@ namespace
             }
         }
 
-        ::WinHttpCloseHandle(session);
-
         if (gotAutoResult)
         {
             return true;
         }
 
-        // 自动代理失败时：若存在显式代理，则仍认为获取成功；否则交由上层决定回退策略
+        // 自动代理失败时：若存在显式代理，则仍认为获取成功；否则交由上层决定回退策略。
         return gotExplicitProxy;
+    }
+
+    static bool GetWindowsSystemProxyForUrlUtf8(const std::string& urlUtf8, const GB_NetworkProxySettings& proxySettings, std::string& proxyUtf8, std::string& bypassUtf8)
+    {
+        proxyUtf8.clear();
+        bypassUtf8.clear();
+
+        const unsigned int cacheTtlMs = proxySettings.systemProxyCacheTtlMs;
+        if (!proxySettings.cacheSystemProxy || cacheTtlMs == 0)
+        {
+            return QueryWindowsSystemProxyForUrlUtf8(urlUtf8, proxySettings, proxyUtf8, bypassUtf8);
+        }
+
+        const std::string cacheKey = BuildWindowsSystemProxyCacheKey(urlUtf8, proxySettings);
+
+        bool querySucceeded = false;
+        if (TryGetWindowsSystemProxyFromCache(cacheKey, proxyUtf8, bypassUtf8, querySucceeded))
+        {
+            return querySucceeded;
+        }
+
+        querySucceeded = QueryWindowsSystemProxyForUrlUtf8(urlUtf8, proxySettings, proxyUtf8, bypassUtf8);
+        PutWindowsSystemProxyToCache(cacheKey, querySucceeded, proxyUtf8, bypassUtf8, cacheTtlMs);
+        return querySucceeded;
     }
 #endif
 
@@ -1011,7 +1186,7 @@ namespace
             std::string systemProxyUtf8;
             std::string systemBypassUtf8;
 
-            if (GetWindowsSystemProxyForUrlUtf8(urlUtf8, systemProxyUtf8, systemBypassUtf8))
+            if (GetWindowsSystemProxyForUrlUtf8(urlUtf8, proxySettings, systemProxyUtf8, systemBypassUtf8))
             {
                 const std::string selectedProxy = PickProxyFromProtocolList(systemProxyUtf8, schemeLower);
 
@@ -4215,6 +4390,13 @@ GB_NetworkRequestOptions::GB_NetworkRequestOptions()
     {
         caBundlePathUtf8 = testCertPath;
     }
+}
+
+void GB_ClearNetworkSystemProxyCache()
+{
+#ifdef _WIN32
+    ClearWindowsSystemProxyCache();
+#endif
 }
 
 GB_NetworkResponse GB_RequestUrlData(const std::string& urlUtf8, const GB_NetworkRequestOptions& options)

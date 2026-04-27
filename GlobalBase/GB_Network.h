@@ -45,6 +45,12 @@ struct GB_NetworkProxySettings
 {
     bool useSystemProxy = true;                       // 是否使用系统代理配置（Windows: WinHTTP/IE；Linux: 环境变量）
 
+    bool cacheSystemProxy = true;                     // 是否缓存 Windows 系统代理解析结果（useSystemProxy=true 时生效）。用于避免高频下载反复触发 WinHTTP/WPAD/PAC 解析
+    unsigned int systemProxyCacheTtlMs = 60000;       // Windows 系统代理缓存有效期（毫秒）。0 表示不缓存
+    unsigned int systemProxyResolveTimeoutMs = 2000;  // Windows 系统代理解析超时时间（毫秒）。0 表示使用内部默认值
+    bool systemProxyCacheByHost = true;               // 是否按 scheme + host + port 缓存代理结果。适合瓦片下载；若 PAC 会按完整 URL path/query 分流，可设为 false
+    bool enableSystemProxyAutoDetect = true;          // 是否允许 Windows 系统代理执行 WPAD/PAC 自动检测。关闭后仍会读取系统显式代理
+
     bool enableProxy = false;                         // 是否启用自定义代理（useSystemProxy=false 时生效）
     GB_NetworkProxyType proxyType = GB_NetworkProxyType::Http; // 自定义代理类型
 
@@ -122,6 +128,16 @@ struct GB_NetworkResponse
  * @return GB_NetworkResponse 请求结果。
  */
 GLOBALBASE_PORT GB_NetworkResponse GB_RequestUrlData(const std::string& urlUtf8, const GB_NetworkRequestOptions& options = GB_NetworkRequestOptions());
+
+/**
+ * @brief 清空 Windows 系统代理解析缓存。
+ *
+ * @remarks
+ * - 仅在 Windows 且 useSystemProxy=true 时有实际作用。
+ * - 当系统代理、PAC 文件、网络环境发生变化后，可主动调用该函数让后续请求重新解析系统代理。
+ * - 非 Windows 平台调用该函数不会产生副作用。
+ */
+GLOBALBASE_PORT void GB_ClearNetworkSystemProxyCache();
 
 /**
  * @brief URL 文件下载结果。
