@@ -112,7 +112,7 @@ public:
     /** @brief 获取 point1 -> point2 的单位方向向量。无效或退化线段返回 NaN 向量。 */
     GB_Vector2d UnitDirectionVector(double tolerance = GB_Epsilon) const;
 
-    /** @brief 获取 point1 -> point2 向量与 X 轴正方向的夹角，范围 [0, 2PI)。 */
+    /** @brief 获取 point1 -> point2 向量与 X 轴正方向的夹角，范围 [0, 2PI)。无效或退化线段返回 NaN。 */
     double Angle() const;
 
     /** @brief 获取线段的轴对齐包围矩形。无效线段返回无效矩形。 */
@@ -220,7 +220,7 @@ public:
     /** @brief 原地分别在 point1 端和 point2 端延伸指定长度。 */
     void Extend(double deltaAtPoint1, double deltaAtPoint2);
 
-    /** @brief 判断点是否在线段上（含端点，使用容差）。 */
+    /** @brief 判断点是否在线段上（含端点，使用点到线段的最短距离容差）。 */
     bool IsContains(const GB_Point2d& point, double tolerance = GB_Epsilon) const;
 
     /**
@@ -235,10 +235,10 @@ public:
     /** @brief 判断两条线段方向是否垂直。退化线段返回 false。 */
     bool IsPerpendicularTo(const GB_LineSegment& other, double tolerance = GB_Epsilon) const;
 
-    /** @brief 判断两条非退化线段是否位于同一直线上。 */
+    /** @brief 判断两条线段是否位于同一直线上；退化线段按端点到另一条线段所在直线的距离处理。 */
     bool IsCollinearWith(const GB_LineSegment& other, double tolerance = GB_Epsilon) const;
 
-    /** @brief 获取两条线段的无方向夹角，范围 [0, PI/2]。 */
+    /** @brief 获取两条线段的无方向夹角，范围 [0, PI/2]。无效或退化线段返回 NaN。 */
     double AngleBetween(const GB_LineSegment& other) const;
 
     /** @brief 判断两条线段是否相交（含端点接触和共线重叠）。 */
