@@ -135,6 +135,9 @@
     <ClInclude Include="Geometry\GB_LineSegment.h">
       <Filter>头文件\Geometry</Filter>
     </ClInclude>
+    <ClInclude Include="Geometry\GB_Polyline.h">
+      <Filter>头文件\Geometry</Filter>
+    </ClInclude>
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="GB_Utf8String.cpp">
@@ -231,6 +234,9 @@
       <Filter>源文件\Desktop</Filter>
     </ClCompile>
     <ClCompile Include="Geometry\GB_LineSegment.cpp">
+      <Filter>源文件\Geometry</Filter>
+    </ClCompile>
+    <ClCompile Include="Geometry\GB_Polyline.cpp">
       <Filter>源文件\Geometry</Filter>
     </ClCompile>
   </ItemGroup>
