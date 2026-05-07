@@ -13,6 +13,7 @@
 #include <limits>
 #include <locale>
 #include <memory>
+#include <mutex>
 #include <sstream>
 #include <utility>
 
@@ -20,6 +21,7 @@ namespace
 {
     constexpr static size_t BvhBuildSegmentThreshold = 64;
     constexpr static size_t BvhLeafSegmentCount = 16;
+    constexpr static size_t InvalidBvhNodeIndex = std::numeric_limits<size_t>::max();
 
     static inline double AbsTol(double tolerance)
     {
@@ -35,18 +37,8 @@ namespace
         return GB_Point2d(GB_QuietNan, GB_QuietNan);
     }
 
-    static inline bool IsFinitePoint(const GB_Point2d& point)
+    static inline bool AreVerticesFinite(const std::vector<GB_Point2d>& vertices)
     {
-        return point.IsValid();
-    }
-
-    static inline bool AreVerticesValid(const std::vector<GB_Point2d>& vertices)
-    {
-        if (vertices.size() < 2)
-        {
-            return false;
-        }
-
         for (const GB_Point2d& vertex : vertices)
         {
             if (!vertex.IsValid())
@@ -56,6 +48,53 @@ namespace
         }
 
         return true;
+    }
+
+    static inline bool AreVerticesValid(const std::vector<GB_Point2d>& vertices)
+    {
+        return vertices.size() >= 2 && AreVerticesFinite(vertices);
+    }
+
+    static inline double LengthCompareTolerance(double totalLength)
+    {
+        if (!std::isfinite(totalLength))
+        {
+            return std::numeric_limits<double>::epsilon() * 64.0;
+        }
+
+        return std::max(std::numeric_limits<double>::epsilon() * 64.0, std::abs(totalLength) * 1e-12);
+    }
+
+    static inline bool AreDistancesNearEqual(double distance1, double distance2, double tolerance)
+    {
+        if (!std::isfinite(distance1) || !std::isfinite(distance2))
+        {
+            return false;
+        }
+
+        return std::abs(distance1 - distance2) <= tolerance;
+    }
+
+    static inline bool IsBetterDistanceCandidate(double candidateDistanceSquared, size_t candidateSegmentIndex, double bestDistanceSquared, size_t bestSegmentIndex)
+    {
+        if (!std::isfinite(candidateDistanceSquared))
+        {
+            return false;
+        }
+
+        if (!std::isfinite(bestDistanceSquared))
+        {
+            return true;
+        }
+
+        if (candidateDistanceSquared < bestDistanceSquared)
+        {
+            return true;
+        }
+
+        const double distanceScale = std::max(1.0, std::max(std::abs(candidateDistanceSquared), std::abs(bestDistanceSquared)));
+        const double compareTolerance = std::numeric_limits<double>::epsilon() * 64.0 * distanceScale;
+        return std::abs(candidateDistanceSquared - bestDistanceSquared) <= compareTolerance && candidateSegmentIndex < bestSegmentIndex;
     }
 
     static inline double Clamp01(double value)
@@ -97,6 +136,41 @@ namespace
         return GB_Rectangle(point1, point2);
     }
 
+    static inline double SquaredLengthFromComponents(double deltaX, double deltaY)
+    {
+        if (!std::isfinite(deltaX) || !std::isfinite(deltaY))
+        {
+            if (std::isnan(deltaX) || std::isnan(deltaY))
+            {
+                return GB_QuietNan;
+            }
+
+            return std::numeric_limits<double>::max();
+        }
+
+        const double scale = std::max(std::abs(deltaX), std::abs(deltaY));
+        if (scale <= 0.0)
+        {
+            return 0.0;
+        }
+
+        const double scaledX = deltaX / scale;
+        const double scaledY = deltaY / scale;
+        const double scaledLengthSquared = scaledX * scaledX + scaledY * scaledY;
+        if (!std::isfinite(scaledLengthSquared) || scaledLengthSquared <= 0.0)
+        {
+            return 0.0;
+        }
+
+        const double maxSafeScale = std::sqrt(std::numeric_limits<double>::max() / scaledLengthSquared);
+        if (scale >= maxSafeScale)
+        {
+            return std::numeric_limits<double>::max();
+        }
+
+        return scale * scale * scaledLengthSquared;
+    }
+
     static inline double RectangleDistanceToPointSquared(const GB_Rectangle& rect, const GB_Point2d& point)
     {
         if (!rect.IsValid() || !point.IsValid())
@@ -124,14 +198,50 @@ namespace
             dy = point.y - rect.maxY;
         }
 
-        return dx * dx + dy * dy;
+        return SquaredLengthFromComponents(dx, dy);
+    }
+
+    static inline bool RectangleContainsPointWithTolerance(const GB_Rectangle& rect, const GB_Point2d& point, double tolerance)
+    {
+        if (!rect.IsValid() || !point.IsValid())
+        {
+            return false;
+        }
+
+        const double absTolerance = AbsTol(tolerance);
+        return point.x >= rect.minX - absTolerance && point.x <= rect.maxX + absTolerance && point.y >= rect.minY - absTolerance && point.y <= rect.maxY + absTolerance;
     }
 
     static inline double PointDistanceSquared(const GB_Point2d& point1, const GB_Point2d& point2)
     {
-        const double dx = point1.x - point2.x;
-        const double dy = point1.y - point2.y;
-        return dx * dx + dy * dy;
+        if (!point1.IsValid() || !point2.IsValid())
+        {
+            return GB_QuietNan;
+        }
+
+        return SquaredLengthFromComponents(point1.x - point2.x, point1.y - point2.y);
+    }
+
+    static inline double PointDistance(const GB_Point2d& point1, const GB_Point2d& point2)
+    {
+        if (!point1.IsValid() || !point2.IsValid())
+        {
+            return GB_QuietNan;
+        }
+
+        const double deltaX = point1.x - point2.x;
+        const double deltaY = point1.y - point2.y;
+        if (!std::isfinite(deltaX) || !std::isfinite(deltaY))
+        {
+            if (std::isnan(deltaX) || std::isnan(deltaY))
+            {
+                return GB_QuietNan;
+            }
+
+            return std::numeric_limits<double>::max();
+        }
+
+        return std::hypot(deltaX, deltaY);
     }
 
     static inline double PointToSegmentDistanceSquared(const GB_Point2d& point, const GB_Point2d& segmentStart, const GB_Point2d& segmentEnd, double& outSegmentParameter, GB_Point2d& outClosestPoint)
@@ -146,27 +256,56 @@ namespace
 
         const double vectorX = segmentEnd.x - segmentStart.x;
         const double vectorY = segmentEnd.y - segmentStart.y;
-        const double lengthSquared = vectorX * vectorX + vectorY * vectorY;
-        if (!std::isfinite(lengthSquared))
+        const double pointVectorX = point.x - segmentStart.x;
+        const double pointVectorY = point.y - segmentStart.y;
+
+        if (!std::isfinite(vectorX) || !std::isfinite(vectorY) || !std::isfinite(pointVectorX) || !std::isfinite(pointVectorY))
         {
             return GB_QuietNan;
         }
 
-        if (lengthSquared <= 0.0)
+        const double scale = std::max(std::abs(vectorX), std::abs(vectorY));
+        if (scale <= 0.0)
         {
             outSegmentParameter = 0.0;
             outClosestPoint = segmentStart;
             return PointDistanceSquared(point, segmentStart);
         }
 
-        const double pointVectorX = point.x - segmentStart.x;
-        const double pointVectorY = point.y - segmentStart.y;
-        double parameter = (pointVectorX * vectorX + pointVectorY * vectorY) / lengthSquared;
+        const double scaledVectorX = vectorX / scale;
+        const double scaledVectorY = vectorY / scale;
+        const double scaledPointVectorX = pointVectorX / scale;
+        const double scaledPointVectorY = pointVectorY / scale;
+        const double scaledLengthSquared = scaledVectorX * scaledVectorX + scaledVectorY * scaledVectorY;
+        if (!std::isfinite(scaledLengthSquared) || scaledLengthSquared <= 0.0)
+        {
+            outSegmentParameter = 0.0;
+            outClosestPoint = segmentStart;
+            return PointDistanceSquared(point, segmentStart);
+        }
+
+        double parameter = (scaledPointVectorX * scaledVectorX + scaledPointVectorY * scaledVectorY) / scaledLengthSquared;
         parameter = Clamp01(parameter);
 
         outSegmentParameter = parameter;
         outClosestPoint = GB_Point2d(segmentStart.x + vectorX * parameter, segmentStart.y + vectorY * parameter);
         return PointDistanceSquared(point, outClosestPoint);
+    }
+
+    static inline double SquaredTolerance(double tolerance)
+    {
+        if (!std::isfinite(tolerance) || tolerance <= 0.0)
+        {
+            return 0.0;
+        }
+
+        const double maxSafeTolerance = std::sqrt(std::numeric_limits<double>::max());
+        if (tolerance >= maxSafeTolerance)
+        {
+            return std::numeric_limits<double>::infinity();
+        }
+
+        return tolerance * tolerance;
     }
 
     static inline bool PointsAreNearEqual(const GB_Point2d& point1, const GB_Point2d& point2, double tolerance)
@@ -176,8 +315,7 @@ namespace
             return false;
         }
 
-        const double toleranceSquared = tolerance * tolerance;
-        return PointDistanceSquared(point1, point2) <= toleranceSquared;
+        return PointDistanceSquared(point1, point2) <= SquaredTolerance(tolerance);
     }
 
     static inline bool TryParseSizeT(const std::string& text, size_t& value)
@@ -274,9 +412,81 @@ namespace
         }
     }
 
+    static std::vector<GB_Point2d> SimplifyOpenVerticesRdp(const std::vector<GB_Point2d>& inputVertices, double toleranceSquared)
+    {
+        if (inputVertices.size() <= 2 || toleranceSquared <= 0.0)
+        {
+            return inputVertices;
+        }
+
+        if (!std::isfinite(toleranceSquared))
+        {
+            std::vector<GB_Point2d> simplifiedVertices;
+            simplifiedVertices.reserve(2);
+            simplifiedVertices.push_back(inputVertices.front());
+            simplifiedVertices.push_back(inputVertices.back());
+            return simplifiedVertices;
+        }
+
+        std::vector<unsigned char> keepFlags(inputVertices.size(), 0);
+        keepFlags.front() = 1;
+        keepFlags.back() = 1;
+
+        std::vector<std::pair<size_t, size_t>> ranges;
+        ranges.reserve(64);
+        ranges.emplace_back(0, inputVertices.size() - 1);
+
+        while (!ranges.empty())
+        {
+            const std::pair<size_t, size_t> range = ranges.back();
+            ranges.pop_back();
+
+            const size_t firstIndex = range.first;
+            const size_t lastIndex = range.second;
+            if (lastIndex <= firstIndex + 1)
+            {
+                continue;
+            }
+
+            double maxDistanceSquared = -1.0;
+            size_t maxIndex = firstIndex;
+            for (size_t i = firstIndex + 1; i < lastIndex; i++)
+            {
+                double segmentParameter = GB_QuietNan;
+                GB_Point2d closestPoint = MakeNanPoint();
+                const double distanceSquared = PointToSegmentDistanceSquared(inputVertices[i], inputVertices[firstIndex], inputVertices[lastIndex], segmentParameter, closestPoint);
+                if (std::isfinite(distanceSquared) && distanceSquared > maxDistanceSquared)
+                {
+                    maxDistanceSquared = distanceSquared;
+                    maxIndex = i;
+                }
+            }
+
+            if (maxDistanceSquared > toleranceSquared && maxIndex > firstIndex && maxIndex < lastIndex)
+            {
+                keepFlags[maxIndex] = 1;
+                ranges.emplace_back(firstIndex, maxIndex);
+                ranges.emplace_back(maxIndex, lastIndex);
+            }
+        }
+
+        std::vector<GB_Point2d> simplifiedVertices;
+        simplifiedVertices.reserve(inputVertices.size());
+        for (size_t i = 0; i < inputVertices.size(); i++)
+        {
+            if (keepFlags[i] != 0)
+            {
+                simplifiedVertices.push_back(inputVertices[i]);
+            }
+        }
+
+        EnsureAtLeastTwoVertices(simplifiedVertices);
+        return simplifiedVertices;
+    }
+
     static GB_Point2d PointAtDistanceFromCache(const std::vector<GB_Point2d>& vertices, const std::vector<double>& cumulativeLengths, double totalLength, double distance)
     {
-        if (!AreVerticesValid(vertices))
+        if (vertices.size() < 2 || cumulativeLengths.size() != vertices.size())
         {
             return MakeNanPoint();
         }
@@ -348,27 +558,29 @@ struct GB_Polyline::CacheData
         GB_Rectangle box;
         size_t firstItemIndex = 0;
         size_t itemCount = 0;
-        int leftChildIndex = -1;
-        int rightChildIndex = -1;
+        size_t leftChildIndex = InvalidBvhNodeIndex;
+        size_t rightChildIndex = InvalidBvhNodeIndex;
 
         bool IsLeaf() const
         {
-            return leftChildIndex < 0 && rightChildIndex < 0;
+            return leftChildIndex == InvalidBvhNodeIndex && rightChildIndex == InvalidBvhNodeIndex;
         }
     };
 
     std::uint64_t version = 0;
+    bool isValid = false;
     double totalLength = GB_QuietNan;
     GB_Rectangle boundingRectangle = GB_Rectangle::Invalid;
     std::vector<double> segmentLengths;
     std::vector<double> cumulativeLengths;
-    std::vector<SegmentBox> segmentBoxes;
-    std::vector<size_t> bvhItemSegmentIndices;
-    std::vector<BvhNode> bvhNodes;
+    mutable std::once_flag spatialIndexBuildOnce;
+    mutable std::vector<SegmentBox> segmentBoxes;
+    mutable std::vector<size_t> bvhItemSegmentIndices;
+    mutable std::vector<BvhNode> bvhNodes;
 
-    int BuildBvhNode(size_t firstItemIndex, size_t itemCount)
+    size_t BuildBvhNode(size_t firstItemIndex, size_t itemCount) const
     {
-        const int nodeIndex = static_cast<int>(bvhNodes.size());
+        const size_t nodeIndex = bvhNodes.size();
         bvhNodes.push_back(BvhNode());
 
         BvhNode node;
@@ -379,8 +591,18 @@ struct GB_Polyline::CacheData
         for (size_t i = 0; i < itemCount; i++)
         {
             const size_t itemIndex = firstItemIndex + i;
-            const size_t segmentIndex = bvhItemSegmentIndices[itemIndex];
-            const GB_Rectangle& segmentBox = segmentBoxes[segmentIndex].box;
+            if (itemIndex >= bvhItemSegmentIndices.size())
+            {
+                continue;
+            }
+
+            const size_t segmentBoxIndex = bvhItemSegmentIndices[itemIndex];
+            if (segmentBoxIndex >= segmentBoxes.size())
+            {
+                continue;
+            }
+
+            const GB_Rectangle& segmentBox = segmentBoxes[segmentBoxIndex].box;
             if (!hasBox)
             {
                 node.box = segmentBox;
@@ -403,7 +625,7 @@ struct GB_Polyline::CacheData
         const bool splitByX = width >= height;
         const size_t middleItemIndex = firstItemIndex + itemCount / 2;
 
-        std::sort(bvhItemSegmentIndices.begin() + firstItemIndex, bvhItemSegmentIndices.begin() + firstItemIndex + itemCount,
+        std::nth_element(bvhItemSegmentIndices.begin() + firstItemIndex, bvhItemSegmentIndices.begin() + middleItemIndex, bvhItemSegmentIndices.begin() + firstItemIndex + itemCount,
             [this, splitByX](size_t leftSegmentIndex, size_t rightSegmentIndex)
             {
                 const GB_Rectangle& leftBox = segmentBoxes[leftSegmentIndex].box;
@@ -431,7 +653,7 @@ struct GB_Polyline::CacheData
         return nodeIndex;
     }
 
-    void BuildBvh()
+    void BuildBvh() const
     {
         bvhItemSegmentIndices.clear();
         bvhNodes.clear();
@@ -447,8 +669,39 @@ struct GB_Polyline::CacheData
             bvhItemSegmentIndices.push_back(i);
         }
 
-        bvhNodes.reserve(segmentBoxes.size() * 2);
+        const size_t nodeReserveCount = (segmentBoxes.size() > std::numeric_limits<size_t>::max() / 2) ? segmentBoxes.size() : segmentBoxes.size() * 2;
+        bvhNodes.reserve(nodeReserveCount);
         BuildBvhNode(0, bvhItemSegmentIndices.size());
+    }
+
+    void BuildSpatialIndex(const std::vector<GB_Point2d>& inputVertices) const
+    {
+        segmentBoxes.clear();
+        bvhItemSegmentIndices.clear();
+        bvhNodes.clear();
+
+        if (!isValid || inputVertices.size() < 2)
+        {
+            return;
+        }
+
+        const size_t numSegments = inputVertices.size() - 1;
+        segmentBoxes.resize(numSegments);
+        for (size_t i = 0; i < numSegments; i++)
+        {
+            segmentBoxes[i].box = SegmentBoundingRectangle(inputVertices[i], inputVertices[i + 1]);
+            segmentBoxes[i].segmentIndex = i;
+        }
+
+        BuildBvh();
+    }
+
+    void EnsureSpatialIndex(const std::vector<GB_Point2d>& inputVertices) const
+    {
+        std::call_once(spatialIndexBuildOnce, [this, &inputVertices]()
+            {
+                BuildSpatialIndex(inputVertices);
+            });
     }
 };
 
@@ -560,12 +813,13 @@ std::shared_ptr<const GB_Polyline::CacheData> GB_Polyline::GetOrBuildCache() con
         return cachedData;
     }
 
+    newCache->isValid = true;
+
     const size_t numVertices = vertices.size();
     const size_t numSegments = numVertices - 1;
 
     newCache->segmentLengths.resize(numSegments, 0.0);
     newCache->cumulativeLengths.resize(numVertices, 0.0);
-    newCache->segmentBoxes.resize(numSegments);
     newCache->totalLength = 0.0;
     newCache->boundingRectangle.SetFromPoint(vertices.front());
 
@@ -578,18 +832,20 @@ std::shared_ptr<const GB_Polyline::CacheData> GB_Polyline::GetOrBuildCache() con
     {
         const GB_Point2d& point1 = vertices[i];
         const GB_Point2d& point2 = vertices[i + 1];
-        const double length = point1.DistanceTo(point2);
+        const double length = PointDistance(point1, point2);
         const double safeLength = std::isfinite(length) ? length : 0.0;
 
         newCache->segmentLengths[i] = safeLength;
-        newCache->totalLength += safeLength;
+        if (safeLength >= std::numeric_limits<double>::max() - newCache->totalLength)
+        {
+            newCache->totalLength = std::numeric_limits<double>::max();
+        }
+        else
+        {
+            newCache->totalLength += safeLength;
+        }
         newCache->cumulativeLengths[i + 1] = newCache->totalLength;
-
-        newCache->segmentBoxes[i].box = SegmentBoundingRectangle(point1, point2);
-        newCache->segmentBoxes[i].segmentIndex = i;
     }
-
-    newCache->BuildBvh();
 
     cachedData = std::shared_ptr<const CacheData>(newCache);
     std::atomic_store_explicit(&cache, cachedData, std::memory_order_release);
@@ -757,7 +1013,7 @@ bool GB_Polyline::TryGetVertex(size_t index, GB_Point2d& outVertex) const
 
 GB_LineSegment GB_Polyline::GetSegment(size_t index) const
 {
-    if (index + 1 >= vertices.size())
+    if (index >= GetNumSegments())
     {
         return GB_LineSegment::Invalid;
     }
@@ -767,14 +1023,14 @@ GB_LineSegment GB_Polyline::GetSegment(size_t index) const
 
 bool GB_Polyline::TryGetSegment(size_t index, GB_LineSegment& outSegment) const
 {
-    if (index + 1 >= vertices.size())
+    if (index >= GetNumSegments())
     {
         outSegment = GB_LineSegment::Invalid;
         return false;
     }
 
     outSegment.Set(vertices[index], vertices[index + 1]);
-    return outSegment.IsValid();
+    return true;
 }
 
 std::vector<GB_LineSegment> GB_Polyline::GetSegments() const
@@ -793,24 +1049,14 @@ std::vector<GB_LineSegment> GB_Polyline::GetSegments() const
 
 double GB_Polyline::Length() const
 {
-    if (!IsValid())
-    {
-        return GB_QuietNan;
-    }
-
     const std::shared_ptr<const CacheData> cachedData = GetOrBuildCache();
-    return cachedData ? cachedData->totalLength : GB_QuietNan;
+    return (cachedData && cachedData->isValid) ? cachedData->totalLength : GB_QuietNan;
 }
 
 GB_Rectangle GB_Polyline::BoundingRectangle() const
 {
-    if (!IsValid())
-    {
-        return GB_Rectangle::Invalid;
-    }
-
     const std::shared_ptr<const CacheData> cachedData = GetOrBuildCache();
-    return cachedData ? cachedData->boundingRectangle : GB_Rectangle::Invalid;
+    return (cachedData && cachedData->isValid) ? cachedData->boundingRectangle : GB_Rectangle::Invalid;
 }
 
 bool GB_Polyline::HasDuplicateAdjacentVertices(double tolerance) const
@@ -844,9 +1090,20 @@ bool GB_Polyline::IsContains(const GB_Point2d& point, double tolerance) const
         return false;
     }
 
-    const double distanceSquared = DistanceToSquared(point);
+    const std::shared_ptr<const CacheData> cachedData = GetOrBuildCache();
+    if (!cachedData || !cachedData->isValid)
+    {
+        return false;
+    }
+
     const double absTolerance = AbsTol(tolerance);
-    return std::isfinite(distanceSquared) && distanceSquared <= absTolerance * absTolerance;
+    if (!RectangleContainsPointWithTolerance(cachedData->boundingRectangle, point, absTolerance))
+    {
+        return false;
+    }
+
+    const double distanceSquared = DistanceToSquared(point);
+    return std::isfinite(distanceSquared) && distanceSquared <= SquaredTolerance(absTolerance);
 }
 
 GB_Point2d GB_Polyline::ClosestPointTo(const GB_Point2d& point) const
@@ -864,24 +1121,31 @@ double GB_Polyline::DistanceTo(const GB_Point2d& point) const
 double GB_Polyline::DistanceToSquared(const GB_Point2d& point) const
 {
     const ClosestPointResult result = GetClosestPointResult(point);
-    return result.succeeded ? (result.distance * result.distance) : GB_QuietNan;
+    return (result.succeeded && result.closestPoint.IsValid() && point.IsValid()) ? PointDistanceSquared(point, result.closestPoint) : GB_QuietNan;
 }
 
 GB_Polyline::ClosestPointResult GB_Polyline::GetClosestPointResult(const GB_Point2d& point) const
 {
     ClosestPointResult result;
 
-    if (!IsValid() || !point.IsValid())
+    if (!point.IsValid())
     {
         return result;
     }
 
     const std::shared_ptr<const CacheData> cachedData = GetOrBuildCache();
-    if (!cachedData || cachedData->segmentBoxes.empty())
+    if (!cachedData || !cachedData->isValid)
     {
         return result;
     }
 
+    cachedData->EnsureSpatialIndex(vertices);
+    if (cachedData->segmentBoxes.empty())
+    {
+        return result;
+    }
+
+    const size_t numSegments = GetNumSegments();
     double bestDistanceSquared = std::numeric_limits<double>::infinity();
     double bestSegmentParameter = GB_QuietNan;
     GB_Point2d bestClosestPoint = MakeNanPoint();
@@ -889,7 +1153,7 @@ GB_Polyline::ClosestPointResult GB_Polyline::GetClosestPointResult(const GB_Poin
 
     const auto evaluateSegment = [&](size_t segmentIndex)
         {
-            if (segmentIndex + 1 >= vertices.size())
+            if (segmentIndex >= numSegments)
             {
                 return;
             }
@@ -902,7 +1166,7 @@ GB_Polyline::ClosestPointResult GB_Polyline::GetClosestPointResult(const GB_Poin
                 return;
             }
 
-            if (distanceSquared < bestDistanceSquared)
+            if (IsBetterDistanceCandidate(distanceSquared, segmentIndex, bestDistanceSquared, bestSegmentIndex))
             {
                 bestDistanceSquared = distanceSquared;
                 bestSegmentParameter = segmentParameter;
@@ -913,21 +1177,21 @@ GB_Polyline::ClosestPointResult GB_Polyline::GetClosestPointResult(const GB_Poin
 
     if (!cachedData->bvhNodes.empty())
     {
-        std::vector<int> nodeStack;
+        std::vector<size_t> nodeStack;
         nodeStack.reserve(64);
         nodeStack.push_back(0);
 
         while (!nodeStack.empty())
         {
-            const int nodeIndex = nodeStack.back();
+            const size_t nodeIndex = nodeStack.back();
             nodeStack.pop_back();
 
-            if (nodeIndex < 0 || static_cast<size_t>(nodeIndex) >= cachedData->bvhNodes.size())
+            if (nodeIndex >= cachedData->bvhNodes.size())
             {
                 continue;
             }
 
-            const CacheData::BvhNode& node = cachedData->bvhNodes[static_cast<size_t>(nodeIndex)];
+            const CacheData::BvhNode& node = cachedData->bvhNodes[nodeIndex];
             const double nodeDistanceSquared = RectangleDistanceToPointSquared(node.box, point);
             if (!std::isfinite(nodeDistanceSquared) || nodeDistanceSquared > bestDistanceSquared)
             {
@@ -943,44 +1207,54 @@ GB_Polyline::ClosestPointResult GB_Polyline::GetClosestPointResult(const GB_Poin
                     {
                         continue;
                     }
-                    evaluateSegment(cachedData->bvhItemSegmentIndices[itemIndex]);
+                    const size_t segmentBoxIndex = cachedData->bvhItemSegmentIndices[itemIndex];
+                    if (segmentBoxIndex >= cachedData->segmentBoxes.size())
+                    {
+                        continue;
+                    }
+
+                    const double boxDistanceSquared = RectangleDistanceToPointSquared(cachedData->segmentBoxes[segmentBoxIndex].box, point);
+                    if (std::isfinite(boxDistanceSquared) && boxDistanceSquared <= bestDistanceSquared)
+                    {
+                        evaluateSegment(cachedData->segmentBoxes[segmentBoxIndex].segmentIndex);
+                    }
                 }
             }
             else
             {
-                const int leftChildIndex = node.leftChildIndex;
-                const int rightChildIndex = node.rightChildIndex;
+                const size_t leftChildIndex = node.leftChildIndex;
+                const size_t rightChildIndex = node.rightChildIndex;
 
                 double leftDistanceSquared = std::numeric_limits<double>::infinity();
                 double rightDistanceSquared = std::numeric_limits<double>::infinity();
 
-                if (leftChildIndex >= 0 && static_cast<size_t>(leftChildIndex) < cachedData->bvhNodes.size())
+                if (leftChildIndex < cachedData->bvhNodes.size())
                 {
-                    leftDistanceSquared = RectangleDistanceToPointSquared(cachedData->bvhNodes[static_cast<size_t>(leftChildIndex)].box, point);
+                    leftDistanceSquared = RectangleDistanceToPointSquared(cachedData->bvhNodes[leftChildIndex].box, point);
                 }
-                if (rightChildIndex >= 0 && static_cast<size_t>(rightChildIndex) < cachedData->bvhNodes.size())
+                if (rightChildIndex < cachedData->bvhNodes.size())
                 {
-                    rightDistanceSquared = RectangleDistanceToPointSquared(cachedData->bvhNodes[static_cast<size_t>(rightChildIndex)].box, point);
+                    rightDistanceSquared = RectangleDistanceToPointSquared(cachedData->bvhNodes[rightChildIndex].box, point);
                 }
 
                 if (leftDistanceSquared < rightDistanceSquared)
                 {
-                    if (rightDistanceSquared <= bestDistanceSquared)
+                    if (rightChildIndex < cachedData->bvhNodes.size() && rightDistanceSquared <= bestDistanceSquared)
                     {
                         nodeStack.push_back(rightChildIndex);
                     }
-                    if (leftDistanceSquared <= bestDistanceSquared)
+                    if (leftChildIndex < cachedData->bvhNodes.size() && leftDistanceSquared <= bestDistanceSquared)
                     {
                         nodeStack.push_back(leftChildIndex);
                     }
                 }
                 else
                 {
-                    if (leftDistanceSquared <= bestDistanceSquared)
+                    if (leftChildIndex < cachedData->bvhNodes.size() && leftDistanceSquared <= bestDistanceSquared)
                     {
                         nodeStack.push_back(leftChildIndex);
                     }
-                    if (rightDistanceSquared <= bestDistanceSquared)
+                    if (rightChildIndex < cachedData->bvhNodes.size() && rightDistanceSquared <= bestDistanceSquared)
                     {
                         nodeStack.push_back(rightChildIndex);
                     }
@@ -1028,13 +1302,13 @@ GB_Polyline::ClosestPointResult GB_Polyline::GetClosestPointResult(const GB_Poin
 
 GB_Point2d GB_Polyline::PointAtDistance(double distance, bool clampToRange) const
 {
-    if (!IsValid() || !std::isfinite(distance))
+    if (!std::isfinite(distance))
     {
         return MakeNanPoint();
     }
 
     const std::shared_ptr<const CacheData> cachedData = GetOrBuildCache();
-    if (!cachedData)
+    if (!cachedData || !cachedData->isValid)
     {
         return MakeNanPoint();
     }
@@ -1060,13 +1334,13 @@ GB_Point2d GB_Polyline::PointAtDistance(double distance, bool clampToRange) cons
 
 GB_Point2d GB_Polyline::PointAtNormalizedLength(double t, bool clampToRange) const
 {
-    if (!IsValid() || !std::isfinite(t))
+    if (!std::isfinite(t))
     {
         return MakeNanPoint();
     }
 
-    const double length = Length();
-    if (!std::isfinite(length))
+    const std::shared_ptr<const CacheData> cachedData = GetOrBuildCache();
+    if (!cachedData || !cachedData->isValid || !std::isfinite(cachedData->totalLength))
     {
         return MakeNanPoint();
     }
@@ -1081,7 +1355,7 @@ GB_Point2d GB_Polyline::PointAtNormalizedLength(double t, bool clampToRange) con
         return MakeNanPoint();
     }
 
-    return PointAtDistance(length * parameter, true);
+    return PointAtDistanceFromCache(vertices, cachedData->cumulativeLengths, cachedData->totalLength, cachedData->totalLength * parameter);
 }
 
 GB_Polyline GB_Polyline::Reversed() const
@@ -1124,6 +1398,12 @@ void GB_Polyline::Offset(double deltaX, double deltaY)
         vertex.Offset(deltaX, deltaY);
     }
 
+    if (!AreVerticesFinite(vertices))
+    {
+        Reset();
+        return;
+    }
+
     InvalidateCaches();
 }
 
@@ -1156,6 +1436,12 @@ void GB_Polyline::Rotate(double angle, const GB_Point2d& center)
     for (GB_Point2d& vertex : vertices)
     {
         vertex.Rotate(angle, center);
+    }
+
+    if (!AreVerticesFinite(vertices))
+    {
+        Reset();
+        return;
     }
 
     InvalidateCaches();
@@ -1192,6 +1478,12 @@ void GB_Polyline::Scale(double scaleX, double scaleY, const GB_Point2d& center)
         vertex.y = center.y + (vertex.y - center.y) * scaleY;
     }
 
+    if (!AreVerticesFinite(vertices))
+    {
+        Reset();
+        return;
+    }
+
     InvalidateCaches();
 }
 
@@ -1215,7 +1507,7 @@ void GB_Polyline::Transform(const GB_Matrix3x3& mat)
         vertex.Transform(mat);
     }
 
-    if (!AreVerticesValid(vertices))
+    if (!AreVerticesFinite(vertices))
     {
         Reset();
         return;
@@ -1269,72 +1561,31 @@ GB_Polyline GB_Polyline::Simplified(double tolerance) const
         return *this;
     }
 
-    const double toleranceSquared = absTolerance * absTolerance;
-    std::vector<unsigned char> keepFlags(vertices.size(), 0);
-    keepFlags.front() = 1;
-    keepFlags.back() = 1;
-
-    std::vector<std::pair<size_t, size_t>> ranges;
-    ranges.reserve(64);
-    ranges.emplace_back(0, vertices.size() - 1);
-
-    while (!ranges.empty())
+    const double toleranceSquared = SquaredTolerance(absTolerance);
+    const bool hasExplicitClosingVertex = vertices.size() > 3 && PointsAreNearEqual(vertices.front(), vertices.back(), GB_Epsilon);
+    if (hasExplicitClosingVertex)
     {
-        const std::pair<size_t, size_t> range = ranges.back();
-        ranges.pop_back();
-
-        const size_t firstIndex = range.first;
-        const size_t lastIndex = range.second;
-        if (lastIndex <= firstIndex + 1)
-        {
-            continue;
-        }
-
-        double maxDistanceSquared = -1.0;
-        size_t maxIndex = firstIndex;
-        for (size_t i = firstIndex + 1; i < lastIndex; i++)
-        {
-            double segmentParameter = GB_QuietNan;
-            GB_Point2d closestPoint = MakeNanPoint();
-            const double distanceSquared = PointToSegmentDistanceSquared(vertices[i], vertices[firstIndex], vertices[lastIndex], segmentParameter, closestPoint);
-            if (std::isfinite(distanceSquared) && distanceSquared > maxDistanceSquared)
-            {
-                maxDistanceSquared = distanceSquared;
-                maxIndex = i;
-            }
-        }
-
-        if (maxDistanceSquared > toleranceSquared && maxIndex > firstIndex && maxIndex < lastIndex)
-        {
-            keepFlags[maxIndex] = 1;
-            ranges.emplace_back(firstIndex, maxIndex);
-            ranges.emplace_back(maxIndex, lastIndex);
-        }
+        std::vector<GB_Point2d> openVertices(vertices.begin(), vertices.end() - 1);
+        std::vector<GB_Point2d> simplifiedVertices = SimplifyOpenVerticesRdp(openVertices, toleranceSquared);
+        EnsureAtLeastTwoVertices(simplifiedVertices);
+        simplifiedVertices.push_back(simplifiedVertices.front());
+        return GB_Polyline(std::move(simplifiedVertices));
     }
 
-    std::vector<GB_Point2d> simplifiedVertices;
-    simplifiedVertices.reserve(vertices.size());
-    for (size_t i = 0; i < vertices.size(); i++)
-    {
-        if (keepFlags[i] != 0)
-        {
-            simplifiedVertices.push_back(vertices[i]);
-        }
-    }
-
+    std::vector<GB_Point2d> simplifiedVertices = SimplifyOpenVerticesRdp(vertices, toleranceSquared);
     EnsureAtLeastTwoVertices(simplifiedVertices);
     return GB_Polyline(std::move(simplifiedVertices));
 }
 
 std::pair<GB_Polyline, GB_Polyline> GB_Polyline::SplitAt(double t) const
 {
-    if (!IsValid())
+    if (!std::isfinite(t))
     {
         return std::make_pair(GB_Polyline::Invalid, GB_Polyline::Invalid);
     }
 
     const std::shared_ptr<const CacheData> cachedData = GetOrBuildCache();
-    if (!cachedData)
+    if (!cachedData || !cachedData->isValid)
     {
         return std::make_pair(GB_Polyline::Invalid, GB_Polyline::Invalid);
     }
@@ -1344,11 +1595,6 @@ std::pair<GB_Polyline, GB_Polyline> GB_Polyline::SplitAt(double t) const
 
     if (!std::isfinite(totalLength) || totalLength <= 0.0)
     {
-        if (parameter <= 0.0)
-        {
-            std::vector<GB_Point2d> firstVertices = { vertices.front(), vertices.front() };
-            return std::make_pair(GB_Polyline(std::move(firstVertices)), *this);
-        }
         if (parameter >= 1.0)
         {
             std::vector<GB_Point2d> secondVertices = { vertices.back(), vertices.back() };
@@ -1360,26 +1606,40 @@ std::pair<GB_Polyline, GB_Polyline> GB_Polyline::SplitAt(double t) const
     }
 
     const double targetDistance = totalLength * parameter;
+    const double lengthTolerance = LengthCompareTolerance(totalLength);
 
-    if (targetDistance <= 0.0)
+    if (targetDistance <= lengthTolerance)
     {
         std::vector<GB_Point2d> firstVertices = { vertices.front(), vertices.front() };
         return std::make_pair(GB_Polyline(std::move(firstVertices)), *this);
     }
 
-    if (targetDistance >= totalLength)
+    if (targetDistance >= totalLength - lengthTolerance)
     {
         std::vector<GB_Point2d> secondVertices = { vertices.back(), vertices.back() };
         return std::make_pair(*this, GB_Polyline(std::move(secondVertices)));
     }
 
     const std::vector<double>& cumulativeLengths = cachedData->cumulativeLengths;
-    for (size_t i = 0; i < cumulativeLengths.size(); i++)
+    const auto lowerIt = std::lower_bound(cumulativeLengths.begin(), cumulativeLengths.end(), targetDistance);
+    if (lowerIt != cumulativeLengths.end() && AreDistancesNearEqual(*lowerIt, targetDistance, lengthTolerance))
     {
-        if (cumulativeLengths[i] == targetDistance)
+        const size_t vertexIndex = static_cast<size_t>(lowerIt - cumulativeLengths.begin());
+        std::vector<GB_Point2d> firstVertices(vertices.begin(), vertices.begin() + vertexIndex + 1);
+        std::vector<GB_Point2d> secondVertices(vertices.begin() + vertexIndex, vertices.end());
+        EnsureAtLeastTwoVertices(firstVertices);
+        EnsureAtLeastTwoVertices(secondVertices);
+        return std::make_pair(GB_Polyline(std::move(firstVertices)), GB_Polyline(std::move(secondVertices)));
+    }
+
+    if (lowerIt != cumulativeLengths.begin())
+    {
+        const auto previousIt = lowerIt - 1;
+        if (AreDistancesNearEqual(*previousIt, targetDistance, lengthTolerance))
         {
-            std::vector<GB_Point2d> firstVertices(vertices.begin(), vertices.begin() + i + 1);
-            std::vector<GB_Point2d> secondVertices(vertices.begin() + i, vertices.end());
+            const size_t vertexIndex = static_cast<size_t>(previousIt - cumulativeLengths.begin());
+            std::vector<GB_Point2d> firstVertices(vertices.begin(), vertices.begin() + vertexIndex + 1);
+            std::vector<GB_Point2d> secondVertices(vertices.begin() + vertexIndex, vertices.end());
             EnsureAtLeastTwoVertices(firstVertices);
             EnsureAtLeastTwoVertices(secondVertices);
             return std::make_pair(GB_Polyline(std::move(firstVertices)), GB_Polyline(std::move(secondVertices)));
@@ -1387,18 +1647,21 @@ std::pair<GB_Polyline, GB_Polyline> GB_Polyline::SplitAt(double t) const
     }
 
     size_t segmentIndex = 0;
-    bool foundSegment = false;
-    for (size_t i = 0; i + 1 < cumulativeLengths.size(); i++)
+    if (lowerIt == cumulativeLengths.begin())
     {
-        if (cumulativeLengths[i] < targetDistance && targetDistance < cumulativeLengths[i + 1])
-        {
-            segmentIndex = i;
-            foundSegment = true;
-            break;
-        }
+        segmentIndex = 0;
+    }
+    else
+    {
+        segmentIndex = static_cast<size_t>(lowerIt - cumulativeLengths.begin() - 1);
     }
 
-    if (!foundSegment || segmentIndex + 1 >= vertices.size())
+    while (segmentIndex + 1 < cumulativeLengths.size() && cumulativeLengths[segmentIndex + 1] <= cumulativeLengths[segmentIndex] + lengthTolerance)
+    {
+        segmentIndex++;
+    }
+
+    if (segmentIndex + 1 >= vertices.size())
     {
         std::vector<GB_Point2d> secondVertices = { vertices.back(), vertices.back() };
         return std::make_pair(*this, GB_Polyline(std::move(secondVertices)));
@@ -1407,8 +1670,17 @@ std::pair<GB_Polyline, GB_Polyline> GB_Polyline::SplitAt(double t) const
     const double segmentStartDistance = cumulativeLengths[segmentIndex];
     const double segmentEndDistance = cumulativeLengths[segmentIndex + 1];
     const double segmentLength = segmentEndDistance - segmentStartDistance;
+    if (!std::isfinite(segmentLength) || segmentLength <= lengthTolerance)
+    {
+        std::vector<GB_Point2d> firstVertices(vertices.begin(), vertices.begin() + segmentIndex + 1);
+        std::vector<GB_Point2d> secondVertices(vertices.begin() + segmentIndex, vertices.end());
+        EnsureAtLeastTwoVertices(firstVertices);
+        EnsureAtLeastTwoVertices(secondVertices);
+        return std::make_pair(GB_Polyline(std::move(firstVertices)), GB_Polyline(std::move(secondVertices)));
+    }
+
     const double segmentParameter = (targetDistance - segmentStartDistance) / segmentLength;
-    const GB_Point2d splitPoint = LerpPoint(vertices[segmentIndex], vertices[segmentIndex + 1], segmentParameter);
+    const GB_Point2d splitPoint = LerpPoint(vertices[segmentIndex], vertices[segmentIndex + 1], Clamp01(segmentParameter));
 
     std::vector<GB_Point2d> firstVertices;
     firstVertices.reserve(segmentIndex + 2);
@@ -1427,11 +1699,6 @@ std::pair<GB_Polyline, GB_Polyline> GB_Polyline::SplitAt(double t) const
 
 GB_Polyline GB_Polyline::SubPolyline(double t1, double t2) const
 {
-    if (!IsValid())
-    {
-        return GB_Polyline::Invalid;
-    }
-
     if (!std::isfinite(t1) || !std::isfinite(t2))
     {
         return GB_Polyline::Invalid;
@@ -1442,7 +1709,7 @@ GB_Polyline GB_Polyline::SubPolyline(double t1, double t2) const
     const double endParameter = needReverse ? Clamp01(t1) : Clamp01(t2);
 
     const std::shared_ptr<const CacheData> cachedData = GetOrBuildCache();
-    if (!cachedData)
+    if (!cachedData || !cachedData->isValid)
     {
         return GB_Polyline::Invalid;
     }
@@ -1461,6 +1728,7 @@ GB_Polyline GB_Polyline::SubPolyline(double t1, double t2) const
 
     const double startDistance = totalLength * startParameter;
     const double endDistance = totalLength * endParameter;
+    const double lengthTolerance = LengthCompareTolerance(totalLength);
     const GB_Point2d startPoint = PointAtDistanceFromCache(vertices, cachedData->cumulativeLengths, totalLength, startDistance);
     const GB_Point2d endPoint = PointAtDistanceFromCache(vertices, cachedData->cumulativeLengths, totalLength, endDistance);
 
@@ -1468,13 +1736,13 @@ GB_Polyline GB_Polyline::SubPolyline(double t1, double t2) const
     resultVertices.reserve(vertices.size());
     resultVertices.push_back(startPoint);
 
-    for (size_t i = 1; i + 1 < vertices.size(); i++)
+    const std::vector<double>& cumulativeLengths = cachedData->cumulativeLengths;
+    auto firstInteriorIt = std::upper_bound(cumulativeLengths.begin() + 1, cumulativeLengths.end(), startDistance + lengthTolerance);
+    size_t vertexIndex = static_cast<size_t>(firstInteriorIt - cumulativeLengths.begin());
+    while (vertexIndex + 1 < vertices.size() && cumulativeLengths[vertexIndex] < endDistance - lengthTolerance)
     {
-        const double vertexDistance = cachedData->cumulativeLengths[i];
-        if (vertexDistance > startDistance && vertexDistance < endDistance)
-        {
-            resultVertices.push_back(vertices[i]);
-        }
+        resultVertices.push_back(vertices[vertexIndex]);
+        vertexIndex++;
     }
 
     resultVertices.push_back(endPoint);
@@ -1577,7 +1845,10 @@ GB_ByteBuffer GB_Polyline::SerializeToBinary() const
     constexpr static uint16_t payloadVersion = 1;
 
     GB_ByteBuffer buffer;
-    buffer.reserve(24 + vertices.size() * 16);
+    if (vertices.size() <= (std::numeric_limits<size_t>::max() - 24) / 16)
+    {
+        buffer.reserve(24 + vertices.size() * 16);
+    }
 
     GB_ByteBufferIO::AppendUInt32LE(buffer, GB_ClassMagicNumber);
     GB_ByteBufferIO::AppendUInt64LE(buffer, GetClassTypeId());
@@ -1623,6 +1894,11 @@ bool GB_Polyline::Deserialize(const std::string& data)
         return false;
     }
 
+    if (numVertices > (body.size() + 1) / 4)
+    {
+        return false;
+    }
+
     std::vector<GB_Point2d> parsedVertices;
     parsedVertices.reserve(numVertices);
 
@@ -1647,13 +1923,15 @@ bool GB_Polyline::Deserialize(const std::string& data)
         parsedVertices.emplace_back(x, y);
     }
 
-    if (offset != body.size())
+    if (offset != body.size() || (!body.empty() && body.back() == '|'))
     {
         Clear();
         return false;
     }
 
-    return SetVertices(std::move(parsedVertices));
+    vertices = std::move(parsedVertices);
+    InvalidateCaches();
+    return true;
 }
 
 bool GB_Polyline::Deserialize(const GB_ByteBuffer& data)
@@ -1684,7 +1962,7 @@ bool GB_Polyline::Deserialize(const GB_ByteBuffer& data)
         return false;
     }
 
-    if (magicNumber != GB_ClassMagicNumber || classTypeId != GetClassTypeId() || payloadVersion != expectedPayloadVersion)
+    if (magicNumber != GB_ClassMagicNumber || classTypeId != GetClassTypeId() || payloadVersion != expectedPayloadVersion || reserved != 0)
     {
         return false;
     }
@@ -1717,8 +1995,15 @@ bool GB_Polyline::Deserialize(const GB_ByteBuffer& data)
             Clear();
             return false;
         }
+        if (!std::isfinite(x) || !std::isfinite(y))
+        {
+            Clear();
+            return false;
+        }
         parsedVertices.emplace_back(x, y);
     }
 
-    return SetVertices(std::move(parsedVertices));
+    vertices = std::move(parsedVertices);
+    InvalidateCaches();
+    return true;
 }
