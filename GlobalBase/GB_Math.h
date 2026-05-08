@@ -207,6 +207,13 @@ GLOBALBASE_PORT std::string GB_RandomString(size_t length, const std::vector<cha
 GLOBALBASE_PORT std::string GB_RandomString(size_t length);
 
 /**
+ * @brief 生成标准 UUID/GUID 文本。
+ * @return 返回小写 UUID/GUID 字符串，格式为 xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx；生成失败时返回空字符串。
+ * @note 当前实现生成随机型 UUID（UUIDv4），并按标准设置 version 与 variant 位。
+ */
+GLOBALBASE_PORT std::string GB_GenerateUuid();
+
+/**
  * @brief 将字符串按十进制解析为 int。
  * @param str 输入字符串（允许首尾空白；仅识别 ASCII 数字与可选正负号）。
  * @param defaultValue 解析失败或越界时返回的默认值。

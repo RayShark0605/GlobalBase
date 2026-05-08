@@ -1,7 +1,21 @@
 ﻿#include "GB_Math.h"
+#include <array>
 #include <cerrno>
 #include <cstdlib>
+#include <fstream>
 #include <locale.h>
+
+#if defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <Windows.h>
+#include <bcrypt.h>
+#pragma comment(lib, "Bcrypt.lib")
+#elif defined(__linux__)
+#include <sys/syscall.h>
+#include <unistd.h>
+#endif
 
 #if !defined(_WIN32) && !defined(LC_NUMERIC_MASK)
 #define LC_NUMERIC_MASK (1 << LC_NUMERIC)
@@ -68,6 +82,136 @@ std::string GB_RandomString(size_t length)
 		}();
 
 	return GB_RandomString(length, defaultCharacterPool);
+}
+
+namespace
+{
+	inline char HexDigit(unsigned char value)
+	{
+		static const char hexDigits[] = "0123456789abcdef";
+		return hexDigits[value & 0x0F];
+	}
+
+	bool FillRandomBytesFromDevice(unsigned char* buffer, size_t bufferSize)
+	{
+		if (bufferSize == 0)
+		{
+			return true;
+		}
+
+		if (buffer == nullptr)
+		{
+			return false;
+		}
+
+		std::ifstream randomStream("/dev/urandom", std::ios::in | std::ios::binary);
+		if (!randomStream.is_open())
+		{
+			return false;
+		}
+
+		randomStream.read(reinterpret_cast<char*>(buffer), static_cast<std::streamsize>(bufferSize));
+		return static_cast<size_t>(randomStream.gcount()) == bufferSize;
+	}
+
+#if defined(__linux__) && defined(SYS_getrandom)
+	bool FillRandomBytesFromGetRandom(unsigned char* buffer, size_t bufferSize)
+	{
+		if (bufferSize == 0)
+		{
+			return true;
+		}
+
+		if (buffer == nullptr)
+		{
+			return false;
+		}
+
+		size_t offset = 0;
+		while (offset < bufferSize)
+		{
+			const long readSize = ::syscall(SYS_getrandom, buffer + offset, bufferSize - offset, 0);
+			if (readSize > 0)
+			{
+				offset += static_cast<size_t>(readSize);
+				continue;
+			}
+
+			if (readSize < 0 && errno == EINTR)
+			{
+				continue;
+			}
+
+			return false;
+		}
+
+		return true;
+	}
+#endif
+
+	bool FillSecureRandomBytes(unsigned char* buffer, size_t bufferSize)
+	{
+		if (bufferSize == 0)
+		{
+			return true;
+		}
+
+		if (buffer == nullptr)
+		{
+			return false;
+		}
+
+#if defined(_WIN32)
+		const NTSTATUS status = ::BCryptGenRandom(nullptr, buffer, static_cast<ULONG>(bufferSize), BCRYPT_USE_SYSTEM_PREFERRED_RNG);
+		return status >= 0;
+#elif defined(__linux__) && defined(SYS_getrandom)
+		if (FillRandomBytesFromGetRandom(buffer, bufferSize))
+		{
+			return true;
+		}
+
+		return FillRandomBytesFromDevice(buffer, bufferSize);
+#else
+		return FillRandomBytesFromDevice(buffer, bufferSize);
+#endif
+	}
+
+	std::string UuidBytesToString(const std::array<unsigned char, 16>& uuidBytes)
+	{
+		std::string uuidString(36, '\0');
+		size_t outputIndex = 0;
+
+		for (size_t i = 0; i < uuidBytes.size(); i++)
+		{
+			if (outputIndex == 8 || outputIndex == 13 || outputIndex == 18 || outputIndex == 23)
+			{
+				uuidString[outputIndex] = '-';
+				outputIndex++;
+			}
+
+			const unsigned char value = uuidBytes[i];
+			uuidString[outputIndex] = HexDigit(static_cast<unsigned char>(value >> 4));
+			outputIndex++;
+			uuidString[outputIndex] = HexDigit(value);
+			outputIndex++;
+		}
+
+		return uuidString;
+	}
+}
+
+std::string GB_GenerateUuid()
+{
+	std::array<unsigned char, 16> uuidBytes = {};
+	if (!FillSecureRandomBytes(uuidBytes.data(), uuidBytes.size()))
+	{
+		return std::string();
+	}
+
+	uuidBytes[6] = static_cast<unsigned char>((uuidBytes[6] & 0x0F) | 0x40);
+	uuidBytes[8] = static_cast<unsigned char>((uuidBytes[8] & 0x3F) | 0x80);
+
+	return UuidBytesToString(uuidBytes);
 }
 
 namespace
