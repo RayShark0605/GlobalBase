@@ -4,6 +4,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <condition_variable>
 #include <cstdint>
 #include <deque>
@@ -24,6 +25,7 @@
 
 namespace
 {
+#if defined(_WIN32)
     static int ClampNonNegativeDelayMs(const int delayMs)
     {
         return std::max(delayMs, 0);
@@ -39,6 +41,7 @@ namespace
 
         std::this_thread::sleep_for(std::chrono::milliseconds(clampedDelayMs));
     }
+#endif
 
     static bool PressTwoKeyShortcut(const GB_VirtualKey firstKey, const GB_VirtualKey secondKey, const GB_KeyCombinationOptions& options)
     {
@@ -93,6 +96,7 @@ namespace
     }
 #endif
 
+#if defined(_WIN32)
     static uint32_t GetGlobalKeyboardEventMaskBits(const GB_GlobalKeyboardEventMask eventMask)
     {
         return static_cast<uint32_t>(eventMask) & static_cast<uint32_t>(GB_GlobalKeyboardEventMask::All);
@@ -123,6 +127,7 @@ namespace
 
         return 2;
     }
+#endif
 }
 
 #if defined(_WIN32)
@@ -159,7 +164,12 @@ namespace
 
         static bool IsValidVirtualKeyCode(const uint16_t virtualKeyCode)
         {
-            return virtualKeyCode > 0 && virtualKeyCode < 256;
+            return virtualKeyCode > 0 && virtualKeyCode <= 0xFEu;
+        }
+
+        static bool IsValidScanCode(const uint16_t scanCode)
+        {
+            return scanCode > 0 && scanCode <= 0xFFu;
         }
 
         static bool IsKeyPressedByCode(const uint16_t virtualKeyCode)
@@ -302,7 +312,7 @@ namespace
                 }
             }
 
-            return virtualKeyCode;
+            return IsValidVirtualKeyCode(virtualKeyCode) ? virtualKeyCode : 0;
         }
 
         static INPUT MakeKeyboardInputByVirtualKey(const uint16_t virtualKeyCode, const bool isKeyUp)
@@ -548,13 +558,20 @@ namespace
 
         static int ResolveCharacterIntervalMs(const GB_TextInputOptions& options)
         {
-            if (options.wordsPerMinute <= 0.0)
+            if (!std::isfinite(options.wordsPerMinute) || options.wordsPerMinute <= 0.0)
             {
                 return 0;
             }
 
+            const int minIntervalMs = std::max(0, options.minCharacterIntervalMs);
+            int maxIntervalMs = options.maxCharacterIntervalMs;
+            if (maxIntervalMs >= 0 && maxIntervalMs < minIntervalMs)
+            {
+                maxIntervalMs = minIntervalMs;
+            }
+
             const double baseIntervalMs = 60000.0 / (options.wordsPerMinute * 5.0);
-            const double safeRandomRatio = std::max(0.0, options.randomIntervalRatio);
+            const double safeRandomRatio = std::isfinite(options.randomIntervalRatio) ? std::min(std::max(0.0, options.randomIntervalRatio), 1.0) : 0.0;
             double randomFactor = 1.0;
             if (safeRandomRatio > 0.0)
             {
@@ -563,11 +580,21 @@ namespace
                 randomFactor = randomDistribution(randomGenerator);
             }
 
-            int intervalMs = static_cast<int>(baseIntervalMs * randomFactor + 0.5);
-            intervalMs = std::max(intervalMs, std::max(0, options.minCharacterIntervalMs));
-            if (options.maxCharacterIntervalMs >= 0)
+            const double realIntervalMs = baseIntervalMs * randomFactor;
+            int intervalMs = 0;
+            if (!std::isfinite(realIntervalMs) || realIntervalMs >= static_cast<double>(std::numeric_limits<int>::max()))
             {
-                intervalMs = std::min(intervalMs, options.maxCharacterIntervalMs);
+                intervalMs = std::numeric_limits<int>::max();
+            }
+            else
+            {
+                intervalMs = static_cast<int>(realIntervalMs + 0.5);
+            }
+
+            intervalMs = std::max(intervalMs, minIntervalMs);
+            if (maxIntervalMs >= 0)
+            {
+                intervalMs = std::min(intervalMs, maxIntervalMs);
             }
             return intervalMs;
         }
@@ -593,6 +620,10 @@ namespace
             const uint8_t virtualKeyCode = static_cast<uint8_t>(virtualKeyAndShiftState & 0xFF);
             const uint8_t shiftState = static_cast<uint8_t>((virtualKeyAndShiftState >> 8) & 0xFF);
             if (!IsValidVirtualKeyCode(virtualKeyCode))
+            {
+                return false;
+            }
+            if ((shiftState & ~static_cast<uint8_t>(0x07u)) != 0)
             {
                 return false;
             }
@@ -667,15 +698,20 @@ namespace
             {
                 return true;
             }
+            if (utf8Text.size() > static_cast<size_t>(std::numeric_limits<int>::max()))
+            {
+                return false;
+            }
 
-            const int requiredLength = ::MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, utf8Text.data(), static_cast<int>(utf8Text.size()), nullptr, 0);
+            const int utf8TextSize = static_cast<int>(utf8Text.size());
+            const int requiredLength = ::MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, utf8Text.data(), utf8TextSize, nullptr, 0);
             if (requiredLength <= 0)
             {
                 return false;
             }
 
             wideText.resize(static_cast<size_t>(requiredLength));
-            const int convertedLength = ::MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, utf8Text.data(), static_cast<int>(utf8Text.size()), &wideText[0], requiredLength);
+            const int convertedLength = ::MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, utf8Text.data(), utf8TextSize, &wideText[0], requiredLength);
             return convertedLength == requiredLength;
         }
 
@@ -912,7 +948,7 @@ namespace
 
                 {
                     std::lock_guard<std::mutex> queueLock(queueMutex);
-                    if (stopWorker.load())
+                    if (stopWorker.load() || !isListening.load())
                     {
                         return false;
                     }
@@ -1041,6 +1077,11 @@ namespace
                 }
 
                 std::unique_lock<std::mutex> managerLock(managerMutex);
+                if (shuttingDown)
+                {
+                    return false;
+                }
+
                 RemoveExpiredListenersLocked();
                 if (!EnsureMessageThreadStarted(managerLock))
                 {
@@ -1174,6 +1215,16 @@ namespace
                 return ::RegisterRawInputDevices(&rawInputDevice, 1, sizeof(rawInputDevice)) != FALSE;
             }
 
+            static void UnregisterKeyboardRawInput()
+            {
+                RAWINPUTDEVICE rawInputDevice = {};
+                rawInputDevice.usUsagePage = 0x01;
+                rawInputDevice.usUsage = 0x06;
+                rawInputDevice.dwFlags = RIDEV_REMOVE;
+                rawInputDevice.hwndTarget = nullptr;
+                (void)::RegisterRawInputDevices(&rawInputDevice, 1, sizeof(rawInputDevice));
+            }
+
             void DispatchRawKeyboardPacket(const RAWKEYBOARD& rawKeyboard, const uint32_t messageTimeMs)
             {
                 if (rawKeyboard.MakeCode == KEYBOARD_OVERRUN_MAKE_CODE)
@@ -1269,6 +1320,11 @@ namespace
 
             bool EnsureMessageThreadStarted(std::unique_lock<std::mutex>& managerLock)
             {
+                if (shuttingDown)
+                {
+                    return false;
+                }
+
                 while (messageThreadStopInProgress)
                 {
                     messageThreadReadyConditionVariable.wait(managerLock);
@@ -1379,6 +1435,7 @@ namespace
                     (void)::DispatchMessageW(&message);
                 }
 
+                UnregisterKeyboardRawInput();
                 if (windowHandle != nullptr && ::IsWindow(windowHandle) != FALSE)
                 {
                     (void)::DestroyWindow(windowHandle);
@@ -1471,6 +1528,11 @@ uint16_t GB_Keyboard::ToVirtualKeyCode(const GB_VirtualKey virtualKey)
 
 GB_VirtualKey GB_Keyboard::FromVirtualKeyCode(const uint16_t virtualKeyCode)
 {
+    if (virtualKeyCode == 0 || virtualKeyCode > 0xFEu)
+    {
+        return GB_VirtualKey::None;
+    }
+
     return static_cast<GB_VirtualKey>(virtualKeyCode);
 }
 
@@ -1525,6 +1587,11 @@ bool GB_Keyboard::ClickKey(const GB_VirtualKey virtualKey, const int downUpInter
 bool GB_Keyboard::PressScanCode(const uint16_t scanCode, const bool isExtendedKey)
 {
 #if defined(_WIN32)
+    if (!internal::IsValidScanCode(scanCode))
+    {
+        return false;
+    }
+
     std::vector<INPUT> inputs;
     inputs.push_back(internal::MakeKeyboardInputByScanCode(scanCode, isExtendedKey, false));
     return internal::TrySendInputEventsWithRetry(inputs);
@@ -1538,6 +1605,11 @@ bool GB_Keyboard::PressScanCode(const uint16_t scanCode, const bool isExtendedKe
 bool GB_Keyboard::ReleaseScanCode(const uint16_t scanCode, const bool isExtendedKey)
 {
 #if defined(_WIN32)
+    if (!internal::IsValidScanCode(scanCode))
+    {
+        return false;
+    }
+
     std::vector<INPUT> inputs;
     inputs.push_back(internal::MakeKeyboardInputByScanCode(scanCode, isExtendedKey, true));
     return internal::TrySendInputEventsWithRetry(inputs);
@@ -1619,7 +1691,10 @@ bool GB_Keyboard::PressKeyCombination(const std::vector<GB_VirtualKey>& virtualK
             {
                 internal::AppendKeyInputs(releaseModifierInputs, modifierKey, inputMode, true);
             }
-            (void)internal::TrySendInputEventsWithRetry(releaseModifierInputs);
+            if (!internal::TrySendInputEventsWithRetry(releaseModifierInputs))
+            {
+                return false;
+            }
             SleepForDelayMs(1);
         }
     }
@@ -1665,7 +1740,10 @@ bool GB_Keyboard::PressKeyCombination(const std::vector<GB_VirtualKey>& virtualK
         {
             internal::AppendKeyInputs(restoreModifierInputs, modifierKey, inputMode, false);
         }
-        (void)internal::TrySendInputEventsWithRetry(restoreModifierInputs);
+        if (!internal::TrySendInputEventsWithRetry(restoreModifierInputs))
+        {
+            succeeded = false;
+        }
     }
 
     return succeeded;
