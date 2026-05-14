@@ -557,6 +557,194 @@ public:
     static bool PressKeyCombination(const std::vector<GB_VirtualKey>& virtualKeys, const GB_KeyCombinationOptions& options = GB_KeyCombinationOptions());
 
     /**
+     * @brief 模拟 Ctrl+C 复制快捷键。
+     */
+    static bool PressCtrlC(const GB_KeyCombinationOptions& options = GB_KeyCombinationOptions());
+
+    /**
+     * @brief 模拟 Ctrl+V 粘贴快捷键。
+     */
+    static bool PressCtrlV(const GB_KeyCombinationOptions& options = GB_KeyCombinationOptions());
+
+    /**
+     * @brief 模拟 Ctrl+X 剪切快捷键。
+     */
+    static bool PressCtrlX(const GB_KeyCombinationOptions& options = GB_KeyCombinationOptions());
+
+    /**
+     * @brief 模拟 Ctrl+A 全选快捷键。
+     */
+    static bool PressCtrlA(const GB_KeyCombinationOptions& options = GB_KeyCombinationOptions());
+
+    /**
+     * @brief 模拟 Ctrl+S 保存快捷键。
+     */
+    static bool PressCtrlS(const GB_KeyCombinationOptions& options = GB_KeyCombinationOptions());
+
+    /**
+     * @brief 模拟 Ctrl+Z 撤销快捷键。
+     */
+    static bool PressCtrlZ(const GB_KeyCombinationOptions& options = GB_KeyCombinationOptions());
+
+    /**
+     * @brief 模拟 Ctrl+Y 重做快捷键。
+     */
+    static bool PressCtrlY(const GB_KeyCombinationOptions& options = GB_KeyCombinationOptions());
+
+    /**
+     * @brief 模拟 Ctrl+F 查找快捷键。
+     */
+    static bool PressCtrlF(const GB_KeyCombinationOptions& options = GB_KeyCombinationOptions());
+
+    /**
+     * @brief 模拟 Ctrl+P 打印快捷键。
+     */
+    static bool PressCtrlP(const GB_KeyCombinationOptions& options = GB_KeyCombinationOptions());
+
+    /**
+     * @brief 模拟 Ctrl+N 新建快捷键。
+     */
+    static bool PressCtrlN(const GB_KeyCombinationOptions& options = GB_KeyCombinationOptions());
+
+    /**
+     * @brief 模拟 Ctrl+O 打开快捷键。
+     */
+    static bool PressCtrlO(const GB_KeyCombinationOptions& options = GB_KeyCombinationOptions());
+
+    /**
+     * @brief 模拟 Ctrl+W 关闭当前标签页或当前文档快捷键。
+     */
+    static bool PressCtrlW(const GB_KeyCombinationOptions& options = GB_KeyCombinationOptions());
+
+    /**
+     * @brief 模拟 Win+D 显示桌面快捷键。
+     */
+    static bool PressWinD(const GB_KeyCombinationOptions& options = GB_KeyCombinationOptions());
+
+    /**
+     * @brief 执行 Win+L 对应的锁定工作站操作。
+     *
+     * 说明：
+     * - Windows 下内部直接调用 LockWorkStation，以避免锁屏过程中 Win 键状态残留；
+     * - 非 Windows 平台返回 false。
+     */
+    static bool PressWinL();
+
+    /**
+     * @brief 模拟 Win+E 打开文件资源管理器快捷键。
+     */
+    static bool PressWinE(const GB_KeyCombinationOptions& options = GB_KeyCombinationOptions());
+
+    /**
+     * @brief 模拟 Win+R 打开运行对话框快捷键。
+     */
+    static bool PressWinR(const GB_KeyCombinationOptions& options = GB_KeyCombinationOptions());
+
+    /**
+     * @brief 模拟 Alt+F4 关闭当前活动窗口快捷键。
+     */
+    static bool PressAltF4(const GB_KeyCombinationOptions& options = GB_KeyCombinationOptions());
+
+    /**
+     * @brief 模拟 Ctrl+Shift+Esc 打开任务管理器快捷键。
+     */
+    static bool PressCtrlShiftEsc(const GB_KeyCombinationOptions& options = GB_KeyCombinationOptions());
+
+    /**
+     * @brief 执行复制命令。
+     */
+    static bool Copy(const GB_KeyCombinationOptions& options = GB_KeyCombinationOptions());
+
+    /**
+     * @brief 执行粘贴命令。
+     */
+    static bool Paste(const GB_KeyCombinationOptions& options = GB_KeyCombinationOptions());
+
+    /**
+     * @brief 执行剪切命令。
+     */
+    static bool Cut(const GB_KeyCombinationOptions& options = GB_KeyCombinationOptions());
+
+    /**
+     * @brief 执行全选命令。
+     */
+    static bool SelectAll(const GB_KeyCombinationOptions& options = GB_KeyCombinationOptions());
+
+    /**
+     * @brief 执行保存命令。
+     */
+    static bool Save(const GB_KeyCombinationOptions& options = GB_KeyCombinationOptions());
+
+    /**
+     * @brief 执行撤销命令。
+     */
+    static bool Undo(const GB_KeyCombinationOptions& options = GB_KeyCombinationOptions());
+
+    /**
+     * @brief 执行重做命令。
+     */
+    static bool Redo(const GB_KeyCombinationOptions& options = GB_KeyCombinationOptions());
+
+    /**
+     * @brief 执行查找命令。
+     */
+    static bool Find(const GB_KeyCombinationOptions& options = GB_KeyCombinationOptions());
+
+    /**
+     * @brief 执行打印命令。
+     */
+    static bool Print(const GB_KeyCombinationOptions& options = GB_KeyCombinationOptions());
+
+    /**
+     * @brief 执行新建命令。
+     */
+    static bool NewDocument(const GB_KeyCombinationOptions& options = GB_KeyCombinationOptions());
+
+    /**
+     * @brief 执行打开命令。
+     */
+    static bool OpenDocument(const GB_KeyCombinationOptions& options = GB_KeyCombinationOptions());
+
+    /**
+     * @brief 执行关闭当前标签页或当前文档命令。
+     */
+    static bool CloseTabOrDocument(const GB_KeyCombinationOptions& options = GB_KeyCombinationOptions());
+
+    /**
+     * @brief 执行显示桌面命令。
+     */
+    static bool ShowDesktop(const GB_KeyCombinationOptions& options = GB_KeyCombinationOptions());
+
+    /**
+     * @brief 锁定当前工作站。
+     */
+    static bool LockWorkstation();
+
+    /**
+     * @brief 执行打开文件资源管理器命令。
+     */
+    static bool OpenFileExplorer(const GB_KeyCombinationOptions& options = GB_KeyCombinationOptions());
+
+    /**
+     * @brief 执行打开运行对话框命令。
+     */
+    static bool OpenRunDialog(const GB_KeyCombinationOptions& options = GB_KeyCombinationOptions());
+
+    /**
+     * @brief 执行关闭当前活动窗口命令。
+     */
+    static bool CloseActiveWindow(const GB_KeyCombinationOptions& options = GB_KeyCombinationOptions());
+
+    /**
+     * @brief 打开任务管理器。
+     *
+     * 说明：
+     * - Windows 下优先直接启动 taskmgr.exe，失败后回退到 Ctrl+Shift+Esc；
+     * - 非 Windows 平台返回 false。
+     */
+    static bool OpenTaskManager(const GB_KeyCombinationOptions& fallbackShortcutOptions = GB_KeyCombinationOptions());
+
+    /**
      * @brief 输入一段宽字符文本。
      *
      * @param text 文本内容。

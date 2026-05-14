@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <deque>
 #include <memory>
+#include <limits>
 #include <mutex>
 #include <new>
 #include <random>
@@ -38,6 +39,59 @@ namespace
 
         std::this_thread::sleep_for(std::chrono::milliseconds(clampedDelayMs));
     }
+
+    static bool PressTwoKeyShortcut(const GB_VirtualKey firstKey, const GB_VirtualKey secondKey, const GB_KeyCombinationOptions& options)
+    {
+        std::vector<GB_VirtualKey> virtualKeys;
+        virtualKeys.reserve(2);
+        virtualKeys.push_back(firstKey);
+        virtualKeys.push_back(secondKey);
+        return GB_Keyboard::PressKeyCombination(virtualKeys, options);
+    }
+
+    static bool PressThreeKeyShortcut(const GB_VirtualKey firstKey, const GB_VirtualKey secondKey, const GB_VirtualKey thirdKey, const GB_KeyCombinationOptions& options)
+    {
+        std::vector<GB_VirtualKey> virtualKeys;
+        virtualKeys.reserve(3);
+        virtualKeys.push_back(firstKey);
+        virtualKeys.push_back(secondKey);
+        virtualKeys.push_back(thirdKey);
+        return GB_Keyboard::PressKeyCombination(virtualKeys, options);
+    }
+
+#if defined(_WIN32)
+    static bool TryCreateProcess(const wchar_t* commandLineText)
+    {
+        if (commandLineText == nullptr || commandLineText[0] == L'\0')
+        {
+            return false;
+        }
+
+        std::wstring commandLine = commandLineText;
+        STARTUPINFOW startupInfo = {};
+        startupInfo.cb = sizeof(startupInfo);
+        startupInfo.dwFlags = STARTF_USESHOWWINDOW;
+        startupInfo.wShowWindow = SW_SHOWNORMAL;
+
+        PROCESS_INFORMATION processInformation = {};
+        const BOOL succeeded = ::CreateProcessW(nullptr, &commandLine[0], nullptr, nullptr, FALSE, 0, nullptr, nullptr, &startupInfo, &processInformation);
+        if (succeeded == FALSE)
+        {
+            return false;
+        }
+
+        if (processInformation.hThread != nullptr)
+        {
+            (void)::CloseHandle(processInformation.hThread);
+        }
+        if (processInformation.hProcess != nullptr)
+        {
+            (void)::CloseHandle(processInformation.hProcess);
+        }
+
+        return true;
+    }
+#endif
 
     static uint32_t GetGlobalKeyboardEventMaskBits(const GB_GlobalKeyboardEventMask eventMask)
     {
@@ -167,7 +221,7 @@ namespace
             return ::MapVirtualKeyExW(static_cast<UINT>(virtualKeyCode), MAPVK_VK_TO_VSC_EX, GetForegroundKeyboardLayout());
         }
 
-        static bool IsKnownExtendedVirtualKey(const uint16_t virtualKeyCode)
+        static bool IsKnownE0ExtendedVirtualKey(const uint16_t virtualKeyCode)
         {
             switch (static_cast<GB_VirtualKey>(virtualKeyCode))
             {
@@ -189,7 +243,6 @@ namespace
             case GB_VirtualKey::NumPadDivide:
             case GB_VirtualKey::NumLock:
             case GB_VirtualKey::PrintScreen:
-            case GB_VirtualKey::Pause:
             case GB_VirtualKey::BrowserBack:
             case GB_VirtualKey::BrowserForward:
             case GB_VirtualKey::BrowserRefresh:
@@ -214,16 +267,42 @@ namespace
             }
         }
 
-        static bool IsExtendedScanCodeEx(const UINT scanCodeEx)
+        static bool HasE0ScanCodePrefix(const UINT scanCodeEx)
         {
-            const UINT scanCodePrefix = scanCodeEx & 0xFF00u;
-            return scanCodePrefix == 0xE000u || scanCodePrefix == 0xE100u;
+            return (scanCodeEx & 0xFF00u) == 0xE000u;
         }
 
         static bool IsExtendedVirtualKey(const uint16_t virtualKeyCode)
         {
             const UINT scanCodeEx = MapVirtualKeyToScanCodeEx(virtualKeyCode);
-            return IsExtendedScanCodeEx(scanCodeEx) || IsKnownExtendedVirtualKey(virtualKeyCode);
+            return HasE0ScanCodePrefix(scanCodeEx) || IsKnownE0ExtendedVirtualKey(virtualKeyCode);
+        }
+
+        static bool IsRawInputModifierVirtualKey(const uint16_t virtualKeyCode)
+        {
+            switch (static_cast<GB_VirtualKey>(virtualKeyCode))
+            {
+            case GB_VirtualKey::Shift:
+            case GB_VirtualKey::Control:
+            case GB_VirtualKey::Alt:
+                return true;
+            default:
+                return false;
+            }
+        }
+
+        static uint16_t NormalizeRawInputVirtualKeyCode(const uint16_t virtualKeyCode, const uint16_t fullScanCode)
+        {
+            if (fullScanCode != 0 && (!IsValidVirtualKeyCode(virtualKeyCode) || IsRawInputModifierVirtualKey(virtualKeyCode)))
+            {
+                const UINT mappedVirtualKeyCode = ::MapVirtualKeyExW(static_cast<UINT>(fullScanCode), MAPVK_VSC_TO_VK_EX, GetForegroundKeyboardLayout());
+                if (IsValidVirtualKeyCode(static_cast<uint16_t>(mappedVirtualKeyCode)))
+                {
+                    return static_cast<uint16_t>(mappedVirtualKeyCode);
+                }
+            }
+
+            return virtualKeyCode;
         }
 
         static INPUT MakeKeyboardInputByVirtualKey(const uint16_t virtualKeyCode, const bool isKeyUp)
@@ -270,7 +349,7 @@ namespace
                 return MakeKeyboardInputByVirtualKey(virtualKeyCode, isKeyUp);
             }
 
-            const bool isExtendedKey = IsExtendedScanCodeEx(scanCodeEx) || IsKnownExtendedVirtualKey(virtualKeyCode);
+            const bool isExtendedKey = HasE0ScanCodePrefix(scanCodeEx) || IsKnownE0ExtendedVirtualKey(virtualKeyCode);
             return MakeKeyboardInputByScanCode(static_cast<uint16_t>(scanCodeEx & 0xFFu), isExtendedKey, isKeyUp);
         }
 
@@ -293,6 +372,11 @@ namespace
             if (inputs.empty())
             {
                 return true;
+            }
+
+            if (inputs.size() > static_cast<size_t>(std::numeric_limits<UINT>::max()))
+            {
+                return false;
             }
 
             const UINT inputCount = static_cast<UINT>(inputs.size());
@@ -432,6 +516,16 @@ namespace
 
         static bool TryInputUnicodeCharacter(const wchar_t unicodeChar, const int downUpIntervalMs)
         {
+            const int clampedDownUpIntervalMs = ClampNonNegativeDelayMs(downUpIntervalMs);
+            if (clampedDownUpIntervalMs <= 0)
+            {
+                std::vector<INPUT> inputs;
+                inputs.reserve(2);
+                inputs.push_back(MakeKeyboardInputByUnicode(unicodeChar, false));
+                inputs.push_back(MakeKeyboardInputByUnicode(unicodeChar, true));
+                return TrySendInputEventsWithRetry(inputs);
+            }
+
             std::vector<INPUT> downInputs;
             downInputs.push_back(MakeKeyboardInputByUnicode(unicodeChar, false));
             if (!TrySendInputEventsWithRetry(downInputs))
@@ -439,11 +533,17 @@ namespace
                 return false;
             }
 
-            SleepForDelayMs(downUpIntervalMs);
+            SleepForDelayMs(clampedDownUpIntervalMs);
 
             std::vector<INPUT> upInputs;
             upInputs.push_back(MakeKeyboardInputByUnicode(unicodeChar, true));
             return TrySendInputEventsWithRetry(upInputs);
+        }
+
+        static bool TryInputEnterKey(const GB_TextInputOptions& options, const int downUpIntervalMs)
+        {
+            const GB_KeyboardInputMode inputMode = options.inputMode == GB_KeyboardInputMode::ScanCode ? GB_KeyboardInputMode::ScanCode : GB_KeyboardInputMode::VirtualKey;
+            return GB_Keyboard::ClickKey(GB_VirtualKey::Enter, downUpIntervalMs, inputMode);
         }
 
         static int ResolveCharacterIntervalMs(const GB_TextInputOptions& options)
@@ -476,7 +576,7 @@ namespace
         {
             if (unicodeChar == L'\r' || unicodeChar == L'\n')
             {
-                return GB_Keyboard::ClickKey(GB_VirtualKey::Enter, options.keyDownUpIntervalMs, options.inputMode == GB_KeyboardInputMode::ScanCode ? GB_KeyboardInputMode::ScanCode : GB_KeyboardInputMode::VirtualKey);
+                return TryInputEnterKey(options, ClampNonNegativeDelayMs(options.keyDownUpIntervalMs));
             }
             if (unicodeChar == L'\t')
             {
@@ -529,7 +629,15 @@ namespace
             {
                 const wchar_t unicodeChar = text[charIndex];
                 bool succeeded = false;
-                if (options.inputMode == GB_KeyboardInputMode::Unicode)
+                if (unicodeChar == L'\r' || unicodeChar == L'\n')
+                {
+                    succeeded = TryInputEnterKey(options, downUpIntervalMs);
+                    if (unicodeChar == L'\r' && charIndex + 1 < text.size() && text[charIndex + 1] == L'\n')
+                    {
+                        charIndex++;
+                    }
+                }
+                else if (options.inputMode == GB_KeyboardInputMode::Unicode)
                 {
                     succeeded = TryInputUnicodeCharacter(unicodeChar, downUpIntervalMs);
                 }
@@ -857,6 +965,17 @@ namespace
                 }
             }
 
+            static void InvokeCallbackSafely(const GB_GlobalKeyboardEventCallback& callback, const GB_GlobalKeyboardEvent& keyboardEvent)
+            {
+                try
+                {
+                    callback(keyboardEvent);
+                }
+                catch (...)
+                {
+                }
+            }
+
             void DispatchOneEvent(const GB_GlobalKeyboardEvent& keyboardEvent)
             {
                 GB_GlobalKeyboardEventCallback unifiedCallback;
@@ -878,12 +997,12 @@ namespace
 
                 if (unifiedCallback && (!keyboardEvent.isAutoRepeat || !unifiedCallbackOptions.ignoreAutoRepeatKeyDown))
                 {
-                    unifiedCallback(keyboardEvent);
+                    InvokeCallbackSafely(unifiedCallback, keyboardEvent);
                 }
 
                 if (eventCallback && (!keyboardEvent.isAutoRepeat || !eventCallbackOptions.ignoreAutoRepeatKeyDown))
                 {
-                    eventCallback(keyboardEvent);
+                    InvokeCallbackSafely(eventCallback, keyboardEvent);
                 }
             }
 
@@ -1017,19 +1136,25 @@ namespace
                     return;
                 }
 
-                std::unique_ptr<uint8_t[]> rawInputBuffer(new (std::nothrow) uint8_t[rawInputSize]);
-                if (!rawInputBuffer)
+                try
+                {
+                    if (rawInputBuffer.size() < rawInputSize)
+                    {
+                        rawInputBuffer.resize(rawInputSize);
+                    }
+                }
+                catch (...)
                 {
                     return;
                 }
 
                 UINT copiedByteCount = rawInputSize;
-                if (::GetRawInputData(reinterpret_cast<HRAWINPUT>(lParam), RID_INPUT, rawInputBuffer.get(), &copiedByteCount, sizeof(RAWINPUTHEADER)) == static_cast<UINT>(-1) || copiedByteCount < sizeof(RAWINPUTHEADER))
+                if (::GetRawInputData(reinterpret_cast<HRAWINPUT>(lParam), RID_INPUT, rawInputBuffer.data(), &copiedByteCount, sizeof(RAWINPUTHEADER)) == static_cast<UINT>(-1) || copiedByteCount < sizeof(RAWINPUTHEADER))
                 {
                     return;
                 }
 
-                const RAWINPUT* rawInput = reinterpret_cast<const RAWINPUT*>(rawInputBuffer.get());
+                const RAWINPUT* rawInput = reinterpret_cast<const RAWINPUT*>(rawInputBuffer.data());
                 if (rawInput == nullptr || rawInput->header.dwType != RIM_TYPEKEYBOARD)
                 {
                     return;
@@ -1056,12 +1181,7 @@ namespace
                     return;
                 }
 
-                const uint16_t virtualKeyCode = static_cast<uint16_t>(rawKeyboard.VKey);
-                if (!IsValidVirtualKeyCode(virtualKeyCode))
-                {
-                    return;
-                }
-
+                const uint16_t rawVirtualKeyCode = static_cast<uint16_t>(rawKeyboard.VKey);
                 const bool isKeyUp = (rawKeyboard.Flags & RI_KEY_BREAK) != 0;
                 const bool isExtendedKey = (rawKeyboard.Flags & RI_KEY_E0) != 0;
                 const bool isE1Key = (rawKeyboard.Flags & RI_KEY_E1) != 0;
@@ -1070,7 +1190,12 @@ namespace
 
                 if (scanCode == 0)
                 {
-                    const UINT scanCodeEx = MapVirtualKeyToScanCodeEx(virtualKeyCode);
+                    if (!IsValidVirtualKeyCode(rawVirtualKeyCode))
+                    {
+                        return;
+                    }
+
+                    const UINT scanCodeEx = MapVirtualKeyToScanCodeEx(rawVirtualKeyCode);
                     scanCode = static_cast<uint16_t>(scanCodeEx & 0xFFu);
                     fullScanCode = static_cast<uint16_t>(scanCodeEx & 0xFFFFu);
                 }
@@ -1081,6 +1206,12 @@ namespace
                 else if (isE1Key)
                 {
                     fullScanCode = static_cast<uint16_t>(0xE100u | scanCode);
+                }
+
+                const uint16_t virtualKeyCode = NormalizeRawInputVirtualKeyCode(rawVirtualKeyCode, fullScanCode);
+                if (!IsValidVirtualKeyCode(virtualKeyCode))
+                {
+                    return;
                 }
 
                 const bool isAutoRepeat = !isKeyUp && keyDownState[virtualKeyCode].load();
@@ -1292,11 +1423,12 @@ namespace
                 const DWORD threadIdToQuit = rawInputThreadId;
                 std::thread messageThreadToJoin = std::move(messageThread);
                 managerLock.unlock();
+                bool shutdownMessagePosted = false;
                 if (windowHandleToClose != nullptr)
                 {
-                    (void)::PostMessageW(windowHandleToClose, shutdownWindowMessage, 0, 0);
+                    shutdownMessagePosted = ::PostMessageW(windowHandleToClose, shutdownWindowMessage, 0, 0) != FALSE;
                 }
-                else if (threadIdToQuit != 0)
+                if (!shutdownMessagePosted && threadIdToQuit != 0)
                 {
                     (void)::PostThreadMessageW(threadIdToQuit, WM_QUIT, 0, 0);
                 }
@@ -1325,6 +1457,7 @@ namespace
             bool rawInputRegisteredSuccessfully = false;
             bool messageThreadStopInProgress = false;
             bool shuttingDown = false;
+            std::vector<uint8_t> rawInputBuffer;
             std::array<std::atomic<bool>, 256> keyDownState;
         };
     }
@@ -1541,6 +1674,197 @@ bool GB_Keyboard::PressKeyCombination(const std::vector<GB_VirtualKey>& virtualK
     (void)options;
     return false;
 #endif
+}
+
+bool GB_Keyboard::PressCtrlC(const GB_KeyCombinationOptions& options)
+{
+    return PressTwoKeyShortcut(GB_VirtualKey::Control, GB_VirtualKey::C, options);
+}
+
+bool GB_Keyboard::PressCtrlV(const GB_KeyCombinationOptions& options)
+{
+    return PressTwoKeyShortcut(GB_VirtualKey::Control, GB_VirtualKey::V, options);
+}
+
+bool GB_Keyboard::PressCtrlX(const GB_KeyCombinationOptions& options)
+{
+    return PressTwoKeyShortcut(GB_VirtualKey::Control, GB_VirtualKey::X, options);
+}
+
+bool GB_Keyboard::PressCtrlA(const GB_KeyCombinationOptions& options)
+{
+    return PressTwoKeyShortcut(GB_VirtualKey::Control, GB_VirtualKey::A, options);
+}
+
+bool GB_Keyboard::PressCtrlS(const GB_KeyCombinationOptions& options)
+{
+    return PressTwoKeyShortcut(GB_VirtualKey::Control, GB_VirtualKey::S, options);
+}
+
+bool GB_Keyboard::PressCtrlZ(const GB_KeyCombinationOptions& options)
+{
+    return PressTwoKeyShortcut(GB_VirtualKey::Control, GB_VirtualKey::Z, options);
+}
+
+bool GB_Keyboard::PressCtrlY(const GB_KeyCombinationOptions& options)
+{
+    return PressTwoKeyShortcut(GB_VirtualKey::Control, GB_VirtualKey::Y, options);
+}
+
+bool GB_Keyboard::PressCtrlF(const GB_KeyCombinationOptions& options)
+{
+    return PressTwoKeyShortcut(GB_VirtualKey::Control, GB_VirtualKey::F, options);
+}
+
+bool GB_Keyboard::PressCtrlP(const GB_KeyCombinationOptions& options)
+{
+    return PressTwoKeyShortcut(GB_VirtualKey::Control, GB_VirtualKey::P, options);
+}
+
+bool GB_Keyboard::PressCtrlN(const GB_KeyCombinationOptions& options)
+{
+    return PressTwoKeyShortcut(GB_VirtualKey::Control, GB_VirtualKey::N, options);
+}
+
+bool GB_Keyboard::PressCtrlO(const GB_KeyCombinationOptions& options)
+{
+    return PressTwoKeyShortcut(GB_VirtualKey::Control, GB_VirtualKey::O, options);
+}
+
+bool GB_Keyboard::PressCtrlW(const GB_KeyCombinationOptions& options)
+{
+    return PressTwoKeyShortcut(GB_VirtualKey::Control, GB_VirtualKey::W, options);
+}
+
+bool GB_Keyboard::PressWinD(const GB_KeyCombinationOptions& options)
+{
+    return PressTwoKeyShortcut(GB_VirtualKey::LeftWin, GB_VirtualKey::D, options);
+}
+
+bool GB_Keyboard::PressWinL()
+{
+    return LockWorkstation();
+}
+
+bool GB_Keyboard::PressWinE(const GB_KeyCombinationOptions& options)
+{
+    return PressTwoKeyShortcut(GB_VirtualKey::LeftWin, GB_VirtualKey::E, options);
+}
+
+bool GB_Keyboard::PressWinR(const GB_KeyCombinationOptions& options)
+{
+    return PressTwoKeyShortcut(GB_VirtualKey::LeftWin, GB_VirtualKey::R, options);
+}
+
+bool GB_Keyboard::PressAltF4(const GB_KeyCombinationOptions& options)
+{
+    return PressTwoKeyShortcut(GB_VirtualKey::Alt, GB_VirtualKey::F4, options);
+}
+
+bool GB_Keyboard::PressCtrlShiftEsc(const GB_KeyCombinationOptions& options)
+{
+    return PressThreeKeyShortcut(GB_VirtualKey::Control, GB_VirtualKey::Shift, GB_VirtualKey::Escape, options);
+}
+
+bool GB_Keyboard::Copy(const GB_KeyCombinationOptions& options)
+{
+    return PressCtrlC(options);
+}
+
+bool GB_Keyboard::Paste(const GB_KeyCombinationOptions& options)
+{
+    return PressCtrlV(options);
+}
+
+bool GB_Keyboard::Cut(const GB_KeyCombinationOptions& options)
+{
+    return PressCtrlX(options);
+}
+
+bool GB_Keyboard::SelectAll(const GB_KeyCombinationOptions& options)
+{
+    return PressCtrlA(options);
+}
+
+bool GB_Keyboard::Save(const GB_KeyCombinationOptions& options)
+{
+    return PressCtrlS(options);
+}
+
+bool GB_Keyboard::Undo(const GB_KeyCombinationOptions& options)
+{
+    return PressCtrlZ(options);
+}
+
+bool GB_Keyboard::Redo(const GB_KeyCombinationOptions& options)
+{
+    return PressCtrlY(options);
+}
+
+bool GB_Keyboard::Find(const GB_KeyCombinationOptions& options)
+{
+    return PressCtrlF(options);
+}
+
+bool GB_Keyboard::Print(const GB_KeyCombinationOptions& options)
+{
+    return PressCtrlP(options);
+}
+
+bool GB_Keyboard::NewDocument(const GB_KeyCombinationOptions& options)
+{
+    return PressCtrlN(options);
+}
+
+bool GB_Keyboard::OpenDocument(const GB_KeyCombinationOptions& options)
+{
+    return PressCtrlO(options);
+}
+
+bool GB_Keyboard::CloseTabOrDocument(const GB_KeyCombinationOptions& options)
+{
+    return PressCtrlW(options);
+}
+
+bool GB_Keyboard::ShowDesktop(const GB_KeyCombinationOptions& options)
+{
+    return PressWinD(options);
+}
+
+bool GB_Keyboard::LockWorkstation()
+{
+#if defined(_WIN32)
+    return ::LockWorkStation() != FALSE;
+#else
+    return false;
+#endif
+}
+
+bool GB_Keyboard::OpenFileExplorer(const GB_KeyCombinationOptions& options)
+{
+    return PressWinE(options);
+}
+
+bool GB_Keyboard::OpenRunDialog(const GB_KeyCombinationOptions& options)
+{
+    return PressWinR(options);
+}
+
+bool GB_Keyboard::CloseActiveWindow(const GB_KeyCombinationOptions& options)
+{
+    return PressAltF4(options);
+}
+
+bool GB_Keyboard::OpenTaskManager(const GB_KeyCombinationOptions& fallbackShortcutOptions)
+{
+#if defined(_WIN32)
+    if (TryCreateProcess(L"taskmgr.exe"))
+    {
+        return true;
+    }
+#endif
+
+    return PressCtrlShiftEsc(fallbackShortcutOptions);
 }
 
 bool GB_Keyboard::InputText(const std::wstring& text, const GB_TextInputOptions& options)
