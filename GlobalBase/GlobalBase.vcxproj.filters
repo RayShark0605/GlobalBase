@@ -138,6 +138,9 @@
     <ClInclude Include="Geometry\GB_Polyline.h">
       <Filter>头文件\Geometry</Filter>
     </ClInclude>
+    <ClInclude Include="Desktop\GB_Keyboard.h">
+      <Filter>头文件\Desktop</Filter>
+    </ClInclude>
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="GB_Utf8String.cpp">
@@ -238,6 +241,9 @@
     </ClCompile>
     <ClCompile Include="Geometry\GB_Polyline.cpp">
       <Filter>源文件\Geometry</Filter>
+    </ClCompile>
+    <ClCompile Include="Desktop\GB_Keyboard.cpp">
+      <Filter>源文件\Desktop</Filter>
     </ClCompile>
   </ItemGroup>
 </Project>
