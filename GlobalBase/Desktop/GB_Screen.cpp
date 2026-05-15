@@ -10,6 +10,7 @@
 #include <limits>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <set>
 #include <string>
 #include <thread>
@@ -305,6 +306,10 @@ namespace internal
 
             setThreadDpiAwarenessContextFunction = setThreadDpiAwarenessContext;
             previousContext = setThreadDpiAwarenessContextFunction(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+            if (previousContext == nullptr)
+            {
+                previousContext = setThreadDpiAwarenessContextFunction(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE);
+            }
             isActive = (previousContext != nullptr);
         }
 
@@ -1380,34 +1385,42 @@ namespace internal
 
         ::GdiFlush();
 
-        cv::Mat capturedMat(captureHeight, captureWidth, CV_8UC4, bitmapBits, static_cast<size_t>(captureWidth) * 4);
-        if (capturedMat.empty())
+        try
         {
-            return false;
-        }
-
-        if (capturedMat.isContinuous())
-        {
-            const size_t pixelCount = capturedMat.total();
-            uint32_t* pixelData = reinterpret_cast<uint32_t*>(capturedMat.data);
-            for (size_t pixelIndex = 0; pixelIndex < pixelCount; pixelIndex++)
+            cv::Mat capturedMat(captureHeight, captureWidth, CV_8UC4, bitmapBits, static_cast<size_t>(captureWidth) * 4);
+            if (capturedMat.empty())
             {
-                pixelData[pixelIndex] |= 0xFF000000u;
+                return false;
             }
-        }
-        else
-        {
-            for (int rowIndex = 0; rowIndex < captureHeight; rowIndex++)
+
+            if (capturedMat.isContinuous())
             {
-                uint32_t* rowPixelData = capturedMat.ptr<uint32_t>(rowIndex);
-                for (int colIndex = 0; colIndex < captureWidth; colIndex++)
+                const size_t pixelCount = capturedMat.total();
+                uint32_t* pixelData = reinterpret_cast<uint32_t*>(capturedMat.data);
+                for (size_t pixelIndex = 0; pixelIndex < pixelCount; pixelIndex++)
                 {
-                    rowPixelData[colIndex] |= 0xFF000000u;
+                    pixelData[pixelIndex] |= 0xFF000000u;
                 }
             }
-        }
+            else
+            {
+                for (int rowIndex = 0; rowIndex < captureHeight; rowIndex++)
+                {
+                    uint32_t* rowPixelData = capturedMat.ptr<uint32_t>(rowIndex);
+                    for (int colIndex = 0; colIndex < captureWidth; colIndex++)
+                    {
+                        rowPixelData[colIndex] |= 0xFF000000u;
+                    }
+                }
+            }
 
-        return screenImage.SetFromCvMat(capturedMat, GB_ImageCopyMode::DeepCopy);
+            return screenImage.SetFromCvMat(capturedMat, GB_ImageCopyMode::DeepCopy);
+        }
+        catch (...)
+        {
+            screenImage.Clear();
+            return false;
+        }
     }
 
 
@@ -1435,6 +1448,21 @@ namespace internal
         return true;
     }
 
+    static void ClearIconInfoBitmaps(ICONINFO& iconInfo)
+    {
+        if (iconInfo.hbmMask != nullptr)
+        {
+            (void)::DeleteObject(iconInfo.hbmMask);
+            iconInfo.hbmMask = nullptr;
+        }
+
+        if (iconInfo.hbmColor != nullptr)
+        {
+            (void)::DeleteObject(iconInfo.hbmColor);
+            iconInfo.hbmColor = nullptr;
+        }
+    }
+
     static bool TryGetCursorBitmapSize(const HCURSOR cursorHandle, int& cursorWidth, int& cursorHeight, ICONINFO& iconInfo)
     {
         cursorWidth = 0;
@@ -1456,33 +1484,49 @@ namespace internal
         {
             if (::GetObjectW(iconInfo.hbmColor, sizeof(bitmapInfo), &bitmapInfo) <= 0)
             {
+                ClearIconInfoBitmaps(iconInfo);
                 return false;
             }
 
             cursorWidth = bitmapInfo.bmWidth;
             cursorHeight = std::abs(bitmapInfo.bmHeight);
-            return cursorWidth > 0 && cursorHeight > 0;
+            if (cursorWidth <= 0 || cursorHeight <= 0)
+            {
+                ClearIconInfoBitmaps(iconInfo);
+                return false;
+            }
+
+            return true;
         }
 
         if (iconInfo.hbmMask == nullptr)
         {
+            ClearIconInfoBitmaps(iconInfo);
             return false;
         }
 
         if (::GetObjectW(iconInfo.hbmMask, sizeof(bitmapInfo), &bitmapInfo) <= 0)
         {
+            ClearIconInfoBitmaps(iconInfo);
             return false;
         }
 
         const int maskBitmapHeight = std::abs(bitmapInfo.bmHeight);
         if (bitmapInfo.bmWidth <= 0 || maskBitmapHeight <= 0 || (maskBitmapHeight % 2) != 0)
         {
+            ClearIconInfoBitmaps(iconInfo);
             return false;
         }
 
         cursorWidth = bitmapInfo.bmWidth;
         cursorHeight = maskBitmapHeight / 2;
-        return cursorWidth > 0 && cursorHeight > 0;
+        if (cursorWidth <= 0 || cursorHeight <= 0)
+        {
+            ClearIconInfoBitmaps(iconInfo);
+            return false;
+        }
+
+        return true;
     }
 
     static bool TryOverlayCursorOnBgraImage(const HCURSOR cursorHandle, const int cursorLeftOnImage, const int cursorTopOnImage, const int cursorWidth, const int cursorHeight, GB_Image& backgroundImage)
@@ -1874,6 +1918,25 @@ namespace internal
         std::chrono::steady_clock::time_point expireTime;
     };
 
+    static std::chrono::steady_clock::time_point BuildExpireTime(const long long displayDurationMilliseconds)
+    {
+        const std::chrono::steady_clock::time_point currentTime = std::chrono::steady_clock::now();
+        if (displayDurationMilliseconds <= 0)
+        {
+            return currentTime;
+        }
+
+        const std::chrono::milliseconds displayDuration(displayDurationMilliseconds);
+        const std::chrono::steady_clock::duration maxRemainingDuration = std::chrono::steady_clock::time_point::max() - currentTime;
+        const std::chrono::milliseconds maxRemainingMilliseconds = std::chrono::duration_cast<std::chrono::milliseconds>(maxRemainingDuration);
+        if (displayDuration >= maxRemainingMilliseconds)
+        {
+            return std::chrono::steady_clock::time_point::max();
+        }
+
+        return currentTime + displayDuration;
+    }
+
     static int GetOpenCvLineType(const bool antialias)
     {
         return antialias ? cv::LINE_AA : cv::LINE_8;
@@ -1934,6 +1997,12 @@ namespace internal
                 const int sourceAlpha = static_cast<int>(sourceRow[colIndex][3]);
                 if (sourceAlpha <= 0)
                 {
+                    continue;
+                }
+
+                if (sourceAlpha >= 255)
+                {
+                    targetRow[colIndex] = sourceRow[colIndex];
                     continue;
                 }
 
@@ -2110,13 +2179,52 @@ namespace internal
             return false;
         }
 
-        if (right <= left || bottom <= top)
+        const long long rectangleWidth = static_cast<long long>(right) - static_cast<long long>(left);
+        const long long rectangleHeight = static_cast<long long>(bottom) - static_cast<long long>(top);
+        if (rectangleWidth <= 0 || rectangleHeight <= 0 || rectangleWidth > static_cast<long long>(std::numeric_limits<int>::max()) || rectangleHeight > static_cast<long long>(std::numeric_limits<int>::max()))
         {
             return false;
         }
 
-        targetRectangle = cv::Rect(left, top, right - left, bottom - top);
+        targetRectangle = cv::Rect(left, top, static_cast<int>(rectangleWidth), static_cast<int>(rectangleHeight));
         return true;
+    }
+
+    static bool BuildVisibleImageLayer(const cv::Mat& sourceStraightBgra, const cv::Rect& targetRectangle, const cv::Rect& clippedTargetRectangle, const bool smoothResize, cv::Mat& visibleStraightBgra)
+    {
+        visibleStraightBgra.release();
+        if (sourceStraightBgra.empty() || sourceStraightBgra.type() != CV_8UC4 || targetRectangle.empty() || clippedTargetRectangle.empty())
+        {
+            return false;
+        }
+
+        if (targetRectangle.width == sourceStraightBgra.cols && targetRectangle.height == sourceStraightBgra.rows)
+        {
+            const cv::Rect sourceRoi(clippedTargetRectangle.x - targetRectangle.x, clippedTargetRectangle.y - targetRectangle.y, clippedTargetRectangle.width, clippedTargetRectangle.height);
+            const cv::Rect validSourceRectangle(0, 0, sourceStraightBgra.cols, sourceStraightBgra.rows);
+            const cv::Rect clippedSourceRoi = sourceRoi & validSourceRectangle;
+            if (clippedSourceRoi.empty() || clippedSourceRoi.width != clippedTargetRectangle.width || clippedSourceRoi.height != clippedTargetRectangle.height)
+            {
+                return false;
+            }
+
+            visibleStraightBgra = sourceStraightBgra(clippedSourceRoi);
+            return true;
+        }
+
+        const double scaleX = static_cast<double>(sourceStraightBgra.cols) / static_cast<double>(targetRectangle.width);
+        const double scaleY = static_cast<double>(sourceStraightBgra.rows) / static_cast<double>(targetRectangle.height);
+        if (!std::isfinite(scaleX) || !std::isfinite(scaleY) || scaleX <= 0.0 || scaleY <= 0.0)
+        {
+            return false;
+        }
+
+        const double sourceOffsetX = (static_cast<double>(clippedTargetRectangle.x - targetRectangle.x) + 0.5) * scaleX - 0.5;
+        const double sourceOffsetY = (static_cast<double>(clippedTargetRectangle.y - targetRectangle.y) + 0.5) * scaleY - 0.5;
+        const cv::Mat inverseTransform = (cv::Mat_<double>(2, 3) << scaleX, 0.0, sourceOffsetX, 0.0, scaleY, sourceOffsetY);
+        const int interpolation = smoothResize ? cv::INTER_LINEAR : cv::INTER_NEAREST;
+        cv::warpAffine(sourceStraightBgra, visibleStraightBgra, inverseTransform, clippedTargetRectangle.size(), interpolation | cv::WARP_INVERSE_MAP, cv::BORDER_CONSTANT, cv::Scalar(0, 0, 0, 0));
+        return !visibleStraightBgra.empty();
     }
 
     static bool RenderImageObject(cv::Mat& canvasPremultipliedBgra, const GB_ScreenPaintObject& paintObject, const int virtualScreenLeft, const int virtualScreenTop)
@@ -2144,21 +2252,14 @@ namespace internal
             return false;
         }
 
-        cv::Mat resizedStraightBgra;
-        const int interpolation = paintObject.imageOptions.smoothResize ? cv::INTER_LINEAR : cv::INTER_NEAREST;
-        if (targetRectangle.width == sourceStraightBgra.cols && targetRectangle.height == sourceStraightBgra.rows)
+        cv::Mat visibleStraightBgra;
+        if (!BuildVisibleImageLayer(sourceStraightBgra, targetRectangle, clippedTargetRectangle, paintObject.imageOptions.smoothResize, visibleStraightBgra))
         {
-            resizedStraightBgra = sourceStraightBgra;
-        }
-        else
-        {
-            cv::resize(sourceStraightBgra, resizedStraightBgra, cv::Size(targetRectangle.width, targetRectangle.height), 0.0, 0.0, interpolation);
+            return false;
         }
 
-        const cv::Rect sourceRoi(clippedTargetRectangle.x - targetRectangle.x, clippedTargetRectangle.y - targetRectangle.y, clippedTargetRectangle.width, clippedTargetRectangle.height);
-        cv::Mat sourceClippedStraightBgra = resizedStraightBgra(sourceRoi);
         cv::Mat targetRoi = canvasPremultipliedBgra(clippedTargetRectangle);
-        BlendStraightBgraOverPremultipliedBgra(targetRoi, sourceClippedStraightBgra);
+        BlendStraightBgraOverPremultipliedBgra(targetRoi, visibleStraightBgra);
         return true;
     }
 
@@ -2215,7 +2316,11 @@ namespace internal
             paintObject.displayDurationMilliseconds = displayDurationMilliseconds;
             paintObject.remainingMilliseconds = displayDurationMilliseconds;
 
-            AddPaintObject(paintObject, displayDurationMilliseconds);
+            if (!AddPaintObject(paintObject, displayDurationMilliseconds))
+            {
+                return 0;
+            }
+
             return paintObject.uid;
         }
 
@@ -2234,7 +2339,11 @@ namespace internal
             paintObject.displayDurationMilliseconds = displayDurationMilliseconds;
             paintObject.remainingMilliseconds = displayDurationMilliseconds;
 
-            AddPaintObject(paintObject, displayDurationMilliseconds);
+            if (!AddPaintObject(paintObject, displayDurationMilliseconds))
+            {
+                return 0;
+            }
+
             return paintObject.uid;
         }
 
@@ -2449,35 +2558,60 @@ namespace internal
                 return;
             }
 
-            cv::Mat canvasPremultipliedBgra(virtualScreenHeight, virtualScreenWidth, CV_8UC4, cv::Scalar(0, 0, 0, 0));
-            for (size_t i = 0; i < objectStates.size(); i++)
+            try
             {
-                const GB_ScreenPaintObject& paintObject = objectStates[i].paintObject;
-                if (paintObject.objectType == GB_ScreenPaintObjectType::Polygon)
+                cv::Mat canvasPremultipliedBgra(virtualScreenHeight, virtualScreenWidth, CV_8UC4, cv::Scalar(0, 0, 0, 0));
+                bool hasVisibleContent = false;
+                for (size_t i = 0; i < objectStates.size(); i++)
                 {
-                    (void)RenderPolygonObject(canvasPremultipliedBgra, paintObject, virtualScreenRect.left, virtualScreenRect.top);
+                    const GB_ScreenPaintObject& paintObject = objectStates[i].paintObject;
+                    if (paintObject.objectType == GB_ScreenPaintObjectType::Polygon)
+                    {
+                        hasVisibleContent = RenderPolygonObject(canvasPremultipliedBgra, paintObject, virtualScreenRect.left, virtualScreenRect.top) || hasVisibleContent;
+                    }
+                    else if (paintObject.objectType == GB_ScreenPaintObjectType::Image)
+                    {
+                        hasVisibleContent = RenderImageObject(canvasPremultipliedBgra, paintObject, virtualScreenRect.left, virtualScreenRect.top) || hasVisibleContent;
+                    }
                 }
-                else if (paintObject.objectType == GB_ScreenPaintObjectType::Image)
+
+                if (!hasVisibleContent)
                 {
-                    (void)RenderImageObject(canvasPremultipliedBgra, paintObject, virtualScreenRect.left, virtualScreenRect.top);
+                    ClearLayeredWindow(currentWindowHandle, virtualScreenRect);
+                    ::ShowWindow(currentWindowHandle, SW_HIDE);
+                    return;
+                }
+
+                if (!UpdateLayeredWindowFromPremultipliedBgra(currentWindowHandle, virtualScreenRect, canvasPremultipliedBgra))
+                {
+                    ClearLayeredWindow(currentWindowHandle, virtualScreenRect);
+                    ::ShowWindow(currentWindowHandle, SW_HIDE);
+                    return;
                 }
             }
+            catch (...)
+            {
+                ClearLayeredWindow(currentWindowHandle, virtualScreenRect);
+                ::ShowWindow(currentWindowHandle, SW_HIDE);
+                return;
+            }
 
-            (void)UpdateLayeredWindowFromPremultipliedBgra(currentWindowHandle, virtualScreenRect, canvasPremultipliedBgra);
             ::ShowWindow(currentWindowHandle, SW_SHOWNOACTIVATE);
         }
 
         void OnTimer()
         {
             bool needRefresh = false;
+            bool hasPaintObjects = false;
             HWND currentWindowHandle = nullptr;
             {
                 std::lock_guard<std::mutex> lockGuard(mutex);
                 needRefresh = RemoveExpiredObjectsLocked();
+                hasPaintObjects = !paintObjects.empty();
                 currentWindowHandle = windowHandle;
             }
 
-            if (currentWindowHandle != nullptr)
+            if (currentWindowHandle != nullptr && hasPaintObjects)
             {
                 (void)::SetWindowPos(currentWindowHandle, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER);
             }
@@ -2512,31 +2646,51 @@ namespace internal
             return uid;
         }
 
-        void AddPaintObject(const GB_ScreenPaintObject& paintObject, const long long displayDurationMilliseconds)
+        bool AddPaintObject(const GB_ScreenPaintObject& paintObject, const long long displayDurationMilliseconds)
         {
             {
                 std::lock_guard<std::mutex> lockGuard(mutex);
                 RemoveFinishedWindowThreadLocked();
-                StartWindowThreadLocked();
+                if (!StartWindowThreadLocked())
+                {
+                    return false;
+                }
 
                 ScreenPainterObjectState objectState;
                 objectState.paintObject = paintObject;
-                objectState.expireTime = std::chrono::steady_clock::now() + std::chrono::milliseconds(displayDurationMilliseconds);
+                objectState.expireTime = BuildExpireTime(displayDurationMilliseconds);
                 paintObjects[paintObject.uid] = objectState;
             }
 
             RequestRefresh();
+            return true;
         }
 
-        void StartWindowThreadLocked()
+        bool StartWindowThreadLocked()
         {
-            if (windowThread.joinable() || windowThreadStopping)
+            if (windowThreadStopping)
             {
-                return;
+                return false;
             }
 
-            windowThreadFinished = false;
-            windowThread = std::thread(&ScreenPainterManager::WindowThreadMain, this);
+            if (windowThread.joinable())
+            {
+                return true;
+            }
+
+            try
+            {
+                windowThreadFinished = false;
+                windowThread = std::thread(&ScreenPainterManager::WindowThreadMain, this);
+            }
+            catch (...)
+            {
+                windowThreadId = 0;
+                windowThreadFinished = true;
+                return false;
+            }
+
+            return true;
         }
 
         void RemoveFinishedWindowThreadLocked()
@@ -2684,7 +2838,13 @@ namespace internal
                 return false;
             }
 
-            const size_t bitmapBytes = static_cast<size_t>(premultipliedBgraImage.rows) * static_cast<size_t>(premultipliedBgraImage.cols) * 4u;
+            const uint64_t bitmapBytes64 = static_cast<uint64_t>(premultipliedBgraImage.rows) * static_cast<uint64_t>(premultipliedBgraImage.cols) * 4ull;
+            if (bitmapBytes64 > static_cast<uint64_t>(std::numeric_limits<size_t>::max()))
+            {
+                return false;
+            }
+
+            const size_t bitmapBytes = static_cast<size_t>(bitmapBytes64);
             if (premultipliedBgraImage.isContinuous())
             {
                 std::memcpy(bitmapPixels, premultipliedBgraImage.data, bitmapBytes);
