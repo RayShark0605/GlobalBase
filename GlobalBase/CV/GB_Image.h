@@ -3,6 +3,8 @@
 
 #include "../GlobalBasePort.h"
 #include "../GB_BaseTypes.h"
+#include "../Geometry/GB_Point2d.h"
+#include "../Geometry/GB_Polygon.h"
 #include "GB_ColorRGBA.h"
 
 #include <cstddef>
@@ -203,6 +205,311 @@ struct GB_ImageSaveOptions
      * @brief WebP 质量，范围 [1, 100]。
      */
     int webpQuality = 95;
+};
+
+
+/**
+ * @brief 图像模板查找算法。
+ */
+enum class GB_ImageTemplateFindAlgorithm
+{
+    /**
+     * @brief 自动策略：优先模板匹配，失败后依次尝试 ORB、SIFT。
+     */
+    Auto = 0,
+
+    /**
+     * @brief 模板匹配，适合模板与目标尺寸、角度、视角基本一致的场景。
+     */
+    TemplateMatching,
+
+    /**
+     * @brief ORB 特征匹配，速度较快，适合存在一定旋转、尺度变化的纹理目标。
+     */
+    ORB,
+
+    /**
+     * @brief SIFT 特征匹配，通常更稳定但计算成本更高。
+     */
+    SIFT
+};
+
+/**
+ * @brief OpenCV 模板匹配方法。
+ */
+enum class GB_ImageTemplateMatchMethod
+{
+    SqDiff = 0,
+    SqDiffNormed,
+    CCorr,
+    CCorrNormed,
+    CCoeff,
+    CCoeffNormed
+};
+
+/**
+ * @brief 图像模板查找选项。
+ */
+struct GB_ImageTemplateFindOptions
+{
+    /**
+     * @brief 查找算法。
+     */
+    GB_ImageTemplateFindAlgorithm algorithm = GB_ImageTemplateFindAlgorithm::Auto;
+
+    /**
+     * @brief 是否优先尝试 CUDA 加速。
+     *
+     * 仅在当前 OpenCV 构建包含 CUDA 模板匹配模块且运行时存在可用 CUDA 设备时生效；
+     * 否则会自动回退到 CPU 路径。
+     */
+    bool preferCuda = true;
+
+    /**
+     * @brief 是否转换为灰度图后再执行匹配。
+     *
+     * 对模板匹配通常能减少计算量并降低通道顺序差异带来的干扰；
+     * ORB / SIFT 特征匹配始终使用灰度图。
+     */
+    bool convertToGray = true;
+
+    /**
+     * @brief 模板匹配方法。
+     */
+    GB_ImageTemplateMatchMethod templateMatchMethod = GB_ImageTemplateMatchMethod::CCoeffNormed;
+
+    /**
+     * @brief 模板匹配最低得分阈值。
+     *
+     * 对归一化模板匹配方法，该值通常取 [0, 1]；默认 0.85 表示较严格匹配。
+     */
+    double minTemplateMatchScore = 0.85;
+
+    /**
+     * @brief 是否对模板图像启用多尺度金字塔搜索。
+     *
+     * 当模板与大图中的目标存在尺度差异时可开启；默认关闭以避免额外计算量。
+     */
+    bool useTemplateScalePyramid = false;
+
+    /**
+     * @brief 多尺度模板搜索的最小模板缩放比例。
+     */
+    double minTemplateScale = 0.75;
+
+    /**
+     * @brief 多尺度模板搜索的最大模板缩放比例。
+     */
+    double maxTemplateScale = 1.25;
+
+    /**
+     * @brief 多尺度模板搜索的缩放步长。
+     */
+    double templateScaleStep = 0.05;
+
+    /**
+     * @brief 多尺度模板搜索最多尝试的缩放数量。
+     */
+    int maxTemplateScaleCount = 32;
+
+    /**
+     * @brief 模板缩放时使用的插值方式。
+     */
+    GB_ImageInterpolation templateScaleInterpolation = GB_ImageInterpolation::Linear;
+
+    /**
+     * @brief ORB 最大特征点数量。
+     */
+    int orbMaxFeatures = 2000;
+
+    /**
+     * @brief ORB 图像金字塔缩放因子。
+     */
+    double orbScaleFactor = 1.2;
+
+    /**
+     * @brief ORB 图像金字塔层数。
+     */
+    int orbNumLevels = 8;
+
+    /**
+     * @brief ORB 边缘阈值。
+     */
+    int orbEdgeThreshold = 31;
+
+    /**
+     * @brief ORB 描述子 patch 尺寸。
+     */
+    int orbPatchSize = 31;
+
+    /**
+     * @brief ORB FAST 角点阈值。
+     */
+    int orbFastThreshold = 20;
+
+    /**
+     * @brief SIFT 保留的最佳特征点数量，0 表示不限制。
+     */
+    int siftNumFeatures = 0;
+
+    /**
+     * @brief SIFT 每个 octave 的层数。
+     */
+    int siftNumOctaveLayers = 3;
+
+    /**
+     * @brief SIFT 对低对比度特征的过滤阈值。
+     */
+    double siftContrastThreshold = 0.04;
+
+    /**
+     * @brief SIFT 对边缘型特征的过滤阈值。
+     */
+    double siftEdgeThreshold = 10.0;
+
+    /**
+     * @brief SIFT 初始高斯模糊参数。
+     */
+    double siftSigma = 1.6;
+
+    /**
+     * @brief KNN 匹配后的 Lowe ratio test 阈值。
+     */
+    double featureRatioTest = 0.75;
+
+    /**
+     * @brief 特征匹配至少需要保留的优质匹配数量。
+     */
+    int minGoodMatches = 8;
+
+    /**
+     * @brief 是否使用 RANSAC 估计单应矩阵并剔除错误匹配。
+     */
+    bool useRansac = true;
+
+    /**
+     * @brief RANSAC 重投影误差阈值，单位为像素。
+     */
+    double ransacReprojThreshold = 3.0;
+
+    /**
+     * @brief 特征匹配至少需要保留的内点数量。
+     */
+    int minInlierMatches = 6;
+
+    /**
+     * @brief 特征匹配最低内点比例。
+     */
+    double minInlierRatio = 0.35;
+
+    /**
+     * @brief 单应矩阵估计前最多使用的优质匹配数量。
+     */
+    int maxFeatureMatches = 500;
+
+    /**
+     * @brief 是否检查结果区域大致落在大图范围内。
+     */
+    bool checkResultInsideSourceImage = true;
+
+    /**
+     * @brief 允许结果区域略微超出大图范围的像素容差。
+     */
+    double outsideTolerance = 3.0;
+};
+
+/**
+ * @brief 图像模板查找结果。
+ */
+struct GB_ImageTemplateFindResult
+{
+    /**
+     * @brief 是否成功找到模板区域。
+     */
+    bool found = false;
+
+    /**
+     * @brief 实际产生结果的算法。
+     */
+    GB_ImageTemplateFindAlgorithm algorithm = GB_ImageTemplateFindAlgorithm::Auto;
+
+    /**
+     * @brief 是否实际使用了 CUDA 路径。
+     */
+    bool usedCuda = false;
+
+    /**
+     * @brief 匹配得分。
+     *
+     * 模板匹配归一化方法通常位于 [0, 1]，越大越可靠；
+     * 特征匹配中该值为内点比例。
+     */
+    double score = 0.0;
+
+    /**
+     * @brief 底层算法的原始得分。
+     */
+    double rawScore = 0.0;
+
+    /**
+     * @brief 模板匹配使用的模板缩放比例。
+     */
+    double templateScale = 1.0;
+
+    /**
+     * @brief 小图像在大图像中的区域。
+     */
+    GB_Polygon polygon;
+
+    /**
+     * @brief 小图像在大图像中的区域中心点。
+     */
+    GB_Point2d centerPoint;
+
+    /**
+     * @brief 结果区域的轴对齐包围盒左上角行号。
+     */
+    size_t boundingRow = 0;
+
+    /**
+     * @brief 结果区域的轴对齐包围盒左上角列号。
+     */
+    size_t boundingCol = 0;
+
+    /**
+     * @brief 结果区域的轴对齐包围盒行数。
+     */
+    size_t boundingRows = 0;
+
+    /**
+     * @brief 结果区域的轴对齐包围盒列数。
+     */
+    size_t boundingCols = 0;
+
+    /**
+     * @brief 模板图像特征点数量，仅特征匹配算法填写。
+     */
+    size_t templateKeyPointCount = 0;
+
+    /**
+     * @brief 大图像特征点数量，仅特征匹配算法填写。
+     */
+    size_t sourceKeyPointCount = 0;
+
+    /**
+     * @brief Lowe ratio test 后保留的优质匹配数量，仅特征匹配算法填写。
+     */
+    size_t goodMatchCount = 0;
+
+    /**
+     * @brief RANSAC 过滤后的内点数量，仅特征匹配算法填写。
+     */
+    size_t inlierMatchCount = 0;
+
+    /**
+     * @brief 失败原因或补充说明。
+     */
+    std::string message = "";
 };
 
 /**
@@ -593,6 +900,25 @@ public:
      * 转换后会同步更新当前对象记录的通道顺序信息。
      */
     bool ConvertColorInPlace(GB_ImageColorConversion conversion);
+
+    /**
+     * @brief 在当前图像中查找模板图像。
+     *
+     * @param templateImage 要查找的小图像。
+     * @param findOptions 查找选项。
+     * @return 查找结果。失败时 found 为 false。
+     */
+    GB_ImageTemplateFindResult FindTemplate(const GB_Image& templateImage, const GB_ImageTemplateFindOptions& findOptions = GB_ImageTemplateFindOptions()) const;
+
+    /**
+     * @brief 在 sourceImage 中查找 templateImage。
+     *
+     * @param sourceImage 大图像。
+     * @param templateImage 要查找的小图像。
+     * @param findOptions 查找选项。
+     * @return 查找结果。失败时 found 为 false。
+     */
+    static GB_ImageTemplateFindResult FindTemplate(const GB_Image& sourceImage, const GB_Image& templateImage, const GB_ImageTemplateFindOptions& findOptions = GB_ImageTemplateFindOptions());
 
 private:
     /**

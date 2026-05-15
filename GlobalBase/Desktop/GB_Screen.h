@@ -4,8 +4,11 @@
 #include "../GlobalBasePort.h"
 #include "../Geometry/GB_Point2d.h"
 #include "../Geometry/GB_Rectangle.h"
+#include "../Geometry/GB_Polygon.h"
 #include "../CV/GB_Image.h"
+#include "../CV/GB_ColorRGBA.h"
 
+#include <cstdint>
 #include <string>
 #include <vector>
 
@@ -213,6 +216,92 @@ struct GB_ScreenInfo
     bool isInternal = false;
 };
 
+
+
+/**
+ * @brief 屏幕绘制对象类型。
+ */
+enum class GB_ScreenPaintObjectType
+{
+    /** @brief 无有效绘制对象。 */
+    None = 0,
+
+    /** @brief 多边形绘制对象。 */
+    Polygon = 1,
+
+    /** @brief 影像绘制对象。 */
+    Image = 2
+};
+
+/**
+ * @brief 屏幕多边形绘制参数。
+ */
+struct GB_ScreenPaintPolygonOptions
+{
+    /** @brief 多边形边界颜色，支持 Alpha 半透明。 */
+    GB_ColorRGBA boundaryColor = GB_ColorRGBA::Red;
+
+    /** @brief 多边形边界线宽，单位为屏幕物理像素。小于等于 0 表示不绘制边界。 */
+    int boundaryThickness = 2;
+
+    /** @brief 是否填充多边形内部。 */
+    bool fill = false;
+
+    /** @brief 多边形填充颜色，支持 Alpha 半透明。 */
+    GB_ColorRGBA fillColor = GB_ColorRGBA(255, 0, 0, 64);
+
+    /** @brief 是否启用抗锯齿。 */
+    bool antialias = true;
+};
+
+/**
+ * @brief 屏幕影像绘制参数。
+ */
+struct GB_ScreenPaintImageOptions
+{
+    /** @brief 影像绘制到屏幕虚拟桌面坐标系中的目标区域，单位为物理像素。 */
+    GB_Rectangle screenRectangle;
+
+    /** @brief 是否启用线性插值缩放。 */
+    bool smoothResize = true;
+};
+
+/**
+ * @brief 屏幕绘制对象快照。
+ *
+ * 说明：
+ * - 该结构体由查询接口返回，是当前绘制对象的只读语义副本；
+ * - 修改返回副本不会影响屏幕上已经绘制的对象；
+ * - 当 objectType 为 Polygon 时 polygon / polygonOptions 有意义；
+ * - 当 objectType 为 Image 时 image / imageOptions 有意义。
+ */
+struct GB_ScreenPaintObject
+{
+    /** @brief 绘制对象唯一标识，0 表示无效。 */
+    uint64_t uid = 0;
+
+    /** @brief 绘制对象类型。 */
+    GB_ScreenPaintObjectType objectType = GB_ScreenPaintObjectType::None;
+
+    /** @brief 多边形对象。 */
+    GB_Polygon polygon;
+
+    /** @brief 多边形绘制参数。 */
+    GB_ScreenPaintPolygonOptions polygonOptions;
+
+    /** @brief 影像对象。 */
+    GB_Image image;
+
+    /** @brief 影像绘制参数。 */
+    GB_ScreenPaintImageOptions imageOptions;
+
+    /** @brief 原始持久化显示时长，单位为毫秒。 */
+    long long displayDurationMilliseconds = 0;
+
+    /** @brief 查询时剩余显示时长，单位为毫秒。 */
+    long long remainingMilliseconds = 0;
+};
+
 /**
  * @brief 与屏幕相关的 Windows 工具类。
  *
@@ -360,5 +449,96 @@ public:
      */
     static bool PhysicalPixelToLogicalPixel(int screenIndex, const GB_Point2d& physicalPixelPointOnScreen, GB_Point2d& logicalPixelPoint);
 };
+
+
+/**
+ * @brief 屏幕顶层绘制工具类。
+ *
+ * 说明：
+ * - 该类用于在屏幕虚拟桌面坐标系中临时绘制多边形或影像；
+ * - 绘制采用进程内共享的透明置顶覆盖窗口，Paint 接口只提交绘制对象并立即返回 uid；
+ * - 坐标统一使用物理像素，不使用 Qt / Win32 逻辑像素；
+ * - 非 Windows 平台下接口不会产生实际绘制，Paint 接口返回 0。
+ */
+class GLOBALBASE_PORT GB_ScreenPainter
+{
+public:
+    /**
+     * @brief 绘制多边形。
+     *
+     * @param polygon                     要绘制的多边形，顶点坐标为虚拟桌面物理像素坐标。
+     * @param paintOptions                绘制参数。
+     * @param displayDurationMilliseconds 持久化显示时长，单位为毫秒；小于等于 0 时不绘制并返回 0。
+     * @return 绘制对象 uid；失败返回 0。
+     */
+    static uint64_t PaintPolygon(const GB_Polygon& polygon, const GB_ScreenPaintPolygonOptions& paintOptions, long long displayDurationMilliseconds);
+
+    /**
+     * @brief 绘制多边形。
+     */
+    static uint64_t PaintPolygon(const GB_Polygon& polygon, const GB_ColorRGBA& boundaryColor, int boundaryThickness, bool fill, const GB_ColorRGBA& fillColor, long long displayDurationMilliseconds);
+
+    /**
+     * @brief 绘制影像。
+     *
+     * @param image                       要绘制的影像。
+     * @param paintOptions                绘制参数。
+     * @param displayDurationMilliseconds 持久化显示时长，单位为毫秒；小于等于 0 时不绘制并返回 0。
+     * @return 绘制对象 uid；失败返回 0。
+     */
+    static uint64_t PaintImage(const GB_Image& image, const GB_ScreenPaintImageOptions& paintOptions, long long displayDurationMilliseconds);
+
+    /**
+     * @brief 绘制影像。
+     */
+    static uint64_t PaintImage(const GB_Image& image, const GB_Rectangle& screenRectangle, long long displayDurationMilliseconds);
+
+    /**
+     * @brief 获取当前仍处于显示期内的所有绘制对象 uid。
+     */
+    static std::vector<uint64_t> GetPaintedObjectUids();
+
+    /**
+     * @brief 获取指定 uid 对应的绘制对象快照。
+     */
+    static bool GetPaintedObject(uint64_t uid, GB_ScreenPaintObject& paintObject);
+
+    /**
+     * @brief 获取指定 uid 列表对应的绘制对象快照。
+     */
+    static std::vector<GB_ScreenPaintObject> GetPaintedObjects(const std::vector<uint64_t>& uids);
+
+    /**
+     * @brief 获取当前仍处于显示期内的全部绘制对象快照。
+     */
+    static std::vector<GB_ScreenPaintObject> GetAllPaintedObjects();
+
+    /**
+     * @brief 判断指定 uid 是否仍处于显示期内。
+     */
+    static bool IsPainting(uint64_t uid);
+
+    /**
+     * @brief 删除指定 uid 对应的绘制对象，并立即从屏幕上移除。
+     */
+    static bool RemovePaintedObject(uint64_t uid);
+
+    /**
+     * @brief 批量删除指定 uid 对应的绘制对象，并立即从屏幕上移除。
+     */
+    static size_t RemovePaintedObjects(const std::vector<uint64_t>& uids);
+
+    /**
+     * @brief 清空当前所有绘制对象，并立即从屏幕上移除。
+     */
+    static void Clear();
+
+private:
+    GB_ScreenPainter() = delete;
+    ~GB_ScreenPainter() = delete;
+    GB_ScreenPainter(const GB_ScreenPainter&) = delete;
+    GB_ScreenPainter& operator=(const GB_ScreenPainter&) = delete;
+};
+
 
 #endif

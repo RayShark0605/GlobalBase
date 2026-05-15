@@ -3,6 +3,7 @@
 #include "../GB_IO.h"
 #include "../Geometry/GB_GeometryInterface.h"
 
+#include <algorithm>
 #include <cctype>
 #include <cmath>
 #include <cstring>
@@ -20,8 +21,19 @@
 
 #include <opencv2/core.hpp>
 #include <opencv2/core/utils/logger.hpp>
+#include <opencv2/calib3d.hpp>
+#include <opencv2/features2d.hpp>
 #include <opencv2/imgcodecs.hpp>
 #include <opencv2/imgproc.hpp>
+#include <opencv2/opencv_modules.hpp>
+
+#if defined(HAVE_OPENCV_CUDAIMGPROC)
+#  include <opencv2/core/cuda.hpp>
+#  include <opencv2/cudaimgproc.hpp>
+#  define GBIMAGE_HAS_OPENCV_CUDA_TEMPLATE_MATCHING 1
+#else
+#  define GBIMAGE_HAS_OPENCV_CUDA_TEMPLATE_MATCHING 0
+#endif
 
 #ifdef _MSC_VER
 #  pragma warning(pop)
@@ -1423,6 +1435,1090 @@ namespace GBImage_Internal
 
         rotateCode = -1;
         return false;
+    }
+
+
+    /**
+     * @brief 判断浮点数是否为有限值。
+     */
+    static bool IsFiniteDouble(double value)
+    {
+        return std::isfinite(value) != 0;
+    }
+
+    /**
+     * @brief 将模板匹配方法映射为 OpenCV 枚举。
+     */
+    static int ToCvTemplateMatchMethod(GB_ImageTemplateMatchMethod matchMethod)
+    {
+        switch (matchMethod)
+        {
+        case GB_ImageTemplateMatchMethod::SqDiff:
+            return cv::TM_SQDIFF;
+        case GB_ImageTemplateMatchMethod::SqDiffNormed:
+            return cv::TM_SQDIFF_NORMED;
+        case GB_ImageTemplateMatchMethod::CCorr:
+            return cv::TM_CCORR;
+        case GB_ImageTemplateMatchMethod::CCorrNormed:
+            return cv::TM_CCORR_NORMED;
+        case GB_ImageTemplateMatchMethod::CCoeff:
+            return cv::TM_CCOEFF;
+        case GB_ImageTemplateMatchMethod::CCoeffNormed:
+            return cv::TM_CCOEFF_NORMED;
+        default:
+            break;
+        }
+
+        return cv::TM_CCOEFF_NORMED;
+    }
+
+    /**
+     * @brief 模板匹配方法是否分值越小越好。
+     */
+    static bool IsTemplateMatchLowerBetter(GB_ImageTemplateMatchMethod matchMethod)
+    {
+        return matchMethod == GB_ImageTemplateMatchMethod::SqDiff || matchMethod == GB_ImageTemplateMatchMethod::SqDiffNormed;
+    }
+
+    /**
+     * @brief 模板匹配方法是否为归一化方法。
+     */
+    static bool IsTemplateMatchNormed(GB_ImageTemplateMatchMethod matchMethod)
+    {
+        return matchMethod == GB_ImageTemplateMatchMethod::SqDiffNormed || matchMethod == GB_ImageTemplateMatchMethod::CCorrNormed || matchMethod == GB_ImageTemplateMatchMethod::CCoeffNormed;
+    }
+
+    /**
+     * @brief 转换为 8 位图像，便于模板匹配和特征提取统一处理。
+     */
+    static bool ConvertImageDepthToUInt8(const cv::Mat& sourceImage, cv::Mat& targetImage)
+    {
+        targetImage.release();
+        if (sourceImage.empty())
+        {
+            return false;
+        }
+
+        try
+        {
+            switch (sourceImage.depth())
+            {
+            case CV_8U:
+                targetImage = sourceImage;
+                return true;
+
+            case CV_8S:
+                sourceImage.convertTo(targetImage, CV_8U, 1.0, 128.0);
+                return !targetImage.empty();
+
+            case CV_16U:
+                sourceImage.convertTo(targetImage, CV_8U, 1.0 / 257.0, 0.0);
+                return !targetImage.empty();
+
+            case CV_16S:
+                sourceImage.convertTo(targetImage, CV_8U, 1.0 / 256.0, 128.0);
+                return !targetImage.empty();
+
+            default:
+                break;
+            }
+
+            double minValue = 0.0;
+            double maxValue = 0.0;
+            cv::minMaxLoc(sourceImage.reshape(1), &minValue, &maxValue);
+            if (IsNearlyEqual(minValue, maxValue))
+            {
+                targetImage = cv::Mat::zeros(sourceImage.rows, sourceImage.cols, CV_MAKETYPE(CV_8U, sourceImage.channels()));
+                return !targetImage.empty();
+            }
+
+            cv::normalize(sourceImage, targetImage, 0.0, 255.0, cv::NORM_MINMAX, CV_MAKETYPE(CV_8U, sourceImage.channels()));
+            return !targetImage.empty();
+        }
+        catch (...)
+        {
+            targetImage.release();
+            return false;
+        }
+    }
+
+    /**
+     * @brief 提取第一个通道。
+     */
+    static bool ExtractFirstChannel(const cv::Mat& sourceImage, cv::Mat& targetImage)
+    {
+        targetImage.release();
+        if (sourceImage.empty())
+        {
+            return false;
+        }
+
+        try
+        {
+            if (sourceImage.channels() == 1)
+            {
+                targetImage = sourceImage;
+                return true;
+            }
+
+            cv::extractChannel(sourceImage, targetImage, 0);
+            return !targetImage.empty();
+        }
+        catch (...)
+        {
+            targetImage.release();
+            return false;
+        }
+    }
+
+    /**
+     * @brief 将图像转换为 8 位灰度图。
+     */
+    static bool ConvertImageToGray8(const cv::Mat& sourceImage, ImageChannelLayout channelLayout, cv::Mat& grayImage)
+    {
+        grayImage.release();
+        if (sourceImage.empty())
+        {
+            return false;
+        }
+
+        cv::Mat image8;
+        if (!ConvertImageDepthToUInt8(sourceImage, image8))
+        {
+            return false;
+        }
+
+        try
+        {
+            switch (image8.channels())
+            {
+            case 1:
+                grayImage = image8;
+                return true;
+
+            case 2:
+                return ExtractFirstChannel(image8, grayImage);
+
+            case 3:
+                if (channelLayout == ImageChannelLayout::Rgb)
+                {
+                    cv::cvtColor(image8, grayImage, cv::COLOR_RGB2GRAY);
+                }
+                else
+                {
+                    cv::cvtColor(image8, grayImage, cv::COLOR_BGR2GRAY);
+                }
+                return !grayImage.empty();
+
+            case 4:
+                if (channelLayout == ImageChannelLayout::Rgba)
+                {
+                    cv::cvtColor(image8, grayImage, cv::COLOR_RGBA2GRAY);
+                }
+                else
+                {
+                    cv::cvtColor(image8, grayImage, cv::COLOR_BGRA2GRAY);
+                }
+                return !grayImage.empty();
+
+            default:
+                return ExtractFirstChannel(image8, grayImage);
+            }
+        }
+        catch (...)
+        {
+            grayImage.release();
+            return false;
+        }
+    }
+
+    /**
+     * @brief 将图像转换为模板匹配所需的 8 位矩阵。
+     */
+    static bool ConvertImageToTemplateMatchMat(const cv::Mat& sourceImage, ImageChannelLayout channelLayout, bool convertToGray, cv::Mat& matchImage)
+    {
+        matchImage.release();
+        if (sourceImage.empty())
+        {
+            return false;
+        }
+
+        if (convertToGray)
+        {
+            return ConvertImageToGray8(sourceImage, channelLayout, matchImage);
+        }
+
+        cv::Mat image8;
+        if (!ConvertImageDepthToUInt8(sourceImage, image8))
+        {
+            return false;
+        }
+
+        try
+        {
+            switch (image8.channels())
+            {
+            case 1:
+                matchImage = image8;
+                return true;
+
+            case 2:
+                return ExtractFirstChannel(image8, matchImage);
+
+            case 3:
+                if (channelLayout == ImageChannelLayout::Rgb)
+                {
+                    cv::cvtColor(image8, matchImage, cv::COLOR_RGB2BGR);
+                }
+                else
+                {
+                    matchImage = image8;
+                }
+                return !matchImage.empty();
+
+            case 4:
+                if (channelLayout == ImageChannelLayout::Rgba)
+                {
+                    cv::cvtColor(image8, matchImage, cv::COLOR_RGBA2BGRA);
+                }
+                else
+                {
+                    matchImage = image8;
+                }
+                return !matchImage.empty();
+
+            default:
+                return ExtractFirstChannel(image8, matchImage);
+            }
+        }
+        catch (...)
+        {
+            matchImage.release();
+            return false;
+        }
+    }
+
+    /**
+     * @brief 当前运行时是否可使用 CUDA 模板匹配。
+     */
+    static bool IsCudaTemplateMatchingAvailable()
+    {
+#if GBIMAGE_HAS_OPENCV_CUDA_TEMPLATE_MATCHING
+        try
+        {
+            return cv::cuda::getCudaEnabledDeviceCount() > 0;
+        }
+        catch (...)
+        {
+            return false;
+        }
+#else
+        return false;
+#endif
+    }
+
+    /**
+     * @brief 使用 CUDA 执行模板匹配。
+     */
+    static bool RunCudaTemplateMatching(const cv::Mat& sourceImage, const cv::Mat& templateImage, int cvMatchMethod, cv::Mat& resultImage)
+    {
+        resultImage.release();
+#if GBIMAGE_HAS_OPENCV_CUDA_TEMPLATE_MATCHING
+        if (sourceImage.empty() || templateImage.empty() || sourceImage.type() != templateImage.type())
+        {
+            return false;
+        }
+
+        try
+        {
+            cv::cuda::GpuMat gpuSourceImage;
+            cv::cuda::GpuMat gpuTemplateImage;
+            cv::cuda::GpuMat gpuResultImage;
+
+            gpuSourceImage.upload(sourceImage);
+            gpuTemplateImage.upload(templateImage);
+
+            cv::Ptr<cv::cuda::TemplateMatching> templateMatcher = cv::cuda::createTemplateMatching(sourceImage.type(), cvMatchMethod);
+            if (templateMatcher.empty())
+            {
+                return false;
+            }
+
+            templateMatcher->match(gpuSourceImage, gpuTemplateImage, gpuResultImage);
+            gpuResultImage.download(resultImage);
+            return !resultImage.empty();
+        }
+        catch (...)
+        {
+            resultImage.release();
+            return false;
+        }
+#else
+        (void)sourceImage;
+        (void)templateImage;
+        (void)cvMatchMethod;
+        return false;
+#endif
+    }
+
+    /**
+     * @brief 使用 CPU 执行模板匹配。
+     */
+    static bool RunCpuTemplateMatching(const cv::Mat& sourceImage, const cv::Mat& templateImage, int cvMatchMethod, cv::Mat& resultImage)
+    {
+        resultImage.release();
+        if (sourceImage.empty() || templateImage.empty() || sourceImage.type() != templateImage.type())
+        {
+            return false;
+        }
+
+        try
+        {
+            cv::matchTemplate(sourceImage, templateImage, resultImage, cvMatchMethod);
+            return !resultImage.empty();
+        }
+        catch (...)
+        {
+            resultImage.release();
+            return false;
+        }
+    }
+
+    /**
+     * @brief 生成多尺度模板匹配所需的缩放比例列表。
+     */
+    static void BuildTemplateScaleList(const GB_ImageTemplateFindOptions& findOptions, std::vector<double>& scales)
+    {
+        scales.clear();
+
+        if (!findOptions.useTemplateScalePyramid)
+        {
+            scales.push_back(1.0);
+            return;
+        }
+
+        double minScale = findOptions.minTemplateScale;
+        double maxScale = findOptions.maxTemplateScale;
+        double scaleStep = findOptions.templateScaleStep;
+        int maxScaleCount = findOptions.maxTemplateScaleCount;
+
+        if (!IsFiniteDouble(minScale) || !IsFiniteDouble(maxScale) || !IsFiniteDouble(scaleStep) || minScale <= 0.0 || maxScale <= 0.0 || scaleStep <= 0.0)
+        {
+            scales.push_back(1.0);
+            return;
+        }
+
+        if (minScale > maxScale)
+        {
+            std::swap(minScale, maxScale);
+        }
+
+        if (maxScaleCount <= 0)
+        {
+            maxScaleCount = 32;
+        }
+
+        for (double scale = minScale; scale <= maxScale + scaleStep * 0.5 && static_cast<int>(scales.size()) < maxScaleCount; scale += scaleStep)
+        {
+            scales.push_back(scale);
+        }
+
+        bool containsOne = false;
+        for (size_t i = 0; i < scales.size(); i++)
+        {
+            if (IsNearlyEqual(scales[i], 1.0, 1e-8))
+            {
+                containsOne = true;
+                break;
+            }
+        }
+
+        if (!containsOne && 1.0 >= minScale && 1.0 <= maxScale && static_cast<int>(scales.size()) < maxScaleCount)
+        {
+            scales.push_back(1.0);
+        }
+
+        std::sort(scales.begin(), scales.end());
+        scales.erase(std::unique(scales.begin(), scales.end(), [](double leftScale, double rightScale)
+            {
+                return IsNearlyEqual(leftScale, rightScale, 1e-8);
+            }), scales.end());
+
+        if (scales.empty())
+        {
+            scales.push_back(1.0);
+        }
+    }
+
+    /**
+     * @brief 按比例缩放模板。
+     */
+    static bool ResizeTemplateByScale(const cv::Mat& templateImage, double scale, GB_ImageInterpolation interpolation, cv::Mat& scaledTemplateImage)
+    {
+        scaledTemplateImage.release();
+        if (templateImage.empty() || !IsFiniteDouble(scale) || scale <= 0.0)
+        {
+            return false;
+        }
+
+        try
+        {
+            if (IsNearlyEqual(scale, 1.0, 1e-8))
+            {
+                scaledTemplateImage = templateImage;
+                return true;
+            }
+
+            const int scaledCols = static_cast<int>(std::floor(static_cast<double>(templateImage.cols) * scale + 0.5));
+            const int scaledRows = static_cast<int>(std::floor(static_cast<double>(templateImage.rows) * scale + 0.5));
+            if (scaledRows <= 0 || scaledCols <= 0)
+            {
+                return false;
+            }
+
+            cv::resize(templateImage, scaledTemplateImage, cv::Size(scaledCols, scaledRows), 0.0, 0.0, ToCvInterpolation(interpolation));
+            return !scaledTemplateImage.empty();
+        }
+        catch (...)
+        {
+            scaledTemplateImage.release();
+            return false;
+        }
+    }
+
+    /**
+     * @brief 计算模板匹配结果中的最佳位置和得分。
+     */
+    static bool EvaluateTemplateMatchMap(const cv::Mat& matchMap, GB_ImageTemplateMatchMethod matchMethod, cv::Point& bestLocation, double& score, double& rawScore)
+    {
+        if (matchMap.empty())
+        {
+            return false;
+        }
+
+        double minValue = 0.0;
+        double maxValue = 0.0;
+        cv::Point minLocation;
+        cv::Point maxLocation;
+
+        try
+        {
+            cv::minMaxLoc(matchMap, &minValue, &maxValue, &minLocation, &maxLocation);
+        }
+        catch (...)
+        {
+            return false;
+        }
+
+        if (IsTemplateMatchLowerBetter(matchMethod))
+        {
+            bestLocation = minLocation;
+            rawScore = minValue;
+            if (IsTemplateMatchNormed(matchMethod))
+            {
+                score = 1.0 - minValue;
+            }
+            else
+            {
+                score = 1.0 / (1.0 + std::max(0.0, minValue));
+            }
+        }
+        else
+        {
+            bestLocation = maxLocation;
+            rawScore = maxValue;
+            score = maxValue;
+        }
+
+        if (IsTemplateMatchNormed(matchMethod))
+        {
+            if (score < 0.0)
+            {
+                score = 0.0;
+            }
+            else if (score > 1.0)
+            {
+                score = 1.0;
+            }
+        }
+
+        return IsFiniteDouble(score) && IsFiniteDouble(rawScore);
+    }
+
+    /**
+     * @brief 根据四个角点计算轴对齐包围盒。
+     */
+    static bool ComputeBoundingBoxFromCorners(const std::vector<cv::Point2d>& corners, size_t& boundingRow, size_t& boundingCol, size_t& boundingRows, size_t& boundingCols)
+    {
+        if (corners.empty())
+        {
+            return false;
+        }
+
+        double minX = 0.0;
+        double minY = 0.0;
+        double maxX = 0.0;
+        double maxY = 0.0;
+        bool firstPoint = true;
+
+        for (size_t i = 0; i < corners.size(); i++)
+        {
+            const cv::Point2d& point = corners[i];
+            if (!IsFiniteDouble(point.x) || !IsFiniteDouble(point.y))
+            {
+                return false;
+            }
+
+            if (firstPoint)
+            {
+                minX = point.x;
+                minY = point.y;
+                maxX = point.x;
+                maxY = point.y;
+                firstPoint = false;
+            }
+            else
+            {
+                if (point.x < minX)
+                {
+                    minX = point.x;
+                }
+                if (point.y < minY)
+                {
+                    minY = point.y;
+                }
+                if (point.x > maxX)
+                {
+                    maxX = point.x;
+                }
+                if (point.y > maxY)
+                {
+                    maxY = point.y;
+                }
+            }
+        }
+
+        const double left = std::floor(minX);
+        const double top = std::floor(minY);
+        const double right = std::ceil(maxX);
+        const double bottom = std::ceil(maxY);
+        if (right <= left || bottom <= top)
+        {
+            return false;
+        }
+
+        boundingCol = left < 0.0 ? 0 : static_cast<size_t>(left);
+        boundingRow = top < 0.0 ? 0 : static_cast<size_t>(top);
+        boundingCols = static_cast<size_t>(right - left);
+        boundingRows = static_cast<size_t>(bottom - top);
+        return true;
+    }
+
+    /**
+     * @brief 检查结果角点是否大致落在图像范围内。
+     */
+    static bool AreCornersInsideSourceImage(const std::vector<cv::Point2d>& corners, int sourceRows, int sourceCols, const GB_ImageTemplateFindOptions& findOptions)
+    {
+        if (!findOptions.checkResultInsideSourceImage)
+        {
+            return true;
+        }
+
+        const double tolerance = std::max(0.0, findOptions.outsideTolerance);
+        for (size_t i = 0; i < corners.size(); i++)
+        {
+            const cv::Point2d& point = corners[i];
+            if (point.x < -tolerance || point.y < -tolerance || point.x > static_cast<double>(sourceCols) + tolerance || point.y > static_cast<double>(sourceRows) + tolerance)
+            {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    /**
+     * @brief 用角点填充模板查找结果。
+     */
+    static bool FillTemplateFindPolygonResult(const std::vector<cv::Point2d>& corners, const cv::Point2d& centerPoint, int sourceRows, int sourceCols, const GB_ImageTemplateFindOptions& findOptions, GB_ImageTemplateFindResult& result)
+    {
+        if (corners.size() != 4 || !IsFiniteDouble(centerPoint.x) || !IsFiniteDouble(centerPoint.y))
+        {
+            return false;
+        }
+
+        if (!AreCornersInsideSourceImage(corners, sourceRows, sourceCols, findOptions))
+        {
+            return false;
+        }
+
+        std::vector<GB_Point2d> vertices;
+        vertices.reserve(4);
+        for (size_t i = 0; i < corners.size(); i++)
+        {
+            const cv::Point2d& point = corners[i];
+            if (!IsFiniteDouble(point.x) || !IsFiniteDouble(point.y))
+            {
+                return false;
+            }
+
+            vertices.push_back(GB_Point2d(point.x, point.y));
+        }
+
+        if (!result.polygon.SetVertices(std::move(vertices)))
+        {
+            return false;
+        }
+
+        result.centerPoint = GB_Point2d(centerPoint.x, centerPoint.y);
+        return ComputeBoundingBoxFromCorners(corners, result.boundingRow, result.boundingCol, result.boundingRows, result.boundingCols);
+    }
+
+    /**
+     * @brief 填充轴对齐模板匹配结果。
+     */
+    static bool FillAxisAlignedTemplateMatchResult(const cv::Point& topLeft, int templateRows, int templateCols, int sourceRows, int sourceCols, const GB_ImageTemplateFindOptions& findOptions, GB_ImageTemplateFindResult& result)
+    {
+        if (templateRows <= 0 || templateCols <= 0)
+        {
+            return false;
+        }
+
+        const double left = static_cast<double>(topLeft.x);
+        const double top = static_cast<double>(topLeft.y);
+        const double right = left + static_cast<double>(templateCols);
+        const double bottom = top + static_cast<double>(templateRows);
+        const std::vector<cv::Point2d> corners =
+        {
+            cv::Point2d(left, top),
+            cv::Point2d(right, top),
+            cv::Point2d(right, bottom),
+            cv::Point2d(left, bottom)
+        };
+
+        const cv::Point2d centerPoint((left + right) * 0.5, (top + bottom) * 0.5);
+        return FillTemplateFindPolygonResult(corners, centerPoint, sourceRows, sourceCols, findOptions, result);
+    }
+
+    /**
+     * @brief 执行模板匹配查找。
+     */
+    static GB_ImageTemplateFindResult FindTemplateByTemplateMatching(const cv::Mat& sourceImage, ImageChannelLayout sourceLayout, const cv::Mat& templateImage, ImageChannelLayout templateLayout, const GB_ImageTemplateFindOptions& findOptions)
+    {
+        GB_ImageTemplateFindResult result;
+        result.algorithm = GB_ImageTemplateFindAlgorithm::TemplateMatching;
+
+        cv::Mat sourceMatchImage;
+        cv::Mat templateMatchImage;
+        if (!ConvertImageToTemplateMatchMat(sourceImage, sourceLayout, findOptions.convertToGray, sourceMatchImage) || !ConvertImageToTemplateMatchMat(templateImage, templateLayout, findOptions.convertToGray, templateMatchImage))
+        {
+            result.message = "无法转换图像格式。";
+            return result;
+        }
+
+        if (sourceMatchImage.type() != templateMatchImage.type())
+        {
+            cv::Mat sourceGrayImage;
+            cv::Mat templateGrayImage;
+            if (!ConvertImageToGray8(sourceImage, sourceLayout, sourceGrayImage) || !ConvertImageToGray8(templateImage, templateLayout, templateGrayImage))
+            {
+                result.message = "大图与模板图像类型不一致，且无法转换为灰度图。";
+                return result;
+            }
+
+            sourceMatchImage = sourceGrayImage;
+            templateMatchImage = templateGrayImage;
+        }
+
+        if (templateMatchImage.rows > sourceMatchImage.rows || templateMatchImage.cols > sourceMatchImage.cols)
+        {
+            result.message = "模板图像尺寸大于大图像。";
+            return result;
+        }
+
+        const int cvMatchMethod = ToCvTemplateMatchMethod(findOptions.templateMatchMethod);
+        const bool canTryCuda = findOptions.preferCuda && IsCudaTemplateMatchingAvailable();
+        std::vector<double> scales;
+        BuildTemplateScaleList(findOptions, scales);
+
+        double bestScore = -std::numeric_limits<double>::infinity();
+        double bestRawScore = 0.0;
+        double bestScale = 1.0;
+        cv::Point bestLocation;
+        int bestTemplateRows = 0;
+        int bestTemplateCols = 0;
+        bool hasBest = false;
+        bool usedCuda = false;
+
+        for (size_t i = 0; i < scales.size(); i++)
+        {
+            cv::Mat scaledTemplateImage;
+            if (!ResizeTemplateByScale(templateMatchImage, scales[i], findOptions.templateScaleInterpolation, scaledTemplateImage))
+            {
+                continue;
+            }
+
+            if (scaledTemplateImage.rows > sourceMatchImage.rows || scaledTemplateImage.cols > sourceMatchImage.cols)
+            {
+                continue;
+            }
+
+            cv::Mat matchMap;
+            bool matched = false;
+            bool currentUsedCuda = false;
+            if (canTryCuda)
+            {
+                matched = RunCudaTemplateMatching(sourceMatchImage, scaledTemplateImage, cvMatchMethod, matchMap);
+                currentUsedCuda = matched;
+            }
+
+            if (!matched)
+            {
+                matched = RunCpuTemplateMatching(sourceMatchImage, scaledTemplateImage, cvMatchMethod, matchMap);
+                currentUsedCuda = false;
+            }
+
+            if (!matched)
+            {
+                continue;
+            }
+
+            cv::Point currentBestLocation;
+            double currentScore = 0.0;
+            double currentRawScore = 0.0;
+            if (!EvaluateTemplateMatchMap(matchMap, findOptions.templateMatchMethod, currentBestLocation, currentScore, currentRawScore))
+            {
+                continue;
+            }
+
+            if (!hasBest || currentScore > bestScore)
+            {
+                hasBest = true;
+                bestScore = currentScore;
+                bestRawScore = currentRawScore;
+                bestScale = scales[i];
+                bestLocation = currentBestLocation;
+                bestTemplateRows = scaledTemplateImage.rows;
+                bestTemplateCols = scaledTemplateImage.cols;
+                usedCuda = currentUsedCuda;
+            }
+        }
+
+        if (!hasBest)
+        {
+            result.message = "模板匹配未得到有效结果。";
+            return result;
+        }
+
+        result.score = bestScore;
+        result.rawScore = bestRawScore;
+        result.templateScale = bestScale;
+        result.usedCuda = usedCuda;
+
+        if (bestScore < findOptions.minTemplateMatchScore)
+        {
+            result.message = "模板匹配得分低于阈值。";
+            return result;
+        }
+
+        if (!FillAxisAlignedTemplateMatchResult(bestLocation, bestTemplateRows, bestTemplateCols, sourceMatchImage.rows, sourceMatchImage.cols, findOptions, result))
+        {
+            result.message = "模板匹配结果区域无效。";
+            return result;
+        }
+
+        result.found = true;
+        return result;
+    }
+
+    /**
+     * @brief 创建特征检测器。
+     */
+    static cv::Ptr<cv::Feature2D> CreateFeatureDetector(GB_ImageTemplateFindAlgorithm algorithm, const GB_ImageTemplateFindOptions& findOptions)
+    {
+        try
+        {
+            if (algorithm == GB_ImageTemplateFindAlgorithm::ORB)
+            {
+                const int orbMaxFeatures = std::max(1, findOptions.orbMaxFeatures);
+                const float orbScaleFactor = static_cast<float>(findOptions.orbScaleFactor > 1.0 ? findOptions.orbScaleFactor : 1.2);
+                const int orbNumLevels = std::max(1, findOptions.orbNumLevels);
+                const int orbEdgeThreshold = std::max(0, findOptions.orbEdgeThreshold);
+                const int orbPatchSize = std::max(2, findOptions.orbPatchSize);
+                const int orbFastThreshold = std::max(0, findOptions.orbFastThreshold);
+                return cv::ORB::create(orbMaxFeatures, orbScaleFactor, orbNumLevels, orbEdgeThreshold, 0, 2, cv::ORB::HARRIS_SCORE, orbPatchSize, orbFastThreshold);
+            }
+
+            if (algorithm == GB_ImageTemplateFindAlgorithm::SIFT)
+            {
+                const int siftNumFeatures = std::max(0, findOptions.siftNumFeatures);
+                const int siftNumOctaveLayers = std::max(1, findOptions.siftNumOctaveLayers);
+                const double siftContrastThreshold = findOptions.siftContrastThreshold > 0.0 ? findOptions.siftContrastThreshold : 0.04;
+                const double siftEdgeThreshold = findOptions.siftEdgeThreshold > 0.0 ? findOptions.siftEdgeThreshold : 10.0;
+                const double siftSigma = findOptions.siftSigma > 0.0 ? findOptions.siftSigma : 1.6;
+                return cv::SIFT::create(siftNumFeatures, siftNumOctaveLayers, siftContrastThreshold, siftEdgeThreshold, siftSigma);
+            }
+        }
+        catch (...)
+        {
+        }
+
+        return cv::Ptr<cv::Feature2D>();
+    }
+
+    /**
+     * @brief 获取特征描述子的匹配距离类型。
+     */
+    static int GetFeatureMatchNormType(GB_ImageTemplateFindAlgorithm algorithm)
+    {
+        if (algorithm == GB_ImageTemplateFindAlgorithm::ORB)
+        {
+            return cv::NORM_HAMMING;
+        }
+
+        return cv::NORM_L2;
+    }
+
+    /**
+     * @brief 判断单应矩阵是否有效。
+     */
+    static bool IsHomographyValid(const cv::Mat& homography)
+    {
+        if (homography.empty() || homography.rows != 3 || homography.cols != 3)
+        {
+            return false;
+        }
+
+        for (int row = 0; row < homography.rows; row++)
+        {
+            for (int col = 0; col < homography.cols; col++)
+            {
+                if (!IsFiniteDouble(homography.at<double>(row, col)))
+                {
+                    return false;
+                }
+            }
+        }
+
+        return true;
+    }
+
+    /**
+     * @brief 执行 ORB / SIFT 特征匹配查找。
+     */
+    static GB_ImageTemplateFindResult FindTemplateByFeatureMatching(const cv::Mat& sourceImage, ImageChannelLayout sourceLayout, const cv::Mat& templateImage, ImageChannelLayout templateLayout, GB_ImageTemplateFindAlgorithm algorithm, const GB_ImageTemplateFindOptions& findOptions)
+    {
+        GB_ImageTemplateFindResult result;
+        result.algorithm = algorithm;
+
+        cv::Mat sourceGrayImage;
+        cv::Mat templateGrayImage;
+        if (!ConvertImageToGray8(sourceImage, sourceLayout, sourceGrayImage) || !ConvertImageToGray8(templateImage, templateLayout, templateGrayImage))
+        {
+            result.message = "无法转换为灰度图。";
+            return result;
+        }
+
+        cv::Ptr<cv::Feature2D> detector = CreateFeatureDetector(algorithm, findOptions);
+        if (detector.empty())
+        {
+            result.message = "无法创建特征检测器。";
+            return result;
+        }
+
+        std::vector<cv::KeyPoint> templateKeyPoints;
+        std::vector<cv::KeyPoint> sourceKeyPoints;
+        cv::Mat templateDescriptors;
+        cv::Mat sourceDescriptors;
+
+        try
+        {
+            detector->detectAndCompute(templateGrayImage, cv::noArray(), templateKeyPoints, templateDescriptors);
+            detector->detectAndCompute(sourceGrayImage, cv::noArray(), sourceKeyPoints, sourceDescriptors);
+        }
+        catch (...)
+        {
+            result.message = "特征点提取失败。";
+            return result;
+        }
+
+        result.templateKeyPointCount = templateKeyPoints.size();
+        result.sourceKeyPointCount = sourceKeyPoints.size();
+
+        if (templateKeyPoints.empty() || sourceKeyPoints.empty() || templateDescriptors.empty() || sourceDescriptors.empty())
+        {
+            result.message = "图像纹理不足，无法提取足够特征。";
+            return result;
+        }
+
+        std::vector<std::vector<cv::DMatch>> knnMatches;
+        try
+        {
+            cv::BFMatcher matcher(GetFeatureMatchNormType(algorithm), false);
+            matcher.knnMatch(templateDescriptors, sourceDescriptors, knnMatches, 2);
+        }
+        catch (...)
+        {
+            result.message = "特征描述子匹配失败。";
+            return result;
+        }
+
+        const double ratioTest = (findOptions.featureRatioTest > 0.0 && findOptions.featureRatioTest < 1.0) ? findOptions.featureRatioTest : 0.75;
+        std::vector<cv::DMatch> goodMatches;
+        goodMatches.reserve(knnMatches.size());
+        for (size_t i = 0; i < knnMatches.size(); i++)
+        {
+            if (knnMatches[i].size() < 2)
+            {
+                continue;
+            }
+
+            const cv::DMatch& firstMatch = knnMatches[i][0];
+            const cv::DMatch& secondMatch = knnMatches[i][1];
+            if (firstMatch.distance < static_cast<float>(ratioTest * static_cast<double>(secondMatch.distance)))
+            {
+                goodMatches.push_back(firstMatch);
+            }
+        }
+
+        std::sort(goodMatches.begin(), goodMatches.end(), [](const cv::DMatch& leftMatch, const cv::DMatch& rightMatch)
+            {
+                return leftMatch.distance < rightMatch.distance;
+            });
+
+        if (findOptions.maxFeatureMatches > 0 && static_cast<int>(goodMatches.size()) > findOptions.maxFeatureMatches)
+        {
+            goodMatches.resize(static_cast<size_t>(findOptions.maxFeatureMatches));
+        }
+
+        result.goodMatchCount = goodMatches.size();
+        const int minGoodMatches = std::max(4, findOptions.minGoodMatches);
+        if (static_cast<int>(goodMatches.size()) < minGoodMatches)
+        {
+            result.message = "优质特征匹配数量不足。";
+            return result;
+        }
+
+        std::vector<cv::Point2f> templatePoints;
+        std::vector<cv::Point2f> sourcePoints;
+        templatePoints.reserve(goodMatches.size());
+        sourcePoints.reserve(goodMatches.size());
+        for (size_t i = 0; i < goodMatches.size(); i++)
+        {
+            const cv::DMatch& match = goodMatches[i];
+            if (match.queryIdx < 0 || match.queryIdx >= static_cast<int>(templateKeyPoints.size()) || match.trainIdx < 0 || match.trainIdx >= static_cast<int>(sourceKeyPoints.size()))
+            {
+                continue;
+            }
+
+            templatePoints.push_back(templateKeyPoints[static_cast<size_t>(match.queryIdx)].pt);
+            sourcePoints.push_back(sourceKeyPoints[static_cast<size_t>(match.trainIdx)].pt);
+        }
+
+        if (templatePoints.size() < 4 || sourcePoints.size() < 4)
+        {
+            result.message = "可用于估计单应矩阵的匹配点不足。";
+            return result;
+        }
+
+        cv::Mat inlierMask;
+        cv::Mat homography;
+        try
+        {
+            if (findOptions.useRansac)
+            {
+                const double reprojThreshold = findOptions.ransacReprojThreshold > 0.0 ? findOptions.ransacReprojThreshold : 3.0;
+                homography = cv::findHomography(templatePoints, sourcePoints, cv::RANSAC, reprojThreshold, inlierMask);
+            }
+            else
+            {
+                homography = cv::findHomography(templatePoints, sourcePoints, 0, 3.0, inlierMask);
+            }
+        }
+        catch (...)
+        {
+            result.message = "单应矩阵估计失败。";
+            return result;
+        }
+
+        if (!IsHomographyValid(homography))
+        {
+            result.message = "单应矩阵无效。";
+            return result;
+        }
+
+        size_t inlierCount = 0;
+        if (findOptions.useRansac && !inlierMask.empty())
+        {
+            for (int row = 0; row < inlierMask.rows; row++)
+            {
+                if (inlierMask.at<unsigned char>(row, 0) != 0)
+                {
+                    inlierCount++;
+                }
+            }
+        }
+        else
+        {
+            inlierCount = templatePoints.size();
+        }
+
+        result.inlierMatchCount = inlierCount;
+        const int minInlierMatches = std::max(4, findOptions.minInlierMatches);
+        const double inlierRatio = templatePoints.empty() ? 0.0 : static_cast<double>(inlierCount) / static_cast<double>(templatePoints.size());
+        result.score = inlierRatio;
+        result.rawScore = inlierRatio;
+
+        if (static_cast<int>(inlierCount) < minInlierMatches || inlierRatio < findOptions.minInlierRatio)
+        {
+            result.message = "特征匹配内点数量或比例不足。";
+            return result;
+        }
+
+        std::vector<cv::Point2f> templateCorners;
+        templateCorners.push_back(cv::Point2f(0.0f, 0.0f));
+        templateCorners.push_back(cv::Point2f(static_cast<float>(templateGrayImage.cols), 0.0f));
+        templateCorners.push_back(cv::Point2f(static_cast<float>(templateGrayImage.cols), static_cast<float>(templateGrayImage.rows)));
+        templateCorners.push_back(cv::Point2f(0.0f, static_cast<float>(templateGrayImage.rows)));
+
+        std::vector<cv::Point2f> transformedCorners;
+        std::vector<cv::Point2f> templateCenter;
+        std::vector<cv::Point2f> transformedCenter;
+        templateCenter.push_back(cv::Point2f(static_cast<float>(templateGrayImage.cols) * 0.5f, static_cast<float>(templateGrayImage.rows) * 0.5f));
+
+        try
+        {
+            cv::perspectiveTransform(templateCorners, transformedCorners, homography);
+            cv::perspectiveTransform(templateCenter, transformedCenter, homography);
+        }
+        catch (...)
+        {
+            result.message = "单应矩阵投影失败。";
+            return result;
+        }
+
+        if (transformedCorners.size() != 4 || transformedCenter.size() != 1)
+        {
+            result.message = "投影结果无效。";
+            return result;
+        }
+
+        std::vector<cv::Point2d> resultCorners;
+        resultCorners.reserve(4);
+        for (size_t i = 0; i < transformedCorners.size(); i++)
+        {
+            resultCorners.push_back(cv::Point2d(static_cast<double>(transformedCorners[i].x), static_cast<double>(transformedCorners[i].y)));
+        }
+
+        const cv::Point2d resultCenter(static_cast<double>(transformedCenter[0].x), static_cast<double>(transformedCenter[0].y));
+        if (!FillTemplateFindPolygonResult(resultCorners, resultCenter, sourceGrayImage.rows, sourceGrayImage.cols, findOptions, result))
+        {
+            result.message = "特征匹配结果区域无效。";
+            return result;
+        }
+
+        result.found = true;
+        return result;
     }
 }
 
@@ -3301,6 +4397,79 @@ bool GB_Image::ConvertColorInPlace(GB_ImageColorConversion conversion)
 
     Swap(convertedImage);
     return true;
+}
+
+
+/**
+ * @brief 在当前图像中查找模板图像。
+ */
+GB_ImageTemplateFindResult GB_Image::FindTemplate(const GB_Image& templateImage, const GB_ImageTemplateFindOptions& findOptions) const
+{
+    return GB_Image::FindTemplate(*this, templateImage, findOptions);
+}
+
+/**
+ * @brief 在大图像中查找模板图像。
+ */
+GB_ImageTemplateFindResult GB_Image::FindTemplate(const GB_Image& sourceImage, const GB_Image& templateImage, const GB_ImageTemplateFindOptions& findOptions)
+{
+    GBImage_Internal::EnsureOpenCvErrorLogOnly();
+
+    GB_ImageTemplateFindResult result;
+    if (sourceImage.IsEmpty() || templateImage.IsEmpty())
+    {
+        result.message = "大图像或模板图像为空。";
+        return result;
+    }
+
+    if (sourceImage.imageImpl == nullptr || templateImage.imageImpl == nullptr)
+    {
+        result.message = "图像内部对象无效。";
+        return result;
+    }
+
+    const cv::Mat& sourceMat = sourceImage.imageImpl->imageMat;
+    const cv::Mat& templateMat = templateImage.imageImpl->imageMat;
+    const GBImage_Internal::ImageChannelLayout sourceLayout = sourceImage.imageImpl->channelLayout;
+    const GBImage_Internal::ImageChannelLayout templateLayout = templateImage.imageImpl->channelLayout;
+
+    switch (findOptions.algorithm)
+    {
+    case GB_ImageTemplateFindAlgorithm::TemplateMatching:
+        return GBImage_Internal::FindTemplateByTemplateMatching(sourceMat, sourceLayout, templateMat, templateLayout, findOptions);
+
+    case GB_ImageTemplateFindAlgorithm::ORB:
+        return GBImage_Internal::FindTemplateByFeatureMatching(sourceMat, sourceLayout, templateMat, templateLayout, GB_ImageTemplateFindAlgorithm::ORB, findOptions);
+
+    case GB_ImageTemplateFindAlgorithm::SIFT:
+        return GBImage_Internal::FindTemplateByFeatureMatching(sourceMat, sourceLayout, templateMat, templateLayout, GB_ImageTemplateFindAlgorithm::SIFT, findOptions);
+
+    case GB_ImageTemplateFindAlgorithm::Auto:
+    default:
+        break;
+    }
+
+    GB_ImageTemplateFindResult templateMatchResult = GBImage_Internal::FindTemplateByTemplateMatching(sourceMat, sourceLayout, templateMat, templateLayout, findOptions);
+    if (templateMatchResult.found)
+    {
+        return templateMatchResult;
+    }
+
+    GB_ImageTemplateFindResult orbResult = GBImage_Internal::FindTemplateByFeatureMatching(sourceMat, sourceLayout, templateMat, templateLayout, GB_ImageTemplateFindAlgorithm::ORB, findOptions);
+    if (orbResult.found)
+    {
+        return orbResult;
+    }
+
+    GB_ImageTemplateFindResult siftResult = GBImage_Internal::FindTemplateByFeatureMatching(sourceMat, sourceLayout, templateMat, templateLayout, GB_ImageTemplateFindAlgorithm::SIFT, findOptions);
+    if (siftResult.found)
+    {
+        return siftResult;
+    }
+
+    result.algorithm = GB_ImageTemplateFindAlgorithm::Auto;
+    result.message = "自动查找失败：模板匹配失败原因：" + templateMatchResult.message + "；ORB 失败原因：" + orbResult.message + "；SIFT 失败原因：" + siftResult.message;
+    return result;
 }
 
 /**

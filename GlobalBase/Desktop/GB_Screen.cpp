@@ -1,6 +1,8 @@
 ﻿#include "GB_Screen.h"
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cwctype>
 #include <cstring>
@@ -10,6 +12,7 @@
 #include <memory>
 #include <set>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -21,7 +24,10 @@
 #include <setupapi.h>
 #include <shellscalingapi.h>
 #include <opencv2/core.hpp>
+#include <opencv2/imgproc.hpp>
 #pragma comment(lib, "Setupapi.lib")
+#pragma comment(lib, "User32.lib")
+#pragma comment(lib, "Gdi32.lib")
 #endif
 
 namespace internal
@@ -1861,6 +1867,996 @@ namespace internal
         return true;
     }
 
+
+    struct ScreenPainterObjectState
+    {
+        GB_ScreenPaintObject paintObject;
+        std::chrono::steady_clock::time_point expireTime;
+    };
+
+    static int GetOpenCvLineType(const bool antialias)
+    {
+        return antialias ? cv::LINE_AA : cv::LINE_8;
+    }
+
+    static bool TryConvertDoubleToIntRound(const double value, int& intValue)
+    {
+        if (!std::isfinite(value) || value < static_cast<double>(std::numeric_limits<int>::min()) || value > static_cast<double>(std::numeric_limits<int>::max()))
+        {
+            return false;
+        }
+
+        intValue = static_cast<int>(std::llround(value));
+        return true;
+    }
+
+    static bool TryConvertDoubleToIntFloor(const double value, int& intValue)
+    {
+        if (!std::isfinite(value) || value < static_cast<double>(std::numeric_limits<int>::min()) || value > static_cast<double>(std::numeric_limits<int>::max()))
+        {
+            return false;
+        }
+
+        intValue = static_cast<int>(std::floor(value));
+        return true;
+    }
+
+    static bool TryConvertDoubleToIntCeil(const double value, int& intValue)
+    {
+        if (!std::isfinite(value) || value < static_cast<double>(std::numeric_limits<int>::min()) || value > static_cast<double>(std::numeric_limits<int>::max()))
+        {
+            return false;
+        }
+
+        intValue = static_cast<int>(std::ceil(value));
+        return true;
+    }
+
+    static cv::Scalar ToBgraScalar(const GB_ColorRGBA& color)
+    {
+        return cv::Scalar(static_cast<double>(color.b), static_cast<double>(color.g), static_cast<double>(color.r), static_cast<double>(color.a));
+    }
+
+    static void BlendStraightBgraOverPremultipliedBgra(cv::Mat& targetPremultipliedBgra, const cv::Mat& sourceStraightBgra)
+    {
+        if (targetPremultipliedBgra.empty() || sourceStraightBgra.empty() || targetPremultipliedBgra.rows != sourceStraightBgra.rows || targetPremultipliedBgra.cols != sourceStraightBgra.cols || targetPremultipliedBgra.type() != CV_8UC4 || sourceStraightBgra.type() != CV_8UC4)
+        {
+            return;
+        }
+
+        for (int rowIndex = 0; rowIndex < sourceStraightBgra.rows; rowIndex++)
+        {
+            const cv::Vec4b* sourceRow = sourceStraightBgra.ptr<cv::Vec4b>(rowIndex);
+            cv::Vec4b* targetRow = targetPremultipliedBgra.ptr<cv::Vec4b>(rowIndex);
+
+            for (int colIndex = 0; colIndex < sourceStraightBgra.cols; colIndex++)
+            {
+                const int sourceAlpha = static_cast<int>(sourceRow[colIndex][3]);
+                if (sourceAlpha <= 0)
+                {
+                    continue;
+                }
+
+                const int inverseAlpha = 255 - sourceAlpha;
+                targetRow[colIndex][0] = static_cast<unsigned char>((static_cast<int>(sourceRow[colIndex][0]) * sourceAlpha + static_cast<int>(targetRow[colIndex][0]) * inverseAlpha + 127) / 255);
+                targetRow[colIndex][1] = static_cast<unsigned char>((static_cast<int>(sourceRow[colIndex][1]) * sourceAlpha + static_cast<int>(targetRow[colIndex][1]) * inverseAlpha + 127) / 255);
+                targetRow[colIndex][2] = static_cast<unsigned char>((static_cast<int>(sourceRow[colIndex][2]) * sourceAlpha + static_cast<int>(targetRow[colIndex][2]) * inverseAlpha + 127) / 255);
+                targetRow[colIndex][3] = static_cast<unsigned char>(sourceAlpha + (static_cast<int>(targetRow[colIndex][3]) * inverseAlpha + 127) / 255);
+            }
+        }
+    }
+
+    static cv::Rect ClipRectToCanvas(const cv::Rect& rectangle, const int canvasWidth, const int canvasHeight)
+    {
+        const cv::Rect canvasRectangle(0, 0, canvasWidth, canvasHeight);
+        return rectangle & canvasRectangle;
+    }
+
+    static bool TryGetPolygonPointsInCanvas(const GB_Polygon& polygon, const int virtualScreenLeft, const int virtualScreenTop, std::vector<cv::Point>& points)
+    {
+        points.clear();
+
+        if (!polygon.IsValid())
+        {
+            return false;
+        }
+
+        const std::vector<GB_Point2d> vertices = polygon.GetVerticesAsDouble();
+        if (vertices.size() < 2)
+        {
+            return false;
+        }
+
+        points.reserve(vertices.size());
+        for (size_t i = 0; i < vertices.size(); i++)
+        {
+            int pointX = 0;
+            int pointY = 0;
+            if (!TryConvertDoubleToIntRound(vertices[i].x - static_cast<double>(virtualScreenLeft), pointX) || !TryConvertDoubleToIntRound(vertices[i].y - static_cast<double>(virtualScreenTop), pointY))
+            {
+                points.clear();
+                return false;
+            }
+
+            points.push_back(cv::Point(pointX, pointY));
+        }
+
+        return !points.empty();
+    }
+
+    static bool RenderPolygonObject(cv::Mat& canvasPremultipliedBgra, const GB_ScreenPaintObject& paintObject, const int virtualScreenLeft, const int virtualScreenTop)
+    {
+        if (canvasPremultipliedBgra.empty() || canvasPremultipliedBgra.type() != CV_8UC4 || paintObject.objectType != GB_ScreenPaintObjectType::Polygon)
+        {
+            return false;
+        }
+
+        std::vector<cv::Point> points;
+        if (!TryGetPolygonPointsInCanvas(paintObject.polygon, virtualScreenLeft, virtualScreenTop, points))
+        {
+            return false;
+        }
+
+        const bool drawFill = paintObject.polygonOptions.fill && paintObject.polygonOptions.fillColor.a > 0 && points.size() >= 3;
+        const bool drawBoundary = paintObject.polygonOptions.boundaryThickness > 0 && paintObject.polygonOptions.boundaryColor.a > 0 && points.size() >= 2;
+        if (!drawFill && !drawBoundary)
+        {
+            return false;
+        }
+
+        cv::Rect boundingRectangle = cv::boundingRect(points);
+        const int boundaryPadding = drawBoundary ? (paintObject.polygonOptions.boundaryThickness + 3) : 2;
+        boundingRectangle.x -= boundaryPadding;
+        boundingRectangle.y -= boundaryPadding;
+        boundingRectangle.width += boundaryPadding * 2;
+        boundingRectangle.height += boundaryPadding * 2;
+        boundingRectangle = ClipRectToCanvas(boundingRectangle, canvasPremultipliedBgra.cols, canvasPremultipliedBgra.rows);
+        if (boundingRectangle.empty())
+        {
+            return false;
+        }
+
+        std::vector<cv::Point> localPoints;
+        localPoints.reserve(points.size());
+        for (size_t i = 0; i < points.size(); i++)
+        {
+            localPoints.push_back(cv::Point(points[i].x - boundingRectangle.x, points[i].y - boundingRectangle.y));
+        }
+
+        cv::Mat layerStraightBgra(boundingRectangle.height, boundingRectangle.width, CV_8UC4, cv::Scalar(0, 0, 0, 0));
+        const int lineType = GetOpenCvLineType(paintObject.polygonOptions.antialias);
+
+        if (drawFill)
+        {
+            std::vector<std::vector<cv::Point>> fillPoints(1, localPoints);
+            cv::fillPoly(layerStraightBgra, fillPoints, ToBgraScalar(paintObject.polygonOptions.fillColor), lineType);
+        }
+
+        if (drawBoundary)
+        {
+            std::vector<std::vector<cv::Point>> boundaryPoints(1, localPoints);
+            cv::polylines(layerStraightBgra, boundaryPoints, true, ToBgraScalar(paintObject.polygonOptions.boundaryColor), paintObject.polygonOptions.boundaryThickness, lineType);
+        }
+
+        cv::Mat targetRoi = canvasPremultipliedBgra(boundingRectangle);
+        BlendStraightBgraOverPremultipliedBgra(targetRoi, layerStraightBgra);
+        return true;
+    }
+
+    static bool TryConvertGbImageToStraightBgra(const GB_Image& image, cv::Mat& straightBgraImage)
+    {
+        straightBgraImage.release();
+        if (image.IsEmpty())
+        {
+            return false;
+        }
+
+        const GB_Image* sourceImage = &image;
+        GB_Image convertedImage;
+        if (image.GetDepth() != GB_ImageDepth::UInt8)
+        {
+            convertedImage = image.ConvertTo(GB_ImageDepth::UInt8);
+            if (convertedImage.IsEmpty())
+            {
+                return false;
+            }
+            sourceImage = &convertedImage;
+        }
+
+        const size_t imageWidth = sourceImage->GetWidth();
+        const size_t imageHeight = sourceImage->GetHeight();
+        if (imageWidth == 0 || imageHeight == 0 || imageWidth > static_cast<size_t>(std::numeric_limits<int>::max()) || imageHeight > static_cast<size_t>(std::numeric_limits<int>::max()))
+        {
+            return false;
+        }
+
+        straightBgraImage.create(static_cast<int>(imageHeight), static_cast<int>(imageWidth), CV_8UC4);
+        for (size_t rowIndex = 0; rowIndex < imageHeight; rowIndex++)
+        {
+            cv::Vec4b* targetRow = straightBgraImage.ptr<cv::Vec4b>(static_cast<int>(rowIndex));
+            for (size_t colIndex = 0; colIndex < imageWidth; colIndex++)
+            {
+                GB_ColorRGBA pixelColor;
+                if (!sourceImage->GetPixelColor(rowIndex, colIndex, pixelColor))
+                {
+                    straightBgraImage.release();
+                    return false;
+                }
+
+                targetRow[colIndex][0] = pixelColor.b;
+                targetRow[colIndex][1] = pixelColor.g;
+                targetRow[colIndex][2] = pixelColor.r;
+                targetRow[colIndex][3] = pixelColor.a;
+            }
+        }
+
+        return !straightBgraImage.empty();
+    }
+
+    static bool TryGetImageTargetRectangleInCanvas(const GB_Rectangle& screenRectangle, const int virtualScreenLeft, const int virtualScreenTop, cv::Rect& targetRectangle)
+    {
+        targetRectangle = cv::Rect();
+        if (!screenRectangle.IsValid())
+        {
+            return false;
+        }
+
+        int left = 0;
+        int top = 0;
+        int right = 0;
+        int bottom = 0;
+        if (!TryConvertDoubleToIntFloor(screenRectangle.minX - static_cast<double>(virtualScreenLeft), left) || !TryConvertDoubleToIntFloor(screenRectangle.minY - static_cast<double>(virtualScreenTop), top) || !TryConvertDoubleToIntCeil(screenRectangle.maxX - static_cast<double>(virtualScreenLeft), right) || !TryConvertDoubleToIntCeil(screenRectangle.maxY - static_cast<double>(virtualScreenTop), bottom))
+        {
+            return false;
+        }
+
+        if (right <= left || bottom <= top)
+        {
+            return false;
+        }
+
+        targetRectangle = cv::Rect(left, top, right - left, bottom - top);
+        return true;
+    }
+
+    static bool RenderImageObject(cv::Mat& canvasPremultipliedBgra, const GB_ScreenPaintObject& paintObject, const int virtualScreenLeft, const int virtualScreenTop)
+    {
+        if (canvasPremultipliedBgra.empty() || canvasPremultipliedBgra.type() != CV_8UC4 || paintObject.objectType != GB_ScreenPaintObjectType::Image)
+        {
+            return false;
+        }
+
+        cv::Rect targetRectangle;
+        if (!TryGetImageTargetRectangleInCanvas(paintObject.imageOptions.screenRectangle, virtualScreenLeft, virtualScreenTop, targetRectangle))
+        {
+            return false;
+        }
+
+        const cv::Rect clippedTargetRectangle = ClipRectToCanvas(targetRectangle, canvasPremultipliedBgra.cols, canvasPremultipliedBgra.rows);
+        if (clippedTargetRectangle.empty())
+        {
+            return false;
+        }
+
+        cv::Mat sourceStraightBgra;
+        if (!TryConvertGbImageToStraightBgra(paintObject.image, sourceStraightBgra))
+        {
+            return false;
+        }
+
+        cv::Mat resizedStraightBgra;
+        const int interpolation = paintObject.imageOptions.smoothResize ? cv::INTER_LINEAR : cv::INTER_NEAREST;
+        if (targetRectangle.width == sourceStraightBgra.cols && targetRectangle.height == sourceStraightBgra.rows)
+        {
+            resizedStraightBgra = sourceStraightBgra;
+        }
+        else
+        {
+            cv::resize(sourceStraightBgra, resizedStraightBgra, cv::Size(targetRectangle.width, targetRectangle.height), 0.0, 0.0, interpolation);
+        }
+
+        const cv::Rect sourceRoi(clippedTargetRectangle.x - targetRectangle.x, clippedTargetRectangle.y - targetRectangle.y, clippedTargetRectangle.width, clippedTargetRectangle.height);
+        cv::Mat sourceClippedStraightBgra = resizedStraightBgra(sourceRoi);
+        cv::Mat targetRoi = canvasPremultipliedBgra(clippedTargetRectangle);
+        BlendStraightBgraOverPremultipliedBgra(targetRoi, sourceClippedStraightBgra);
+        return true;
+    }
+
+    static bool TryGetCurrentVirtualScreenRectForPainter(RECT& virtualScreenRect)
+    {
+        const int left = ::GetSystemMetrics(SM_XVIRTUALSCREEN);
+        const int top = ::GetSystemMetrics(SM_YVIRTUALSCREEN);
+        const int width = ::GetSystemMetrics(SM_CXVIRTUALSCREEN);
+        const int height = ::GetSystemMetrics(SM_CYVIRTUALSCREEN);
+        if (width <= 0 || height <= 0)
+        {
+            virtualScreenRect = { 0, 0, 0, 0 };
+            return false;
+        }
+
+        virtualScreenRect.left = left;
+        virtualScreenRect.top = top;
+        virtualScreenRect.right = left + width;
+        virtualScreenRect.bottom = top + height;
+        return true;
+    }
+
+    class ScreenPainterManager
+    {
+    public:
+        ScreenPainterManager()
+        {
+        }
+
+        ~ScreenPainterManager()
+        {
+            StopWindowThread();
+        }
+
+        uint64_t PaintPolygon(const GB_Polygon& polygon, const GB_ScreenPaintPolygonOptions& paintOptions, const long long displayDurationMilliseconds)
+        {
+            if (displayDurationMilliseconds <= 0 || !polygon.IsValid())
+            {
+                return 0;
+            }
+
+            const bool drawFill = paintOptions.fill && paintOptions.fillColor.a > 0;
+            const bool drawBoundary = paintOptions.boundaryThickness > 0 && paintOptions.boundaryColor.a > 0;
+            if (!drawFill && !drawBoundary)
+            {
+                return 0;
+            }
+
+            GB_ScreenPaintObject paintObject;
+            paintObject.uid = AllocateUid();
+            paintObject.objectType = GB_ScreenPaintObjectType::Polygon;
+            paintObject.polygon = polygon;
+            paintObject.polygonOptions = paintOptions;
+            paintObject.displayDurationMilliseconds = displayDurationMilliseconds;
+            paintObject.remainingMilliseconds = displayDurationMilliseconds;
+
+            AddPaintObject(paintObject, displayDurationMilliseconds);
+            return paintObject.uid;
+        }
+
+        uint64_t PaintImage(const GB_Image& image, const GB_ScreenPaintImageOptions& paintOptions, const long long displayDurationMilliseconds)
+        {
+            if (displayDurationMilliseconds <= 0 || image.IsEmpty() || !paintOptions.screenRectangle.IsValid() || paintOptions.screenRectangle.Width() <= 0.0 || paintOptions.screenRectangle.Height() <= 0.0)
+            {
+                return 0;
+            }
+
+            GB_ScreenPaintObject paintObject;
+            paintObject.uid = AllocateUid();
+            paintObject.objectType = GB_ScreenPaintObjectType::Image;
+            paintObject.image = GB_Image(image, GB_ImageCopyMode::DeepCopy);
+            paintObject.imageOptions = paintOptions;
+            paintObject.displayDurationMilliseconds = displayDurationMilliseconds;
+            paintObject.remainingMilliseconds = displayDurationMilliseconds;
+
+            AddPaintObject(paintObject, displayDurationMilliseconds);
+            return paintObject.uid;
+        }
+
+        std::vector<uint64_t> GetPaintedObjectUids()
+        {
+            bool needRefresh = false;
+            std::vector<uint64_t> uids;
+            {
+                std::lock_guard<std::mutex> lockGuard(mutex);
+                needRefresh = RemoveExpiredObjectsLocked();
+                uids.reserve(paintObjects.size());
+                for (auto iterator = paintObjects.begin(); iterator != paintObjects.end(); ++iterator)
+                {
+                    uids.push_back(iterator->first);
+                }
+            }
+
+            if (needRefresh)
+            {
+                RequestRefresh();
+            }
+
+            return uids;
+        }
+
+        bool GetPaintedObject(const uint64_t uid, GB_ScreenPaintObject& paintObject)
+        {
+            bool needRefresh = false;
+            bool succeeded = false;
+            {
+                std::lock_guard<std::mutex> lockGuard(mutex);
+                needRefresh = RemoveExpiredObjectsLocked();
+                const auto iterator = paintObjects.find(uid);
+                if (iterator != paintObjects.end())
+                {
+                    paintObject = BuildPublicObjectLocked(iterator->second);
+                    succeeded = true;
+                }
+                else
+                {
+                    paintObject = GB_ScreenPaintObject();
+                }
+            }
+
+            if (needRefresh)
+            {
+                RequestRefresh();
+            }
+
+            return succeeded;
+        }
+
+        std::vector<GB_ScreenPaintObject> GetPaintedObjects(const std::vector<uint64_t>& uids)
+        {
+            bool needRefresh = false;
+            std::vector<GB_ScreenPaintObject> result;
+            {
+                std::lock_guard<std::mutex> lockGuard(mutex);
+                needRefresh = RemoveExpiredObjectsLocked();
+                result.reserve(uids.size());
+                for (size_t i = 0; i < uids.size(); i++)
+                {
+                    const auto iterator = paintObjects.find(uids[i]);
+                    if (iterator != paintObjects.end())
+                    {
+                        result.push_back(BuildPublicObjectLocked(iterator->second));
+                    }
+                }
+            }
+
+            if (needRefresh)
+            {
+                RequestRefresh();
+            }
+
+            return result;
+        }
+
+        std::vector<GB_ScreenPaintObject> GetAllPaintedObjects()
+        {
+            bool needRefresh = false;
+            std::vector<GB_ScreenPaintObject> result;
+            {
+                std::lock_guard<std::mutex> lockGuard(mutex);
+                needRefresh = RemoveExpiredObjectsLocked();
+                result.reserve(paintObjects.size());
+                for (auto iterator = paintObjects.begin(); iterator != paintObjects.end(); ++iterator)
+                {
+                    result.push_back(BuildPublicObjectLocked(iterator->second));
+                }
+            }
+
+            if (needRefresh)
+            {
+                RequestRefresh();
+            }
+
+            return result;
+        }
+
+        bool IsPainting(const uint64_t uid)
+        {
+            bool needRefresh = false;
+            bool isPainting = false;
+            {
+                std::lock_guard<std::mutex> lockGuard(mutex);
+                needRefresh = RemoveExpiredObjectsLocked();
+                isPainting = paintObjects.find(uid) != paintObjects.end();
+            }
+
+            if (needRefresh)
+            {
+                RequestRefresh();
+            }
+
+            return isPainting;
+        }
+
+        bool RemovePaintedObject(const uint64_t uid)
+        {
+            bool removed = false;
+            {
+                std::lock_guard<std::mutex> lockGuard(mutex);
+                removed = paintObjects.erase(uid) > 0;
+            }
+
+            if (removed)
+            {
+                RequestRefresh();
+            }
+
+            return removed;
+        }
+
+        size_t RemovePaintedObjects(const std::vector<uint64_t>& uids)
+        {
+            size_t removeCount = 0;
+            {
+                std::lock_guard<std::mutex> lockGuard(mutex);
+                for (size_t i = 0; i < uids.size(); i++)
+                {
+                    removeCount += paintObjects.erase(uids[i]);
+                }
+            }
+
+            if (removeCount > 0)
+            {
+                RequestRefresh();
+            }
+
+            return removeCount;
+        }
+
+        void Clear()
+        {
+            bool needRefresh = false;
+            {
+                std::lock_guard<std::mutex> lockGuard(mutex);
+                needRefresh = !paintObjects.empty();
+                paintObjects.clear();
+            }
+
+            if (needRefresh)
+            {
+                RequestRefresh();
+            }
+        }
+
+        void RenderWindow()
+        {
+            HWND currentWindowHandle = nullptr;
+            std::vector<ScreenPainterObjectState> objectStates;
+            {
+                std::lock_guard<std::mutex> lockGuard(mutex);
+                (void)RemoveExpiredObjectsLocked();
+                currentWindowHandle = windowHandle;
+                objectStates.reserve(paintObjects.size());
+                for (auto iterator = paintObjects.begin(); iterator != paintObjects.end(); ++iterator)
+                {
+                    objectStates.push_back(iterator->second);
+                }
+            }
+
+            if (currentWindowHandle == nullptr)
+            {
+                return;
+            }
+
+            DpiAwarenessScope dpiAwarenessScope;
+
+            RECT virtualScreenRect = { 0, 0, 0, 0 };
+            if (!TryGetCurrentVirtualScreenRectForPainter(virtualScreenRect))
+            {
+                ::ShowWindow(currentWindowHandle, SW_HIDE);
+                return;
+            }
+
+            const int virtualScreenWidth = virtualScreenRect.right - virtualScreenRect.left;
+            const int virtualScreenHeight = virtualScreenRect.bottom - virtualScreenRect.top;
+            if (virtualScreenWidth <= 0 || virtualScreenHeight <= 0)
+            {
+                ::ShowWindow(currentWindowHandle, SW_HIDE);
+                return;
+            }
+
+            (void)::SetWindowPos(currentWindowHandle, HWND_TOPMOST, virtualScreenRect.left, virtualScreenRect.top, virtualScreenWidth, virtualScreenHeight, SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_SHOWWINDOW);
+
+            if (objectStates.empty())
+            {
+                ClearLayeredWindow(currentWindowHandle, virtualScreenRect);
+                ::ShowWindow(currentWindowHandle, SW_HIDE);
+                return;
+            }
+
+            cv::Mat canvasPremultipliedBgra(virtualScreenHeight, virtualScreenWidth, CV_8UC4, cv::Scalar(0, 0, 0, 0));
+            for (size_t i = 0; i < objectStates.size(); i++)
+            {
+                const GB_ScreenPaintObject& paintObject = objectStates[i].paintObject;
+                if (paintObject.objectType == GB_ScreenPaintObjectType::Polygon)
+                {
+                    (void)RenderPolygonObject(canvasPremultipliedBgra, paintObject, virtualScreenRect.left, virtualScreenRect.top);
+                }
+                else if (paintObject.objectType == GB_ScreenPaintObjectType::Image)
+                {
+                    (void)RenderImageObject(canvasPremultipliedBgra, paintObject, virtualScreenRect.left, virtualScreenRect.top);
+                }
+            }
+
+            (void)UpdateLayeredWindowFromPremultipliedBgra(currentWindowHandle, virtualScreenRect, canvasPremultipliedBgra);
+            ::ShowWindow(currentWindowHandle, SW_SHOWNOACTIVATE);
+        }
+
+        void OnTimer()
+        {
+            bool needRefresh = false;
+            HWND currentWindowHandle = nullptr;
+            {
+                std::lock_guard<std::mutex> lockGuard(mutex);
+                needRefresh = RemoveExpiredObjectsLocked();
+                currentWindowHandle = windowHandle;
+            }
+
+            if (currentWindowHandle != nullptr)
+            {
+                (void)::SetWindowPos(currentWindowHandle, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER);
+            }
+
+            if (needRefresh)
+            {
+                RenderWindow();
+            }
+        }
+
+    private:
+        static const UINT kRefreshMessage = WM_APP + 0x432;
+        static const UINT_PTR kRefreshTimerId = 1;
+        static const UINT kRefreshTimerMilliseconds = 50;
+
+        std::mutex mutex;
+        std::map<uint64_t, ScreenPainterObjectState> paintObjects;
+        std::atomic<uint64_t> nextUid{ 1 };
+        std::thread windowThread;
+        HWND windowHandle = nullptr;
+        DWORD windowThreadId = 0;
+        bool windowThreadStopping = false;
+        bool windowThreadFinished = true;
+
+        uint64_t AllocateUid()
+        {
+            uint64_t uid = nextUid.fetch_add(1, std::memory_order_relaxed);
+            if (uid == 0)
+            {
+                uid = nextUid.fetch_add(1, std::memory_order_relaxed);
+            }
+            return uid;
+        }
+
+        void AddPaintObject(const GB_ScreenPaintObject& paintObject, const long long displayDurationMilliseconds)
+        {
+            {
+                std::lock_guard<std::mutex> lockGuard(mutex);
+                RemoveFinishedWindowThreadLocked();
+                StartWindowThreadLocked();
+
+                ScreenPainterObjectState objectState;
+                objectState.paintObject = paintObject;
+                objectState.expireTime = std::chrono::steady_clock::now() + std::chrono::milliseconds(displayDurationMilliseconds);
+                paintObjects[paintObject.uid] = objectState;
+            }
+
+            RequestRefresh();
+        }
+
+        void StartWindowThreadLocked()
+        {
+            if (windowThread.joinable() || windowThreadStopping)
+            {
+                return;
+            }
+
+            windowThreadFinished = false;
+            windowThread = std::thread(&ScreenPainterManager::WindowThreadMain, this);
+        }
+
+        void RemoveFinishedWindowThreadLocked()
+        {
+            if (windowThreadFinished && windowThread.joinable())
+            {
+                windowThread.join();
+            }
+        }
+
+        void StopWindowThread()
+        {
+            HWND currentWindowHandle = nullptr;
+            DWORD currentWindowThreadId = 0;
+            {
+                std::lock_guard<std::mutex> lockGuard(mutex);
+                windowThreadStopping = true;
+                currentWindowHandle = windowHandle;
+                currentWindowThreadId = windowThreadId;
+            }
+
+            if (currentWindowHandle != nullptr)
+            {
+                (void)::PostMessageW(currentWindowHandle, WM_CLOSE, 0, 0);
+            }
+            else if (currentWindowThreadId != 0)
+            {
+                (void)::PostThreadMessageW(currentWindowThreadId, WM_QUIT, 0, 0);
+            }
+
+            if (windowThread.joinable())
+            {
+                windowThread.join();
+            }
+
+            {
+                std::lock_guard<std::mutex> lockGuard(mutex);
+                windowHandle = nullptr;
+                windowThreadId = 0;
+                windowThreadStopping = false;
+                windowThreadFinished = true;
+            }
+        }
+
+        void RequestRefresh()
+        {
+            HWND currentWindowHandle = nullptr;
+            {
+                std::lock_guard<std::mutex> lockGuard(mutex);
+                currentWindowHandle = windowHandle;
+            }
+
+            if (currentWindowHandle != nullptr)
+            {
+                (void)::PostMessageW(currentWindowHandle, kRefreshMessage, 0, 0);
+            }
+        }
+
+        bool RemoveExpiredObjectsLocked()
+        {
+            if (paintObjects.empty())
+            {
+                return false;
+            }
+
+            const std::chrono::steady_clock::time_point currentTime = std::chrono::steady_clock::now();
+            bool removed = false;
+            for (auto iterator = paintObjects.begin(); iterator != paintObjects.end(); )
+            {
+                if (iterator->second.expireTime <= currentTime)
+                {
+                    iterator = paintObjects.erase(iterator);
+                    removed = true;
+                }
+                else
+                {
+                    ++iterator;
+                }
+            }
+
+            return removed;
+        }
+
+        GB_ScreenPaintObject BuildPublicObjectLocked(const ScreenPainterObjectState& objectState) const
+        {
+            GB_ScreenPaintObject paintObject = objectState.paintObject;
+            if (paintObject.objectType == GB_ScreenPaintObjectType::Image && !objectState.paintObject.image.IsEmpty())
+            {
+                paintObject.image = GB_Image(objectState.paintObject.image, GB_ImageCopyMode::DeepCopy);
+            }
+
+            const std::chrono::steady_clock::time_point currentTime = std::chrono::steady_clock::now();
+            if (objectState.expireTime <= currentTime)
+            {
+                paintObject.remainingMilliseconds = 0;
+            }
+            else
+            {
+                paintObject.remainingMilliseconds = std::chrono::duration_cast<std::chrono::milliseconds>(objectState.expireTime - currentTime).count();
+            }
+
+            return paintObject;
+        }
+
+        static bool ClearLayeredWindow(HWND targetWindowHandle, const RECT& virtualScreenRect)
+        {
+            cv::Mat emptyImage(1, 1, CV_8UC4, cv::Scalar(0, 0, 0, 0));
+            RECT clearRect = virtualScreenRect;
+            clearRect.right = clearRect.left + 1;
+            clearRect.bottom = clearRect.top + 1;
+            return UpdateLayeredWindowFromPremultipliedBgra(targetWindowHandle, clearRect, emptyImage);
+        }
+
+        static bool UpdateLayeredWindowFromPremultipliedBgra(HWND targetWindowHandle, const RECT& virtualScreenRect, const cv::Mat& premultipliedBgraImage)
+        {
+            if (targetWindowHandle == nullptr || premultipliedBgraImage.empty() || premultipliedBgraImage.type() != CV_8UC4)
+            {
+                return false;
+            }
+
+            ScreenDcScope screenDc;
+            if (!screenDc.IsValid())
+            {
+                return false;
+            }
+
+            CompatibleDcScope memoryDc(screenDc.Get());
+            if (!memoryDc.IsValid())
+            {
+                return false;
+            }
+
+            BITMAPINFO bitmapInfo = {};
+            bitmapInfo.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+            bitmapInfo.bmiHeader.biWidth = premultipliedBgraImage.cols;
+            bitmapInfo.bmiHeader.biHeight = -premultipliedBgraImage.rows;
+            bitmapInfo.bmiHeader.biPlanes = 1;
+            bitmapInfo.bmiHeader.biBitCount = 32;
+            bitmapInfo.bmiHeader.biCompression = BI_RGB;
+
+            void* bitmapPixels = nullptr;
+            BitmapScope dibBitmap(::CreateDIBSection(screenDc.Get(), &bitmapInfo, DIB_RGB_COLORS, &bitmapPixels, nullptr, 0));
+            if (!dibBitmap.IsValid() || bitmapPixels == nullptr)
+            {
+                return false;
+            }
+
+            const size_t bitmapBytes = static_cast<size_t>(premultipliedBgraImage.rows) * static_cast<size_t>(premultipliedBgraImage.cols) * 4u;
+            if (premultipliedBgraImage.isContinuous())
+            {
+                std::memcpy(bitmapPixels, premultipliedBgraImage.data, bitmapBytes);
+            }
+            else
+            {
+                unsigned char* targetBytes = static_cast<unsigned char*>(bitmapPixels);
+                const size_t rowBytes = static_cast<size_t>(premultipliedBgraImage.cols) * 4u;
+                for (int rowIndex = 0; rowIndex < premultipliedBgraImage.rows; rowIndex++)
+                {
+                    std::memcpy(targetBytes + static_cast<size_t>(rowIndex) * rowBytes, premultipliedBgraImage.ptr(rowIndex), rowBytes);
+                }
+            }
+
+            SelectObjectScope selectBitmap(memoryDc.Get(), dibBitmap.Get());
+            if (!selectBitmap.IsValid())
+            {
+                return false;
+            }
+
+            POINT sourcePoint = { 0, 0 };
+            POINT targetPoint = { virtualScreenRect.left, virtualScreenRect.top };
+            SIZE targetSize = { premultipliedBgraImage.cols, premultipliedBgraImage.rows };
+            BLENDFUNCTION blendFunction = {};
+            blendFunction.BlendOp = AC_SRC_OVER;
+            blendFunction.BlendFlags = 0;
+            blendFunction.SourceConstantAlpha = 255;
+            blendFunction.AlphaFormat = AC_SRC_ALPHA;
+
+            return ::UpdateLayeredWindow(targetWindowHandle, screenDc.Get(), &targetPoint, &targetSize, memoryDc.Get(), &sourcePoint, 0, &blendFunction, ULW_ALPHA) != FALSE;
+        }
+
+        static LRESULT CALLBACK WindowProc(HWND windowHandle, UINT message, WPARAM wParam, LPARAM lParam)
+        {
+            ScreenPainterManager* manager = reinterpret_cast<ScreenPainterManager*>(::GetWindowLongPtrW(windowHandle, GWLP_USERDATA));
+            if (message == WM_NCCREATE)
+            {
+                CREATESTRUCTW* createStruct = reinterpret_cast<CREATESTRUCTW*>(lParam);
+                manager = reinterpret_cast<ScreenPainterManager*>(createStruct->lpCreateParams);
+                (void)::SetWindowLongPtrW(windowHandle, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(manager));
+            }
+
+            if (manager == nullptr)
+            {
+                return ::DefWindowProcW(windowHandle, message, wParam, lParam);
+            }
+
+            switch (message)
+            {
+            case kRefreshMessage:
+                manager->RenderWindow();
+                return 0;
+
+            case WM_TIMER:
+                if (wParam == kRefreshTimerId)
+                {
+                    manager->OnTimer();
+                    return 0;
+                }
+                break;
+
+            case WM_DISPLAYCHANGE:
+            case WM_SETTINGCHANGE:
+            case WM_DPICHANGED:
+                manager->RenderWindow();
+                return 0;
+
+            case WM_CLOSE:
+                ::DestroyWindow(windowHandle);
+                return 0;
+
+            case WM_DESTROY:
+                ::PostQuitMessage(0);
+                return 0;
+
+            default:
+                break;
+            }
+
+            return ::DefWindowProcW(windowHandle, message, wParam, lParam);
+        }
+
+        void WindowThreadMain()
+        {
+            DpiAwarenessScope dpiAwarenessScope;
+
+            MSG initialMessage = {};
+            (void)::PeekMessageW(&initialMessage, nullptr, WM_USER, WM_USER, PM_NOREMOVE);
+            {
+                std::lock_guard<std::mutex> lockGuard(mutex);
+                windowThreadId = ::GetCurrentThreadId();
+                if (windowThreadStopping)
+                {
+                    windowThreadId = 0;
+                    windowThreadFinished = true;
+                    return;
+                }
+            }
+
+            const wchar_t* className = L"GB_ScreenPainterLayeredWindow";
+            WNDCLASSEXW windowClass = {};
+            windowClass.cbSize = sizeof(windowClass);
+            windowClass.style = CS_HREDRAW | CS_VREDRAW;
+            windowClass.lpfnWndProc = &ScreenPainterManager::WindowProc;
+            windowClass.hInstance = ::GetModuleHandleW(nullptr);
+            windowClass.hCursor = nullptr;
+            windowClass.hbrBackground = nullptr;
+            windowClass.lpszClassName = className;
+            (void)::RegisterClassExW(&windowClass);
+
+            RECT virtualScreenRect = { 0, 0, 1, 1 };
+            if (!TryGetCurrentVirtualScreenRectForPainter(virtualScreenRect))
+            {
+                virtualScreenRect.right = virtualScreenRect.left + 1;
+                virtualScreenRect.bottom = virtualScreenRect.top + 1;
+            }
+
+            const DWORD exStyle = WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE;
+            const HWND createdWindowHandle = ::CreateWindowExW(exStyle, className, L"GB_ScreenPainter", WS_POPUP, virtualScreenRect.left, virtualScreenRect.top, virtualScreenRect.right - virtualScreenRect.left, virtualScreenRect.bottom - virtualScreenRect.top, nullptr, nullptr, ::GetModuleHandleW(nullptr), this);
+            if (createdWindowHandle == nullptr)
+            {
+                std::lock_guard<std::mutex> lockGuard(mutex);
+                windowHandle = nullptr;
+                windowThreadFinished = true;
+                return;
+            }
+
+            {
+                std::lock_guard<std::mutex> lockGuard(mutex);
+                if (windowThreadStopping)
+                {
+                    windowHandle = nullptr;
+                    windowThreadId = 0;
+                    windowThreadFinished = true;
+                    ::DestroyWindow(createdWindowHandle);
+                    return;
+                }
+
+                windowHandle = createdWindowHandle;
+            }
+
+            (void)::SetTimer(createdWindowHandle, kRefreshTimerId, kRefreshTimerMilliseconds, nullptr);
+            (void)::SetWindowPos(createdWindowHandle, HWND_TOPMOST, virtualScreenRect.left, virtualScreenRect.top, virtualScreenRect.right - virtualScreenRect.left, virtualScreenRect.bottom - virtualScreenRect.top, SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_SHOWWINDOW);
+            ::ShowWindow(createdWindowHandle, SW_SHOWNOACTIVATE);
+            RenderWindow();
+
+            MSG message = {};
+            while (::GetMessageW(&message, nullptr, 0, 0) > 0)
+            {
+                ::TranslateMessage(&message);
+                ::DispatchMessageW(&message);
+            }
+
+            (void)::KillTimer(createdWindowHandle, kRefreshTimerId);
+            {
+                std::lock_guard<std::mutex> lockGuard(mutex);
+                if (windowHandle == createdWindowHandle)
+                {
+                    windowHandle = nullptr;
+                }
+                windowThreadId = 0;
+                windowThreadFinished = true;
+            }
+        }
+    };
+
+    static ScreenPainterManager& GetScreenPainterManager()
+    {
+        static ScreenPainterManager manager;
+        return manager;
+    }
+
 #endif
 }
 
@@ -2267,3 +3263,121 @@ bool GB_Screen::PhysicalPixelToLogicalPixel(const int screenIndex, const GB_Poin
     return true;
 #endif
 }
+
+uint64_t GB_ScreenPainter::PaintPolygon(const GB_Polygon& polygon, const GB_ScreenPaintPolygonOptions& paintOptions, const long long displayDurationMilliseconds)
+{
+#if !defined(_WIN32)
+    (void)polygon;
+    (void)paintOptions;
+    (void)displayDurationMilliseconds;
+    return 0;
+#else
+    return internal::GetScreenPainterManager().PaintPolygon(polygon, paintOptions, displayDurationMilliseconds);
+#endif
+}
+
+uint64_t GB_ScreenPainter::PaintPolygon(const GB_Polygon& polygon, const GB_ColorRGBA& boundaryColor, const int boundaryThickness, const bool fill, const GB_ColorRGBA& fillColor, const long long displayDurationMilliseconds)
+{
+    GB_ScreenPaintPolygonOptions paintOptions;
+    paintOptions.boundaryColor = boundaryColor;
+    paintOptions.boundaryThickness = boundaryThickness;
+    paintOptions.fill = fill;
+    paintOptions.fillColor = fillColor;
+    return PaintPolygon(polygon, paintOptions, displayDurationMilliseconds);
+}
+
+uint64_t GB_ScreenPainter::PaintImage(const GB_Image& image, const GB_ScreenPaintImageOptions& paintOptions, const long long displayDurationMilliseconds)
+{
+#if !defined(_WIN32)
+    (void)image;
+    (void)paintOptions;
+    (void)displayDurationMilliseconds;
+    return 0;
+#else
+    return internal::GetScreenPainterManager().PaintImage(image, paintOptions, displayDurationMilliseconds);
+#endif
+}
+
+uint64_t GB_ScreenPainter::PaintImage(const GB_Image& image, const GB_Rectangle& screenRectangle, const long long displayDurationMilliseconds)
+{
+    GB_ScreenPaintImageOptions paintOptions;
+    paintOptions.screenRectangle = screenRectangle;
+    return PaintImage(image, paintOptions, displayDurationMilliseconds);
+}
+
+std::vector<uint64_t> GB_ScreenPainter::GetPaintedObjectUids()
+{
+#if !defined(_WIN32)
+    return std::vector<uint64_t>();
+#else
+    return internal::GetScreenPainterManager().GetPaintedObjectUids();
+#endif
+}
+
+bool GB_ScreenPainter::GetPaintedObject(const uint64_t uid, GB_ScreenPaintObject& paintObject)
+{
+#if !defined(_WIN32)
+    (void)uid;
+    paintObject = GB_ScreenPaintObject();
+    return false;
+#else
+    return internal::GetScreenPainterManager().GetPaintedObject(uid, paintObject);
+#endif
+}
+
+std::vector<GB_ScreenPaintObject> GB_ScreenPainter::GetPaintedObjects(const std::vector<uint64_t>& uids)
+{
+#if !defined(_WIN32)
+    (void)uids;
+    return std::vector<GB_ScreenPaintObject>();
+#else
+    return internal::GetScreenPainterManager().GetPaintedObjects(uids);
+#endif
+}
+
+std::vector<GB_ScreenPaintObject> GB_ScreenPainter::GetAllPaintedObjects()
+{
+#if !defined(_WIN32)
+    return std::vector<GB_ScreenPaintObject>();
+#else
+    return internal::GetScreenPainterManager().GetAllPaintedObjects();
+#endif
+}
+
+bool GB_ScreenPainter::IsPainting(const uint64_t uid)
+{
+#if !defined(_WIN32)
+    (void)uid;
+    return false;
+#else
+    return internal::GetScreenPainterManager().IsPainting(uid);
+#endif
+}
+
+bool GB_ScreenPainter::RemovePaintedObject(const uint64_t uid)
+{
+#if !defined(_WIN32)
+    (void)uid;
+    return false;
+#else
+    return internal::GetScreenPainterManager().RemovePaintedObject(uid);
+#endif
+}
+
+size_t GB_ScreenPainter::RemovePaintedObjects(const std::vector<uint64_t>& uids)
+{
+#if !defined(_WIN32)
+    (void)uids;
+    return 0;
+#else
+    return internal::GetScreenPainterManager().RemovePaintedObjects(uids);
+#endif
+}
+
+void GB_ScreenPainter::Clear()
+{
+#if defined(_WIN32)
+    internal::GetScreenPainterManager().Clear();
+#endif
+}
+
