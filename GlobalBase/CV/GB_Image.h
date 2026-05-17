@@ -5,6 +5,7 @@
 #include "../GB_BaseTypes.h"
 #include "../Geometry/GB_Point2d.h"
 #include "../Geometry/GB_Polygon.h"
+#include "../Geometry/GB_Rectangle.h"
 #include "GB_ColorRGBA.h"
 
 #include <cstddef>
@@ -467,24 +468,11 @@ struct GB_ImageTemplateFindResult
     GB_Point2d centerPoint;
 
     /**
-     * @brief 结果区域的轴对齐包围盒左上角行号。
+     * @brief 结果区域的轴对齐包围盒。
+     *
+     * 图像坐标语义：minX / maxX 对应列方向边界，minY / maxY 对应行方向边界。
      */
-    size_t boundingRow = 0;
-
-    /**
-     * @brief 结果区域的轴对齐包围盒左上角列号。
-     */
-    size_t boundingCol = 0;
-
-    /**
-     * @brief 结果区域的轴对齐包围盒行数。
-     */
-    size_t boundingRows = 0;
-
-    /**
-     * @brief 结果区域的轴对齐包围盒列数。
-     */
-    size_t boundingCols = 0;
+    GB_Rectangle boundingBox;
 
     /**
      * @brief 模板图像特征点数量，仅特征匹配算法填写。

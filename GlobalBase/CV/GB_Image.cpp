@@ -1948,7 +1948,7 @@ namespace GBImage_Internal
     /**
      * @brief 根据四个角点计算轴对齐包围盒。
      */
-    static bool ComputeBoundingBoxFromCorners(const std::vector<cv::Point2d>& corners, size_t& boundingRow, size_t& boundingCol, size_t& boundingRows, size_t& boundingCols)
+    static bool ComputeBoundingBoxFromCorners(const std::vector<cv::Point2d>& corners, GB_Rectangle& boundingBox)
     {
         if (corners.empty())
         {
@@ -2007,11 +2007,12 @@ namespace GBImage_Internal
             return false;
         }
 
-        boundingCol = left < 0.0 ? 0 : static_cast<size_t>(left);
-        boundingRow = top < 0.0 ? 0 : static_cast<size_t>(top);
-        boundingCols = static_cast<size_t>(right - left);
-        boundingRows = static_cast<size_t>(bottom - top);
-        return true;
+        const double boundingLeft = left < 0.0 ? 0.0 : left;
+        const double boundingTop = top < 0.0 ? 0.0 : top;
+        const double boundingWidth = right - left;
+        const double boundingHeight = bottom - top;
+        boundingBox.Set(boundingLeft, boundingTop, boundingLeft + boundingWidth, boundingTop + boundingHeight);
+        return boundingBox.IsValid();
     }
 
     /**
@@ -2071,7 +2072,7 @@ namespace GBImage_Internal
         }
 
         result.centerPoint = GB_Point2d(centerPoint.x, centerPoint.y);
-        return ComputeBoundingBoxFromCorners(corners, result.boundingRow, result.boundingCol, result.boundingRows, result.boundingCols);
+        return ComputeBoundingBoxFromCorners(corners, result.boundingBox);
     }
 
     /**
