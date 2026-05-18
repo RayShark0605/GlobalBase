@@ -1,32 +1,58 @@
 ﻿#include "GB_ReadWriteLock.h"
 
+#include <cassert>
+
+bool GB_ReadWriteLock::CanLockSharedUnlocked() const
+{
+    return !writerActive_ && waitingWriters_ == 0;
+}
+
+bool GB_ReadWriteLock::CanLockUnlocked() const
+{
+    return !writerActive_ && activeReaders_ == 0;
+}
+
 void GB_ReadWriteLock::LockShared()
 {
     std::unique_lock<std::mutex> lockGuard(mutex_);
-
-    while (writerActive_ || waitingWriters_ > 0)
-    {
-        readersCondition_.wait(lockGuard);
-    }
-
+    readersCondition_.wait(lockGuard, [this]() { return CanLockSharedUnlocked(); });
     activeReaders_++;
 }
 
 void GB_ReadWriteLock::UnlockShared()
 {
-    std::unique_lock<std::mutex> lockGuard(mutex_);
+    bool shouldNotifyWriter = false;
+    bool shouldNotifyReaders = false;
 
-    activeReaders_--;
-    if (activeReaders_ == 0)
     {
-        if (waitingWriters_ > 0)
+        std::unique_lock<std::mutex> lockGuard(mutex_);
+        if (activeReaders_ == 0)
         {
-            writersCondition_.notify_one();
+            assert(false && "GB_ReadWriteLock::UnlockShared called without a shared lock.");
+            return;
         }
-        else
+
+        activeReaders_--;
+        if (activeReaders_ == 0)
         {
-            readersCondition_.notify_all();
+            if (waitingWriters_ > 0)
+            {
+                shouldNotifyWriter = true;
+            }
+            else
+            {
+                shouldNotifyReaders = true;
+            }
         }
+    }
+
+    if (shouldNotifyWriter)
+    {
+        writersCondition_.notify_one();
+    }
+    else if (shouldNotifyReaders)
+    {
+        readersCondition_.notify_all();
     }
 }
 
@@ -35,10 +61,22 @@ void GB_ReadWriteLock::Lock()
     std::unique_lock<std::mutex> lockGuard(mutex_);
 
     waitingWriters_++;
-
-    while (writerActive_ || activeReaders_ > 0)
+    try
     {
-        writersCondition_.wait(lockGuard);
+        writersCondition_.wait(lockGuard, [this]() { return CanLockUnlocked(); });
+    }
+    catch (...)
+    {
+        waitingWriters_--;
+        const bool shouldNotifyReaders = !writerActive_ && waitingWriters_ == 0;
+        lockGuard.unlock();
+
+        if (shouldNotifyReaders)
+        {
+            readersCondition_.notify_all();
+        }
+
+        throw;
     }
 
     waitingWriters_--;
@@ -47,15 +85,33 @@ void GB_ReadWriteLock::Lock()
 
 void GB_ReadWriteLock::Unlock()
 {
-    std::unique_lock<std::mutex> lockGuard(mutex_);
+    bool shouldNotifyWriter = false;
+    bool shouldNotifyReaders = false;
 
-    writerActive_ = false;
+    {
+        std::unique_lock<std::mutex> lockGuard(mutex_);
+        if (!writerActive_)
+        {
+            assert(false && "GB_ReadWriteLock::Unlock called without an exclusive lock.");
+            return;
+        }
 
-    if (waitingWriters_ > 0)
+        writerActive_ = false;
+        if (waitingWriters_ > 0)
+        {
+            shouldNotifyWriter = true;
+        }
+        else
+        {
+            shouldNotifyReaders = true;
+        }
+    }
+
+    if (shouldNotifyWriter)
     {
         writersCondition_.notify_one();
     }
-    else
+    else if (shouldNotifyReaders)
     {
         readersCondition_.notify_all();
     }
@@ -69,7 +125,7 @@ bool GB_ReadWriteLock::TryLockShared()
         return false;
     }
 
-    if (writerActive_ || waitingWriters_ > 0)
+    if (!CanLockSharedUnlocked())
     {
         return false;
     }
@@ -86,7 +142,7 @@ bool GB_ReadWriteLock::TryLock()
         return false;
     }
 
-    if (writerActive_ || activeReaders_ > 0)
+    if (!CanLockUnlocked())
     {
         return false;
     }
@@ -96,9 +152,10 @@ bool GB_ReadWriteLock::TryLock()
 }
 
 GB_ReadLockGuard::GB_ReadLockGuard(GB_ReadWriteLock& lock)
-    : lock_(&lock), ownsLock_(true)
+    : lock_(&lock), ownsLock_(false)
 {
     lock_->LockShared();
+    ownsLock_ = true;
 }
 
 GB_ReadLockGuard::GB_ReadLockGuard(GB_ReadWriteLock& lock, GB_DeferLockTag)
@@ -121,9 +178,8 @@ GB_ReadLockGuard::~GB_ReadLockGuard()
 }
 
 GB_ReadLockGuard::GB_ReadLockGuard(GB_ReadLockGuard&& other) noexcept
+    : lock_(other.lock_), ownsLock_(other.ownsLock_)
 {
-    lock_ = other.lock_;
-    ownsLock_ = other.ownsLock_;
     other.ResetNoUnlock();
 }
 
@@ -190,11 +246,11 @@ void GB_ReadLockGuard::ResetNoUnlock()
     ownsLock_ = false;
 }
 
-
 GB_WriteLockGuard::GB_WriteLockGuard(GB_ReadWriteLock& lock)
-    : lock_(&lock), ownsLock_(true)
+    : lock_(&lock), ownsLock_(false)
 {
     lock_->Lock();
+    ownsLock_ = true;
 }
 
 GB_WriteLockGuard::GB_WriteLockGuard(GB_ReadWriteLock& lock, GB_DeferLockTag)
@@ -217,9 +273,8 @@ GB_WriteLockGuard::~GB_WriteLockGuard()
 }
 
 GB_WriteLockGuard::GB_WriteLockGuard(GB_WriteLockGuard&& other) noexcept
+    : lock_(other.lock_), ownsLock_(other.ownsLock_)
 {
-    lock_ = other.lock_;
-    ownsLock_ = other.ownsLock_;
     other.ResetNoUnlock();
 }
 
