@@ -837,11 +837,12 @@ namespace GBImage_Internal
     /**
      * @brief 在编码前将图像整理成写出端更容易接受的通道顺序。
      *
-     * 当前只在内部真实排列为 RGB / RGBA 时做显式转换；
-     * 其它情况直接沿用原图像。
+     * 当前会在 JPEG 编码前主动剥离 Alpha，并在内部真实排列为 RGB / RGBA 时
+     * 转换为 OpenCV 写出端常用的 BGR / BGRA 顺序。
      */
-    static bool PrepareImageForEncoding(const cv::Mat& sourceImage, ImageChannelLayout channelLayout, cv::Mat& encodedImage)
+    static bool PrepareImageForEncoding(const cv::Mat& sourceImage, ImageChannelLayout channelLayout, const std::string& fileExt, cv::Mat& encodedImage)
     {
+        encodedImage.release();
         if (sourceImage.empty())
         {
             return false;
@@ -849,6 +850,34 @@ namespace GBImage_Internal
 
         try
         {
+            if (IsJpegExtension(fileExt))
+            {
+                switch (channelLayout)
+                {
+                case ImageChannelLayout::Gray:
+                case ImageChannelLayout::Bgr:
+                    encodedImage = sourceImage;
+                    return true;
+
+                case ImageChannelLayout::Rgb:
+                    cv::cvtColor(sourceImage, encodedImage, cv::COLOR_RGB2BGR);
+                    return !encodedImage.empty();
+
+                case ImageChannelLayout::Bgra:
+                    cv::cvtColor(sourceImage, encodedImage, cv::COLOR_BGRA2BGR);
+                    return !encodedImage.empty();
+
+                case ImageChannelLayout::Rgba:
+                    cv::cvtColor(sourceImage, encodedImage, cv::COLOR_RGBA2BGR);
+                    return !encodedImage.empty();
+
+                default:
+                    break;
+                }
+
+                return false;
+            }
+
             switch (channelLayout)
             {
             case ImageChannelLayout::Rgb:
@@ -1312,6 +1341,27 @@ namespace GBImage_Internal
             destinationImage.release();
             return false;
         }
+    }
+
+    /**
+     * @brief 获取旋转采样越界时使用的边界填充值。
+     */
+    static bool TryGetRotateBorderScalar(const cv::Mat& sourceImage, ImageChannelLayout channelLayout, const GB_ImageRotateOptions& rotateOptions, cv::Scalar& borderScalar)
+    {
+        borderScalar = cv::Scalar();
+        if (sourceImage.empty())
+        {
+            return false;
+        }
+
+        const GB_ColorRGBA backgroundColor = ResolveRotateBackgroundColor(rotateOptions);
+        const int channels = sourceImage.channels();
+        if (channels > 4)
+        {
+            return backgroundColor == GB_ColorRGBA::Black || IsZeroColor(backgroundColor);
+        }
+
+        return TryGetRotateFillScalar(channels, channelLayout, backgroundColor, borderScalar);
     }
 
     /**
@@ -1891,43 +1941,94 @@ namespace GBImage_Internal
      */
     static bool EvaluateTemplateMatchMap(const cv::Mat& matchMap, GB_ImageTemplateMatchMethod matchMethod, cv::Point& bestLocation, double& score, double& rawScore)
     {
-        if (matchMap.empty())
+        if (matchMap.empty() || matchMap.channels() != 1)
         {
             return false;
         }
 
-        double minValue = 0.0;
-        double maxValue = 0.0;
-        cv::Point minLocation;
-        cv::Point maxLocation;
+        const bool lowerBetter = IsTemplateMatchLowerBetter(matchMethod);
+        double bestValue = lowerBetter ? std::numeric_limits<double>::infinity() : -std::numeric_limits<double>::infinity();
+        cv::Point currentBestLocation;
+        bool hasFiniteValue = false;
 
         try
         {
-            cv::minMaxLoc(matchMap, &minValue, &maxValue, &minLocation, &maxLocation);
+            if (matchMap.depth() == CV_32F)
+            {
+                for (int rowIndex = 0; rowIndex < matchMap.rows; rowIndex++)
+                {
+                    const float* rowData = matchMap.ptr<float>(rowIndex);
+                    for (int colIndex = 0; colIndex < matchMap.cols; colIndex++)
+                    {
+                        const double value = static_cast<double>(rowData[colIndex]);
+                        if (!IsFiniteDouble(value))
+                        {
+                            continue;
+                        }
+
+                        if (!hasFiniteValue || (lowerBetter ? value < bestValue : value > bestValue))
+                        {
+                            hasFiniteValue = true;
+                            bestValue = value;
+                            currentBestLocation = cv::Point(colIndex, rowIndex);
+                        }
+                    }
+                }
+            }
+            else if (matchMap.depth() == CV_64F)
+            {
+                for (int rowIndex = 0; rowIndex < matchMap.rows; rowIndex++)
+                {
+                    const double* rowData = matchMap.ptr<double>(rowIndex);
+                    for (int colIndex = 0; colIndex < matchMap.cols; colIndex++)
+                    {
+                        const double value = rowData[colIndex];
+                        if (!IsFiniteDouble(value))
+                        {
+                            continue;
+                        }
+
+                        if (!hasFiniteValue || (lowerBetter ? value < bestValue : value > bestValue))
+                        {
+                            hasFiniteValue = true;
+                            bestValue = value;
+                            currentBestLocation = cv::Point(colIndex, rowIndex);
+                        }
+                    }
+                }
+            }
+            else
+            {
+                return false;
+            }
         }
         catch (...)
         {
             return false;
         }
 
-        if (IsTemplateMatchLowerBetter(matchMethod))
+        if (!hasFiniteValue)
         {
-            bestLocation = minLocation;
-            rawScore = minValue;
+            return false;
+        }
+
+        bestLocation = currentBestLocation;
+        rawScore = bestValue;
+
+        if (lowerBetter)
+        {
             if (IsTemplateMatchNormed(matchMethod))
             {
-                score = 1.0 - minValue;
+                score = 1.0 - bestValue;
             }
             else
             {
-                score = 1.0 / (1.0 + std::max(0.0, minValue));
+                score = 1.0 / (1.0 + std::max(0.0, bestValue));
             }
         }
         else
         {
-            bestLocation = maxLocation;
-            rawScore = maxValue;
-            score = maxValue;
+            score = bestValue;
         }
 
         if (IsTemplateMatchNormed(matchMethod))
@@ -2007,11 +2108,7 @@ namespace GBImage_Internal
             return false;
         }
 
-        const double boundingLeft = left < 0.0 ? 0.0 : left;
-        const double boundingTop = top < 0.0 ? 0.0 : top;
-        const double boundingWidth = right - left;
-        const double boundingHeight = bottom - top;
-        boundingBox.Set(boundingLeft, boundingTop, boundingLeft + boundingWidth, boundingTop + boundingHeight);
+        boundingBox.Set(left, top, right, bottom);
         return boundingBox.IsValid();
     }
 
@@ -2521,6 +2618,455 @@ namespace GBImage_Internal
         result.found = true;
         return result;
     }
+
+    /**
+     * @brief 判断当前通道排列是否支持绘图类接口的逻辑 RGBA 读写。
+     */
+    static bool IsSupportedDrawTargetLayout(ImageChannelLayout channelLayout)
+    {
+        return channelLayout == ImageChannelLayout::Gray || channelLayout == ImageChannelLayout::Bgr || channelLayout == ImageChannelLayout::Bgra || channelLayout == ImageChannelLayout::Rgb || channelLayout == ImageChannelLayout::Rgba;
+    }
+
+    /**
+     * @brief 将 double 四舍五入后安全转换为 int。
+     */
+    static bool TryConvertDoubleToIntRound(const double value, int& intValue)
+    {
+        if (!std::isfinite(value) || value < static_cast<double>(std::numeric_limits<int>::min()) || value > static_cast<double>(std::numeric_limits<int>::max()))
+        {
+            return false;
+        }
+
+        intValue = static_cast<int>(std::llround(value));
+        return true;
+    }
+
+    /**
+     * @brief 将 double 向下取整后安全转换为 int。
+     */
+    static bool TryConvertDoubleToIntFloor(const double value, int& intValue)
+    {
+        if (!std::isfinite(value) || value < static_cast<double>(std::numeric_limits<int>::min()) || value > static_cast<double>(std::numeric_limits<int>::max()))
+        {
+            return false;
+        }
+
+        intValue = static_cast<int>(std::floor(value));
+        return true;
+    }
+
+    /**
+     * @brief 将 double 向上取整后安全转换为 int。
+     */
+    static bool TryConvertDoubleToIntCeil(const double value, int& intValue)
+    {
+        if (!std::isfinite(value) || value < static_cast<double>(std::numeric_limits<int>::min()) || value > static_cast<double>(std::numeric_limits<int>::max()))
+        {
+            return false;
+        }
+
+        intValue = static_cast<int>(std::ceil(value));
+        return true;
+    }
+
+    /**
+     * @brief 获取 OpenCV 线型。
+     */
+    static int GetOpenCvLineType(const bool antialias)
+    {
+        return antialias ? cv::LINE_AA : cv::LINE_8;
+    }
+
+    /**
+     * @brief 将逻辑 RGBA 转为直通道 BGRA 标量。
+     */
+    static cv::Scalar ToBgraScalar(const GB_ColorRGBA& color)
+    {
+        return cv::Scalar(static_cast<double>(color.b), static_cast<double>(color.g), static_cast<double>(color.r), static_cast<double>(color.a));
+    }
+
+    /**
+     * @brief 将矩形裁剪到图像范围内。
+     */
+    static cv::Rect ClipRectToImage(const cv::Rect& rectangle, const int imageWidth, const int imageHeight)
+    {
+        const cv::Rect imageRectangle(0, 0, imageWidth, imageHeight);
+        return rectangle & imageRectangle;
+    }
+
+    /**
+     * @brief 将多边形顶点转换为图像像素坐标。
+     */
+    static bool TryGetPolygonPointsInImage(const GB_Polygon& polygon, std::vector<cv::Point>& points)
+    {
+        points.clear();
+        if (!polygon.IsValid())
+        {
+            return false;
+        }
+
+        const std::vector<GB_Point2d> vertices = polygon.GetVerticesAsDouble();
+        if (vertices.size() < 2)
+        {
+            return false;
+        }
+
+        points.reserve(vertices.size());
+        for (size_t i = 0; i < vertices.size(); i++)
+        {
+            int pointX = 0;
+            int pointY = 0;
+            if (!TryConvertDoubleToIntRound(vertices[i].x, pointX) || !TryConvertDoubleToIntRound(vertices[i].y, pointY))
+            {
+                points.clear();
+                return false;
+            }
+
+            points.push_back(cv::Point(pointX, pointY));
+        }
+
+        return !points.empty();
+    }
+
+    /**
+     * @brief 将 GB_Rectangle 转为图像像素矩形。
+     */
+    static bool TryGetImageTargetRectangle(const GB_Rectangle& imageRectangle, cv::Rect& targetRectangle)
+    {
+        targetRectangle = cv::Rect();
+        if (!imageRectangle.IsValid())
+        {
+            return false;
+        }
+
+        int left = 0;
+        int top = 0;
+        int right = 0;
+        int bottom = 0;
+        if (!TryConvertDoubleToIntFloor(imageRectangle.minX, left) || !TryConvertDoubleToIntFloor(imageRectangle.minY, top) || !TryConvertDoubleToIntCeil(imageRectangle.maxX, right) || !TryConvertDoubleToIntCeil(imageRectangle.maxY, bottom))
+        {
+            return false;
+        }
+
+        const long long rectangleWidth = static_cast<long long>(right) - static_cast<long long>(left);
+        const long long rectangleHeight = static_cast<long long>(bottom) - static_cast<long long>(top);
+        if (rectangleWidth <= 0 || rectangleHeight <= 0 || rectangleWidth > static_cast<long long>(std::numeric_limits<int>::max()) || rectangleHeight > static_cast<long long>(std::numeric_limits<int>::max()))
+        {
+            return false;
+        }
+
+        targetRectangle = cv::Rect(left, top, static_cast<int>(rectangleWidth), static_cast<int>(rectangleHeight));
+        return true;
+    }
+
+
+
+    /**
+     * @brief 计算点集的轴对齐像素包围盒。
+     */
+    static bool TryGetPointBoundingRectangle(const std::vector<cv::Point>& points, cv::Rect& boundingRectangle)
+    {
+        boundingRectangle = cv::Rect();
+        if (points.empty())
+        {
+            return false;
+        }
+
+        int minX = points[0].x;
+        int minY = points[0].y;
+        int maxX = points[0].x;
+        int maxY = points[0].y;
+        for (size_t i = 1; i < points.size(); i++)
+        {
+            minX = std::min(minX, points[i].x);
+            minY = std::min(minY, points[i].y);
+            maxX = std::max(maxX, points[i].x);
+            maxY = std::max(maxY, points[i].y);
+        }
+
+        const long long rectangleWidth = static_cast<long long>(maxX) - static_cast<long long>(minX) + 1;
+        const long long rectangleHeight = static_cast<long long>(maxY) - static_cast<long long>(minY) + 1;
+        if (rectangleWidth <= 0 || rectangleHeight <= 0 || rectangleWidth > static_cast<long long>(std::numeric_limits<int>::max()) || rectangleHeight > static_cast<long long>(std::numeric_limits<int>::max()))
+        {
+            return false;
+        }
+
+        boundingRectangle = cv::Rect(minX, minY, static_cast<int>(rectangleWidth), static_cast<int>(rectangleHeight));
+        return true;
+    }
+
+    /**
+     * @brief 对像素矩形做安全外扩。
+     */
+    static bool TryPadRectangle(const cv::Rect& rectangle, const int padding, cv::Rect& paddedRectangle)
+    {
+        paddedRectangle = cv::Rect();
+        if (rectangle.empty() || padding < 0)
+        {
+            return false;
+        }
+
+        const long long left = static_cast<long long>(rectangle.x) - static_cast<long long>(padding);
+        const long long top = static_cast<long long>(rectangle.y) - static_cast<long long>(padding);
+        const long long right = static_cast<long long>(rectangle.x) + static_cast<long long>(rectangle.width) + static_cast<long long>(padding);
+        const long long bottom = static_cast<long long>(rectangle.y) + static_cast<long long>(rectangle.height) + static_cast<long long>(padding);
+        const long long width = right - left;
+        const long long height = bottom - top;
+        if (left < static_cast<long long>(std::numeric_limits<int>::min()) || top < static_cast<long long>(std::numeric_limits<int>::min()) || left > static_cast<long long>(std::numeric_limits<int>::max()) || top > static_cast<long long>(std::numeric_limits<int>::max()) || width <= 0 || height <= 0 || width > static_cast<long long>(std::numeric_limits<int>::max()) || height > static_cast<long long>(std::numeric_limits<int>::max()))
+        {
+            return false;
+        }
+
+        paddedRectangle = cv::Rect(static_cast<int>(left), static_cast<int>(top), static_cast<int>(width), static_cast<int>(height));
+        return true;
+    }
+
+    /**
+     * @brief 必要时外扩图像，以容纳指定绘制范围。
+     */
+    static bool ExpandImageForDraw(cv::Mat& imageMat, ImageChannelLayout channelLayout, const cv::Rect& drawRectangle, const GB_ColorRGBA& backgroundColor, int& offsetX, int& offsetY)
+    {
+        offsetX = 0;
+        offsetY = 0;
+        if (imageMat.empty() || imageMat.depth() != CV_8U || drawRectangle.empty() || !IsSupportedDrawTargetLayout(channelLayout))
+        {
+            return false;
+        }
+
+        const long long oldLeft = 0;
+        const long long oldTop = 0;
+        const long long oldRight = static_cast<long long>(imageMat.cols);
+        const long long oldBottom = static_cast<long long>(imageMat.rows);
+        const long long drawLeft = static_cast<long long>(drawRectangle.x);
+        const long long drawTop = static_cast<long long>(drawRectangle.y);
+        const long long drawRight = static_cast<long long>(drawRectangle.x) + static_cast<long long>(drawRectangle.width);
+        const long long drawBottom = static_cast<long long>(drawRectangle.y) + static_cast<long long>(drawRectangle.height);
+
+        const long long newLeft = std::min(oldLeft, drawLeft);
+        const long long newTop = std::min(oldTop, drawTop);
+        const long long newRight = std::max(oldRight, drawRight);
+        const long long newBottom = std::max(oldBottom, drawBottom);
+        const long long newWidth = newRight - newLeft;
+        const long long newHeight = newBottom - newTop;
+        if (newWidth <= 0 || newHeight <= 0 || newWidth > static_cast<long long>(std::numeric_limits<int>::max()) || newHeight > static_cast<long long>(std::numeric_limits<int>::max()))
+        {
+            return false;
+        }
+
+        if (newLeft < -static_cast<long long>(std::numeric_limits<int>::max()) || newTop < -static_cast<long long>(std::numeric_limits<int>::max()))
+        {
+            return false;
+        }
+
+        offsetX = static_cast<int>(-newLeft);
+        offsetY = static_cast<int>(-newTop);
+        if (newLeft == oldLeft && newTop == oldTop && newRight == oldRight && newBottom == oldBottom)
+        {
+            return true;
+        }
+
+        cv::Scalar backgroundScalar;
+        if (!GetFillScalar(backgroundColor, channelLayout, backgroundScalar))
+        {
+            return false;
+        }
+
+        try
+        {
+            cv::Mat expandedImage(static_cast<int>(newHeight), static_cast<int>(newWidth), imageMat.type(), backgroundScalar);
+            const cv::Rect oldImageRectangle(offsetX, offsetY, imageMat.cols, imageMat.rows);
+            imageMat.copyTo(expandedImage(oldImageRectangle));
+            imageMat = std::move(expandedImage);
+            return !imageMat.empty();
+        }
+        catch (...)
+        {
+            return false;
+        }
+    }
+
+    /**
+     * @brief 将直通道 BGRA 图层按 source-over 规则叠加到目标图像 ROI。
+     */
+    static bool BlendStraightBgraOverImageMat(cv::Mat& targetImageRoi, ImageChannelLayout targetChannelLayout, const cv::Mat& sourceStraightBgra)
+    {
+        if (targetImageRoi.empty() || sourceStraightBgra.empty() || targetImageRoi.rows != sourceStraightBgra.rows || targetImageRoi.cols != sourceStraightBgra.cols || targetImageRoi.depth() != CV_8U || sourceStraightBgra.type() != CV_8UC4 || !IsSupportedDrawTargetLayout(targetChannelLayout))
+        {
+            return false;
+        }
+
+        for (int rowIndex = 0; rowIndex < sourceStraightBgra.rows; rowIndex++)
+        {
+            const cv::Vec4b* sourceRow = sourceStraightBgra.ptr<cv::Vec4b>(rowIndex);
+            unsigned char* targetRow = targetImageRoi.ptr<unsigned char>(rowIndex);
+            const size_t targetPixelSize = targetImageRoi.elemSize();
+
+            for (int colIndex = 0; colIndex < sourceStraightBgra.cols; colIndex++)
+            {
+                const cv::Vec4b& sourcePixel = sourceRow[colIndex];
+                if (sourcePixel[3] == 0)
+                {
+                    continue;
+                }
+
+                unsigned char* targetPixel = targetRow + static_cast<size_t>(colIndex) * targetPixelSize;
+                const GB_ColorRGBA sourceColor(sourcePixel[2], sourcePixel[1], sourcePixel[0], sourcePixel[3]);
+                if (sourcePixel[3] == 255)
+                {
+                    if (!WritePixelColor(targetPixel, targetChannelLayout, sourceColor))
+                    {
+                        return false;
+                    }
+
+                    continue;
+                }
+
+                GB_ColorRGBA destinationColor;
+                if (!ReadPixelColor(targetPixel, targetChannelLayout, destinationColor))
+                {
+                    return false;
+                }
+
+                const GB_ColorRGBA blendedColor = GB_ColorRGBA::AlphaBlend(sourceColor, destinationColor);
+                if (!WritePixelColor(targetPixel, targetChannelLayout, blendedColor))
+                {
+                    return false;
+                }
+            }
+        }
+
+        return true;
+    }
+
+    /**
+     * @brief 将指定图像矩阵转换为 8 位直通道 BGRA 图像。
+     */
+    static bool TryConvertImageMatToStraightBgra(const cv::Mat& sourceImage, ImageChannelLayout sourceLayout, cv::Mat& straightBgraImage)
+    {
+        straightBgraImage.release();
+        if (sourceImage.empty())
+        {
+            return false;
+        }
+
+        cv::Mat image8;
+        if (!ConvertImageDepthToUInt8(sourceImage, image8))
+        {
+            return false;
+        }
+
+        try
+        {
+            switch (sourceLayout)
+            {
+            case ImageChannelLayout::Gray:
+                if (image8.channels() != 1)
+                {
+                    return false;
+                }
+                cv::cvtColor(image8, straightBgraImage, cv::COLOR_GRAY2BGRA);
+                return !straightBgraImage.empty();
+
+            case ImageChannelLayout::Bgr:
+                if (image8.channels() != 3)
+                {
+                    return false;
+                }
+                cv::cvtColor(image8, straightBgraImage, cv::COLOR_BGR2BGRA);
+                return !straightBgraImage.empty();
+
+            case ImageChannelLayout::Bgra:
+                if (image8.channels() != 4)
+                {
+                    return false;
+                }
+                straightBgraImage = image8;
+                return true;
+
+            case ImageChannelLayout::Rgb:
+                if (image8.channels() != 3)
+                {
+                    return false;
+                }
+                cv::cvtColor(image8, straightBgraImage, cv::COLOR_RGB2BGRA);
+                return !straightBgraImage.empty();
+
+            case ImageChannelLayout::Rgba:
+                if (image8.channels() != 4)
+                {
+                    return false;
+                }
+                cv::cvtColor(image8, straightBgraImage, cv::COLOR_RGBA2BGRA);
+                return !straightBgraImage.empty();
+
+            case ImageChannelLayout::Other:
+                if (image8.channels() == 2)
+                {
+                    return ConvertGrayAlphaToBgra(image8, straightBgraImage);
+                }
+                break;
+
+            default:
+                break;
+            }
+        }
+        catch (...)
+        {
+            straightBgraImage.release();
+            return false;
+        }
+
+        straightBgraImage.release();
+        return false;
+    }
+
+    /**
+     * @brief 根据可见目标区域构造待叠加的源图像局部图层。
+     */
+    static bool BuildVisibleImageLayer(const cv::Mat& sourceStraightBgra, const cv::Rect& targetRectangle, const cv::Rect& clippedTargetRectangle, const GB_ImageInterpolation interpolation, cv::Mat& visibleStraightBgra)
+    {
+        visibleStraightBgra.release();
+        if (sourceStraightBgra.empty() || sourceStraightBgra.type() != CV_8UC4 || targetRectangle.empty() || clippedTargetRectangle.empty())
+        {
+            return false;
+        }
+
+        if (targetRectangle.width == sourceStraightBgra.cols && targetRectangle.height == sourceStraightBgra.rows)
+        {
+            const cv::Rect sourceRoi(clippedTargetRectangle.x - targetRectangle.x, clippedTargetRectangle.y - targetRectangle.y, clippedTargetRectangle.width, clippedTargetRectangle.height);
+            const cv::Rect validSourceRectangle(0, 0, sourceStraightBgra.cols, sourceStraightBgra.rows);
+            const cv::Rect clippedSourceRoi = sourceRoi & validSourceRectangle;
+            if (clippedSourceRoi.empty() || clippedSourceRoi.width != clippedTargetRectangle.width || clippedSourceRoi.height != clippedTargetRectangle.height)
+            {
+                return false;
+            }
+
+            visibleStraightBgra = sourceStraightBgra(clippedSourceRoi);
+            return true;
+        }
+
+        const double scaleX = static_cast<double>(sourceStraightBgra.cols) / static_cast<double>(targetRectangle.width);
+        const double scaleY = static_cast<double>(sourceStraightBgra.rows) / static_cast<double>(targetRectangle.height);
+        if (!std::isfinite(scaleX) || !std::isfinite(scaleY) || scaleX <= 0.0 || scaleY <= 0.0)
+        {
+            return false;
+        }
+
+        try
+        {
+            const double sourceOffsetX = (static_cast<double>(clippedTargetRectangle.x - targetRectangle.x) + 0.5) * scaleX - 0.5;
+            const double sourceOffsetY = (static_cast<double>(clippedTargetRectangle.y - targetRectangle.y) + 0.5) * scaleY - 0.5;
+            const cv::Mat inverseTransform = (cv::Mat_<double>(2, 3) << scaleX, 0.0, sourceOffsetX, 0.0, scaleY, sourceOffsetY);
+            cv::warpAffine(sourceStraightBgra, visibleStraightBgra, inverseTransform, clippedTargetRectangle.size(), ToCvInterpolation(interpolation) | cv::WARP_INVERSE_MAP, cv::BORDER_CONSTANT, cv::Scalar(0, 0, 0, 0));
+            return !visibleStraightBgra.empty();
+        }
+        catch (...)
+        {
+            visibleStraightBgra.release();
+            return false;
+        }
+    }
+
 }
 
 /**
@@ -2940,7 +3486,7 @@ bool GB_Image::EncodeToMemory(GB_ByteBuffer& encodedBytes, const std::string& fi
         GBImage_Internal::BuildImwriteParams(normalizedExt, saveOptions, imwriteParams);
 
         cv::Mat imageForEncode;
-        if (!GBImage_Internal::PrepareImageForEncoding(imageImpl->imageMat, imageImpl->channelLayout, imageForEncode))
+        if (!GBImage_Internal::PrepareImageForEncoding(imageImpl->imageMat, imageImpl->channelLayout, normalizedExt, imageForEncode))
         {
             return false;
         }
@@ -3941,6 +4487,197 @@ bool GB_Image::Fill(const GB_ColorRGBA& pixelColor)
     }
 }
 
+
+
+/**
+ * @brief 在当前图像上绘制多边形。
+ */
+bool GB_Image::DrawPolygon(const GB_Polygon& polygon, const GB_ImageDrawPolygonOptions& drawOptions)
+{
+    GBImage_Internal::EnsureOpenCvErrorLogOnly();
+    if (IsEmpty() || imageImpl->imageMat.depth() != CV_8U || !GBImage_Internal::IsSupportedDrawTargetLayout(imageImpl->channelLayout))
+    {
+        return false;
+    }
+
+    std::vector<cv::Point> points;
+    if (!GBImage_Internal::TryGetPolygonPointsInImage(polygon, points))
+    {
+        return false;
+    }
+
+    const bool drawFill = drawOptions.fill && drawOptions.fillColor.a > 0 && points.size() >= 3;
+    const bool drawBoundary = drawOptions.boundaryThickness > 0 && drawOptions.boundaryColor.a > 0 && points.size() >= 2;
+    if (!drawFill && !drawBoundary)
+    {
+        return true;
+    }
+
+    try
+    {
+        cv::Rect pointBoundingRectangle;
+        if (!GBImage_Internal::TryGetPointBoundingRectangle(points, pointBoundingRectangle))
+        {
+            return false;
+        }
+
+        if (drawBoundary && drawOptions.boundaryThickness > std::numeric_limits<int>::max() - 3)
+        {
+            return false;
+        }
+
+        const int boundaryPadding = drawBoundary ? (drawOptions.boundaryThickness + 3) : 2;
+        cv::Rect drawRectangle;
+        if (!GBImage_Internal::TryPadRectangle(pointBoundingRectangle, boundaryPadding, drawRectangle))
+        {
+            return false;
+        }
+
+        if (drawOptions.outOfBoundsPolicy == GB_ImageDrawOutOfBoundsPolicy::ExpandImage)
+        {
+            int offsetX = 0;
+            int offsetY = 0;
+            if (!GBImage_Internal::ExpandImageForDraw(imageImpl->imageMat, imageImpl->channelLayout, drawRectangle, drawOptions.expandBackgroundColor, offsetX, offsetY))
+            {
+                return false;
+            }
+
+            if (offsetX != 0 || offsetY != 0)
+            {
+                for (size_t i = 0; i < points.size(); i++)
+                {
+                    points[i].x += offsetX;
+                    points[i].y += offsetY;
+                }
+
+                drawRectangle.x += offsetX;
+                drawRectangle.y += offsetY;
+            }
+        }
+
+        const cv::Rect clippedDrawRectangle = GBImage_Internal::ClipRectToImage(drawRectangle, imageImpl->imageMat.cols, imageImpl->imageMat.rows);
+        if (clippedDrawRectangle.empty())
+        {
+            return false;
+        }
+
+        std::vector<cv::Point> localPoints;
+        localPoints.reserve(points.size());
+        for (size_t i = 0; i < points.size(); i++)
+        {
+            localPoints.push_back(cv::Point(points[i].x - clippedDrawRectangle.x, points[i].y - clippedDrawRectangle.y));
+        }
+
+        cv::Mat layerStraightBgra(clippedDrawRectangle.height, clippedDrawRectangle.width, CV_8UC4, cv::Scalar(0, 0, 0, 0));
+        const int lineType = GBImage_Internal::GetOpenCvLineType(drawOptions.antialias);
+
+        if (drawFill)
+        {
+            std::vector<std::vector<cv::Point>> fillPoints(1, localPoints);
+            cv::fillPoly(layerStraightBgra, fillPoints, GBImage_Internal::ToBgraScalar(drawOptions.fillColor), lineType);
+        }
+
+        if (drawBoundary)
+        {
+            std::vector<std::vector<cv::Point>> boundaryPoints(1, localPoints);
+            cv::polylines(layerStraightBgra, boundaryPoints, true, GBImage_Internal::ToBgraScalar(drawOptions.boundaryColor), drawOptions.boundaryThickness, lineType);
+        }
+
+        cv::Mat targetRoi = imageImpl->imageMat(clippedDrawRectangle);
+        return GBImage_Internal::BlendStraightBgraOverImageMat(targetRoi, imageImpl->channelLayout, layerStraightBgra);
+    }
+    catch (...)
+    {
+        return false;
+    }
+}
+
+/**
+ * @brief 在当前图像上绘制多边形。
+ */
+bool GB_Image::DrawPolygon(const GB_Polygon& polygon, const GB_ColorRGBA& boundaryColor, const int boundaryThickness, const bool fill, const GB_ColorRGBA& fillColor)
+{
+    GB_ImageDrawPolygonOptions drawOptions;
+    drawOptions.boundaryColor = boundaryColor;
+    drawOptions.boundaryThickness = boundaryThickness;
+    drawOptions.fill = fill;
+    drawOptions.fillColor = fillColor;
+    return DrawPolygon(polygon, drawOptions);
+}
+
+/**
+ * @brief 在当前图像上叠加绘制另一幅图像。
+ */
+bool GB_Image::DrawImage(const GB_Image& image, const GB_ImageDrawImageOptions& drawOptions)
+{
+    GBImage_Internal::EnsureOpenCvErrorLogOnly();
+    if (IsEmpty() || image.IsEmpty() || imageImpl->imageMat.depth() != CV_8U || !GBImage_Internal::IsSupportedDrawTargetLayout(imageImpl->channelLayout))
+    {
+        return false;
+    }
+
+    cv::Rect targetRectangle;
+    if (!GBImage_Internal::TryGetImageTargetRectangle(drawOptions.imageRectangle, targetRectangle))
+    {
+        return false;
+    }
+
+    cv::Mat sourceStraightBgra;
+    if (!GBImage_Internal::TryConvertImageMatToStraightBgra(image.imageImpl->imageMat, image.imageImpl->channelLayout, sourceStraightBgra))
+    {
+        return false;
+    }
+
+    try
+    {
+        if (drawOptions.outOfBoundsPolicy == GB_ImageDrawOutOfBoundsPolicy::ExpandImage)
+        {
+            int offsetX = 0;
+            int offsetY = 0;
+            if (!GBImage_Internal::ExpandImageForDraw(imageImpl->imageMat, imageImpl->channelLayout, targetRectangle, drawOptions.expandBackgroundColor, offsetX, offsetY))
+            {
+                return false;
+            }
+
+            if (offsetX != 0 || offsetY != 0)
+            {
+                targetRectangle.x += offsetX;
+                targetRectangle.y += offsetY;
+            }
+        }
+
+        const cv::Rect clippedTargetRectangle = GBImage_Internal::ClipRectToImage(targetRectangle, imageImpl->imageMat.cols, imageImpl->imageMat.rows);
+        if (clippedTargetRectangle.empty())
+        {
+            return false;
+        }
+
+        cv::Mat visibleStraightBgra;
+        if (!GBImage_Internal::BuildVisibleImageLayer(sourceStraightBgra, targetRectangle, clippedTargetRectangle, drawOptions.interpolation, visibleStraightBgra))
+        {
+            return false;
+        }
+
+        cv::Mat targetRoi = imageImpl->imageMat(clippedTargetRectangle);
+        return GBImage_Internal::BlendStraightBgraOverImageMat(targetRoi, imageImpl->channelLayout, visibleStraightBgra);
+    }
+    catch (...)
+    {
+        return false;
+    }
+}
+
+/**
+ * @brief 在当前图像上叠加绘制另一幅图像。
+ */
+bool GB_Image::DrawImage(const GB_Image& image, const GB_Rectangle& imageRectangle)
+{
+    GB_ImageDrawImageOptions drawOptions;
+    drawOptions.imageRectangle = imageRectangle;
+    return DrawImage(image, drawOptions);
+}
+
+
 /**
  * @brief 生成当前图像的深拷贝副本。
  */
@@ -3995,7 +4732,7 @@ GB_Image GB_Image::ConvertTo(GB_ImageDepth targetDepth, double scale, double shi
 {
     GBImage_Internal::EnsureOpenCvErrorLogOnly();
     GB_Image resultImage;
-    if (IsEmpty())
+    if (IsEmpty() || !GBImage_Internal::IsFiniteDouble(scale) || !GBImage_Internal::IsFiniteDouble(shift))
     {
         return resultImage;
     }
@@ -4103,8 +4840,31 @@ GB_Image GB_Image::Rotate(double angleDegrees, const GB_ImageRotateOptions& rota
 {
     GBImage_Internal::EnsureOpenCvErrorLogOnly();
     GB_Image resultImage;
-    if (IsEmpty())
+    if (IsEmpty() || !GBImage_Internal::IsFiniteDouble(angleDegrees))
     {
+        return resultImage;
+    }
+
+    const double normalizedAngle = GBImage_Internal::NormalizeAngleDegrees(angleDegrees);
+    if (GBImage_Internal::IsNearlyEqual(normalizedAngle, 0.0))
+    {
+        return Clone();
+    }
+
+    int cvRotateCode = -1;
+    const bool isQuarterTurn = GBImage_Internal::TryGetCvRotateCode(normalizedAngle, cvRotateCode);
+    if (isQuarterTurn && (rotateOptions.expandOutput || cvRotateCode == cv::ROTATE_180))
+    {
+        try
+        {
+            cv::rotate(imageImpl->imageMat, resultImage.imageImpl->imageMat, cvRotateCode);
+            resultImage.imageImpl->channelLayout = imageImpl->channelLayout;
+        }
+        catch (...)
+        {
+            resultImage.Clear();
+        }
+
         return resultImage;
     }
 
@@ -4115,45 +4875,12 @@ GB_Image GB_Image::Rotate(double angleDegrees, const GB_ImageRotateOptions& rota
         return resultImage;
     }
 
-    const double normalizedAngle = GBImage_Internal::NormalizeAngleDegrees(angleDegrees);
-    if (GBImage_Internal::IsNearlyEqual(normalizedAngle, 0.0))
-    {
-        try
-        {
-            resultImage.imageImpl->imageMat = rotateSourceImage.clone();
-            resultImage.imageImpl->channelLayout = rotateSourceLayout;
-        }
-        catch (...)
-        {
-            resultImage.Clear();
-        }
-
-        return resultImage;
-    }
-
-    int cvRotateCode = -1;
-    const bool isQuarterTurn = GBImage_Internal::TryGetCvRotateCode(normalizedAngle, cvRotateCode);
-    if (isQuarterTurn && (rotateOptions.expandOutput || cvRotateCode == cv::ROTATE_180))
-    {
-        try
-        {
-            cv::rotate(rotateSourceImage, resultImage.imageImpl->imageMat, cvRotateCode);
-            resultImage.imageImpl->channelLayout = rotateSourceLayout;
-        }
-        catch (...)
-        {
-            resultImage.Clear();
-        }
-
-        return resultImage;
-    }
-
     int dstRows = rotateSourceImage.rows;
     int dstCols = rotateSourceImage.cols;
 
     try
     {
-        cv::Mat rotationMatrix = cv::getRotationMatrix2D(GBImage_Internal::GetRotationCenter(rotateSourceImage), angleDegrees, 1.0);
+        cv::Mat rotationMatrix = cv::getRotationMatrix2D(GBImage_Internal::GetRotationCenter(rotateSourceImage), normalizedAngle, 1.0);
         if (rotationMatrix.empty())
         {
             return resultImage;
@@ -4173,8 +4900,14 @@ GB_Image GB_Image::Rotate(double angleDegrees, const GB_ImageRotateOptions& rota
             return resultImage;
         }
 
+        cv::Scalar borderScalar;
+        if (!GBImage_Internal::TryGetRotateBorderScalar(rotateSourceImage, rotateSourceLayout, rotateOptions, borderScalar))
+        {
+            return resultImage;
+        }
+
         cv::warpAffine(rotateSourceImage, resultImage.imageImpl->imageMat, rotationMatrix, cv::Size(dstCols, dstRows),
-            GBImage_Internal::ToCvInterpolation(rotateOptions.interpolation), cv::BORDER_TRANSPARENT);
+            GBImage_Internal::ToCvInterpolation(rotateOptions.interpolation), cv::BORDER_CONSTANT, borderScalar);
 
         resultImage.imageImpl->channelLayout = rotateSourceLayout;
     }

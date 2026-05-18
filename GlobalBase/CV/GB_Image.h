@@ -210,6 +210,82 @@ struct GB_ImageSaveOptions
 
 
 /**
+ * @brief 图像绘制对象超出当前图像范围时的处理策略。
+ */
+enum class GB_ImageDrawOutOfBoundsPolicy
+{
+    /**
+     * @brief 保持当前图像尺寸不变，只绘制落在当前图像范围内的部分。
+     */
+    ClipToImage = 0,
+
+    /**
+     * @brief 自动外扩当前图像，使原图像与待绘制对象都能被完整容纳。
+     *
+     * 当外扩发生在左侧或上侧时，原图像内容会整体平移到新画布中的对应位置，
+     * 待绘制对象也会使用相同平移量，以保持二者在同一像素坐标系下的相对位置不变。
+     */
+    ExpandImage
+};
+
+/**
+ * @brief 图像多边形绘制参数。
+ */
+struct GB_ImageDrawPolygonOptions
+{
+    /** @brief 多边形边界颜色，按 source-over 规则与目标图像 Alpha 混合。 */
+    GB_ColorRGBA boundaryColor = GB_ColorRGBA::Red;
+
+    /** @brief 多边形边界线宽，单位为图像像素。小于等于 0 表示不绘制边界。 */
+    int boundaryThickness = 2;
+
+    /** @brief 是否填充多边形内部。 */
+    bool fill = false;
+
+    /** @brief 多边形填充颜色，按 source-over 规则与目标图像 Alpha 混合。 */
+    GB_ColorRGBA fillColor = GB_ColorRGBA(255, 0, 0, 64);
+
+    /** @brief 是否启用抗锯齿。 */
+    bool antialias = true;
+
+    /** @brief 多边形超出当前图像范围时的处理策略。 */
+    GB_ImageDrawOutOfBoundsPolicy outOfBoundsPolicy = GB_ImageDrawOutOfBoundsPolicy::ClipToImage;
+
+    /**
+     * @brief 自动外扩图像时，新扩展区域的背景色。
+     *
+     * 仅当 outOfBoundsPolicy 为 ExpandImage 且实际发生外扩时使用。
+     */
+    GB_ColorRGBA expandBackgroundColor = GB_ColorRGBA::Transparent;
+};
+
+/**
+ * @brief 图像叠加绘制参数。
+ */
+struct GB_ImageDrawImageOptions
+{
+    /**
+     * @brief 源图像绘制到当前图像像素坐标系中的目标区域。
+     *
+     * minX / maxX 对应列方向边界，minY / maxY 对应行方向边界。
+     */
+    GB_Rectangle imageRectangle;
+
+    /** @brief 源图像缩放到目标区域时使用的插值方式。 */
+    GB_ImageInterpolation interpolation = GB_ImageInterpolation::Linear;
+
+    /** @brief 绘制区域超出当前图像范围时的处理策略。 */
+    GB_ImageDrawOutOfBoundsPolicy outOfBoundsPolicy = GB_ImageDrawOutOfBoundsPolicy::ClipToImage;
+
+    /**
+     * @brief 自动外扩图像时，新扩展区域的背景色。
+     *
+     * 仅当 outOfBoundsPolicy 为 ExpandImage 且实际发生外扩时使用。
+     */
+    GB_ColorRGBA expandBackgroundColor = GB_ColorRGBA::Transparent;
+};
+
+/**
  * @brief 图像模板查找算法。
  */
 enum class GB_ImageTemplateFindAlgorithm
@@ -792,6 +868,46 @@ public:
      * 对 3 / 4 通道图像，会按照当前实际通道顺序写入像素值。
      */
     bool Fill(const GB_ColorRGBA& pixelColor);
+
+    /**
+     * @brief 在当前图像上绘制一个多边形。
+     *
+     * @param polygon 顶点坐标位于当前图像像素坐标系中，x 对应列方向，y 对应行方向。
+     * @param drawOptions 绘制参数。
+     * @return true=绘制成功；false=输入非法、图像格式不支持或没有可绘制内容。
+     *
+     * 说明：
+     * - 当前实现仅对 8 位、1 / 3 / 4 通道图像提供稳定支持；
+     * - 颜色会按当前图像的真实通道顺序写入，并按 source-over 规则处理 Alpha；
+     * - 当 outOfBoundsPolicy 为 ClipToImage 时，当前图像尺寸保持不变，超出部分被裁剪；
+     * - 当 outOfBoundsPolicy 为 ExpandImage 时，当前图像会在需要时外扩到能同时容纳原图像与多边形绘制范围。
+     */
+    bool DrawPolygon(const GB_Polygon& polygon, const GB_ImageDrawPolygonOptions& drawOptions = GB_ImageDrawPolygonOptions());
+
+    /**
+     * @brief 在当前图像上绘制一个多边形。
+     */
+    bool DrawPolygon(const GB_Polygon& polygon, const GB_ColorRGBA& boundaryColor, int boundaryThickness, bool fill, const GB_ColorRGBA& fillColor);
+
+    /**
+     * @brief 在当前图像上叠加绘制另一幅图像。
+     *
+     * @param image 要绘制的源图像。
+     * @param drawOptions 绘制参数。
+     * @return true=绘制成功；false=输入非法、图像格式不支持或没有可绘制内容。
+     *
+     * 说明：
+     * - 当前目标图像仅对 8 位、1 / 3 / 4 通道提供稳定支持；
+     * - 源图像会按逻辑 RGBA 读取，并按 source-over 规则叠加到当前图像；
+     * - imageRectangle 可指定负坐标或超出当前图像大小的区域，具体处理由 outOfBoundsPolicy 决定。
+     */
+    bool DrawImage(const GB_Image& image, const GB_ImageDrawImageOptions& drawOptions);
+
+    /**
+     * @brief 在当前图像上叠加绘制另一幅图像。
+     */
+    bool DrawImage(const GB_Image& image, const GB_Rectangle& imageRectangle);
+
 
     /**
      * @brief 返回深拷贝图像。
