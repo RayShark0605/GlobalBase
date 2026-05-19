@@ -2306,10 +2306,10 @@ string GB_Utf8ToAnsi(const string& utf8Str)
     {
         throw runtime_error("WideCharToMultiByte(CP_ACP) failed (convert).");
     }
-    if (usedDefaultChar == TRUE)
-    {
-        throw runtime_error("WideCharToMultiByte(CP_ACP) would lose information for one or more characters.");
-    }
+    //if (usedDefaultChar == TRUE)
+    //{
+    //    throw runtime_error("WideCharToMultiByte(CP_ACP) would lose information for one or more characters.");
+    //}
     return ansi;
 
 #else

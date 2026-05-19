@@ -1,6 +1,7 @@
 ﻿#include "GB_Image.h"
 #include "../GB_FileSystem.h"
 #include "../GB_IO.h"
+#include "../GB_Utf8String.h"
 #include "../Geometry/GB_GeometryInterface.h"
 
 #include <algorithm>
@@ -2210,7 +2211,7 @@ namespace GBImage_Internal
         cv::Mat templateMatchImage;
         if (!ConvertImageToTemplateMatchMat(sourceImage, sourceLayout, findOptions.convertToGray, sourceMatchImage) || !ConvertImageToTemplateMatchMat(templateImage, templateLayout, findOptions.convertToGray, templateMatchImage))
         {
-            result.message = "无法转换图像格式。";
+            result.message = GB_STR("无法转换图像格式。");
             return result;
         }
 
@@ -2220,7 +2221,7 @@ namespace GBImage_Internal
             cv::Mat templateGrayImage;
             if (!ConvertImageToGray8(sourceImage, sourceLayout, sourceGrayImage) || !ConvertImageToGray8(templateImage, templateLayout, templateGrayImage))
             {
-                result.message = "大图与模板图像类型不一致，且无法转换为灰度图。";
+                result.message = GB_STR("大图与模板图像类型不一致，且无法转换为灰度图。");
                 return result;
             }
 
@@ -2230,7 +2231,7 @@ namespace GBImage_Internal
 
         if (templateMatchImage.rows > sourceMatchImage.rows || templateMatchImage.cols > sourceMatchImage.cols)
         {
-            result.message = "模板图像尺寸大于大图像。";
+            result.message = GB_STR("模板图像尺寸大于大图像。");
             return result;
         }
 
@@ -2304,7 +2305,7 @@ namespace GBImage_Internal
 
         if (!hasBest)
         {
-            result.message = "模板匹配未得到有效结果。";
+            result.message = GB_STR("模板匹配未得到有效结果。");
             return result;
         }
 
@@ -2315,13 +2316,13 @@ namespace GBImage_Internal
 
         if (bestScore < findOptions.minTemplateMatchScore)
         {
-            result.message = "模板匹配得分低于阈值。";
+            result.message = GB_STR("模板匹配得分低于阈值。");
             return result;
         }
 
         if (!FillAxisAlignedTemplateMatchResult(bestLocation, bestTemplateRows, bestTemplateCols, sourceMatchImage.rows, sourceMatchImage.cols, findOptions, result))
         {
-            result.message = "模板匹配结果区域无效。";
+            result.message = GB_STR("模板匹配结果区域无效。");
             return result;
         }
 
@@ -2413,14 +2414,14 @@ namespace GBImage_Internal
         cv::Mat templateGrayImage;
         if (!ConvertImageToGray8(sourceImage, sourceLayout, sourceGrayImage) || !ConvertImageToGray8(templateImage, templateLayout, templateGrayImage))
         {
-            result.message = "无法转换为灰度图。";
+            result.message = GB_STR("无法转换为灰度图。");
             return result;
         }
 
         cv::Ptr<cv::Feature2D> detector = CreateFeatureDetector(algorithm, findOptions);
         if (detector.empty())
         {
-            result.message = "无法创建特征检测器。";
+            result.message = GB_STR("无法创建特征检测器。");
             return result;
         }
 
@@ -2436,7 +2437,7 @@ namespace GBImage_Internal
         }
         catch (...)
         {
-            result.message = "特征点提取失败。";
+            result.message = GB_STR("特征点提取失败。");
             return result;
         }
 
@@ -2445,7 +2446,7 @@ namespace GBImage_Internal
 
         if (templateKeyPoints.empty() || sourceKeyPoints.empty() || templateDescriptors.empty() || sourceDescriptors.empty())
         {
-            result.message = "图像纹理不足，无法提取足够特征。";
+            result.message = GB_STR("图像纹理不足，无法提取足够特征。");
             return result;
         }
 
@@ -2457,7 +2458,7 @@ namespace GBImage_Internal
         }
         catch (...)
         {
-            result.message = "特征描述子匹配失败。";
+            result.message = GB_STR("特征描述子匹配失败。");
             return result;
         }
 
@@ -2493,7 +2494,7 @@ namespace GBImage_Internal
         const int minGoodMatches = std::max(4, findOptions.minGoodMatches);
         if (static_cast<int>(goodMatches.size()) < minGoodMatches)
         {
-            result.message = "优质特征匹配数量不足。";
+            result.message = GB_STR("优质特征匹配数量不足。");
             return result;
         }
 
@@ -2515,7 +2516,7 @@ namespace GBImage_Internal
 
         if (templatePoints.size() < 4 || sourcePoints.size() < 4)
         {
-            result.message = "可用于估计单应矩阵的匹配点不足。";
+            result.message = GB_STR("可用于估计单应矩阵的匹配点不足。");
             return result;
         }
 
@@ -2535,13 +2536,13 @@ namespace GBImage_Internal
         }
         catch (...)
         {
-            result.message = "单应矩阵估计失败。";
+            result.message = GB_STR("单应矩阵估计失败。");
             return result;
         }
 
         if (!IsHomographyValid(homography))
         {
-            result.message = "单应矩阵无效。";
+            result.message = GB_STR("单应矩阵无效。");
             return result;
         }
 
@@ -2569,7 +2570,7 @@ namespace GBImage_Internal
 
         if (static_cast<int>(inlierCount) < minInlierMatches || inlierRatio < findOptions.minInlierRatio)
         {
-            result.message = "特征匹配内点数量或比例不足。";
+            result.message = GB_STR("特征匹配内点数量或比例不足。");
             return result;
         }
 
@@ -2591,13 +2592,13 @@ namespace GBImage_Internal
         }
         catch (...)
         {
-            result.message = "单应矩阵投影失败。";
+            result.message = GB_STR("单应矩阵投影失败。");
             return result;
         }
 
         if (transformedCorners.size() != 4 || transformedCenter.size() != 1)
         {
-            result.message = "投影结果无效。";
+            result.message = GB_STR("投影结果无效。");
             return result;
         }
 
@@ -2611,7 +2612,7 @@ namespace GBImage_Internal
         const cv::Point2d resultCenter(static_cast<double>(transformedCenter[0].x), static_cast<double>(transformedCenter[0].y));
         if (!FillTemplateFindPolygonResult(resultCorners, resultCenter, sourceGrayImage.rows, sourceGrayImage.cols, findOptions, result))
         {
-            result.message = "特征匹配结果区域无效。";
+            result.message = GB_STR("特征匹配结果区域无效。");
             return result;
         }
 
@@ -4487,8 +4488,6 @@ bool GB_Image::Fill(const GB_ColorRGBA& pixelColor)
     }
 }
 
-
-
 /**
  * @brief 在当前图像上绘制多边形。
  */
@@ -4676,7 +4675,6 @@ bool GB_Image::DrawImage(const GB_Image& image, const GB_Rectangle& imageRectang
     drawOptions.imageRectangle = imageRectangle;
     return DrawImage(image, drawOptions);
 }
-
 
 /**
  * @brief 生成当前图像的深拷贝副本。
@@ -5152,13 +5150,13 @@ GB_ImageTemplateFindResult GB_Image::FindTemplate(const GB_Image& sourceImage, c
     GB_ImageTemplateFindResult result;
     if (sourceImage.IsEmpty() || templateImage.IsEmpty())
     {
-        result.message = "大图像或模板图像为空。";
+        result.message = GB_STR("大图像或模板图像为空。");
         return result;
     }
 
     if (sourceImage.imageImpl == nullptr || templateImage.imageImpl == nullptr)
     {
-        result.message = "图像内部对象无效。";
+        result.message = GB_STR("图像内部对象无效。");
         return result;
     }
 
@@ -5202,7 +5200,7 @@ GB_ImageTemplateFindResult GB_Image::FindTemplate(const GB_Image& sourceImage, c
     }
 
     result.algorithm = GB_ImageTemplateFindAlgorithm::Auto;
-    result.message = "自动查找失败：模板匹配失败原因：" + templateMatchResult.message + "；ORB 失败原因：" + orbResult.message + "；SIFT 失败原因：" + siftResult.message;
+    result.message = GB_STR("自动查找失败：模板匹配失败原因：") + templateMatchResult.message + GB_STR("；ORB 失败原因：") + orbResult.message + GB_STR("；SIFT 失败原因：") + siftResult.message;
     return result;
 }
 
