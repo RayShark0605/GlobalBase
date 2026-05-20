@@ -131,6 +131,7 @@ namespace
 		options.detImagePadding = std::max(0, options.detImagePadding);
 		options.maxCandidateTextBoxes = options.maxCandidateTextBoxes < 0 ? 0 : options.maxCandidateTextBoxes;
 		options.detBoxNmsThresh = ClampDouble(options.detBoxNmsThresh, 0.0, 1.0);
+		options.detSliceOverlap = std::max(0, options.detSliceOverlap);
 		options.recImageHeight = std::max(1, options.recImageHeight);
 		options.recImageWidth = std::max(1, options.recImageWidth);
 		options.recImagePadding = std::max(0, options.recImagePadding);
@@ -293,31 +294,21 @@ namespace
 		return true;
 	}
 
-	bool PrepareOnnxRuntimeDependencyDlls(bool requireCudaDependencyDlls, std::string& errorMessage)
+	bool PrepareOnnxRuntimeCudaDependencyDlls(std::string& errorMessage)
 	{
 		errorMessage.clear();
 
 		const std::string dependencyDirectoryPathUtf8 = BuildGlobalBaseDependencyDirectoryPath();
 		if (dependencyDirectoryPathUtf8.empty())
 		{
-			if (requireCudaDependencyDlls)
-			{
-				errorMessage = GB_STR("获取 exe 所在目录失败，无法定位 GlobalBaseDependencies 目录。");
-				return false;
-			}
-
-			return true;
+			errorMessage = GB_STR("获取 exe 所在目录失败，无法定位 GlobalBaseDependencies 目录。");
+			return false;
 		}
 
 		if (!GB_IsDirectoryExists(dependencyDirectoryPathUtf8))
 		{
-			if (requireCudaDependencyDlls)
-			{
-				errorMessage = GB_STR("ONNX Runtime CUDA 依赖库目录不存在：") + dependencyDirectoryPathUtf8;
-				return false;
-			}
-
-			return true;
+			errorMessage = GB_STR("ONNX Runtime CUDA 依赖库目录不存在：") + dependencyDirectoryPathUtf8;
+			return false;
 		}
 
 		if (!AddGlobalBaseDependencyDirectoryToDllSearchPath(dependencyDirectoryPathUtf8, errorMessage))
@@ -325,32 +316,28 @@ namespace
 			return false;
 		}
 
-		if (requireCudaDependencyDlls)
+		const std::vector<std::string> requiredCudaDependencyDllNames =
 		{
-			const std::vector<std::string> requiredCudaDependencyDllNames =
-			{
-				"onnxruntime_providers_shared.dll",
-				"onnxruntime_providers_cuda.dll",
-				"cudnn64_9.dll"
-			};
+			"onnxruntime_providers_shared.dll",
+			"onnxruntime_providers_cuda.dll",
+			"cudnn64_9.dll"
+		};
 
-			for (const std::string& dllName : requiredCudaDependencyDllNames)
+		for (const std::string& dllName : requiredCudaDependencyDllNames)
+		{
+			const std::string dllPathUtf8 = GB_JoinPath(dependencyDirectoryPathUtf8, dllName);
+			if (!GB_IsFileExists(dllPathUtf8))
 			{
-				const std::string dllPathUtf8 = GB_JoinPath(dependencyDirectoryPathUtf8, dllName);
-				if (!GB_IsFileExists(dllPathUtf8))
-				{
-					errorMessage = GB_STR("缺少 ONNX Runtime CUDA 运行时依赖库：") + dllPathUtf8;
-					return false;
-				}
+				errorMessage = GB_STR("缺少 ONNX Runtime CUDA 运行时依赖库：") + dllPathUtf8;
+				return false;
 			}
 		}
 
 		return true;
 	}
 #else
-	bool PrepareOnnxRuntimeDependencyDlls(bool requireCudaDependencyDlls, std::string& errorMessage)
+	bool PrepareOnnxRuntimeCudaDependencyDlls(std::string& errorMessage)
 	{
-		(void)requireCudaDependencyDlls;
 		errorMessage.clear();
 		return true;
 	}
@@ -446,12 +433,41 @@ namespace
 		return true;
 	}
 
+	void ConfigureOnnxRuntimeSessionOptions(Ort::SessionOptions& sessionOptions, const GB_OCROptions& options, GB_OCRBackend backendType)
+	{
+		const OrtLoggingLevel ortLogSeverityLevel = ToOrtLoggingLevel(options.onnxRuntimeLogSeverityLevel);
+		sessionOptions.SetLogSeverityLevel(static_cast<int>(ortLogSeverityLevel));
+		if (options.intraOpNumThreads > 0)
+		{
+			sessionOptions.SetIntraOpNumThreads(options.intraOpNumThreads);
+		}
+		if (options.interOpNumThreads > 0)
+		{
+			sessionOptions.SetInterOpNumThreads(options.interOpNumThreads);
+		}
+
+		// PP-OCRv5 mobile 的检测、方向分类、识别模型通常不是多分支图，ORT_SEQUENTIAL 可避免额外 inter-op 调度开销。
+		// ORT_ENABLE_ALL 会启用 ONNX Runtime 支持的图优化；CPU Arena 与 MemPattern 对重复推理时的内存复用更友好。
+		sessionOptions.SetExecutionMode(ORT_SEQUENTIAL);
+		sessionOptions.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
+		sessionOptions.EnableCpuMemArena();
+		sessionOptions.EnableMemPattern();
+		sessionOptions.AddConfigEntry("session.dynamic_block_base", "4");
+
+		if (backendType == GB_OCRBackend::PPOCRv5MobileOnnxRuntimeCpu)
+		{
+			// CPU 后端必须保持纯 CPU 路径：不追加 CUDA/TensorRT EP，不主动加载、探测或预热 CUDA 相关 DLL。
+			// 这里仅显式固定 CPU SessionOptions，避免 GPU 包存在时误以为需要进行 provider 探测。
+			sessionOptions.AddConfigEntry("session.intra_op.allow_spinning", "1");
+		}
+	}
+
 	bool IsOnnxRuntimeCudaExecutionProviderAvailable(const GB_OCROptions& options)
 	{
 		try
 		{
 			std::string errorMessage;
-			if (!PrepareOnnxRuntimeDependencyDlls(true, errorMessage))
+			if (!PrepareOnnxRuntimeCudaDependencyDlls(errorMessage))
 			{
 				return false;
 			}
@@ -788,7 +804,7 @@ namespace
 			return cv::Mat();
 		}
 
-		cv::Mat imageMat = image.ToCvMat(GB_ImageCopyMode::DeepCopy);
+		cv::Mat imageMat = image.ToCvMat(GB_ImageCopyMode::ShallowCopy);
 		if (imageMat.empty())
 		{
 			return cv::Mat();
@@ -995,7 +1011,7 @@ namespace
 
 	void ShiftDetectedTextBoxesToOriginalImage(std::vector<DetectedTextBox>& textBoxes, int paddingSize, int originalImageWidth, int originalImageHeight, double detMinBoxSideLen)
 	{
-		if (textBoxes.empty() || paddingSize <= 0 || originalImageWidth <= 0 || originalImageHeight <= 0)
+		if (textBoxes.empty() || originalImageWidth <= 0 || originalImageHeight <= 0)
 		{
 			return;
 		}
@@ -1033,7 +1049,7 @@ namespace
 			return false;
 		}
 
-		inputData.assign(inputValueCount, 0.0f);
+		inputData.resize(inputValueCount);
 		const float meanValues[3] = { 0.485f, 0.456f, 0.406f };
 		const float stdValues[3] = { 0.229f, 0.224f, 0.225f };
 #ifdef _OPENMP
@@ -1078,7 +1094,8 @@ namespace
 		const int resizedWidth = std::max(1, std::min(safeRecImageWidth, static_cast<int>(std::ceil(static_cast<double>(safeRecImageHeight) * widthHeightRatio))));
 
 		cv::Mat resizedImage;
-		cv::resize(bgrImage, resizedImage, cv::Size(resizedWidth, safeRecImageHeight));
+		const int interpolationMode = (resizedWidth < bgrImage.cols || safeRecImageHeight < bgrImage.rows) ? cv::INTER_AREA : cv::INTER_LINEAR;
+		cv::resize(bgrImage, resizedImage, cv::Size(resizedWidth, safeRecImageHeight), 0.0, 0.0, interpolationMode);
 
 		const size_t imageArea = static_cast<size_t>(safeRecImageHeight) * safeRecImageWidth;
 #ifdef _OPENMP
@@ -1491,6 +1508,69 @@ namespace
 		}
 
 		textBoxes.swap(keptBoxes);
+	}
+
+	void OffsetDetectedTextBoxes(std::vector<DetectedTextBox>& textBoxes, double offsetX, double offsetY, int imageWidth, int imageHeight)
+	{
+		if (textBoxes.empty() || imageWidth <= 0 || imageHeight <= 0)
+		{
+			return;
+		}
+
+		for (DetectedTextBox& textBox : textBoxes)
+		{
+			for (cv::Point2f& point : textBox.points)
+			{
+				point.x = static_cast<float>(ClampDouble(static_cast<double>(point.x) + offsetX, 0.0, static_cast<double>(imageWidth - 1)));
+				point.y = static_cast<float>(ClampDouble(static_cast<double>(point.y) + offsetY, 0.0, static_cast<double>(imageHeight - 1)));
+			}
+		}
+	}
+
+	std::vector<std::pair<int, int>> BuildLongImageSliceRanges(int longSideLength, int sliceLength, int overlapLength)
+	{
+		std::vector<std::pair<int, int>> ranges;
+		if (longSideLength <= 0 || sliceLength <= 0)
+		{
+			return ranges;
+		}
+
+		const int safeSliceLength = std::min(longSideLength, std::max(32, sliceLength));
+		const int safeOverlapLength = ClampInt(overlapLength, 0, std::max(0, safeSliceLength - 32));
+		const int stepLength = std::max(1, safeSliceLength - safeOverlapLength);
+
+		int startPos = 0;
+		while (startPos < longSideLength)
+		{
+			const int endPos = std::min(longSideLength, startPos + safeSliceLength);
+			if (endPos <= startPos)
+			{
+				break;
+			}
+			if (!ranges.empty() && ranges.back().first == startPos)
+			{
+				break;
+			}
+
+			ranges.push_back(std::make_pair(startPos, endPos));
+			if (endPos >= longSideLength)
+			{
+				break;
+			}
+
+			int nextStartPos = startPos + stepLength;
+			if (nextStartPos + safeSliceLength > longSideLength)
+			{
+				nextStartPos = std::max(0, longSideLength - safeSliceLength);
+			}
+			if (nextStartPos <= startPos)
+			{
+				nextStartPos = startPos + stepLength;
+			}
+			startPos = nextStartPos;
+		}
+
+		return ranges;
 	}
 
 	std::vector<const char*> MakeNamePointers(const std::vector<std::string>& names)
@@ -1948,9 +2028,12 @@ namespace
 					return false;
 				}
 
-				if (!PrepareOnnxRuntimeDependencyDlls(backendType == GB_OCRBackend::PPOCRv5MobileOnnxRuntimeCuda, errorMessage))
+				if (backendType == GB_OCRBackend::PPOCRv5MobileOnnxRuntimeCuda)
 				{
-					return false;
+					if (!PrepareOnnxRuntimeCudaDependencyDlls(errorMessage))
+					{
+						return false;
+					}
 				}
 
 				if (!ReadTextLinesUtf8(modelPaths.dictPathUtf8, characterDict))
@@ -1962,16 +2045,7 @@ namespace
 				const OrtLoggingLevel ortLogSeverityLevel = ToOrtLoggingLevel(options.onnxRuntimeLogSeverityLevel);
 				ortEnv.reset(new Ort::Env(ortLogSeverityLevel, "GlobalBase.GB_OCR"));
 				Ort::SessionOptions sessionOptions;
-				sessionOptions.SetLogSeverityLevel(static_cast<int>(ortLogSeverityLevel));
-				if (options.intraOpNumThreads > 0)
-				{
-					sessionOptions.SetIntraOpNumThreads(options.intraOpNumThreads);
-				}
-				if (options.interOpNumThreads > 0)
-				{
-					sessionOptions.SetInterOpNumThreads(options.interOpNumThreads);
-				}
-				sessionOptions.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
+				ConfigureOnnxRuntimeSessionOptions(sessionOptions, options, backendType);
 				if (backendType == GB_OCRBackend::PPOCRv5MobileOnnxRuntimeCuda)
 				{
 					if (!AppendCudaExecutionProvider(sessionOptions, options, errorMessage))
@@ -2036,6 +2110,7 @@ namespace
 					clsInputNamePointers = MakeNamePointers(clsInputNames);
 					clsOutputNamePointers = MakeNamePointers(clsOutputNames);
 				}
+				runOptions.reset(new Ort::RunOptions(CreateOnnxRuntimeRunOptions(options)));
 			}
 			catch (const Ort::Exception& exception)
 			{
@@ -2191,7 +2266,107 @@ namespace
 		}
 
 	private:
+		bool ShouldUseLongImageDetectionSlice(const cv::Mat& sourceImage, bool verticalDirection) const
+		{
+			if (!options.enableLongImageDetectionSlice || sourceImage.empty() || sourceImage.rows <= 0 || sourceImage.cols <= 0)
+			{
+				return false;
+			}
+
+			const int longSideLength = verticalDirection ? sourceImage.rows : sourceImage.cols;
+			const int shortSideLength = verticalDirection ? sourceImage.cols : sourceImage.rows;
+			if (longSideLength <= shortSideLength || shortSideLength <= 0)
+			{
+				return false;
+			}
+
+			const double longShortRatio = static_cast<double>(longSideLength) / static_cast<double>(shortSideLength);
+			const double ratioThresh = verticalDirection ? 2.0 : 3.0;
+			const int sideLengthThresh = options.detMaxSideLen > 0 ? options.detMaxSideLen : std::max(32, options.detLimitSideLen);
+			return longShortRatio > ratioThresh && longSideLength > sideLengthThresh;
+		}
+
 		bool DetectTextBoxes(const cv::Mat& sourceImage, std::vector<DetectedTextBox>& textBoxes, std::string& errorMessage)
+		{
+			textBoxes.clear();
+			if (ShouldUseLongImageDetectionSlice(sourceImage, true))
+			{
+				return DetectTextBoxesBySlices(sourceImage, textBoxes, errorMessage, true);
+			}
+			if (ShouldUseLongImageDetectionSlice(sourceImage, false))
+			{
+				return DetectTextBoxesBySlices(sourceImage, textBoxes, errorMessage, false);
+			}
+
+			return DetectTextBoxesSingle(sourceImage, textBoxes, errorMessage);
+		}
+
+		bool DetectTextBoxesBySlices(const cv::Mat& sourceImage, std::vector<DetectedTextBox>& textBoxes, std::string& errorMessage, bool verticalDirection)
+		{
+			textBoxes.clear();
+			errorMessage.clear();
+
+			if (sourceImage.empty())
+			{
+				return true;
+			}
+
+			const int longSideLength = verticalDirection ? sourceImage.rows : sourceImage.cols;
+			const int shortSideLength = verticalDirection ? sourceImage.cols : sourceImage.rows;
+			const int safeDetLimitSideLen = std::max(32, options.detLimitSideLen);
+			const double preferredLongShortRatio = verticalDirection ? 2.0 : 3.0;
+			int preferredSliceLength = std::max(safeDetLimitSideLen, static_cast<int>(std::round(static_cast<double>(shortSideLength) * preferredLongShortRatio)));
+			if (options.detMaxSideLen > 0 && safeDetLimitSideLen > 0)
+			{
+				const double maxSliceLengthByResize = static_cast<double>(options.detMaxSideLen) * static_cast<double>(shortSideLength) / static_cast<double>(safeDetLimitSideLen);
+				preferredSliceLength = std::min(preferredSliceLength, std::max(32, static_cast<int>(std::floor(maxSliceLengthByResize))));
+			}
+			const int sliceLength = ClampInt(preferredSliceLength, 32, longSideLength);
+			const std::vector<std::pair<int, int>> ranges = BuildLongImageSliceRanges(longSideLength, sliceLength, options.detSliceOverlap);
+			if (ranges.empty() || ranges.size() == 1)
+			{
+				return DetectTextBoxesSingle(sourceImage, textBoxes, errorMessage);
+			}
+
+			for (const std::pair<int, int>& range : ranges)
+			{
+				const int startPos = range.first;
+				const int endPos = range.second;
+				const cv::Rect sliceRectangle = verticalDirection ? cv::Rect(0, startPos, sourceImage.cols, endPos - startPos) : cv::Rect(startPos, 0, endPos - startPos, sourceImage.rows);
+				const cv::Mat sliceImage = sourceImage(sliceRectangle);
+
+				std::vector<DetectedTextBox> sliceTextBoxes;
+				if (!DetectTextBoxesSingle(sliceImage, sliceTextBoxes, errorMessage))
+				{
+					return false;
+				}
+
+				if (!sliceTextBoxes.empty())
+				{
+					OffsetDetectedTextBoxes(sliceTextBoxes, verticalDirection ? 0.0 : static_cast<double>(startPos), verticalDirection ? static_cast<double>(startPos) : 0.0, sourceImage.cols, sourceImage.rows);
+					textBoxes.insert(textBoxes.end(), sliceTextBoxes.begin(), sliceTextBoxes.end());
+				}
+			}
+
+			SuppressDuplicatedTextBoxes(textBoxes, options.detBoxNmsThresh);
+			std::sort(textBoxes.begin(), textBoxes.end(), [](const DetectedTextBox& leftBox, const DetectedTextBox& rightBox)
+				{
+					const double leftY = std::accumulate(leftBox.points.begin(), leftBox.points.end(), 0.0, [](double value, const cv::Point2f& point) { return value + point.y; }) / std::max<size_t>(1, leftBox.points.size());
+					const double rightY = std::accumulate(rightBox.points.begin(), rightBox.points.end(), 0.0, [](double value, const cv::Point2f& point) { return value + point.y; }) / std::max<size_t>(1, rightBox.points.size());
+					if (std::fabs(leftY - rightY) > 10.0)
+					{
+						return leftY < rightY;
+					}
+
+					const double leftX = std::accumulate(leftBox.points.begin(), leftBox.points.end(), 0.0, [](double value, const cv::Point2f& point) { return value + point.x; }) / std::max<size_t>(1, leftBox.points.size());
+					const double rightX = std::accumulate(rightBox.points.begin(), rightBox.points.end(), 0.0, [](double value, const cv::Point2f& point) { return value + point.x; }) / std::max<size_t>(1, rightBox.points.size());
+					return leftX < rightX;
+				});
+
+			return true;
+		}
+
+		bool DetectTextBoxesSingle(const cv::Mat& sourceImage, std::vector<DetectedTextBox>& textBoxes, std::string& errorMessage)
 		{
 			textBoxes.clear();
 
@@ -2220,8 +2395,7 @@ namespace
 			Ort::MemoryInfo memoryInfo = Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault);
 			Ort::Value inputTensor = Ort::Value::CreateTensor<float>(memoryInfo, detInputDataCache.data(), detInputDataCache.size(), inputShape.data(), inputShape.size());
 
-			Ort::RunOptions runOptions = CreateOnnxRuntimeRunOptions(options);
-			std::vector<Ort::Value> outputTensors = detSession->Run(runOptions, detInputNamePointers.data(), &inputTensor, 1, detOutputNamePointers.data(), detOutputNamePointers.size());
+			std::vector<Ort::Value> outputTensors = detSession->Run(GetRunOptions(), detInputNamePointers.data(), &inputTensor, 1, detOutputNamePointers.data(), detOutputNamePointers.size());
 			if (outputTensors.empty() || !outputTensors[0].IsTensor())
 			{
 				errorMessage = GB_STR("文本检测模型输出为空。");
@@ -2247,8 +2421,7 @@ namespace
 			const float* outputData = outputTensors[0].GetTensorMutableData<float>();
 			cv::Mat probabilityMap(outputHeight, outputWidth, CV_32FC1, const_cast<float*>(outputData));
 			cv::Mat binaryMap;
-			cv::threshold(probabilityMap, binaryMap, options.detDbThresh, 1.0, cv::THRESH_BINARY);
-			binaryMap.convertTo(binaryMap, CV_8UC1, 255.0);
+			cv::compare(probabilityMap, options.detDbThresh, binaryMap, cv::CMP_GT);
 			if (options.detUseDilation)
 			{
 				const cv::Mat dilationKernel = cv::getStructuringElement(cv::MORPH_RECT, cv::Size(2, 2));
@@ -2387,8 +2560,7 @@ namespace
 			Ort::MemoryInfo memoryInfo = Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault);
 			Ort::Value inputTensor = Ort::Value::CreateTensor<float>(memoryInfo, clsInputDataCache.data(), clsInputDataCache.size(), inputShape.data(), inputShape.size());
 
-			Ort::RunOptions runOptions = CreateOnnxRuntimeRunOptions(options);
-			std::vector<Ort::Value> outputTensors = clsSession->Run(runOptions, clsInputNamePointers.data(), &inputTensor, 1, clsOutputNamePointers.data(), clsOutputNamePointers.size());
+			std::vector<Ort::Value> outputTensors = clsSession->Run(GetRunOptions(), clsInputNamePointers.data(), &inputTensor, 1, clsOutputNamePointers.data(), clsOutputNamePointers.size());
 			if (outputTensors.empty() || !outputTensors[0].IsTensor())
 			{
 				errorMessage = GB_STR("文字方向分类模型输出为空。");
@@ -2580,8 +2752,7 @@ namespace
 			Ort::MemoryInfo memoryInfo = Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault);
 			Ort::Value inputTensor = Ort::Value::CreateTensor<float>(memoryInfo, recInputDataCache.data(), recInputDataCache.size(), inputShape.data(), inputShape.size());
 
-			Ort::RunOptions runOptions = CreateOnnxRuntimeRunOptions(options);
-			std::vector<Ort::Value> outputTensors = recSession->Run(runOptions, recInputNamePointers.data(), &inputTensor, 1, recOutputNamePointers.data(), recOutputNamePointers.size());
+			std::vector<Ort::Value> outputTensors = recSession->Run(GetRunOptions(), recInputNamePointers.data(), &inputTensor, 1, recOutputNamePointers.data(), recOutputNamePointers.size());
 			if (outputTensors.empty() || !outputTensors[0].IsTensor())
 			{
 				errorMessage = GB_STR("文本识别模型输出为空。");
@@ -2683,11 +2854,22 @@ namespace
 			return true;
 		}
 
+		Ort::RunOptions& GetRunOptions()
+		{
+			if (!runOptions)
+			{
+				runOptions.reset(new Ort::RunOptions(CreateOnnxRuntimeRunOptions(options)));
+			}
+
+			return *runOptions;
+		}
+
 		void ClearRuntime()
 		{
 			detSession.reset();
 			recSession.reset();
 			clsSession.reset();
+			runOptions.reset();
 			ortEnv.reset();
 			detInputNames.clear();
 			detOutputNames.clear();
@@ -2723,6 +2905,7 @@ namespace
 		std::unique_ptr<Ort::Session> detSession;
 		std::unique_ptr<Ort::Session> recSession;
 		std::unique_ptr<Ort::Session> clsSession;
+		std::unique_ptr<Ort::RunOptions> runOptions;
 		int runtimeRecBatchSize = 1;
 		int runtimeClsBatchSize = 1;
 		int fixedRecBatchSize = 0;

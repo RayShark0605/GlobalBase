@@ -25,6 +25,9 @@ enum class GB_OCRBackend
 
 	/**
 	 * @brief 使用 PP-OCRv5 mobile ONNX 模型，并通过 ONNX Runtime CPU 执行推理。
+	 *
+	 * 该后端只使用 ONNX Runtime 默认 CPU Execution Provider，不追加 CUDA/TensorRT EP，
+	 * 也不会主动加载、探测或预热 CUDA/cuDNN/TensorRT 相关 DLL。
 	 */
 	PPOCRv5MobileOnnxRuntimeCpu,
 
@@ -329,6 +332,21 @@ struct GB_OCROptions
 	double detBoxNmsThresh = 0.3;
 
 	/**
+	 * @brief 是否对超长图像自动分片检测。
+	 *
+	 * 对手机长截图、长票据、窄长扫描件等图像，整体缩放会导致短边被压得过小，容易漏检小字；
+	 * 开启后会按长边分片检测并合并结果。普通比例图像不会触发分片。
+	 */
+	bool enableLongImageDetectionSlice = true;
+
+	/**
+	 * @brief 超长图像分片检测的相邻分片重叠像素数。
+	 *
+	 * 适当重叠可避免文字正好落在切片边界导致被截断；最终会通过检测框 NMS 合并重复结果。
+	 */
+	int detSliceOverlap = 64;
+
+	/**
 	 * @brief 识别模型输入高度。
 	 */
 	int recImageHeight = 48;
@@ -366,9 +384,10 @@ struct GB_OCROptions
 	 * @brief 是否启用文字行方向分类。
 	 *
 	 * 仅当 clsModelPathUtf8 指向的模型文件存在时才会实际启用；若未配置该模型，将自动跳过本阶段。
-	 * 该阶段用于识别并纠正 180° 倒置文字行，可提升扫描件、截图和拍照文档的识别准确率。
+	 * 该阶段主要用于识别并纠正 180° 倒置文字行。常规截图、票据和文档图片通常不需要该阶段，
+	 * 默认关闭以避免额外的模型推理耗时；若存在倒置文字行，可显式开启以提升这类图像的识别准确率。
 	 */
-	bool useTextLineOrientationClassification = true;
+	bool useTextLineOrientationClassification = false;
 
 	/**
 	 * @brief 文字行方向分类模型输入高度。
