@@ -41,7 +41,6 @@
 #include <memory>
 #include <mutex>
 #include <sstream>
-#include <string_view>
 #include <unordered_map>
 #include <utility>
 
@@ -795,22 +794,95 @@ namespace
         return TryParseYamlUnsignedMagnitude(digits, numericBase, outValue);
     }
 
-    bool LooksLikeYamlFloatingPoint(const std::string& text)
+    bool IsYamlDecimalDigit(const char character)
     {
-        const std::string lowerText = ToLowerAsciiText(TrimAsciiText(text));
-        if (lowerText.empty())
+        return character >= '0' && character <= '9';
+    }
+
+    bool ConsumeYamlDecimalDigits(const std::string& text, std::size_t& index)
+    {
+        const std::size_t beginIndex = index;
+        while (index < text.size() && IsYamlDecimalDigit(text[index]))
+        {
+            index++;
+        }
+
+        return index > beginIndex;
+    }
+
+    bool TryConsumeYamlExponent(const std::string& text, std::size_t& index)
+    {
+        if (index >= text.size() || (text[index] != 'e' && text[index] != 'E'))
         {
             return false;
         }
 
+        std::size_t nextIndex = index + 1;
+        if (nextIndex < text.size() && (text[nextIndex] == '+' || text[nextIndex] == '-'))
+        {
+            nextIndex++;
+        }
+
+        if (!ConsumeYamlDecimalDigits(text, nextIndex))
+        {
+            return false;
+        }
+
+        index = nextIndex;
+        return true;
+    }
+
+    bool IsYamlFloatingPointSyntax(const std::string& trimmedText)
+    {
+        if (trimmedText.empty() || ContainsYamlNumericSeparator(trimmedText))
+        {
+            return false;
+        }
+
+        const std::string lowerText = ToLowerAsciiText(trimmedText);
         if (lowerText == ".nan" || lowerText == "+.nan" || lowerText == "-.nan"
             || lowerText == ".inf" || lowerText == "+.inf" || lowerText == "-.inf")
         {
             return true;
         }
 
-        return lowerText.find('.') != std::string::npos
-            || lowerText.find('e') != std::string::npos;
+        std::size_t index = 0;
+        if (trimmedText[index] == '+' || trimmedText[index] == '-')
+        {
+            index++;
+            if (index >= trimmedText.size())
+            {
+                return false;
+            }
+        }
+
+        const bool hasDigitsBeforeDot = ConsumeYamlDecimalDigits(trimmedText, index);
+        bool hasDot = false;
+        bool hasDigitsAfterDot = false;
+        if (index < trimmedText.size() && trimmedText[index] == '.')
+        {
+            hasDot = true;
+            index++;
+            hasDigitsAfterDot = ConsumeYamlDecimalDigits(trimmedText, index);
+        }
+
+        const bool hasExponent = TryConsumeYamlExponent(trimmedText, index);
+        if (index != trimmedText.size())
+        {
+            return false;
+        }
+
+        if (hasDot)
+        {
+            return hasDigitsBeforeDot || hasDigitsAfterDot;
+        }
+
+        return hasDigitsBeforeDot && hasExponent;
+    }
+
+    bool LooksLikeYamlFloatingPoint(const std::string& text)
+    {
+        return IsYamlFloatingPointSyntax(TrimAsciiText(text));
     }
 
     bool ContainsYamlNumericSeparator(const std::string& text)
@@ -875,7 +947,7 @@ namespace
             return true;
         }
 
-        if (ContainsYamlNumericSeparator(trimmedText))
+        if (!IsYamlFloatingPointSyntax(trimmedText))
         {
             return false;
         }
@@ -2354,24 +2426,29 @@ namespace
             return;
         }
 
-        outDocument.version = XmlCharToString(xmlDocument->version);
-        outDocument.encoding = XmlCharToString(xmlDocument->encoding);
-
         if (!hasXmlDeclaration)
         {
+            outDocument.version.clear();
+            outDocument.encoding.clear();
             outDocument.standalone = GB_XmlDocument::StandaloneMode::NoDeclaration;
-        }
-        else if (xmlDocument->standalone < 0)
-        {
-            outDocument.standalone = GB_XmlDocument::StandaloneMode::Omitted;
-        }
-        else if (xmlDocument->standalone == 0)
-        {
-            outDocument.standalone = GB_XmlDocument::StandaloneMode::No;
         }
         else
         {
-            outDocument.standalone = GB_XmlDocument::StandaloneMode::Yes;
+            outDocument.version = XmlCharToString(xmlDocument->version);
+            outDocument.encoding = XmlCharToString(xmlDocument->encoding);
+
+            if (xmlDocument->standalone < 0)
+            {
+                outDocument.standalone = GB_XmlDocument::StandaloneMode::Omitted;
+            }
+            else if (xmlDocument->standalone == 0)
+            {
+                outDocument.standalone = GB_XmlDocument::StandaloneMode::No;
+            }
+            else
+            {
+                outDocument.standalone = GB_XmlDocument::StandaloneMode::Yes;
+            }
         }
 
         if (xmlDocument->intSubset != nullptr)
@@ -3173,7 +3250,87 @@ namespace
             || unsignedCharacter == '\v';
     }
 
-    std::string_view TrimIniTextView(const std::string_view text)
+    class IniTextView
+    {
+    public:
+        static const std::size_t npos = static_cast<std::size_t>(-1);
+
+        IniTextView() noexcept
+            : data_(""), size_(0)
+        {
+        }
+
+        IniTextView(const char* const data, const std::size_t size) noexcept
+            : data_(data != nullptr ? data : ""), size_(data != nullptr ? size : 0)
+        {
+        }
+
+        const char* data() const noexcept
+        {
+            return data_;
+        }
+
+        std::size_t size() const noexcept
+        {
+            return size_;
+        }
+
+        bool empty() const noexcept
+        {
+            return size_ == 0;
+        }
+
+        char operator[](const std::size_t index) const noexcept
+        {
+            return data_[index];
+        }
+
+        IniTextView substr(const std::size_t position) const noexcept
+        {
+            return substr(position, npos);
+        }
+
+        IniTextView substr(const std::size_t position, const std::size_t count) const noexcept
+        {
+            if (position >= size_)
+            {
+                return IniTextView(data_ + size_, 0);
+            }
+
+            const std::size_t remainSize = size_ - position;
+            const std::size_t resultSize = count < remainSize ? count : remainSize;
+            return IniTextView(data_ + position, resultSize);
+        }
+
+        std::size_t find(const char character) const noexcept
+        {
+            for (std::size_t index = 0; index < size_; index++)
+            {
+                if (data_[index] == character)
+                {
+                    return index;
+                }
+            }
+
+            return npos;
+        }
+
+    private:
+        const char* data_;
+        std::size_t size_;
+    };
+
+    std::string MakeStringFromIniTextView(const IniTextView text)
+    {
+        if (text.empty())
+        {
+            return std::string();
+        }
+
+        return std::string(text.data(), text.size());
+    }
+
+    IniTextView TrimIniTextView(const IniTextView text)
     {
         std::size_t beginIndex = 0;
         std::size_t endIndex = text.size();
@@ -3193,8 +3350,8 @@ namespace
 
     std::string TrimIniTextCopy(const std::string& text)
     {
-        const std::string_view trimmedText = TrimIniTextView(std::string_view(text));
-        return std::string(trimmedText.data(), trimmedText.size());
+        const IniTextView trimmedText = TrimIniTextView(IniTextView(text.data(), text.size()));
+        return MakeStringFromIniTextView(trimmedText);
     }
 
     struct IniLineNumberItemInfo
@@ -3216,7 +3373,7 @@ namespace
         std::vector<IniLineNumberSectionInfo> sections;
     };
 
-    bool TryParseIniSectionHeader(const std::string_view trimmedLine, std::string& outSectionName)
+    bool TryParseIniSectionHeader(const IniTextView trimmedLine, std::string& outSectionName)
     {
         outSectionName.clear();
 
@@ -3226,33 +3383,27 @@ namespace
         }
 
         const std::size_t closeBracketPosition = trimmedLine.find(']');
-        if (closeBracketPosition == std::string_view::npos)
+        if (closeBracketPosition == IniTextView::npos)
         {
             return false;
         }
 
-        const std::string_view trailingText = TrimIniTextView(trimmedLine.substr(closeBracketPosition + 1));
-        if (!trailingText.empty() && trailingText[0] != ';' && trailingText[0] != '#')
-        {
-            return false;
-        }
-
-        const std::string_view sectionNameText = TrimIniTextView(trimmedLine.substr(1, closeBracketPosition - 1));
+        const IniTextView sectionNameText = TrimIniTextView(trimmedLine.substr(1, closeBracketPosition - 1));
         outSectionName.assign(sectionNameText.data(), sectionNameText.size());
         return true;
     }
 
-    bool TryParseIniKeyName(const std::string_view trimmedLine, std::string& outKey)
+    bool TryParseIniKeyName(const IniTextView trimmedLine, std::string& outKey)
     {
         outKey.clear();
 
         const std::size_t equalSignPosition = trimmedLine.find('=');
-        if (equalSignPosition == std::string_view::npos || equalSignPosition == 0)
+        if (equalSignPosition == IniTextView::npos || equalSignPosition == 0)
         {
             return false;
         }
 
-        const std::string_view keyText = TrimIniTextView(trimmedLine.substr(0, equalSignPosition));
+        const IniTextView keyText = TrimIniTextView(trimmedLine.substr(0, equalSignPosition));
         if (keyText.empty())
         {
             return false;
@@ -3366,8 +3517,8 @@ namespace
                 lineEndIndex++;
             }
 
-            const std::string_view rawLine(iniText.data() + lineStartIndex, lineEndIndex - lineStartIndex);
-            const std::string_view trimmedLine = TrimIniTextView(rawLine);
+            const IniTextView rawLine(iniText.data() + lineStartIndex, lineEndIndex - lineStartIndex);
+            const IniTextView trimmedLine = TrimIniTextView(rawLine);
             if (!trimmedLine.empty())
             {
                 const char firstCharacter = trimmedLine[0];
