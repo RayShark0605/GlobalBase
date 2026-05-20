@@ -13,6 +13,7 @@
 #include <limits>
 #include <mutex>
 #include <numeric>
+#include <set>
 #include <stdexcept>
 #include <utility>
 
@@ -146,6 +147,32 @@ namespace
 		return options;
 	}
 
+	OrtLoggingLevel ToOrtLoggingLevel(GB_OCROnnxRuntimeLogSeverityLevel logSeverityLevel)
+	{
+		switch (logSeverityLevel)
+		{
+		case GB_OCROnnxRuntimeLogSeverityLevel::Verbose:
+			return ORT_LOGGING_LEVEL_VERBOSE;
+		case GB_OCROnnxRuntimeLogSeverityLevel::Info:
+			return ORT_LOGGING_LEVEL_INFO;
+		case GB_OCROnnxRuntimeLogSeverityLevel::Warning:
+			return ORT_LOGGING_LEVEL_WARNING;
+		case GB_OCROnnxRuntimeLogSeverityLevel::Error:
+			return ORT_LOGGING_LEVEL_ERROR;
+		case GB_OCROnnxRuntimeLogSeverityLevel::Fatal:
+			return ORT_LOGGING_LEVEL_FATAL;
+		default:
+			return ORT_LOGGING_LEVEL_ERROR;
+		}
+	}
+
+	Ort::RunOptions CreateOnnxRuntimeRunOptions(const GB_OCROptions& options)
+	{
+		Ort::RunOptions runOptions;
+		runOptions.SetRunLogSeverityLevel(static_cast<int>(ToOrtLoggingLevel(options.onnxRuntimeLogSeverityLevel)));
+		return runOptions;
+	}
+
 	std::string JoinPath(const std::string& leftPathUtf8, const std::string& rightPathUtf8)
 	{
 		if (leftPathUtf8.empty())
@@ -195,6 +222,140 @@ namespace
 	}
 #endif
 
+
+	std::string BuildGlobalBaseDependencyDirectoryPath()
+	{
+		const std::string exeDirectory = GB_GetExeDirectory();
+		if (exeDirectory.empty())
+		{
+			return std::string();
+		}
+
+		return GB_JoinPath(exeDirectory, "GlobalBaseDependencies");
+	}
+
+#ifdef _WIN32
+	std::string BuildWin32ErrorMessage(const std::string& operationName, const std::string& filePathUtf8, DWORD errorCode)
+	{
+		std::string errorMessage = operationName;
+		errorMessage += GB_STR("失败，Win32 错误码：");
+		errorMessage += std::to_string(static_cast<unsigned long>(errorCode));
+		if (!filePathUtf8.empty())
+		{
+			errorMessage += GB_STR("，路径：");
+			errorMessage += filePathUtf8;
+		}
+
+		return errorMessage;
+	}
+
+	bool AddGlobalBaseDependencyDirectoryToDllSearchPath(const std::string& dependencyDirectoryPathUtf8, std::string& errorMessage)
+	{
+		errorMessage.clear();
+
+		if (dependencyDirectoryPathUtf8.empty())
+		{
+			errorMessage = GB_STR("依赖库目录为空。");
+			return false;
+		}
+
+		const std::wstring wideDependencyDirectoryPath = Utf8ToWideString(dependencyDirectoryPathUtf8);
+		if (wideDependencyDirectoryPath.empty())
+		{
+			errorMessage = GB_STR("依赖库目录 UTF-8 转换失败：") + dependencyDirectoryPathUtf8;
+			return false;
+		}
+
+		static std::mutex dependencyDirectoryMutex;
+		static bool hasAddedDependencyDirectory = false;
+		static std::string addedDependencyDirectoryPathUtf8;
+
+		std::lock_guard<std::mutex> lockGuard(dependencyDirectoryMutex);
+		if (hasAddedDependencyDirectory)
+		{
+			if (addedDependencyDirectoryPathUtf8 == dependencyDirectoryPathUtf8)
+			{
+				return true;
+			}
+
+			errorMessage = GB_STR("当前进程已经设置过不同的 DLL 搜索目录：") + addedDependencyDirectoryPathUtf8;
+			return false;
+		}
+
+		if (!SetDllDirectoryW(wideDependencyDirectoryPath.c_str()))
+		{
+			errorMessage = BuildWin32ErrorMessage(GB_STR("添加 DLL 搜索目录"), dependencyDirectoryPathUtf8, GetLastError());
+			return false;
+		}
+
+		addedDependencyDirectoryPathUtf8 = dependencyDirectoryPathUtf8;
+		hasAddedDependencyDirectory = true;
+		return true;
+	}
+
+	bool PrepareOnnxRuntimeDependencyDlls(bool requireCudaDependencyDlls, std::string& errorMessage)
+	{
+		errorMessage.clear();
+
+		const std::string dependencyDirectoryPathUtf8 = BuildGlobalBaseDependencyDirectoryPath();
+		if (dependencyDirectoryPathUtf8.empty())
+		{
+			if (requireCudaDependencyDlls)
+			{
+				errorMessage = GB_STR("获取 exe 所在目录失败，无法定位 GlobalBaseDependencies 目录。");
+				return false;
+			}
+
+			return true;
+		}
+
+		if (!GB_IsDirectoryExists(dependencyDirectoryPathUtf8))
+		{
+			if (requireCudaDependencyDlls)
+			{
+				errorMessage = GB_STR("ONNX Runtime CUDA 依赖库目录不存在：") + dependencyDirectoryPathUtf8;
+				return false;
+			}
+
+			return true;
+		}
+
+		if (!AddGlobalBaseDependencyDirectoryToDllSearchPath(dependencyDirectoryPathUtf8, errorMessage))
+		{
+			return false;
+		}
+
+		if (requireCudaDependencyDlls)
+		{
+			const std::vector<std::string> requiredCudaDependencyDllNames =
+			{
+				"onnxruntime_providers_shared.dll",
+				"onnxruntime_providers_cuda.dll",
+				"cudnn64_9.dll"
+			};
+
+			for (const std::string& dllName : requiredCudaDependencyDllNames)
+			{
+				const std::string dllPathUtf8 = GB_JoinPath(dependencyDirectoryPathUtf8, dllName);
+				if (!GB_IsFileExists(dllPathUtf8))
+				{
+					errorMessage = GB_STR("缺少 ONNX Runtime CUDA 运行时依赖库：") + dllPathUtf8;
+					return false;
+				}
+			}
+		}
+
+		return true;
+	}
+#else
+	bool PrepareOnnxRuntimeDependencyDlls(bool requireCudaDependencyDlls, std::string& errorMessage)
+	{
+		(void)requireCudaDependencyDlls;
+		errorMessage.clear();
+		return true;
+	}
+#endif
+
 	std::basic_string<ORTCHAR_T> ToOrtPath(const std::string& filePathUtf8)
 	{
 #ifdef _WIN32
@@ -202,6 +363,106 @@ namespace
 #else
 		return filePathUtf8;
 #endif
+	}
+
+	struct CudaProviderOptionsDeleter
+	{
+		void operator()(OrtCUDAProviderOptionsV2* cudaProviderOptions) const
+		{
+			if (cudaProviderOptions)
+			{
+				Ort::GetApi().ReleaseCUDAProviderOptions(cudaProviderOptions);
+			}
+		}
+	};
+
+	bool AppendCudaExecutionProvider(Ort::SessionOptions& sessionOptions, const GB_OCROptions& options, std::string& errorMessage)
+	{
+		errorMessage.clear();
+
+		try
+		{
+			const OrtApi& ortApi = Ort::GetApi();
+			OrtCUDAProviderOptionsV2* rawCudaProviderOptions = nullptr;
+			Ort::ThrowOnError(ortApi.CreateCUDAProviderOptions(&rawCudaProviderOptions));
+			std::unique_ptr<OrtCUDAProviderOptionsV2, CudaProviderOptionsDeleter> cudaProviderOptions(rawCudaProviderOptions);
+
+			std::vector<std::string> optionKeys;
+			std::vector<std::string> optionValues;
+			optionKeys.reserve(4);
+			optionValues.reserve(4);
+
+			optionKeys.push_back("device_id");
+			optionValues.push_back(std::to_string(std::max(0, options.onnxRuntimeCudaDeviceId)));
+
+			optionKeys.push_back("do_copy_in_default_stream");
+			optionValues.push_back("1");
+
+			optionKeys.push_back("use_tf32");
+			optionValues.push_back(options.onnxRuntimeCudaUseTf32 ? "1" : "0");
+
+			if (options.onnxRuntimeCudaGpuMemLimitBytes > 0)
+			{
+				optionKeys.push_back("gpu_mem_limit");
+				optionValues.push_back(std::to_string(options.onnxRuntimeCudaGpuMemLimitBytes));
+			}
+
+			std::vector<const char*> optionKeyPointers;
+			std::vector<const char*> optionValuePointers;
+			optionKeyPointers.reserve(optionKeys.size());
+			optionValuePointers.reserve(optionValues.size());
+			for (size_t optionIndex = 0; optionIndex < optionKeys.size(); optionIndex++)
+			{
+				optionKeyPointers.push_back(optionKeys[optionIndex].c_str());
+				optionValuePointers.push_back(optionValues[optionIndex].c_str());
+			}
+
+			Ort::ThrowOnError(ortApi.UpdateCUDAProviderOptions(cudaProviderOptions.get(), optionKeyPointers.data(), optionValuePointers.data(), optionKeyPointers.size()));
+			Ort::ThrowOnError(ortApi.SessionOptionsAppendExecutionProvider_CUDA_V2(static_cast<OrtSessionOptions*>(sessionOptions), cudaProviderOptions.get()));
+		}
+		catch (const Ort::Exception& exception)
+		{
+			errorMessage = GB_STR("ONNX Runtime CUDA Execution Provider 初始化失败：") + exception.what();
+			return false;
+		}
+		catch (const std::exception& exception)
+		{
+			errorMessage = GB_STR("ONNX Runtime CUDA Execution Provider 初始化失败：") + exception.what();
+			return false;
+		}
+
+		return true;
+	}
+
+	bool AppendCpuExecutionProvider(Ort::SessionOptions& sessionOptions, std::string& errorMessage)
+	{
+		(void)sessionOptions;
+		errorMessage.clear();
+
+		// ONNX Runtime 的 CPU Execution Provider 是默认后端。
+		// 部分 ONNX Runtime 版本的 C++ 头文件提供了 AppendExecutionProvider_CPU 包装函数，
+		// 但实际发行包中的 C API 头文件未必导出 OrtSessionOptionsAppendExecutionProvider_CPU 符号，
+		// 直接调用该包装函数可能导致编译失败。这里保留函数入口，仅依赖默认 CPU EP。
+		return true;
+	}
+
+	bool IsOnnxRuntimeCudaExecutionProviderAvailable(const GB_OCROptions& options)
+	{
+		try
+		{
+			std::string errorMessage;
+			if (!PrepareOnnxRuntimeDependencyDlls(true, errorMessage))
+			{
+				return false;
+			}
+
+			Ort::SessionOptions sessionOptions;
+			return AppendCudaExecutionProvider(sessionOptions, NormalizeOptions(options), errorMessage);
+		}
+		catch (...)
+		{
+			return false;
+		}
 	}
 
 	FILE* OpenFileUtf8(const std::string& filePathUtf8, const char* mode)
@@ -1666,11 +1927,11 @@ namespace
 		return sampleData[classIndex];
 	}
 
-	class GB_PPOCRv5MobileOnnxRuntimeCpuBackend : public IGB_OCRBackend
+	class GB_PPOCRv5MobileOnnxRuntimeBackend : public IGB_OCRBackend
 	{
 	public:
-		explicit GB_PPOCRv5MobileOnnxRuntimeCpuBackend(const GB_OCROptions& inputOptions)
-			: options(NormalizeOptions(inputOptions))
+		explicit GB_PPOCRv5MobileOnnxRuntimeBackend(const GB_OCROptions& inputOptions, GB_OCRBackend inputBackendType)
+			: backendType(inputBackendType), options(NormalizeOptions(inputOptions))
 		{
 		}
 
@@ -1687,14 +1948,21 @@ namespace
 					return false;
 				}
 
+				if (!PrepareOnnxRuntimeDependencyDlls(backendType == GB_OCRBackend::PPOCRv5MobileOnnxRuntimeCuda, errorMessage))
+				{
+					return false;
+				}
+
 				if (!ReadTextLinesUtf8(modelPaths.dictPathUtf8, characterDict))
 				{
 					errorMessage = GB_STR("读取 PP-OCRv5 字典文件失败。");
 					return false;
 				}
 
-				ortEnv.reset(new Ort::Env(ORT_LOGGING_LEVEL_WARNING, "GlobalBase.GB_OCR"));
+				const OrtLoggingLevel ortLogSeverityLevel = ToOrtLoggingLevel(options.onnxRuntimeLogSeverityLevel);
+				ortEnv.reset(new Ort::Env(ortLogSeverityLevel, "GlobalBase.GB_OCR"));
 				Ort::SessionOptions sessionOptions;
+				sessionOptions.SetLogSeverityLevel(static_cast<int>(ortLogSeverityLevel));
 				if (options.intraOpNumThreads > 0)
 				{
 					sessionOptions.SetIntraOpNumThreads(options.intraOpNumThreads);
@@ -1704,6 +1972,20 @@ namespace
 					sessionOptions.SetInterOpNumThreads(options.interOpNumThreads);
 				}
 				sessionOptions.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
+				if (backendType == GB_OCRBackend::PPOCRv5MobileOnnxRuntimeCuda)
+				{
+					if (!AppendCudaExecutionProvider(sessionOptions, options, errorMessage))
+					{
+						ClearRuntime();
+						return false;
+					}
+
+					if (!AppendCpuExecutionProvider(sessionOptions, errorMessage))
+					{
+						ClearRuntime();
+						return false;
+					}
+				}
 
 				const std::basic_string<ORTCHAR_T> detModelPath = ToOrtPath(modelPaths.detModelPathUtf8);
 				const std::basic_string<ORTCHAR_T> recModelPath = ToOrtPath(modelPaths.recModelPathUtf8);
@@ -1905,7 +2187,7 @@ namespace
 
 		virtual GB_OCRBackend GetBackendType() const override
 		{
-			return GB_OCRBackend::PPOCRv5MobileOnnxRuntimeCpu;
+			return backendType;
 		}
 
 	private:
@@ -1938,7 +2220,8 @@ namespace
 			Ort::MemoryInfo memoryInfo = Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault);
 			Ort::Value inputTensor = Ort::Value::CreateTensor<float>(memoryInfo, detInputDataCache.data(), detInputDataCache.size(), inputShape.data(), inputShape.size());
 
-			std::vector<Ort::Value> outputTensors = detSession->Run(Ort::RunOptions{ nullptr }, detInputNamePointers.data(), &inputTensor, 1, detOutputNamePointers.data(), detOutputNamePointers.size());
+			Ort::RunOptions runOptions = CreateOnnxRuntimeRunOptions(options);
+			std::vector<Ort::Value> outputTensors = detSession->Run(runOptions, detInputNamePointers.data(), &inputTensor, 1, detOutputNamePointers.data(), detOutputNamePointers.size());
 			if (outputTensors.empty() || !outputTensors[0].IsTensor())
 			{
 				errorMessage = GB_STR("文本检测模型输出为空。");
@@ -2104,7 +2387,8 @@ namespace
 			Ort::MemoryInfo memoryInfo = Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault);
 			Ort::Value inputTensor = Ort::Value::CreateTensor<float>(memoryInfo, clsInputDataCache.data(), clsInputDataCache.size(), inputShape.data(), inputShape.size());
 
-			std::vector<Ort::Value> outputTensors = clsSession->Run(Ort::RunOptions{ nullptr }, clsInputNamePointers.data(), &inputTensor, 1, clsOutputNamePointers.data(), clsOutputNamePointers.size());
+			Ort::RunOptions runOptions = CreateOnnxRuntimeRunOptions(options);
+			std::vector<Ort::Value> outputTensors = clsSession->Run(runOptions, clsInputNamePointers.data(), &inputTensor, 1, clsOutputNamePointers.data(), clsOutputNamePointers.size());
 			if (outputTensors.empty() || !outputTensors[0].IsTensor())
 			{
 				errorMessage = GB_STR("文字方向分类模型输出为空。");
@@ -2296,7 +2580,8 @@ namespace
 			Ort::MemoryInfo memoryInfo = Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault);
 			Ort::Value inputTensor = Ort::Value::CreateTensor<float>(memoryInfo, recInputDataCache.data(), recInputDataCache.size(), inputShape.data(), inputShape.size());
 
-			std::vector<Ort::Value> outputTensors = recSession->Run(Ort::RunOptions{ nullptr }, recInputNamePointers.data(), &inputTensor, 1, recOutputNamePointers.data(), recOutputNamePointers.size());
+			Ort::RunOptions runOptions = CreateOnnxRuntimeRunOptions(options);
+			std::vector<Ort::Value> outputTensors = recSession->Run(runOptions, recInputNamePointers.data(), &inputTensor, 1, recOutputNamePointers.data(), recOutputNamePointers.size());
 			if (outputTensors.empty() || !outputTensors[0].IsTensor())
 			{
 				errorMessage = GB_STR("文本识别模型输出为空。");
@@ -2430,6 +2715,7 @@ namespace
 		}
 
 	private:
+		GB_OCRBackend backendType = GB_OCRBackend::PPOCRv5MobileOnnxRuntimeCpu;
 		GB_OCROptions options;
 		GB_PPOCRv5MobileModelPaths modelPaths;
 		std::vector<std::string> characterDict;
@@ -2471,11 +2757,11 @@ namespace
 			const GB_PPOCRv5MobileModelPaths modelPaths = NormalizeModelPaths(options.ppocrv5MobileModelPaths);
 			if (HasAllRequiredPPOCRv5ModelFiles(modelPaths))
 			{
-				actualBackend = GB_OCRBackend::PPOCRv5MobileOnnxRuntimeCpu;
+				actualBackend = IsOnnxRuntimeCudaExecutionProviderAvailable(options) ? GB_OCRBackend::PPOCRv5MobileOnnxRuntimeCuda : GB_OCRBackend::PPOCRv5MobileOnnxRuntimeCpu;
 			}
 			else
 			{
-				errorMessage = BuildMissingPPOCRv5ModelFileMessage(modelPaths) + GB_STR(" Auto 当前只会自动选择 PP-OCRv5 mobile ONNX Runtime CPU 后端。");
+				errorMessage = BuildMissingPPOCRv5ModelFileMessage(modelPaths) + GB_STR(" Auto 当前只会自动选择 PP-OCRv5 mobile ONNX Runtime CPU/CUDA 后端。");
 				return std::unique_ptr<IGB_OCRBackend>();
 			}
 		}
@@ -2483,7 +2769,9 @@ namespace
 		switch (actualBackend)
 		{
 		case GB_OCRBackend::PPOCRv5MobileOnnxRuntimeCpu:
-			return std::unique_ptr<IGB_OCRBackend>(new GB_PPOCRv5MobileOnnxRuntimeCpuBackend(options));
+			return std::unique_ptr<IGB_OCRBackend>(new GB_PPOCRv5MobileOnnxRuntimeBackend(options, GB_OCRBackend::PPOCRv5MobileOnnxRuntimeCpu));
+		case GB_OCRBackend::PPOCRv5MobileOnnxRuntimeCuda:
+			return std::unique_ptr<IGB_OCRBackend>(new GB_PPOCRv5MobileOnnxRuntimeBackend(options, GB_OCRBackend::PPOCRv5MobileOnnxRuntimeCuda));
 		case GB_OCRBackend::OpenCVTesseract:
 			errorMessage = GB_STR("OpenCV Tesseract OCR 后端尚未实现。");
 			return std::unique_ptr<IGB_OCRBackend>();
@@ -2528,22 +2816,7 @@ public:
 			return true;
 		}
 
-		backend = CreateBackend(options, actualBackend, lastErrorMessage);
-		if (!backend)
-		{
-			actualBackend = GB_OCRBackend::Auto;
-			return false;
-		}
-
-		if (!backend->Initialize(lastErrorMessage))
-		{
-			backend.reset();
-			actualBackend = GB_OCRBackend::Auto;
-			return false;
-		}
-
-		actualBackend = backend->GetBackendType();
-		return true;
+		return EnsureBackendInitialized();
 	}
 
 	bool Recognize(const GB_Image& image, std::vector<GB_OCRTextBlock>& textBlocks, GB_OCRBackend& outputActualBackend, std::string& outputErrorMessage)
@@ -2555,16 +2828,7 @@ public:
 		bool success = false;
 		if (!backend)
 		{
-			backend = CreateBackend(options, actualBackend, lastErrorMessage);
-			if (backend && backend->Initialize(lastErrorMessage))
-			{
-				actualBackend = backend->GetBackendType();
-			}
-			else
-			{
-				backend.reset();
-				actualBackend = GB_OCRBackend::Auto;
-			}
+			EnsureBackendInitialized();
 		}
 
 		if (backend)
@@ -2575,6 +2839,47 @@ public:
 		outputActualBackend = actualBackend;
 		outputErrorMessage = lastErrorMessage;
 		return success;
+	}
+
+	bool EnsureBackendInitialized()
+	{
+		backend = CreateBackend(options, actualBackend, lastErrorMessage);
+		if (!backend)
+		{
+			actualBackend = GB_OCRBackend::Auto;
+			return false;
+		}
+
+		if (backend->Initialize(lastErrorMessage))
+		{
+			actualBackend = backend->GetBackendType();
+			return true;
+		}
+
+		const GB_OCRBackend failedBackend = actualBackend;
+		const std::string firstErrorMessage = lastErrorMessage;
+		backend.reset();
+
+		if (options.backend == GB_OCRBackend::Auto && failedBackend == GB_OCRBackend::PPOCRv5MobileOnnxRuntimeCuda)
+		{
+			GB_OCROptions cpuOptions = options;
+			cpuOptions.backend = GB_OCRBackend::PPOCRv5MobileOnnxRuntimeCpu;
+			backend = CreateBackend(cpuOptions, actualBackend, lastErrorMessage);
+			if (backend && backend->Initialize(lastErrorMessage))
+			{
+				actualBackend = backend->GetBackendType();
+				return true;
+			}
+
+			const std::string fallbackErrorMessage = lastErrorMessage;
+			backend.reset();
+			actualBackend = GB_OCRBackend::Auto;
+			lastErrorMessage = firstErrorMessage + GB_STR(" 自动回退 CPU 后端也失败：") + fallbackErrorMessage;
+			return false;
+		}
+
+		actualBackend = GB_OCRBackend::Auto;
+		return false;
 	}
 
 	void SetLastErrorMessage(const std::string& errorMessage)
@@ -2780,6 +3085,11 @@ bool GB_OCR::IsBackendAvailable(GB_OCRBackend backend)
 	if (backend == GB_OCRBackend::Auto || backend == GB_OCRBackend::PPOCRv5MobileOnnxRuntimeCpu)
 	{
 		return IsDefaultPPOCRv5MobileModelAvailable();
+	}
+
+	if (backend == GB_OCRBackend::PPOCRv5MobileOnnxRuntimeCuda)
+	{
+		return IsDefaultPPOCRv5MobileModelAvailable() && IsOnnxRuntimeCudaExecutionProviderAvailable(GB_OCROptions());
 	}
 
 	return false;

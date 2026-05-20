@@ -13,8 +13,8 @@
 /**
  * @brief OCR 后端类型。
  *
- * 当前已实现 PP-OCRv5_mobile_det + PP-OCRv5_mobile_rec + ONNX Runtime CPU。
- * 其它枚举值用于后续平滑扩展，不会在当前版本中被自动选择。
+ * 当前已实现 PP-OCRv5_mobile_det + PP-OCRv5_mobile_rec + ONNX Runtime CPU/CUDA。
+ * Auto 会优先尝试 CUDA 后端，CUDA 不可用时自动退回 CPU 后端。
  */
 enum class GB_OCRBackend
 {
@@ -27,6 +27,14 @@ enum class GB_OCRBackend
 	 * @brief 使用 PP-OCRv5 mobile ONNX 模型，并通过 ONNX Runtime CPU 执行推理。
 	 */
 	PPOCRv5MobileOnnxRuntimeCpu,
+
+	/**
+	 * @brief 使用 PP-OCRv5 mobile ONNX 模型，并通过 ONNX Runtime CUDA 执行推理。
+	 *
+	 * 需要使用带 CUDA Execution Provider 的 ONNX Runtime GPU 包。
+	 * Windows 下会优先尝试从 $(exe所在目录)/GlobalBaseDependencies 预加载 CUDA/cuDNN 相关运行时 DLL。
+	 */
+	PPOCRv5MobileOnnxRuntimeCuda,
 
 	/**
 	 * @brief 预留：使用 OpenCV Tesseract OCR。
@@ -58,6 +66,41 @@ enum class GB_OCRTextDetectionScoreMode
 	 * @brief 使用原始轮廓区域内的概率均值，过滤低质量框更精确，但会略微增加后处理耗时。
 	 */
 	Slow
+};
+
+/**
+ * @brief ONNX Runtime 日志严重程度。
+ *
+ * ONNX Runtime 在 CUDA 后端中可能会把少量形状推导类节点放到 CPU 上执行，
+ * 并在 Warning 级别输出提示。OCR 正常使用时通常不需要显示这类内部调度提示，
+ * 因此 GB_OCROptions 默认使用 Error 级别；调试模型节点分配时可改为 Verbose 或 Info。
+ */
+enum class GB_OCROnnxRuntimeLogSeverityLevel
+{
+	/**
+	 * @brief 输出详细诊断日志。
+	 */
+	Verbose = 0,
+
+	/**
+	 * @brief 输出信息、警告和错误日志。
+	 */
+	Info = 1,
+
+	/**
+	 * @brief 输出警告和错误日志。
+	 */
+	Warning = 2,
+
+	/**
+	 * @brief 仅输出错误和致命错误日志。
+	 */
+	Error = 3,
+
+	/**
+	 * @brief 仅输出致命错误日志。
+	 */
+	Fatal = 4
 };
 
 /**
@@ -181,6 +224,36 @@ struct GB_OCROptions
 	 * @brief ONNX Runtime inter-op 线程数，0 表示使用 ONNX Runtime 默认值。
 	 */
 	int interOpNumThreads = 0;
+
+	/**
+	 * @brief ONNX Runtime 日志严重程度。
+	 *
+	 * 默认只输出 Error 及以上级别，避免 CUDA 后端在正常模型图优化和节点分配时输出非错误 warning。
+	 * 若需要诊断 CUDA/CPU 节点分配情况，可临时设置为 Warning、Info 或 Verbose。
+	 */
+	GB_OCROnnxRuntimeLogSeverityLevel onnxRuntimeLogSeverityLevel = GB_OCROnnxRuntimeLogSeverityLevel::Error;
+
+	/**
+	 * @brief ONNX Runtime CUDA 设备编号。
+	 *
+	 * 仅在 PPOCRv5MobileOnnxRuntimeCuda 后端或 Auto 自动选择到 CUDA 后端时生效。
+	 */
+	int onnxRuntimeCudaDeviceId = 0;
+
+	/**
+	 * @brief ONNX Runtime CUDA 显存池上限，单位为字节。
+	 *
+	 * 0 表示使用 ONNX Runtime 默认值；该限制只作用于 CUDA Execution Provider 的 Arena，不代表进程总显存上限。
+	 */
+	unsigned long long onnxRuntimeCudaGpuMemLimitBytes = 0;
+
+	/**
+	 * @brief ONNX Runtime CUDA 是否允许使用 TF32。
+	 *
+	 * Ampere 及之后的 NVIDIA GPU 上，开启 TF32 通常能提升 float32 卷积和矩阵运算速度；
+	 * OCR 推理场景通常可以保持默认开启。
+	 */
+	bool onnxRuntimeCudaUseTf32 = true;
 
 	/**
 	 * @brief 文本检测输入图像边长限制。
