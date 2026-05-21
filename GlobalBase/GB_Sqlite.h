@@ -340,6 +340,45 @@ struct GLOBALBASE_PORT GB_SqliteColumnInfo
 };
 
 /**
+ * @brief SQLite 表字段信息。
+ *
+ * @details
+ * 该结构用于描述数据库表中真实字段的定义信息，通常由 GetTableFieldInfos() 返回。
+ * 与 GB_SqliteColumnInfo 不同，GB_SqliteColumnInfo 描述的是查询结果列；本结构描述的是表结构中的字段。
+ */
+struct GLOBALBASE_PORT GB_SqliteTableFieldInfo
+{
+    /** @brief 字段在当前表结构查询结果中的序号。 */
+    int cid = -1;
+
+    /** @brief 字段名称，UTF-8 编码。 */
+    std::string nameUtf8;
+
+    /** @brief 字段声明类型，例如 INTEGER、TEXT、REAL、BLOB。未声明时为空字符串。 */
+    std::string typeUtf8;
+
+    /** @brief 字段是否声明为 NOT NULL。 */
+    bool notNull = false;
+
+    /** @brief 字段是否存在默认值声明。 */
+    bool hasDefaultValue = false;
+
+    /** @brief 字段默认值表达式文本，UTF-8 编码。仅当 hasDefaultValue 为 true 时有效。 */
+    std::string defaultValueUtf8;
+
+    /** @brief 主键字段序号。0 表示不是主键字段；大于 0 表示在复合主键中的 1 基序号。 */
+    int primaryKeyIndex = 0;
+
+    /**
+     * @brief SQLite table_xinfo hidden 标记。
+     *
+     * @remarks
+     * 0 表示普通字段；1 通常表示虚表隐藏字段；2 或 3 表示生成字段。includeHiddenFields 为 false 时只返回 hidden == 0 的普通字段。
+     */
+    int hidden = 0;
+};
+
+/**
  * @brief SQLite 查询结果。
  *
  * @details
@@ -351,6 +390,7 @@ struct GLOBALBASE_PORT GB_SqliteColumnInfo
  * - SQL NULL 会被转换为空 GB_Variant。
  * - SQLite INTEGER / REAL / TEXT / BLOB 分别转换为 long long / double / std::string / GB_ByteBuffer。
  */
+
 struct GLOBALBASE_PORT GB_SqliteResult
 {
     /** @brief 查询结果列元信息，顺序与 SELECT 输出列顺序一致。 */
@@ -625,6 +665,109 @@ public:
 
     /** @brief 清空最近一次错误信息。 */
     void ClearLastError();
+
+
+    /**
+     * @brief 获取当前数据库某个 schema 中的所有表名。
+     *
+     * @param outTableNames 输出表名列表。函数开始时会清空旧内容。
+     * @param includeSystemTables 是否包含 sqlite_ 开头的 SQLite 内部表。
+     * @param schemaNameUtf8 schema 名称，默认 main；也可传入 temp 或已 ATTACH 的 schema 名。
+     * @return true 查询成功；
+     * @return false 查询失败，可通过 GetLastError() 获取错误信息。
+     */
+    bool GetTableNames(std::vector<std::string>& outTableNames, bool includeSystemTables = false, const std::string& schemaNameUtf8 = "main") const;
+
+    /**
+     * @brief 判断指定表是否存在。
+     *
+     * @param tableNameUtf8 表名，UTF-8 编码，不需要包含 schema 前缀。
+     * @param outExists 输出是否存在。函数开始时会先置为 false。
+     * @param includeSystemTables 是否允许匹配 sqlite_ 开头的 SQLite 内部表。
+     * @param schemaNameUtf8 schema 名称，默认 main。
+     * @return true 查询成功；
+     * @return false 查询失败。
+     */
+    bool TableExists(const std::string& tableNameUtf8, bool& outExists, bool includeSystemTables = false, const std::string& schemaNameUtf8 = "main") const;
+
+    /**
+     * @brief 获取指定表的字段定义信息。
+     *
+     * @param tableNameUtf8 表名，UTF-8 编码，不需要包含 schema 前缀。
+     * @param outFieldInfos 输出字段信息。函数开始时会清空旧内容。
+     * @param includeHiddenFields 是否包含虚表隐藏字段、生成字段等 table_xinfo 扩展字段。
+     * @param schemaNameUtf8 schema 名称，默认 main。
+     * @return true 查询成功；
+     * @return false 查询失败。
+     *
+     * @remarks
+     * 本接口优先使用 SQLite 的 pragma_table_xinfo 表值函数，可取得比 table_info 更完整的字段信息。
+     */
+    bool GetTableFieldInfos(const std::string& tableNameUtf8, std::vector<GB_SqliteTableFieldInfo>& outFieldInfos, bool includeHiddenFields = false, const std::string& schemaNameUtf8 = "main") const;
+
+    /**
+     * @brief 获取指定表的当前数据内容。
+     *
+     * @param tableNameUtf8 表名，UTF-8 编码，不需要包含 schema 前缀。
+     * @param outResult 输出查询结果。字段信息和单元格数据按 SELECT * 的列顺序返回。
+     * @param maxRowCount 最大读取行数；0 表示不限制。
+     * @param schemaNameUtf8 schema 名称，默认 main。
+     * @return true 查询成功；
+     * @return false 查询失败。
+     *
+     * @remarks
+     * 该接口会完整读取结果到内存。大表建议设置 maxRowCount，或直接使用 QueryEach() 自行流式遍历。
+     */
+    bool GetTableData(const std::string& tableNameUtf8, GB_SqliteResult& outResult, std::size_t maxRowCount = 0, const std::string& schemaNameUtf8 = "main") const;
+
+    /**
+     * @brief 获取指定表的当前行数。
+     *
+     * @param tableNameUtf8 表名，UTF-8 编码，不需要包含 schema 前缀。
+     * @param outRowCount 输出行数。函数开始时会先置为 0。
+     * @param schemaNameUtf8 schema 名称，默认 main。
+     * @return true 查询成功；
+     * @return false 查询失败。
+     */
+    bool GetTableRowCount(const std::string& tableNameUtf8, long long& outRowCount, const std::string& schemaNameUtf8 = "main") const;
+
+    /**
+     * @brief 判断指定表中是否存在一行满足字段等值条件的数据。
+     *
+     * @param tableNameUtf8 表名，UTF-8 编码，不需要包含 schema 前缀。
+     * @param equalFieldValues 字段等值条件。key 为字段名，value 为期望值；value 为空 GB_Variant 时按 SQL NULL 判断。
+     * @param outExists 输出是否存在。函数开始时会先置为 false。
+     * @param schemaNameUtf8 schema 名称，默认 main。
+     * @return true 查询成功；
+     * @return false 查询失败。
+     *
+     * @remarks
+     * equalFieldValues 为空时，本接口退化为判断表中是否至少存在一行数据。
+     */
+    bool TableRowExists(const std::string& tableNameUtf8, const GB_SqliteNamedParameters& equalFieldValues, bool& outExists, const std::string& schemaNameUtf8 = "main") const;
+
+    /**
+     * @brief 将另一个 SQLite 数据库附加到当前连接池的所有内部连接。
+     *
+     * @param databasePathUtf8 被附加数据库路径，UTF-8 编码；启用 URI 时可传入 file: URI。
+     * @param schemaNameUtf8 附加后的 schema 名称，不能为 main 或 temp。
+     * @return true 附加成功；
+     * @return false 附加失败。
+     *
+     * @remarks
+     * SQLite 的 ATTACH 是连接级状态。为了避免“写连接已 ATTACH、读连接未 ATTACH”的不一致，本接口会在 schema 写锁下同步更新写连接和所有读连接。
+     */
+    bool AttachDatabase(const std::string& databasePathUtf8, const std::string& schemaNameUtf8);
+
+    /**
+     * @brief 从当前连接池的所有内部连接中分离一个已附加数据库。
+     *
+     * @param schemaNameUtf8 需要分离的 schema 名称，不能为 main 或 temp。
+     * @return true 分离成功；
+     * @return false 分离失败。
+     */
+    bool DetachDatabase(const std::string& schemaNameUtf8);
+
 
     /**
      * @brief 执行一条不带参数的非查询 SQL。

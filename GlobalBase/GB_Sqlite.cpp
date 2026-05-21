@@ -394,6 +394,273 @@ namespace
         return openMode == GB_SqliteOpenMode::ReadOnly;
     }
 
+
+    static bool ContainsNullCharacter(const std::string& textUtf8)
+    {
+        return textUtf8.find('\0') != std::string::npos;
+    }
+
+    static std::string NormalizeSchemaName(const std::string& schemaNameUtf8)
+    {
+        return schemaNameUtf8.empty() ? std::string("main") : schemaNameUtf8;
+    }
+
+    static std::string QuoteSqlIdentifierUnchecked(const std::string& identifierUtf8)
+    {
+        std::string result;
+        result.reserve(identifierUtf8.size() + 2);
+        result.push_back('"');
+        for (std::size_t index = 0; index < identifierUtf8.size(); index++)
+        {
+            const char ch = identifierUtf8[index];
+            if (ch == '"')
+            {
+                result.push_back('"');
+                result.push_back('"');
+            }
+            else
+            {
+                result.push_back(ch);
+            }
+        }
+        result.push_back('"');
+        return result;
+    }
+
+    static std::string QuoteSqlStringLiteralUnchecked(const std::string& textUtf8)
+    {
+        std::string result;
+        result.reserve(textUtf8.size() + 2);
+        result.push_back('\'');
+        for (std::size_t index = 0; index < textUtf8.size(); index++)
+        {
+            const char ch = textUtf8[index];
+            if (ch == '\'')
+            {
+                result.push_back('\'');
+                result.push_back('\'');
+            }
+            else
+            {
+                result.push_back(ch);
+            }
+        }
+        result.push_back('\'');
+        return result;
+    }
+
+    static bool IsMainOrTempSchemaName(const std::string& schemaNameUtf8)
+    {
+        const std::string lowerSchemaNameUtf8 = ToLowerAsciiString(schemaNameUtf8);
+        return lowerSchemaNameUtf8 == "main" || lowerSchemaNameUtf8 == "temp";
+    }
+
+    static void SkipSqlQuotedContent(const char*& currentPtr)
+    {
+        if (currentPtr == nullptr || *currentPtr == '\0')
+        {
+            return;
+        }
+
+        const char quoteChar = *currentPtr;
+        if (quoteChar == '\'' || quoteChar == '"' || quoteChar == '`')
+        {
+            currentPtr++;
+            while (*currentPtr != '\0')
+            {
+                if (*currentPtr == quoteChar)
+                {
+                    if (currentPtr[1] == quoteChar)
+                    {
+                        currentPtr += 2;
+                        continue;
+                    }
+
+                    currentPtr++;
+                    return;
+                }
+
+                currentPtr++;
+            }
+            return;
+        }
+
+        if (quoteChar == '[')
+        {
+            currentPtr++;
+            while (*currentPtr != '\0')
+            {
+                if (*currentPtr == ']')
+                {
+                    currentPtr++;
+                    return;
+                }
+
+                currentPtr++;
+            }
+        }
+    }
+
+    static std::string ReadSqlKeywordLowerAtCurrent(const char*& currentPtr)
+    {
+        std::string keyword;
+        while (currentPtr != nullptr && *currentPtr != '\0')
+        {
+            const char ch = *currentPtr;
+            if (!((ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z') || ch == '_'))
+            {
+                break;
+            }
+
+            keyword.push_back(ToLowerAscii(ch));
+            currentPtr++;
+        }
+
+        return keyword;
+    }
+
+    static void SkipToNextSqlStatement(const char*& currentPtr)
+    {
+        while (currentPtr != nullptr && *currentPtr != '\0')
+        {
+            if (SkipSqlComment(currentPtr))
+            {
+                continue;
+            }
+
+            if (*currentPtr == '\'' || *currentPtr == '"' || *currentPtr == '`' || *currentPtr == '[')
+            {
+                SkipSqlQuotedContent(currentPtr);
+                continue;
+            }
+
+            if (*currentPtr == ';')
+            {
+                currentPtr++;
+                return;
+            }
+
+            currentPtr++;
+        }
+    }
+
+    static bool SqlBatchContainsAttachOrDetachSql(const std::string& sqlUtf8)
+    {
+        const char* currentPtr = sqlUtf8.c_str();
+        while (currentPtr != nullptr && *currentPtr != '\0')
+        {
+            while (*currentPtr != '\0' && (IsSqlWhitespace(*currentPtr) || *currentPtr == ';'))
+            {
+                currentPtr++;
+            }
+
+            if (SkipSqlComment(currentPtr))
+            {
+                continue;
+            }
+
+            if (*currentPtr == '\0')
+            {
+                break;
+            }
+
+            const char* keywordPtr = currentPtr;
+            const std::string keyword = ReadSqlKeywordLowerAtCurrent(keywordPtr);
+            if (keyword == "attach" || keyword == "detach")
+            {
+                return true;
+            }
+
+            SkipToNextSqlStatement(currentPtr);
+        }
+
+        return false;
+    }
+
+    static bool ValidateSqlText(const std::string& sqlUtf8, GB_SqliteError& outError)
+    {
+        if (ContainsNullCharacter(sqlUtf8))
+        {
+            outError = MakeUserError("SQLite SQL text contains null character.", sqlUtf8);
+            return false;
+        }
+
+        outError.Clear();
+        return true;
+    }
+
+    static bool ValidateSqlIdentifier(const std::string& identifierUtf8, const std::string& identifierDescriptionUtf8, GB_SqliteError& outError, const std::string& sqlUtf8 = std::string())
+    {
+        if (identifierUtf8.empty())
+        {
+            outError = MakeUserError("SQLite " + identifierDescriptionUtf8 + " is empty.", sqlUtf8);
+            return false;
+        }
+
+        if (ContainsNullCharacter(identifierUtf8))
+        {
+            outError = MakeUserError("SQLite " + identifierDescriptionUtf8 + " contains null character.", sqlUtf8);
+            return false;
+        }
+
+        outError.Clear();
+        return true;
+    }
+
+    static bool BuildQualifiedTableName(const std::string& schemaNameUtf8, const std::string& tableNameUtf8, std::string& outQualifiedNameUtf8, GB_SqliteError& outError)
+    {
+        const std::string normalizedSchemaNameUtf8 = NormalizeSchemaName(schemaNameUtf8);
+        if (!ValidateSqlIdentifier(normalizedSchemaNameUtf8, "schema name", outError) || !ValidateSqlIdentifier(tableNameUtf8, "table name", outError))
+        {
+            return false;
+        }
+
+        outQualifiedNameUtf8 = QuoteSqlIdentifierUnchecked(normalizedSchemaNameUtf8) + "." + QuoteSqlIdentifierUnchecked(tableNameUtf8);
+        outError.Clear();
+        return true;
+    }
+
+    static bool BuildQualifiedSchemaObjectName(const std::string& schemaNameUtf8, const std::string& objectNameUtf8, std::string& outQualifiedNameUtf8, GB_SqliteError& outError)
+    {
+        const std::string normalizedSchemaNameUtf8 = NormalizeSchemaName(schemaNameUtf8);
+        if (!ValidateSqlIdentifier(normalizedSchemaNameUtf8, "schema name", outError) || !ValidateSqlIdentifier(objectNameUtf8, "schema object name", outError))
+        {
+            return false;
+        }
+
+        outQualifiedNameUtf8 = QuoteSqlIdentifierUnchecked(normalizedSchemaNameUtf8) + "." + QuoteSqlIdentifierUnchecked(objectNameUtf8);
+        outError.Clear();
+        return true;
+    }
+
+    static bool VariantToInt(const GB_Variant& value, int& outValue)
+    {
+        bool ok = false;
+        outValue = value.ToInt(&ok);
+        return ok;
+    }
+
+    static bool VariantToInt64(const GB_Variant& value, long long& outValue)
+    {
+        bool ok = false;
+        outValue = value.ToInt64(&ok);
+        return ok;
+    }
+
+    static bool VariantToString(const GB_Variant& value, std::string& outValue)
+    {
+        if (value.IsEmpty() || value.Type() == GB_VariantType::Empty)
+        {
+            outValue.clear();
+            return false;
+        }
+
+        bool ok = false;
+        outValue = value.ToString(&ok);
+        return ok;
+    }
+
+
     static int PrepareSqlStatement(sqlite3* database, const std::string& sqlUtf8, bool persistent, sqlite3_stmt** outStatement, const char** outTail)
     {
         const int sqlByteCount = static_cast<int>(sqlUtf8.size() + 1);
@@ -734,6 +1001,11 @@ namespace
             return false;
         }
 
+        if (!ValidateSqlText(sqlUtf8, outError))
+        {
+            return false;
+        }
+
         char* errorMessage = nullptr;
         const int code = sqlite3_exec(database, sqlUtf8.c_str(), nullptr, nullptr, &errorMessage);
         if (code == SQLITE_OK)
@@ -834,6 +1106,11 @@ namespace
             return false;
         }
 
+        if (!ValidateSqlText(sqlUtf8, outError))
+        {
+            return false;
+        }
+
         if (sqlUtf8.size() > static_cast<std::size_t>(std::numeric_limits<int>::max() - 1))
         {
             outError = MakeUserError("SQLite SQL text is too large.", sqlUtf8);
@@ -842,7 +1119,7 @@ namespace
 
         if (IsConnectionStateSql(sqlUtf8))
         {
-            outError = MakeUserError("SQLite transaction/connection state SQL should use GB_SqliteTransaction or a complete ExecuteBatch().", sqlUtf8);
+            outError = MakeUserError("SQLite transaction SQL should use GB_SqliteTransaction. ATTACH/DETACH should use AttachDatabase() or DetachDatabase().", sqlUtf8);
             return false;
         }
 
@@ -2001,6 +2278,7 @@ struct GB_Sqlite::Impl
                     {
                         GB_SqliteError ignoredResetError;
                         (void)ResetStatementHandle(connection, sqlUtf8, statementHandle, ignoredResetError);
+                        outResult.Clear();
                         outResult.error = MakeUserError("Failed to read SQLite query result row.", sqlUtf8);
                         return false;
                     }
@@ -2347,9 +2625,23 @@ struct GB_SqliteTransaction::Impl
 
     bool Rollback()
     {
-        if (!active || owner == nullptr || !owner->writeConnection || owner->writeConnection->database == nullptr)
+        if (!active)
+        {
+            ClearError();
+            return true;
+        }
+
+        if (owner == nullptr || !owner->writeConnection || owner->writeConnection->database == nullptr)
         {
             SetError(MakeUserError("SQLite transaction is not active."));
+            active = false;
+            if (writeLock.owns_lock())
+            {
+                writeLock.unlock();
+            }
+            schemaGuard.reset();
+            lifecycleGuard.reset();
+            owner = nullptr;
             return false;
         }
 
@@ -2819,6 +3111,12 @@ bool GB_Sqlite::ExecuteBatch(const std::string& sqlBatchUtf8)
         return false;
     }
 
+    if (SqlBatchContainsAttachOrDetachSql(sqlBatchUtf8))
+    {
+        impl_->SetLastError(MakeUserError("SQLite ATTACH/DETACH should use AttachDatabase() or DetachDatabase() so all internal connections stay consistent.", sqlBatchUtf8));
+        return false;
+    }
+
     GB_WriteLockGuard schemaGuard(impl_->schemaLock);
     std::lock_guard<std::mutex> writeLock(impl_->writeMutex);
     if (!impl_->CanWrite())
@@ -3058,6 +3356,562 @@ bool GB_Sqlite::ExecuteScalarNamed(const std::string& sqlUtf8, const GB_SqliteNa
 
     impl_->SetLastError(ok ? MakeOkError() : error);
     return ok;
+}
+
+
+bool GB_Sqlite::GetTableNames(std::vector<std::string>& outTableNames, bool includeSystemTables, const std::string& schemaNameUtf8) const
+{
+    outTableNames.clear();
+
+    GB_SqliteError error;
+    std::string schemaObjectNameUtf8;
+    if (!BuildQualifiedSchemaObjectName(schemaNameUtf8, "sqlite_schema", schemaObjectNameUtf8, error))
+    {
+        if (impl_)
+        {
+            impl_->SetLastError(error);
+        }
+        return false;
+    }
+
+    const std::string sqlUtf8 = "SELECT name FROM " + schemaObjectNameUtf8 + " WHERE type = 'table' AND (:includeSystemTables != 0 OR name NOT LIKE 'sqlite\\_%' ESCAPE '\\') ORDER BY name";
+    GB_SqliteNamedParameters parameters;
+    parameters["includeSystemTables"] = GB_Variant(includeSystemTables ? 1 : 0);
+
+    GB_SqliteResult result;
+    if (!QueryNamed(sqlUtf8, parameters, result))
+    {
+        return false;
+    }
+
+    try
+    {
+        outTableNames.reserve(result.RowCount());
+        for (std::size_t rowIndex = 0; rowIndex < result.RowCount(); rowIndex++)
+        {
+            std::string tableNameUtf8;
+            if (!VariantToString(result.GetValue(rowIndex, "name"), tableNameUtf8))
+            {
+                error = MakeUserError("Failed to read SQLite table name.", sqlUtf8);
+                impl_->SetLastError(error);
+                outTableNames.clear();
+                return false;
+            }
+
+            outTableNames.push_back(tableNameUtf8);
+        }
+    }
+    catch (const std::bad_alloc&)
+    {
+        error = MakeBadAllocError("read SQLite table names", sqlUtf8);
+        impl_->SetLastError(error);
+        outTableNames.clear();
+        return false;
+    }
+    catch (...)
+    {
+        error = MakeExceptionError("read SQLite table names", sqlUtf8);
+        impl_->SetLastError(error);
+        outTableNames.clear();
+        return false;
+    }
+
+    if (impl_)
+    {
+        impl_->ClearLastError();
+    }
+    return true;
+}
+
+bool GB_Sqlite::TableExists(const std::string& tableNameUtf8, bool& outExists, bool includeSystemTables, const std::string& schemaNameUtf8) const
+{
+    outExists = false;
+
+    GB_SqliteError error;
+    if (!ValidateSqlIdentifier(tableNameUtf8, "table name", error))
+    {
+        if (impl_)
+        {
+            impl_->SetLastError(error);
+        }
+        return false;
+    }
+
+    std::string schemaObjectNameUtf8;
+    if (!BuildQualifiedSchemaObjectName(schemaNameUtf8, "sqlite_schema", schemaObjectNameUtf8, error))
+    {
+        if (impl_)
+        {
+            impl_->SetLastError(error);
+        }
+        return false;
+    }
+
+    const std::string sqlUtf8 = "SELECT 1 FROM " + schemaObjectNameUtf8 + " WHERE type = 'table' AND name = :tableName AND (:includeSystemTables != 0 OR name NOT LIKE 'sqlite\\_%' ESCAPE '\\') LIMIT 1";
+    GB_SqliteNamedParameters parameters;
+    parameters["tableName"] = GB_Variant(tableNameUtf8);
+    parameters["includeSystemTables"] = GB_Variant(includeSystemTables ? 1 : 0);
+
+    GB_Variant value;
+    if (!ExecuteScalarNamed(sqlUtf8, parameters, value))
+    {
+        return false;
+    }
+
+    outExists = !value.IsEmpty() && value.Type() != GB_VariantType::Empty;
+    if (impl_)
+    {
+        impl_->ClearLastError();
+    }
+    return true;
+}
+
+bool GB_Sqlite::GetTableFieldInfos(const std::string& tableNameUtf8, std::vector<GB_SqliteTableFieldInfo>& outFieldInfos, bool includeHiddenFields, const std::string& schemaNameUtf8) const
+{
+    outFieldInfos.clear();
+
+    GB_SqliteError error;
+    if (!ValidateSqlIdentifier(tableNameUtf8, "table name", error))
+    {
+        if (impl_)
+        {
+            impl_->SetLastError(error);
+        }
+        return false;
+    }
+
+    const std::string normalizedSchemaNameUtf8 = NormalizeSchemaName(schemaNameUtf8);
+    if (!ValidateSqlIdentifier(normalizedSchemaNameUtf8, "schema name", error))
+    {
+        if (impl_)
+        {
+            impl_->SetLastError(error);
+        }
+        return false;
+    }
+
+    bool tableExists = false;
+    if (!TableExists(tableNameUtf8, tableExists, true, normalizedSchemaNameUtf8))
+    {
+        return false;
+    }
+
+    if (!tableExists)
+    {
+        error = MakeUserError("SQLite table does not exist: " + tableNameUtf8);
+        if (impl_)
+        {
+            impl_->SetLastError(error);
+        }
+        return false;
+    }
+
+    const std::string sqlUtf8 = "SELECT cid, name, type, \"notnull\", dflt_value, pk, hidden FROM pragma_table_xinfo(:tableName, :schemaName) WHERE (:includeHiddenFields != 0 OR hidden = 0) ORDER BY cid";
+    GB_SqliteNamedParameters parameters;
+    parameters["tableName"] = GB_Variant(tableNameUtf8);
+    parameters["schemaName"] = GB_Variant(normalizedSchemaNameUtf8);
+    parameters["includeHiddenFields"] = GB_Variant(includeHiddenFields ? 1 : 0);
+
+    GB_SqliteResult result;
+    if (!QueryNamed(sqlUtf8, parameters, result))
+    {
+        return false;
+    }
+
+    try
+    {
+        outFieldInfos.reserve(result.RowCount());
+        for (std::size_t rowIndex = 0; rowIndex < result.RowCount(); rowIndex++)
+        {
+            GB_SqliteTableFieldInfo fieldInfo;
+            if (!VariantToInt(result.GetValue(rowIndex, "cid"), fieldInfo.cid))
+            {
+                error = MakeUserError("Failed to read SQLite table field cid.", sqlUtf8);
+                impl_->SetLastError(error);
+                outFieldInfos.clear();
+                return false;
+            }
+
+            if (!VariantToString(result.GetValue(rowIndex, "name"), fieldInfo.nameUtf8))
+            {
+                error = MakeUserError("Failed to read SQLite table field name.", sqlUtf8);
+                impl_->SetLastError(error);
+                outFieldInfos.clear();
+                return false;
+            }
+
+            (void)VariantToString(result.GetValue(rowIndex, "type"), fieldInfo.typeUtf8);
+
+            int notNullValue = 0;
+            if (!VariantToInt(result.GetValue(rowIndex, "notnull"), notNullValue))
+            {
+                error = MakeUserError("Failed to read SQLite table field notnull flag.", sqlUtf8);
+                impl_->SetLastError(error);
+                outFieldInfos.clear();
+                return false;
+            }
+            fieldInfo.notNull = notNullValue != 0;
+
+            const GB_Variant defaultValue = result.GetValue(rowIndex, "dflt_value");
+            fieldInfo.hasDefaultValue = !defaultValue.IsEmpty() && defaultValue.Type() != GB_VariantType::Empty;
+            if (fieldInfo.hasDefaultValue)
+            {
+                (void)VariantToString(defaultValue, fieldInfo.defaultValueUtf8);
+            }
+
+            if (!VariantToInt(result.GetValue(rowIndex, "pk"), fieldInfo.primaryKeyIndex))
+            {
+                error = MakeUserError("Failed to read SQLite table field primary key index.", sqlUtf8);
+                impl_->SetLastError(error);
+                outFieldInfos.clear();
+                return false;
+            }
+
+            if (!VariantToInt(result.GetValue(rowIndex, "hidden"), fieldInfo.hidden))
+            {
+                error = MakeUserError("Failed to read SQLite table field hidden flag.", sqlUtf8);
+                impl_->SetLastError(error);
+                outFieldInfos.clear();
+                return false;
+            }
+
+            outFieldInfos.push_back(std::move(fieldInfo));
+        }
+    }
+    catch (const std::bad_alloc&)
+    {
+        error = MakeBadAllocError("read SQLite table field infos", sqlUtf8);
+        impl_->SetLastError(error);
+        outFieldInfos.clear();
+        return false;
+    }
+    catch (...)
+    {
+        error = MakeExceptionError("read SQLite table field infos", sqlUtf8);
+        impl_->SetLastError(error);
+        outFieldInfos.clear();
+        return false;
+    }
+
+    if (impl_)
+    {
+        impl_->ClearLastError();
+    }
+    return true;
+}
+
+bool GB_Sqlite::GetTableData(const std::string& tableNameUtf8, GB_SqliteResult& outResult, std::size_t maxRowCount, const std::string& schemaNameUtf8) const
+{
+    outResult.Clear();
+
+    GB_SqliteError error;
+    std::string qualifiedTableNameUtf8;
+    if (!BuildQualifiedTableName(schemaNameUtf8, tableNameUtf8, qualifiedTableNameUtf8, error))
+    {
+        outResult.error = error;
+        if (impl_)
+        {
+            impl_->SetLastError(error);
+        }
+        return false;
+    }
+
+    std::string sqlUtf8 = "SELECT * FROM " + qualifiedTableNameUtf8;
+    if (maxRowCount > 0 && maxRowCount <= static_cast<std::size_t>(std::numeric_limits<long long>::max()))
+    {
+        sqlUtf8 += " LIMIT " + ToString(static_cast<long long>(maxRowCount));
+    }
+
+    return Query(sqlUtf8, outResult, maxRowCount);
+}
+
+bool GB_Sqlite::GetTableRowCount(const std::string& tableNameUtf8, long long& outRowCount, const std::string& schemaNameUtf8) const
+{
+    outRowCount = 0;
+
+    GB_SqliteError error;
+    std::string qualifiedTableNameUtf8;
+    if (!BuildQualifiedTableName(schemaNameUtf8, tableNameUtf8, qualifiedTableNameUtf8, error))
+    {
+        if (impl_)
+        {
+            impl_->SetLastError(error);
+        }
+        return false;
+    }
+
+    const std::string sqlUtf8 = "SELECT COUNT(*) FROM " + qualifiedTableNameUtf8;
+    GB_Variant value;
+    if (!ExecuteScalar(sqlUtf8, value))
+    {
+        return false;
+    }
+
+    if (!VariantToInt64(value, outRowCount))
+    {
+        error = MakeUserError("Failed to read SQLite table row count.", sqlUtf8);
+        if (impl_)
+        {
+            impl_->SetLastError(error);
+        }
+        outRowCount = 0;
+        return false;
+    }
+
+    if (impl_)
+    {
+        impl_->ClearLastError();
+    }
+    return true;
+}
+
+bool GB_Sqlite::TableRowExists(const std::string& tableNameUtf8, const GB_SqliteNamedParameters& equalFieldValues, bool& outExists, const std::string& schemaNameUtf8) const
+{
+    outExists = false;
+
+    GB_SqliteError error;
+    std::string qualifiedTableNameUtf8;
+    if (!BuildQualifiedTableName(schemaNameUtf8, tableNameUtf8, qualifiedTableNameUtf8, error))
+    {
+        if (impl_)
+        {
+            impl_->SetLastError(error);
+        }
+        return false;
+    }
+
+    std::string sqlUtf8 = "SELECT 1 FROM " + qualifiedTableNameUtf8;
+    GB_SqliteNamedParameters parameters;
+
+    if (!equalFieldValues.empty())
+    {
+        sqlUtf8 += " WHERE ";
+        std::size_t conditionIndex = 0;
+        for (GB_SqliteNamedParameters::const_iterator iter = equalFieldValues.begin(); iter != equalFieldValues.end(); iter++)
+        {
+            if (!ValidateSqlIdentifier(iter->first, "field name", error))
+            {
+                if (impl_)
+                {
+                    impl_->SetLastError(error);
+                }
+                return false;
+            }
+
+            std::ostringstream parameterNameStream;
+            parameterNameStream << "gbRowValue" << conditionIndex;
+            const std::string parameterNameUtf8 = parameterNameStream.str();
+
+            if (conditionIndex > 0)
+            {
+                sqlUtf8 += " AND ";
+            }
+
+            sqlUtf8 += QuoteSqlIdentifierUnchecked(iter->first) + " IS :" + parameterNameUtf8;
+            parameters[parameterNameUtf8] = iter->second;
+            conditionIndex++;
+        }
+    }
+
+    sqlUtf8 += " LIMIT 1";
+
+    GB_Variant value;
+    if (!ExecuteScalarNamed(sqlUtf8, parameters, value))
+    {
+        return false;
+    }
+
+    outExists = !value.IsEmpty() && value.Type() != GB_VariantType::Empty;
+    if (impl_)
+    {
+        impl_->ClearLastError();
+    }
+    return true;
+}
+
+bool GB_Sqlite::AttachDatabase(const std::string& databasePathUtf8, const std::string& schemaNameUtf8)
+{
+    if (!impl_)
+    {
+        return false;
+    }
+
+    GB_SqliteError error;
+    const std::string normalizedSchemaNameUtf8 = NormalizeSchemaName(schemaNameUtf8);
+    if (databasePathUtf8.empty())
+    {
+        impl_->SetLastError(MakeUserError("SQLite attached database path is empty."));
+        return false;
+    }
+
+    if (ContainsNullCharacter(databasePathUtf8))
+    {
+        impl_->SetLastError(MakeUserError("SQLite attached database path contains null character."));
+        return false;
+    }
+
+    if (!ValidateSqlIdentifier(normalizedSchemaNameUtf8, "schema name", error))
+    {
+        impl_->SetLastError(error);
+        return false;
+    }
+
+    if (IsMainOrTempSchemaName(normalizedSchemaNameUtf8))
+    {
+        impl_->SetLastError(MakeUserError("SQLite attached schema name cannot be main or temp."));
+        return false;
+    }
+
+    const std::string sqlUtf8 = "ATTACH DATABASE " + QuoteSqlStringLiteralUnchecked(databasePathUtf8) + " AS " + QuoteSqlIdentifierUnchecked(normalizedSchemaNameUtf8);
+
+    GB_ReadLockGuard lifecycleGuard(impl_->lifecycleLock);
+    if (!impl_->isOpen || !impl_->writeConnection)
+    {
+        impl_->SetLastError(MakeUserError("SQLite database is not open.", sqlUtf8));
+        return false;
+    }
+
+    GB_WriteLockGuard schemaGuard(impl_->schemaLock);
+    std::lock_guard<std::mutex> writeLock(impl_->writeMutex);
+    std::lock_guard<std::mutex> readLock(impl_->readPoolMutex);
+
+    const auto clearStatementCaches = [this]()
+        {
+            if (impl_->writeConnection)
+            {
+                impl_->writeConnection->statementCache.Clear();
+            }
+
+            for (std::size_t index = 0; index < impl_->readConnections.size(); index++)
+            {
+                if (impl_->readConnections[index])
+                {
+                    impl_->readConnections[index]->statementCache.Clear();
+                }
+            }
+
+            impl_->pendingReadStatementCacheClear = false;
+        };
+
+    clearStatementCaches();
+
+    std::vector<GB_SqliteConnection*> attachedConnections;
+    attachedConnections.reserve(impl_->readConnections.size() + 1);
+
+    if (!DirectExec(impl_->writeConnection->database, sqlUtf8, error))
+    {
+        impl_->SetLastError(error);
+        return false;
+    }
+    attachedConnections.push_back(impl_->writeConnection.get());
+
+    for (std::size_t index = 0; index < impl_->readConnections.size(); index++)
+    {
+        if (!impl_->readConnections[index] || impl_->readConnections[index]->database == nullptr)
+        {
+            continue;
+        }
+
+        if (!DirectExec(impl_->readConnections[index]->database, sqlUtf8, error))
+        {
+            const std::string detachSqlUtf8 = "DETACH DATABASE " + QuoteSqlIdentifierUnchecked(normalizedSchemaNameUtf8);
+            for (std::size_t attachedIndex = 0; attachedIndex < attachedConnections.size(); attachedIndex++)
+            {
+                GB_SqliteError ignoredError;
+                (void)DirectExec(attachedConnections[attachedIndex]->database, detachSqlUtf8, ignoredError);
+            }
+
+            clearStatementCaches();
+            impl_->SetLastError(error);
+            return false;
+        }
+
+        attachedConnections.push_back(impl_->readConnections[index].get());
+    }
+
+    clearStatementCaches();
+    impl_->ClearLastError();
+    return true;
+}
+
+bool GB_Sqlite::DetachDatabase(const std::string& schemaNameUtf8)
+{
+    if (!impl_)
+    {
+        return false;
+    }
+
+    GB_SqliteError error;
+    const std::string normalizedSchemaNameUtf8 = NormalizeSchemaName(schemaNameUtf8);
+    if (!ValidateSqlIdentifier(normalizedSchemaNameUtf8, "schema name", error))
+    {
+        impl_->SetLastError(error);
+        return false;
+    }
+
+    if (IsMainOrTempSchemaName(normalizedSchemaNameUtf8))
+    {
+        impl_->SetLastError(MakeUserError("SQLite detached schema name cannot be main or temp."));
+        return false;
+    }
+
+    const std::string sqlUtf8 = "DETACH DATABASE " + QuoteSqlIdentifierUnchecked(normalizedSchemaNameUtf8);
+
+    GB_ReadLockGuard lifecycleGuard(impl_->lifecycleLock);
+    if (!impl_->isOpen || !impl_->writeConnection)
+    {
+        impl_->SetLastError(MakeUserError("SQLite database is not open.", sqlUtf8));
+        return false;
+    }
+
+    GB_WriteLockGuard schemaGuard(impl_->schemaLock);
+    std::lock_guard<std::mutex> writeLock(impl_->writeMutex);
+    std::lock_guard<std::mutex> readLock(impl_->readPoolMutex);
+
+    const auto clearStatementCaches = [this]()
+        {
+            if (impl_->writeConnection)
+            {
+                impl_->writeConnection->statementCache.Clear();
+            }
+
+            for (std::size_t index = 0; index < impl_->readConnections.size(); index++)
+            {
+                if (impl_->readConnections[index])
+                {
+                    impl_->readConnections[index]->statementCache.Clear();
+                }
+            }
+
+            impl_->pendingReadStatementCacheClear = false;
+        };
+
+    clearStatementCaches();
+
+    if (!DirectExec(impl_->writeConnection->database, sqlUtf8, error))
+    {
+        impl_->SetLastError(error);
+        return false;
+    }
+
+    for (std::size_t index = 0; index < impl_->readConnections.size(); index++)
+    {
+        if (!impl_->readConnections[index] || impl_->readConnections[index]->database == nullptr)
+        {
+            continue;
+        }
+
+        if (!DirectExec(impl_->readConnections[index]->database, sqlUtf8, error))
+        {
+            clearStatementCaches();
+            impl_->SetLastError(error);
+            return false;
+        }
+    }
+
+    clearStatementCaches();
+    impl_->ClearLastError();
+    return true;
 }
 
 GB_SqliteTransaction GB_Sqlite::BeginTransaction(GB_SqliteTransactionMode transactionMode)
