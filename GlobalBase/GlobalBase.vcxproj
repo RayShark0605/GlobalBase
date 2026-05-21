@@ -40,6 +40,7 @@
     <ClInclude Include="GB_Process.h" />
     <ClInclude Include="GB_ReadWriteLock.h" />
     <ClInclude Include="GB_SmbAccessor.h" />
+    <ClInclude Include="GB_Sqlite.h" />
     <ClInclude Include="GB_SysInfo.h" />
     <ClInclude Include="GB_ThreadPool.h" />
     <ClInclude Include="GB_Timer.h" />
@@ -79,6 +80,7 @@
     <ClCompile Include="GB_Process.cpp" />
     <ClCompile Include="GB_ReadWriteLock.cpp" />
     <ClCompile Include="GB_SmbAccessor.cpp" />
+    <ClCompile Include="GB_Sqlite.cpp" />
     <ClCompile Include="GB_SysInfo.cpp" />
     <ClCompile Include="GB_ThreadPool.cpp" />
     <ClCompile Include="GB_Timer.cpp" />
@@ -243,7 +245,7 @@
       <SubSystem>Windows</SubSystem>
       <GenerateDebugInformation>true</GenerateDebugInformation>
       <EnableUAC>false</EnableUAC>
-      <AdditionalDependencies>libcurl.lib;libcrypto.lib;z.lib;opencv_core4.lib;opencv_imgcodecs4.lib;opencv_imgproc4.lib;opencv_features2d4.lib;opencv_calib3d4.lib;opencv_cudaimgproc4.lib;gdal.lib;libxml2.lib;yaml-cpp.lib;onnxruntime.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>libcurl.lib;libcrypto.lib;z.lib;opencv_core4.lib;opencv_imgcodecs4.lib;opencv_imgproc4.lib;opencv_features2d4.lib;opencv_calib3d4.lib;opencv_cudaimgproc4.lib;gdal.lib;libxml2.lib;yaml-cpp.lib;onnxruntime.lib;sqlite3.lib;%(AdditionalDependencies)</AdditionalDependencies>
       <LinkTimeCodeGeneration>UseLinkTimeCodeGeneration</LinkTimeCodeGeneration>
       <DelayLoadDLLs>libcurl.dll;libcrypto-3-x64.dll;z.dll;opencv_core4.dll;opencv_imgcodecs4.dll;opencv_imgproc4.dll;opencv_features2d4.dll;opencv_calib3d4.dll;opencv_cudaimgproc4.dll;gdal.dll;libxml2.dll;yaml-cpp.dll;onnxruntime.dll;%(DelayLoadDLLs)</DelayLoadDLLs>
     </Link>
