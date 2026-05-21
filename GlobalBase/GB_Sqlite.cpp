@@ -394,7 +394,6 @@ namespace
         return openMode == GB_SqliteOpenMode::ReadOnly;
     }
 
-
     static bool ContainsNullCharacter(const std::string& textUtf8)
     {
         return textUtf8.find('\0') != std::string::npos;

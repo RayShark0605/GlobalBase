@@ -29,6 +29,7 @@
     <ClInclude Include="GB_Crypto.h" />
     <ClInclude Include="GB_DataCache.h" />
     <ClInclude Include="GB_DateTime.h" />
+    <ClInclude Include="GB_Dbg.h" />
     <ClInclude Include="GB_DelayLoadRuntime.h" />
     <ClInclude Include="GB_FileSystem.h" />
     <ClInclude Include="GB_FormatParser.h" />
@@ -69,6 +70,7 @@
     <ClCompile Include="GB_Crypto.cpp" />
     <ClCompile Include="GB_DataCache.cpp" />
     <ClCompile Include="GB_DateTime.cpp" />
+    <ClCompile Include="GB_Dbg.cpp" />
     <ClCompile Include="GB_DelayLoadRuntime.cpp" />
     <ClCompile Include="GB_DllMain.cpp" />
     <ClCompile Include="GB_FileSystem.cpp" />

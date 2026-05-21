@@ -147,6 +147,9 @@
     <ClInclude Include="GB_Sqlite.h">
       <Filter>头文件</Filter>
     </ClInclude>
+    <ClInclude Include="GB_Dbg.h">
+      <Filter>头文件</Filter>
+    </ClInclude>
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="GB_Utf8String.cpp">
@@ -255,6 +258,9 @@
       <Filter>源文件\CV</Filter>
     </ClCompile>
     <ClCompile Include="GB_Sqlite.cpp">
+      <Filter>源文件</Filter>
+    </ClCompile>
+    <ClCompile Include="GB_Dbg.cpp">
       <Filter>源文件</Filter>
     </ClCompile>
   </ItemGroup>
