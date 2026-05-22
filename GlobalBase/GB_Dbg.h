@@ -56,11 +56,12 @@ struct GB_DbgStackTrace
  */
 struct GB_DbgSymbolOptions
 {
-    std::string symbolSearchPathUtf8 = "";           // 符号搜索路径；为空时由 DbgHelp 使用默认搜索规则
+    std::string symbolSearchPathUtf8 = "";           // 符号搜索路径；为空时自动使用“程序目录 + 当前目录 + _NT_SYMBOL_PATH + _NT_ALTERNATE_SYMBOL_PATH”
     bool loadLineInfo = true;                        // 是否加载源码行号信息
     bool undecorateSymbolNames = true;               // 是否尽量输出未修饰函数名
     bool deferredLoadSymbols = true;                 // 是否延迟加载符号
     bool failCriticalErrors = true;                  // 是否避免弹出系统级严重错误对话框
+    bool noSymbolPrompts = true;                     // 是否禁用符号服务器交互式提示，适合无人值守程序和崩溃处理路径
     bool loadModules = true;                         // 初始化时是否枚举并加载当前进程已加载模块
 };
 
@@ -161,36 +162,78 @@ GLOBALBASE_PORT void GB_DbgBreakIfDebuggerPresent();
  *
  * @param skipFrameCount 额外跳过的栈帧数量。默认 0 表示返回调用者视角的栈。
  * @param maxFrameCount 最多捕获的栈帧数量。建议 16~128，过大意义有限。
+ * @param resolveSymbols 是否解析模块、函数名和源码行号。
  * @return GB_DbgStackTrace 调用栈信息。失败时 frames 为空；若符号解析失败，仍会尽量返回地址帧。
  *
  * @remarks
  * - Windows x64 下当前线程采集优先使用 CaptureStackBackTrace，开销比完整 StackWalk64 更低。
- * - 本函数会自动确保符号引擎已初始化，以便解析模块、函数名和源码行号。
+ * - 当 resolveSymbols 为 true 时，本函数会自动确保符号引擎已初始化，以便解析模块、函数名和源码行号。
+ * - 当 resolveSymbols 为 false 时，本函数只填充地址字段，可避免 DbgHelp 初始化和符号解析开销。
  */
-GLOBALBASE_PORT GB_DbgStackTrace GB_DbgCaptureStackTrace(size_t skipFrameCount = 0, size_t maxFrameCount = 64);
+GLOBALBASE_PORT GB_DbgStackTrace GB_DbgCaptureStackTrace(size_t skipFrameCount = 0, size_t maxFrameCount = 64, bool resolveSymbols = true);
+
+/**
+ * @brief 捕获当前线程的调用栈地址。
+ *
+ * @param skipFrameCount 额外跳过的栈帧数量。默认 0 表示返回调用者视角的栈。
+ * @param maxFrameCount 最多捕获的栈帧数量。
+ * @return std::vector<uint64_t> 调用栈地址。失败时返回空数组。
+ *
+ * @remarks
+ * - 本函数只采集地址，不初始化 DbgHelp 符号引擎，也不解析模块/函数/源码行号，适合高频日志、采样或性能敏感路径。
+ * - 若后续需要解析，可调用 GB_DbgResolveStackTraceAddresses。
+ */
+GLOBALBASE_PORT std::vector<uint64_t> GB_DbgCaptureStackTraceAddresses(size_t skipFrameCount = 0, size_t maxFrameCount = 64);
+
 
 /**
  * @brief 基于 Windows EXCEPTION_POINTERS 中的 ContextRecord 捕获异常现场调用栈。
  *
  * @param contextRecord Windows CONTEXT* 指针；为避免在头文件中暴露 Windows.h，此处使用 const void*。
  * @param maxFrameCount 最多捕获的栈帧数量。
+ * @param resolveSymbols 是否解析模块、函数名和源码行号。
  * @return GB_DbgStackTrace 调用栈信息。参数非法或失败时 frames 为空。
  *
  * @remarks
  * - 该接口适合在 SetUnhandledExceptionFilter、AddVectoredExceptionHandler 或 __try/__except 中使用。
  * - 与 GB_DbgCaptureStackTrace 不同，本函数从异常发生点的寄存器上下文开始回溯，更适合崩溃现场分析。
+ * - Windows x64 下地址回溯优先使用系统 Unwind 元数据；只有 resolveSymbols 为 true 时才会初始化并使用 DbgHelp 符号引擎。
  * - 当前实现面向 Windows x64 当前进程、当前线程异常现场。
  */
-GLOBALBASE_PORT GB_DbgStackTrace GB_DbgCaptureStackTraceFromContext(const void* contextRecord, size_t maxFrameCount = 64);
+GLOBALBASE_PORT GB_DbgStackTrace GB_DbgCaptureStackTraceFromContext(const void* contextRecord, size_t maxFrameCount = 64, bool resolveSymbols = true);
+
+/**
+ * @brief 基于 Windows CONTEXT* 捕获异常现场调用栈地址。
+ *
+ * @param contextRecord Windows CONTEXT* 指针；为避免在头文件中暴露 Windows.h，此处使用 const void*。
+ * @param maxFrameCount 最多捕获的栈帧数量。
+ * @return std::vector<uint64_t> 调用栈地址。参数非法或失败时返回空数组。
+ *
+ * @remarks
+ * Windows x64 下本函数只采集地址，不初始化 DbgHelp 符号引擎，也不解析符号；适合崩溃处理中的低开销兜底记录。
+ */
+GLOBALBASE_PORT std::vector<uint64_t> GB_DbgCaptureStackTraceAddressesFromContext(const void* contextRecord, size_t maxFrameCount = 64);
+
 
 /**
  * @brief 基于 Windows EXCEPTION_POINTERS* 捕获异常现场调用栈。
  *
  * @param exceptionPointers Windows EXCEPTION_POINTERS* 指针；为避免在头文件中暴露 Windows.h，此处使用 const void*。
  * @param maxFrameCount 最多捕获的栈帧数量。
+ * @param resolveSymbols 是否解析模块、函数名和源码行号。
  * @return GB_DbgStackTrace 调用栈信息。参数非法或失败时 frames 为空。
  */
-GLOBALBASE_PORT GB_DbgStackTrace GB_DbgCaptureStackTraceFromExceptionPointers(const void* exceptionPointers, size_t maxFrameCount = 64);
+GLOBALBASE_PORT GB_DbgStackTrace GB_DbgCaptureStackTraceFromExceptionPointers(const void* exceptionPointers, size_t maxFrameCount = 64, bool resolveSymbols = true);
+
+/**
+ * @brief 基于 Windows EXCEPTION_POINTERS* 捕获异常现场调用栈地址。
+ *
+ * @param exceptionPointers Windows EXCEPTION_POINTERS* 指针；为避免在头文件中暴露 Windows.h，此处使用 const void*。
+ * @param maxFrameCount 最多捕获的栈帧数量。
+ * @return std::vector<uint64_t> 调用栈地址。参数非法或失败时返回空数组。
+ */
+GLOBALBASE_PORT std::vector<uint64_t> GB_DbgCaptureStackTraceAddressesFromExceptionPointers(const void* exceptionPointers, size_t maxFrameCount = 64);
+
 
 /**
  * @brief 解析单个程序地址的符号信息。
@@ -200,6 +243,18 @@ GLOBALBASE_PORT GB_DbgStackTrace GB_DbgCaptureStackTraceFromExceptionPointers(co
  * @return true 至少解析到模块、函数名或源码位置之一；false 完全无法解析。
  */
 GLOBALBASE_PORT bool GB_DbgResolveAddress(uint64_t address, GB_DbgStackFrame& frame);
+
+/**
+ * @brief 批量解析调用栈地址。
+ *
+ * @param addresses 调用栈地址数组。
+ * @return GB_DbgStackTrace 解析后的调用栈信息。若符号解析失败，仍会尽量返回仅包含地址或模块信息的帧。
+ *
+ * @remarks
+ * 该接口适合与 GB_DbgCaptureStackTraceAddresses 配合使用：热路径先只记录地址，非热路径再统一解析。
+ */
+GLOBALBASE_PORT GB_DbgStackTrace GB_DbgResolveStackTraceAddresses(const std::vector<uint64_t>& addresses);
+
 
 /**
  * @brief 将调用栈格式化为便于日志记录的 UTF-8 文本。

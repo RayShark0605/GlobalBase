@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <limits>
 #include <sys/stat.h>
 
@@ -14,12 +15,22 @@
 #    include <windows.h>
 #    include <shlobj.h>
 #    include <KnownFolders.h>
+#    include <objbase.h>
+#    include <shobjidl.h>
+#    include <cwchar>
+#    if defined(_MSC_VER)
+#        pragma comment(lib, "Ole32.lib")
+#        pragma comment(lib, "Shell32.lib")
+#    endif
 #else
 #    include <dirent.h>
 #    include <fcntl.h>
 #    include <pwd.h>
 #    include <sys/types.h>
+#    include <sys/statvfs.h>
+#    include <sys/time.h>
 #    include <unistd.h>
+#    include <utime.h>
 #    include <fstream>
 #endif
 
@@ -36,6 +47,7 @@ namespace internal
     }
 
 
+#if defined(_WIN32)
     static unsigned char ToLowerAscii(unsigned char ch)
     {
         if (ch >= static_cast<unsigned char>('A') && ch <= static_cast<unsigned char>('Z'))
@@ -45,6 +57,7 @@ namespace internal
         return ch;
     }
 
+#endif
     static void ReplaceBackslashWithSlash(std::string& text)
     {
         for (size_t i = 0; i < text.size(); i++)
@@ -63,6 +76,7 @@ namespace internal
         return out;
     }
 
+#if defined(_WIN32)
     static std::string ToWindowsNative(const std::string& pathUtf8)
     {
         std::string out = pathUtf8;
@@ -76,6 +90,7 @@ namespace internal
         return out;
     }
 
+#endif
     static size_t FindUncShareEnd(const std::string& normalizedPath)
     {
         // normalizedPath uses '/'
@@ -217,6 +232,16 @@ namespace internal
         return text.size() >= prefix.size() && text.compare(0, prefix.size(), prefix) == 0;
     }
 
+    static bool ContainsNullByte(const std::string& text)
+    {
+        return text.find('\0') != std::string::npos;
+    }
+
+    static bool IsValidNativePathString(const std::string& pathUtf8)
+    {
+        return !pathUtf8.empty() && !ContainsNullByte(pathUtf8);
+    }
+
     static PathParts ParseAndNormalizePathLexical(const std::string& rawPathUtf8)
     {
         PathParts path;
@@ -241,8 +266,11 @@ namespace internal
 
         size_t index = 0;
 
-        // Drive root
-        if (s.size() >= 2 && IsAsciiAlpha(s[0]) && s[1] == ':')
+        // Windows drive absolute path.
+        // "C:/xxx" is absolute; "C:" is kept as a drive-root shorthand for historical compatibility;
+        // "C:xxx" is drive-relative on Windows and must not be silently normalized to "C:/xxx".
+        if ((s.size() == 2 && IsAsciiAlpha(s[0]) && s[1] == ':')
+            || (s.size() >= 3 && IsAsciiAlpha(s[0]) && s[1] == ':' && s[2] == '/'))
         {
             path.isAbsolute = true;
             path.isDrive = true;
@@ -338,6 +366,40 @@ namespace internal
     {
         const PathParts path = ParseAndNormalizePathLexical(pathUtf8);
         return path.isAbsolute && path.segments.empty();
+    }
+
+    static bool IsRootPathString(const std::string& pathUtf8)
+    {
+        if (pathUtf8.empty())
+        {
+            return false;
+        }
+
+        const std::string trimmedPath = StripTrailingSlashesButKeepRoot(pathUtf8);
+        return IsAbsoluteRootPath(trimmedPath);
+    }
+
+    static bool IsUnsafeDeleteTargetPath(const std::string& pathUtf8)
+    {
+        const PathParts path = ParseAndNormalizePathLexical(pathUtf8);
+        if (path.isAbsolute && path.segments.empty())
+        {
+            return true;
+        }
+
+        // Do not allow deleting the process current directory through "." or paths normalized to ".".
+        if (!path.isAbsolute && path.segments.empty())
+        {
+            return true;
+        }
+
+        // Deleting ".." is too error-prone for a low-level helper.
+        if (!path.isAbsolute && path.segments.size() == 1 && path.segments[0] == "..")
+        {
+            return true;
+        }
+
+        return false;
     }
 
     static std::string BuildPathString(const PathParts& path, bool forceDir)
@@ -479,14 +541,82 @@ namespace internal
     }
 
 #if defined(_WIN32)
+    static bool StartsWithWide(const std::wstring& text, const std::wstring& prefix)
+    {
+        return text.size() >= prefix.size() && text.compare(0, prefix.size(), prefix) == 0;
+    }
+
+    static bool IsDriveAbsoluteNativePath(const std::wstring& nativePath)
+    {
+        return nativePath.size() >= 3
+            && IsAsciiAlpha(static_cast<char>(nativePath[0]))
+            && nativePath[1] == L':'
+            && (nativePath[2] == L'\\' || nativePath[2] == L'/');
+    }
+
+    static bool IsUncNativePath(const std::wstring& nativePath)
+    {
+        return nativePath.size() >= 5
+            && nativePath[0] == L'\\'
+            && nativePath[1] == L'\\'
+            && nativePath[2] != L'?'
+            && nativePath[2] != L'.';
+    }
+
+    static std::wstring AddExtendedPathPrefixIfNeeded(const std::wstring& nativePath)
+    {
+        if (nativePath.empty())
+        {
+            return nativePath;
+        }
+
+        if (StartsWithWide(nativePath, L"\\\\?\\") || StartsWithWide(nativePath, L"\\\\.\\"))
+        {
+            return nativePath;
+        }
+
+        if (IsDriveAbsoluteNativePath(nativePath))
+        {
+            return L"\\\\?\\" + nativePath;
+        }
+
+        if (IsUncNativePath(nativePath))
+        {
+            return L"\\\\?\\UNC\\" + nativePath.substr(2);
+        }
+
+        // Root-relative and pure relative paths cannot use the "\\\\?\\" prefix.
+        return nativePath;
+    }
+
     static std::wstring Utf8ToWide(const std::string& utf8)
     {
-        if (utf8.empty())
+        if (utf8.empty() || ContainsNullByte(utf8))
         {
             return L"";
         }
 
-        const std::string native = ToWindowsNative(utf8);
+        std::string pathForApiUtf8 = utf8;
+        const std::string normalizedOriginal = ToOutputNorm(utf8);
+        if (StartsWith(normalizedOriginal, "//?/") || StartsWith(normalizedOriginal, "//./"))
+        {
+            pathForApiUtf8 = normalizedOriginal;
+        }
+        else
+        {
+            const PathParts parsedPath = ParseAndNormalizePathLexical(utf8);
+            if (parsedPath.isAbsolute)
+            {
+                pathForApiUtf8 = BuildPathString(parsedPath, EndsWithSlash(utf8));
+            }
+        }
+
+        const std::string native = ToWindowsNative(pathForApiUtf8);
+        if (native.size() > static_cast<size_t>(std::numeric_limits<int>::max()))
+        {
+            return L"";
+        }
+
         const int required = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, native.c_str(),
             static_cast<int>(native.size()), nullptr, 0);
         if (required <= 0)
@@ -502,12 +632,18 @@ namespace internal
         {
             return L"";
         }
-        return out;
+
+        return AddExtendedPathPrefixIfNeeded(out);
     }
 
     static std::string WideToUtf8(const std::wstring& wide)
     {
         if (wide.empty())
+        {
+            return "";
+        }
+
+        if (wide.size() > static_cast<size_t>(std::numeric_limits<int>::max()))
         {
             return "";
         }
@@ -529,6 +665,52 @@ namespace internal
         }
 
         return ToOutputNorm(out);
+    }
+
+    static DWORD GetFindFirstFileExFlagsForDirectoryScan()
+    {
+#if defined(FIND_FIRST_EX_LARGE_FETCH)
+        // 大目录遍历时让系统使用更大的内部缓冲，减少内核态/用户态往返。
+        return FIND_FIRST_EX_LARGE_FETCH;
+#else
+        return 0;
+#endif
+    }
+
+    static HANDLE FindFirstFileExBasicWithFallback(const std::wstring& patternW, WIN32_FIND_DATAW& outData)
+    {
+        HANDLE findHandle = FindFirstFileExW(patternW.c_str(), FindExInfoBasic, &outData, FindExSearchNameMatch, nullptr, GetFindFirstFileExFlagsForDirectoryScan());
+#if defined(FIND_FIRST_EX_LARGE_FETCH)
+        if (findHandle == INVALID_HANDLE_VALUE && GetFindFirstFileExFlagsForDirectoryScan() != 0)
+        {
+            const DWORD errorCode = GetLastError();
+            if (errorCode == ERROR_INVALID_PARAMETER || errorCode == ERROR_NOT_SUPPORTED)
+            {
+                // 部分旧系统、特殊文件系统或网络文件系统可能不支持 FIND_FIRST_EX_LARGE_FETCH；
+                // 此时回退为普通枚举，避免因为性能优化标志导致功能失败。
+                findHandle = FindFirstFileExW(patternW.c_str(), FindExInfoBasic, &outData, FindExSearchNameMatch, nullptr, 0);
+            }
+        }
+#endif
+        return findHandle;
+    }
+
+    static bool IsDotOrDotDotW(const wchar_t* name)
+    {
+        if (!name)
+        {
+            return false;
+        }
+        return wcscmp(name, L".") == 0 || wcscmp(name, L"..") == 0;
+    }
+#else
+    static bool IsDotOrDotDotA(const char* name)
+    {
+        if (!name)
+        {
+            return false;
+        }
+        return std::strcmp(name, ".") == 0 || std::strcmp(name, "..") == 0;
     }
 #endif
 
@@ -562,6 +744,10 @@ namespace internal
         return true;
 #else
         const std::string normalized = ToOutputNorm(pathUtf8);
+        if (ContainsNullByte(normalized))
+        {
+            return false;
+        }
 
         struct stat st;
         if (::stat(normalized.c_str(), &st) != 0)
@@ -588,41 +774,26 @@ namespace internal
             return false;
         }
 
-        const DWORD attrs = GetFileAttributesW(pathW.c_str());
-        if (attrs == INVALID_FILE_ATTRIBUTES)
-        {
-            return false;
-        }
-        if ((attrs & FILE_ATTRIBUTE_DIRECTORY) != 0)
+        WIN32_FILE_ATTRIBUTE_DATA data;
+        if (!GetFileAttributesExW(pathW.c_str(), GetFileExInfoStandard, &data))
         {
             return false;
         }
 
-        const HANDLE handle = CreateFileW(pathW.c_str(), FILE_READ_ATTRIBUTES,
-            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
-            FILE_ATTRIBUTE_NORMAL, nullptr);
-        if (handle == INVALID_HANDLE_VALUE)
+        const DWORD attrs = data.dwFileAttributes;
+        if ((attrs & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_DEVICE | FILE_ATTRIBUTE_REPARSE_POINT)) != 0)
         {
             return false;
         }
 
-        LARGE_INTEGER size = {};
-        const BOOL ok = GetFileSizeEx(handle, &size);
-        CloseHandle(handle);
-        if (!ok)
-        {
-            return false;
-        }
-
-        if (size.QuadPart < 0)
-        {
-            return false;
-        }
-
-        outSize = static_cast<unsigned long long>(size.QuadPart);
+        outSize = (static_cast<unsigned long long>(data.nFileSizeHigh) << 32) | static_cast<unsigned long long>(data.nFileSizeLow);
         return true;
 #else
         const std::string normalized = ToOutputNorm(filePathUtf8);
+        if (ContainsNullByte(normalized))
+        {
+            return false;
+        }
 
         struct stat st;
         if (::stat(normalized.c_str(), &st) != 0)
@@ -804,24 +975,56 @@ namespace internal
         return out;
     }
 
-    static void ClearReadOnlyAttributeIfNeeded(const std::wstring& pathW)
+    static DWORD GetSettableFileAttributes(DWORD attrs)
+    {
+        DWORD settableAttrs = attrs & (FILE_ATTRIBUTE_READONLY | FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM
+            | FILE_ATTRIBUTE_ARCHIVE | FILE_ATTRIBUTE_TEMPORARY | FILE_ATTRIBUTE_NOT_CONTENT_INDEXED | FILE_ATTRIBUTE_OFFLINE);
+        if (settableAttrs == 0)
+        {
+            settableAttrs = FILE_ATTRIBUTE_NORMAL;
+        }
+        return settableAttrs;
+    }
+
+    static bool SetSettableFileAttributes(const std::wstring& pathW, DWORD attrs)
     {
         if (pathW.empty())
         {
-            return;
+            return false;
+        }
+        return SetFileAttributesW(pathW.c_str(), GetSettableFileAttributes(attrs)) != 0;
+    }
+
+    static bool ClearFileAttributesIfNeeded(const std::wstring& pathW, DWORD attributesToClear)
+    {
+        if (pathW.empty())
+        {
+            return false;
         }
 
         const DWORD attrs = GetFileAttributesW(pathW.c_str());
         if (attrs == INVALID_FILE_ATTRIBUTES)
         {
-            return;
-        }
-        if ((attrs & FILE_ATTRIBUTE_READONLY) == 0)
-        {
-            return;
+            return true;
         }
 
-        SetFileAttributesW(pathW.c_str(), attrs & ~FILE_ATTRIBUTE_READONLY);
+        const DWORD newAttrs = attrs & ~attributesToClear;
+        if (newAttrs == attrs)
+        {
+            return true;
+        }
+
+        return SetSettableFileAttributes(pathW, newAttrs);
+    }
+
+    static bool ClearReadOnlyAttributeIfNeeded(const std::wstring& pathW)
+    {
+        return ClearFileAttributesIfNeeded(pathW, FILE_ATTRIBUTE_READONLY);
+    }
+
+    static bool ClearOverwriteBlockingAttributesIfNeeded(const std::wstring& pathW)
+    {
+        return ClearFileAttributesIfNeeded(pathW, FILE_ATTRIBUTE_READONLY | FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM);
     }
 
     static bool DeleteOneFile(const std::string& filePathUtf8)
@@ -863,7 +1066,7 @@ namespace internal
         }
 
         WIN32_FIND_DATAW data;
-        HANDLE find = FindFirstFileW(patternW.c_str(), &data);
+        HANDLE find = FindFirstFileExBasicWithFallback(patternW, data);
         if (find == INVALID_HANDLE_VALUE)
         {
             const DWORD err = GetLastError();
@@ -881,12 +1084,17 @@ namespace internal
             {
                 continue;
             }
-            if (wcscmp(name, L".") == 0 || wcscmp(name, L"..") == 0)
+            if (IsDotOrDotDotW(name))
             {
                 continue;
             }
 
-            const std::string child = dirWithSlash + WideToUtf8(std::wstring(name));
+            const std::string childNameUtf8 = WideToUtf8(std::wstring(name));
+            if (childNameUtf8.empty())
+            {
+                continue;
+            }
+            const std::string child = dirWithSlash + childNameUtf8;
             const DWORD attrs = data.dwFileAttributes;
             const bool isDir = (attrs & FILE_ATTRIBUTE_DIRECTORY) != 0;
             const bool isReparsePoint = (attrs & FILE_ATTRIBUTE_REPARSE_POINT) != 0;
@@ -925,8 +1133,9 @@ namespace internal
             }
         } while (FindNextFileW(find, &data));
 
+        const DWORD findErr = GetLastError();
         FindClose(find);
-        return true;
+        return findErr == ERROR_NO_MORE_FILES;
     }
 #else
     static bool DeleteDirContents(const std::string& dirPathUtf8)
@@ -943,15 +1152,19 @@ namespace internal
             return false;
         }
 
-        struct dirent* entry = nullptr;
-        while ((entry = readdir(dir)) != nullptr)
+        for (;;)
         {
-            const char* name = entry->d_name;
-            if (!name)
+            errno = 0;
+            struct dirent* entry = readdir(dir);
+            if (!entry)
             {
-                continue;
+                const int readDirErrno = errno;
+                const int closeDirResult = closedir(dir);
+                return readDirErrno == 0 && closeDirResult == 0;
             }
-            if (std::strcmp(name, ".") == 0 || std::strcmp(name, "..") == 0)
+
+            const char* name = entry->d_name;
+            if (IsDotOrDotDotA(name))
             {
                 continue;
             }
@@ -960,7 +1173,12 @@ namespace internal
             struct stat st;
             if (lstat(fullPath.c_str(), &st) != 0)
             {
-                continue;
+                if (errno == ENOENT)
+                {
+                    continue;
+                }
+                closedir(dir);
+                return false;
             }
 
             if (S_ISDIR(st.st_mode))
@@ -985,9 +1203,6 @@ namespace internal
                 }
             }
         }
-
-        closedir(dir);
-        return true;
     }
 #endif
 
@@ -1019,7 +1234,7 @@ namespace internal
         }
 
         WIN32_FIND_DATAW data;
-        HANDLE find = FindFirstFileExW(patternW.c_str(), FindExInfoBasic, &data, FindExSearchNameMatch, nullptr, 0);
+        HANDLE find = FindFirstFileExBasicWithFallback(patternW, data);
         if (find == INVALID_HANDLE_VALUE)
         {
             return;
@@ -1032,12 +1247,17 @@ namespace internal
             {
                 continue;
             }
-            if (wcscmp(name, L".") == 0 || wcscmp(name, L"..") == 0)
+            if (IsDotOrDotDotW(name))
             {
                 continue;
             }
 
-            const std::string item = dirWithSlash + WideToUtf8(std::wstring(name));
+            const std::string itemNameUtf8 = WideToUtf8(std::wstring(name));
+            if (itemNameUtf8.empty())
+            {
+                continue;
+            }
+            const std::string item = dirWithSlash + itemNameUtf8;
             const DWORD attrs = data.dwFileAttributes;
             const bool entryIsDir = (attrs & FILE_ATTRIBUTE_DIRECTORY) != 0;
             const bool isReparsePoint = (attrs & FILE_ATTRIBUTE_REPARSE_POINT) != 0;
@@ -1066,11 +1286,7 @@ namespace internal
         while ((entry = readdir(dir)) != nullptr)
         {
             const char* name = entry->d_name;
-            if (!name)
-            {
-                continue;
-            }
-            if (std::strcmp(name, ".") == 0 || std::strcmp(name, "..") == 0)
+            if (IsDotOrDotDotA(name))
             {
                 continue;
             }
@@ -1341,7 +1557,1153 @@ namespace internal
         }
         return GB_WStringToUtf8(valueW);
     }
+
+    static DWORD GetTempPathBySystemPolicyW(DWORD bufferLength, wchar_t* buffer)
+    {
+        typedef DWORD(WINAPI* GetTempPath2WFunc)(DWORD, LPWSTR);
+        static GetTempPath2WFunc getTempPath2WFunc = reinterpret_cast<GetTempPath2WFunc>(GetProcAddress(GetModuleHandleW(L"Kernel32.dll"), "GetTempPath2W"));
+        if (getTempPath2WFunc)
+        {
+            return getTempPath2WFunc(bufferLength, buffer);
+        }
+        return GetTempPathW(bufferLength, buffer);
+    }
 #endif
+
+    static bool ContainsPathSlash(const std::string& text)
+    {
+        for (size_t i = 0; i < text.size(); i++)
+        {
+            if (IsSlash(text[i]))
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    static bool IsDotOrDotDotName(const std::string& name)
+    {
+        return name == "." || name == "..";
+    }
+
+    static bool IsExistingDirectoryPath(const std::string& pathUtf8)
+    {
+        bool exists = false;
+        bool isDir = false;
+        if (!IsDirByStat(pathUtf8, exists, isDir))
+        {
+            return false;
+        }
+        return exists && isDir;
+    }
+
+    static bool IsSamePathLexically(const std::string& leftPathUtf8, const std::string& rightPathUtf8)
+    {
+        const PathParts left = ParseAndNormalizePathLexical(StripTrailingSlashesButKeepRoot(leftPathUtf8));
+        const PathParts right = ParseAndNormalizePathLexical(StripTrailingSlashesButKeepRoot(rightPathUtf8));
+        if (!EqualRoot(left, right))
+        {
+            return false;
+        }
+        if (left.segments.size() != right.segments.size())
+        {
+            return false;
+        }
+        for (size_t i = 0; i < left.segments.size(); i++)
+        {
+            if (!EqualSegment(left.segments[i], right.segments[i]))
+            {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    static bool TryCheckSameExistingPath(const std::string& leftPathUtf8, const std::string& rightPathUtf8, bool& outIsSamePath)
+    {
+        outIsSamePath = false;
+
+#if defined(_WIN32)
+        const std::wstring leftW = Utf8ToWide(leftPathUtf8);
+        const std::wstring rightW = Utf8ToWide(rightPathUtf8);
+        if (leftW.empty() || rightW.empty())
+        {
+            return false;
+        }
+
+        const DWORD flags = FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT;
+        const HANDLE leftHandle = CreateFileW(leftW.c_str(), 0, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, flags, nullptr);
+        if (leftHandle == INVALID_HANDLE_VALUE)
+        {
+            return false;
+        }
+
+        const HANDLE rightHandle = CreateFileW(rightW.c_str(), 0, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, flags, nullptr);
+        if (rightHandle == INVALID_HANDLE_VALUE)
+        {
+            CloseHandle(leftHandle);
+            return false;
+        }
+
+        BY_HANDLE_FILE_INFORMATION leftInfo;
+        BY_HANDLE_FILE_INFORMATION rightInfo;
+        const BOOL leftOk = GetFileInformationByHandle(leftHandle, &leftInfo);
+        const BOOL rightOk = GetFileInformationByHandle(rightHandle, &rightInfo);
+        CloseHandle(rightHandle);
+        CloseHandle(leftHandle);
+
+        if (!leftOk || !rightOk)
+        {
+            return false;
+        }
+
+        outIsSamePath = leftInfo.dwVolumeSerialNumber == rightInfo.dwVolumeSerialNumber
+            && leftInfo.nFileIndexHigh == rightInfo.nFileIndexHigh
+            && leftInfo.nFileIndexLow == rightInfo.nFileIndexLow;
+        return true;
+#else
+        const std::string leftNormalized = ToOutputNorm(leftPathUtf8);
+        const std::string rightNormalized = ToOutputNorm(rightPathUtf8);
+        if (ContainsNullByte(leftNormalized) || ContainsNullByte(rightNormalized))
+        {
+            return false;
+        }
+
+        struct stat leftStat;
+        struct stat rightStat;
+        if (lstat(leftNormalized.c_str(), &leftStat) != 0 || lstat(rightNormalized.c_str(), &rightStat) != 0)
+        {
+            return false;
+        }
+
+        outIsSamePath = leftStat.st_dev == rightStat.st_dev && leftStat.st_ino == rightStat.st_ino;
+        return true;
+#endif
+    }
+
+    static bool IsSubPathLexically(const std::string& parentPathUtf8, const std::string& childPathUtf8)
+    {
+        const PathParts parent = ParseAndNormalizePathLexical(StripTrailingSlashesButKeepRoot(parentPathUtf8));
+        const PathParts child = ParseAndNormalizePathLexical(StripTrailingSlashesButKeepRoot(childPathUtf8));
+        if (!EqualRoot(parent, child))
+        {
+            return false;
+        }
+        if (child.segments.size() <= parent.segments.size())
+        {
+            return false;
+        }
+        for (size_t i = 0; i < parent.segments.size(); i++)
+        {
+            if (!EqualSegment(parent.segments[i], child.segments[i]))
+            {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    static bool IsPathReplaceCompatible(GB_FileType srcType, const std::string& dstPathUtf8)
+    {
+        const GB_FileType dstType = GB_GetFileType(dstPathUtf8);
+        if (dstType == GB_FileType::NotExists)
+        {
+            return true;
+        }
+
+        const bool srcIsDir = (srcType == GB_FileType::Directory);
+        const bool dstIsDir = IsExistingDirectoryPath(dstPathUtf8);
+        if (srcIsDir != dstIsDir)
+        {
+            return false;
+        }
+        return true;
+    }
+
+    static bool IsDestinationParentDirectoryReady(const std::string& dstPathUtf8)
+    {
+        std::string parentPathUtf8 = GB_GetDirectoryPath(dstPathUtf8);
+        if (parentPathUtf8.empty())
+        {
+            return true;
+        }
+
+        parentPathUtf8 = StripTrailingSlashesButKeepRoot(parentPathUtf8);
+        if (parentPathUtf8.empty())
+        {
+            return true;
+        }
+
+        return IsExistingDirectoryPath(parentPathUtf8);
+    }
+
+    static std::string MakeMoveTempPath(const std::string& dstPathUtf8)
+    {
+        const std::string trimmedDst = StripTrailingSlashesButKeepRoot(dstPathUtf8);
+        if (trimmedDst.empty())
+        {
+            return "";
+        }
+
+        const std::string parentPathUtf8 = GB_GetDirectoryPath(trimmedDst);
+        const std::string fileNameUtf8 = GB_GetFileName(trimmedDst, true);
+        if (fileNameUtf8.empty())
+        {
+            return "";
+        }
+
+#if defined(_WIN32)
+        const unsigned long processId = static_cast<unsigned long>(GetCurrentProcessId());
+#else
+        const unsigned long processId = static_cast<unsigned long>(getpid());
+#endif
+
+        for (int i = 0; i < 1000; i++)
+        {
+            char suffix[128];
+#if defined(_MSC_VER)
+            sprintf_s(suffix, sizeof(suffix), ".gb_move_tmp_%lu_%d", processId, i);
+#else
+            std::snprintf(suffix, sizeof(suffix), ".gb_move_tmp_%lu_%d", processId, i);
+#endif
+            const std::string candidate = parentPathUtf8 + fileNameUtf8 + suffix;
+            if (GB_GetFileType(candidate) == GB_FileType::NotExists)
+            {
+                return candidate;
+            }
+        }
+
+        return "";
+    }
+
+    static bool SystemRenamePathNoFallback(const std::string& srcPathUtf8, const std::string& dstPathUtf8, bool overwriteIfExists, bool allowCopyAcrossVolume = false)
+    {
+        if (srcPathUtf8.empty() || dstPathUtf8.empty())
+        {
+            return false;
+        }
+
+#if defined(_WIN32)
+        const std::wstring srcW = Utf8ToWide(srcPathUtf8);
+        const std::wstring dstW = Utf8ToWide(dstPathUtf8);
+        if (srcW.empty() || dstW.empty())
+        {
+            return false;
+        }
+
+        DWORD flags = 0;
+        if (overwriteIfExists)
+        {
+            flags |= MOVEFILE_REPLACE_EXISTING;
+        }
+        if (allowCopyAcrossVolume)
+        {
+            flags |= MOVEFILE_COPY_ALLOWED;
+        }
+        return MoveFileExW(srcW.c_str(), dstW.c_str(), flags) != 0;
+#else
+        (void)allowCopyAcrossVolume;
+        if (!overwriteIfExists && GB_GetFileType(dstPathUtf8) != GB_FileType::NotExists)
+        {
+            errno = EEXIST;
+            return false;
+        }
+
+        const std::string srcNormalized = ToOutputNorm(srcPathUtf8);
+        const std::string dstNormalized = ToOutputNorm(dstPathUtf8);
+        return std::rename(srcNormalized.c_str(), dstNormalized.c_str()) == 0;
+#endif
+    }
+
+    static bool DeletePathAnyType(const std::string& pathUtf8)
+    {
+        if (pathUtf8.empty())
+        {
+            return false;
+        }
+
+#if defined(_WIN32)
+        const std::wstring pathW = Utf8ToWide(pathUtf8);
+        if (pathW.empty())
+        {
+            return false;
+        }
+
+        const DWORD attrs = GetFileAttributesW(pathW.c_str());
+        if (attrs == INVALID_FILE_ATTRIBUTES)
+        {
+            return false;
+        }
+
+        if ((attrs & FILE_ATTRIBUTE_DIRECTORY) != 0)
+        {
+            return GB_DeleteDirectory(pathUtf8);
+        }
+
+        // 文件符号链接也是重解析点。GB_DeleteFile 按接口语义只接受常规文件，
+        // 因此这里必须直接使用 DeleteFileW 删除路径项本身，而不能再转回 GB_DeleteFile。
+        return DeleteOneFile(pathUtf8);
+#else
+        const std::string normalized = ToOutputNorm(pathUtf8);
+        struct stat st;
+        if (lstat(normalized.c_str(), &st) != 0)
+        {
+            return false;
+        }
+
+        if (S_ISDIR(st.st_mode) && !S_ISLNK(st.st_mode))
+        {
+            return GB_DeleteDirectory(pathUtf8);
+        }
+        return unlink(normalized.c_str()) == 0;
+#endif
+    }
+
+#if defined(_WIN32)
+    static unsigned long long FileTimeToUInt64(const FILETIME& fileTime)
+    {
+        ULARGE_INTEGER value;
+        value.LowPart = fileTime.dwLowDateTime;
+        value.HighPart = fileTime.dwHighDateTime;
+        return static_cast<unsigned long long>(value.QuadPart);
+    }
+
+    static GB_DateTime FileTimeToDateTime(const FILETIME& fileTime)
+    {
+        static const unsigned long long windowsToUnixEpoch100Ns = 116444736000000000ULL;
+        const unsigned long long fileTimeValue = FileTimeToUInt64(fileTime);
+        if (fileTimeValue < windowsToUnixEpoch100Ns)
+        {
+            return GB_DateTime::Invalid;
+        }
+
+        const unsigned long long unixMillisecondsUnsigned = (fileTimeValue - windowsToUnixEpoch100Ns) / 10000ULL;
+        if (unixMillisecondsUnsigned > static_cast<unsigned long long>(std::numeric_limits<long long>::max()))
+        {
+            return GB_DateTime::Invalid;
+        }
+
+        return GB_DateTime::CreateFromUnixMilliseconds(static_cast<long long>(unixMillisecondsUnsigned), GB_DateTimeSpec::UtcTime);
+    }
+
+    static bool DateTimeToFileTime(const GB_DateTime& dateTime, FILETIME& outFileTime)
+    {
+        static const long long windowsToUnixEpoch100Ns = 116444736000000000LL;
+        if (!dateTime.IsValid())
+        {
+            return false;
+        }
+
+        const long long unixMilliseconds = dateTime.ToUnixMilliseconds();
+        if (unixMilliseconds < -11644473600000LL)
+        {
+            return false;
+        }
+        if (unixMilliseconds > (std::numeric_limits<long long>::max() - windowsToUnixEpoch100Ns) / 10000LL)
+        {
+            return false;
+        }
+
+        const long long fileTimeValueSigned = unixMilliseconds * 10000LL + windowsToUnixEpoch100Ns;
+        if (fileTimeValueSigned < 0)
+        {
+            return false;
+        }
+
+        ULARGE_INTEGER value;
+        value.QuadPart = static_cast<ULONGLONG>(fileTimeValueSigned);
+        outFileTime.dwLowDateTime = value.LowPart;
+        outFileTime.dwHighDateTime = value.HighPart;
+        return true;
+    }
+
+    static std::wstring StripTrailingSlashForFindFile(const std::wstring& path)
+    {
+        if (path.empty())
+        {
+            return path;
+        }
+
+        std::wstring out = path;
+        while (out.size() > 1)
+        {
+            const wchar_t last = out.back();
+            if (last != L'/' && last != L'\\')
+            {
+                break;
+            }
+            if (out.size() == 3 && IsAsciiAlpha(static_cast<char>(out[0])) && out[1] == L':' && (out[2] == L'\\' || out[2] == L'/'))
+            {
+                break;
+            }
+            out.pop_back();
+        }
+        return out;
+    }
+
+    static bool IsWindowsSymbolicLink(const std::wstring& pathW, DWORD attrs)
+    {
+        if ((attrs & FILE_ATTRIBUTE_REPARSE_POINT) == 0)
+        {
+            return false;
+        }
+
+        WIN32_FIND_DATAW data;
+        const std::wstring pathForFind = StripTrailingSlashForFindFile(pathW);
+        const HANDLE find = FindFirstFileW(pathForFind.c_str(), &data);
+        if (find == INVALID_HANDLE_VALUE)
+        {
+            return false;
+        }
+
+        const DWORD reparseTag = data.dwReserved0;
+        FindClose(find);
+        return reparseTag == IO_REPARSE_TAG_SYMLINK;
+    }
+
+    static GB_FileType GetWindowsFileTypeByAttributes(const std::wstring& pathW, DWORD attrs)
+    {
+        if (IsWindowsSymbolicLink(pathW, attrs))
+        {
+            return GB_FileType::SymbolicLink;
+        }
+        if ((attrs & FILE_ATTRIBUTE_REPARSE_POINT) != 0)
+        {
+            return GB_FileType::Other;
+        }
+        if ((attrs & FILE_ATTRIBUTE_DIRECTORY) != 0)
+        {
+            return GB_FileType::Directory;
+        }
+        if ((attrs & FILE_ATTRIBUTE_DEVICE) != 0)
+        {
+            return GB_FileType::Other;
+        }
+        return GB_FileType::RegularFile;
+    }
+
+    static bool TryOpenFileWithAccess(const std::string& filePathUtf8, DWORD desiredAccess)
+    {
+        const std::wstring pathW = Utf8ToWide(filePathUtf8);
+        if (pathW.empty())
+        {
+            return false;
+        }
+
+        const HANDLE handle = CreateFileW(pathW.c_str(), desiredAccess,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (handle == INVALID_HANDLE_VALUE)
+        {
+            return false;
+        }
+
+        CloseHandle(handle);
+        return true;
+    }
+
+    static bool ExpandEnvironmentString(const std::wstring& text, std::wstring& outText)
+    {
+        outText.clear();
+        if (text.empty())
+        {
+            return false;
+        }
+
+        const DWORD required = ExpandEnvironmentStringsW(text.c_str(), nullptr, 0);
+        if (required == 0)
+        {
+            return false;
+        }
+
+        std::wstring buffer;
+        buffer.resize(static_cast<size_t>(required), L'\0');
+        const DWORD written = ExpandEnvironmentStringsW(text.c_str(), &buffer[0], required);
+        if (written == 0 || written > required)
+        {
+            return false;
+        }
+
+        if (written > 0)
+        {
+            buffer.resize(static_cast<size_t>(written - 1));
+        }
+        outText.swap(buffer);
+        return true;
+    }
+#else
+    static GB_DateTime PosixTimeToDateTime(std::time_t seconds)
+    {
+        if (seconds > static_cast<std::time_t>(std::numeric_limits<long long>::max())
+            || seconds < static_cast<std::time_t>(std::numeric_limits<long long>::min()))
+        {
+            return GB_DateTime::Invalid;
+        }
+        return GB_DateTime::CreateFromUnixSeconds(static_cast<long long>(seconds), GB_DateTimeSpec::UtcTime);
+    }
+
+    static bool DateTimeToTimeval(const GB_DateTime& dateTime, timeval& outTimeValue)
+    {
+        if (!dateTime.IsValid())
+        {
+            return false;
+        }
+
+        const long long unixMilliseconds = dateTime.ToUnixMilliseconds();
+        long long seconds = unixMilliseconds / 1000LL;
+        long long milliseconds = unixMilliseconds % 1000LL;
+        if (milliseconds < 0)
+        {
+            milliseconds += 1000LL;
+            seconds--;
+        }
+
+        if (seconds > static_cast<long long>(std::numeric_limits<time_t>::max())
+            || seconds < static_cast<long long>(std::numeric_limits<time_t>::min()))
+        {
+            return false;
+        }
+
+        outTimeValue.tv_sec = static_cast<time_t>(seconds);
+        outTimeValue.tv_usec = static_cast<suseconds_t>(milliseconds * 1000LL);
+        return true;
+    }
+
+    static GB_FileType GetPosixFileTypeFromMode(mode_t mode)
+    {
+        if (S_ISLNK(mode))
+        {
+            return GB_FileType::SymbolicLink;
+        }
+        if (S_ISREG(mode))
+        {
+            return GB_FileType::RegularFile;
+        }
+        if (S_ISDIR(mode))
+        {
+            return GB_FileType::Directory;
+        }
+        return GB_FileType::Other;
+    }
+
+    static bool TryOpenFileWithFlags(const std::string& filePathUtf8, int flags)
+    {
+        const std::string normalized = ToOutputNorm(filePathUtf8);
+        if (ContainsNullByte(normalized))
+        {
+            return false;
+        }
+
+        const int fd = open(normalized.c_str(), flags);
+        if (fd < 0)
+        {
+            return false;
+        }
+
+        close(fd);
+        return true;
+    }
+#endif
+
+    static bool CopyRegularFilePreserveMetadata(const std::string& srcFilePathUtf8, const std::string& dstFilePathUtf8, bool overwriteIfExists)
+    {
+        if (srcFilePathUtf8.empty() || dstFilePathUtf8.empty())
+        {
+            return false;
+        }
+
+#if defined(_WIN32)
+        const std::wstring srcW = Utf8ToWide(srcFilePathUtf8);
+        const std::wstring dstW = Utf8ToWide(dstFilePathUtf8);
+        if (srcW.empty() || dstW.empty())
+        {
+            return false;
+        }
+
+        if (overwriteIfExists && !ClearOverwriteBlockingAttributesIfNeeded(dstW))
+        {
+            return false;
+        }
+
+        DWORD copyFlags = COPY_FILE_RESTARTABLE;
+        if (!overwriteIfExists)
+        {
+            copyFlags |= COPY_FILE_FAIL_IF_EXISTS;
+        }
+
+        return CopyFileExW(srcW.c_str(), dstW.c_str(), nullptr, nullptr, nullptr, copyFlags) != 0;
+#else
+        const std::string srcNormalized = ToOutputNorm(srcFilePathUtf8);
+        const std::string dstNormalized = ToOutputNorm(dstFilePathUtf8);
+        if (ContainsNullByte(srcNormalized) || ContainsNullByte(dstNormalized))
+        {
+            return false;
+        }
+
+        struct stat srcStat;
+        if (lstat(srcNormalized.c_str(), &srcStat) != 0 || !S_ISREG(srcStat.st_mode))
+        {
+            return false;
+        }
+
+        struct stat dstStat;
+        if (lstat(dstNormalized.c_str(), &dstStat) == 0)
+        {
+            if (srcStat.st_dev == dstStat.st_dev && srcStat.st_ino == dstStat.st_ino)
+            {
+                return true;
+            }
+            if (!overwriteIfExists || !S_ISREG(dstStat.st_mode))
+            {
+                return false;
+            }
+            if ((dstStat.st_mode & S_IWUSR) == 0)
+            {
+                chmod(dstNormalized.c_str(), dstStat.st_mode | S_IWUSR);
+            }
+        }
+
+        const int srcFd = open(srcNormalized.c_str(), O_RDONLY);
+        if (srcFd < 0)
+        {
+            return false;
+        }
+
+        struct stat openedSrcStat;
+        if (fstat(srcFd, &openedSrcStat) != 0 || !S_ISREG(openedSrcStat.st_mode))
+        {
+            close(srcFd);
+            return false;
+        }
+        if (openedSrcStat.st_dev != srcStat.st_dev || openedSrcStat.st_ino != srcStat.st_ino)
+        {
+            close(srcFd);
+            return false;
+        }
+
+        int dstFlags = O_WRONLY | O_CREAT;
+        if (overwriteIfExists)
+        {
+            dstFlags |= O_TRUNC;
+        }
+        else
+        {
+            dstFlags |= O_EXCL;
+        }
+
+        const int dstFd = open(dstNormalized.c_str(), dstFlags, srcStat.st_mode & 07777);
+        if (dstFd < 0)
+        {
+            close(srcFd);
+            return false;
+        }
+
+        std::vector<char> buffer;
+        buffer.resize(4 * 1024 * 1024);
+
+        bool ok = true;
+        for (;;)
+        {
+            const ssize_t bytesRead = read(srcFd, buffer.data(), buffer.size());
+            if (bytesRead < 0)
+            {
+                if (errno == EINTR)
+                {
+                    continue;
+                }
+                ok = false;
+                break;
+            }
+            if (bytesRead == 0)
+            {
+                break;
+            }
+
+            ssize_t totalWritten = 0;
+            while (totalWritten < bytesRead)
+            {
+                const ssize_t bytesWritten = write(dstFd, buffer.data() + totalWritten, static_cast<size_t>(bytesRead - totalWritten));
+                if (bytesWritten < 0)
+                {
+                    if (errno == EINTR)
+                    {
+                        continue;
+                    }
+                    ok = false;
+                    break;
+                }
+                if (bytesWritten == 0)
+                {
+                    ok = false;
+                    break;
+                }
+                totalWritten += bytesWritten;
+            }
+            if (!ok)
+            {
+                break;
+            }
+        }
+
+        if (ok && fchmod(dstFd, srcStat.st_mode & 07777) != 0)
+        {
+            ok = false;
+        }
+
+        if (close(srcFd) != 0)
+        {
+            ok = false;
+        }
+        if (close(dstFd) != 0)
+        {
+            ok = false;
+        }
+
+        if (!ok)
+        {
+            unlink(dstNormalized.c_str());
+            return false;
+        }
+
+        timeval times[2];
+        times[0].tv_sec = srcStat.st_atime;
+        times[0].tv_usec = 0;
+        times[1].tv_sec = srcStat.st_mtime;
+        times[1].tv_usec = 0;
+        utimes(dstNormalized.c_str(), times);
+        return true;
+#endif
+    }
+
+    static bool CopyDirectoryMetadata(const std::string& srcDirPathUtf8, const std::string& dstDirPathUtf8)
+    {
+#if defined(_WIN32)
+        const std::wstring srcW = Utf8ToWide(srcDirPathUtf8);
+        const std::wstring dstW = Utf8ToWide(dstDirPathUtf8);
+        if (srcW.empty() || dstW.empty())
+        {
+            return false;
+        }
+
+        WIN32_FILE_ATTRIBUTE_DATA data;
+        if (!GetFileAttributesExW(srcW.c_str(), GetFileExInfoStandard, &data))
+        {
+            return false;
+        }
+
+        const HANDLE handle = CreateFileW(dstW.c_str(), FILE_WRITE_ATTRIBUTES,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+        if (handle == INVALID_HANDLE_VALUE)
+        {
+            return false;
+        }
+
+        const BOOL setTimeOk = SetFileTime(handle, &data.ftCreationTime, &data.ftLastAccessTime, &data.ftLastWriteTime);
+        CloseHandle(handle);
+        if (!setTimeOk)
+        {
+            return false;
+        }
+
+        const DWORD attrs = data.dwFileAttributes;
+        return SetSettableFileAttributes(dstW, attrs);
+#else
+        const std::string srcNormalized = ToOutputNorm(srcDirPathUtf8);
+        const std::string dstNormalized = ToOutputNorm(dstDirPathUtf8);
+        if (ContainsNullByte(srcNormalized) || ContainsNullByte(dstNormalized))
+        {
+            return false;
+        }
+
+        struct stat srcStat;
+        if (lstat(srcNormalized.c_str(), &srcStat) != 0 || !S_ISDIR(srcStat.st_mode))
+        {
+            return false;
+        }
+
+        timeval times[2];
+        times[0].tv_sec = srcStat.st_atime;
+        times[0].tv_usec = 0;
+        times[1].tv_sec = srcStat.st_mtime;
+        times[1].tv_usec = 0;
+        if (utimes(dstNormalized.c_str(), times) != 0)
+        {
+            return false;
+        }
+
+        return chmod(dstNormalized.c_str(), srcStat.st_mode & 07777) == 0;
+#endif
+    }
+
+#if !defined(_WIN32)
+    static bool CopySymbolicLink(const std::string& srcPathUtf8, const std::string& dstPathUtf8, bool overwriteIfExists)
+    {
+        const std::string srcNormalized = ToOutputNorm(srcPathUtf8);
+        const std::string dstNormalized = ToOutputNorm(dstPathUtf8);
+        if (ContainsNullByte(srcNormalized) || ContainsNullByte(dstNormalized))
+        {
+            return false;
+        }
+
+        std::vector<char> buffer;
+        buffer.resize(512);
+        for (;;)
+        {
+            const ssize_t len = readlink(srcNormalized.c_str(), buffer.data(), buffer.size());
+            if (len < 0)
+            {
+                return false;
+            }
+            if (static_cast<size_t>(len) < buffer.size())
+            {
+                buffer[static_cast<size_t>(len)] = '\0';
+                break;
+            }
+            buffer.resize(buffer.size() * 2);
+            if (buffer.size() > 1024 * 1024)
+            {
+                return false;
+            }
+        }
+
+        if (GB_GetFileType(dstPathUtf8) != GB_FileType::NotExists)
+        {
+            if (!overwriteIfExists || !DeletePathAnyType(dstPathUtf8))
+            {
+                return false;
+            }
+        }
+
+        return symlink(buffer.data(), dstNormalized.c_str()) == 0;
+    }
+#endif
+
+    static bool CopyPathRecursive(const std::string& srcPathUtf8, const std::string& dstPathUtf8, bool overwriteIfExists);
+    static bool CopyPathToFinalReplacing(const std::string& srcPathUtf8, const std::string& dstPathUtf8, GB_FileType srcType, bool overwriteIfExists);
+
+    static bool CopyDirectoryRecursive(const std::string& srcDirPathUtf8, const std::string& dstDirPathUtf8, bool overwriteIfExists)
+    {
+        if (srcDirPathUtf8.empty() || dstDirPathUtf8.empty())
+        {
+            return false;
+        }
+
+        if (IsSubPathLexically(srcDirPathUtf8, dstDirPathUtf8) || IsSamePathLexically(srcDirPathUtf8, dstDirPathUtf8))
+        {
+            return false;
+        }
+
+        bool dstCreatedByThisCall = false;
+        if (GB_GetFileType(dstDirPathUtf8) == GB_FileType::NotExists)
+        {
+#if defined(_WIN32)
+            const std::wstring dstW = Utf8ToWide(dstDirPathUtf8);
+            if (dstW.empty())
+            {
+                return false;
+            }
+            if (!CreateDirectoryW(dstW.c_str(), nullptr))
+            {
+                return false;
+            }
+#else
+            const std::string dstNormalized = ToOutputNorm(dstDirPathUtf8);
+            struct stat srcStat;
+            const std::string srcNormalized = ToOutputNorm(srcDirPathUtf8);
+            if (lstat(srcNormalized.c_str(), &srcStat) != 0)
+            {
+                return false;
+            }
+
+            // 先以“所有者可写可进入”的权限创建目标目录，避免源目录本身为只读权限时，
+            // 目标目录刚创建出来就无法继续写入子项；全部复制完成后再恢复源目录权限与时间戳。
+            const mode_t createMode = static_cast<mode_t>((srcStat.st_mode | S_IRWXU) & 07777);
+            if (mkdir(dstNormalized.c_str(), createMode) != 0)
+            {
+                return false;
+            }
+#endif
+            dstCreatedByThisCall = true;
+        }
+        else
+        {
+            if (!overwriteIfExists || !IsExistingDirectoryPath(dstDirPathUtf8))
+            {
+                return false;
+            }
+        }
+
+        bool ok = true;
+#if defined(_WIN32)
+        const std::string srcDirWithSlash = EnsureTrailingSlash(srcDirPathUtf8);
+        const std::string dstDirWithSlash = EnsureTrailingSlash(dstDirPathUtf8);
+        const std::wstring patternW = Utf8ToWide(srcDirWithSlash + "*");
+        if (patternW.empty())
+        {
+            ok = false;
+        }
+        else
+        {
+            WIN32_FIND_DATAW data;
+            HANDLE find = FindFirstFileExBasicWithFallback(patternW, data);
+            if (find == INVALID_HANDLE_VALUE)
+            {
+                const DWORD err = GetLastError();
+                ok = (err == ERROR_FILE_NOT_FOUND);
+            }
+            else
+            {
+                do
+                {
+                    const wchar_t* name = data.cFileName;
+                    if (IsDotOrDotDotW(name))
+                    {
+                        continue;
+                    }
+
+                    const bool isReparsePoint = (data.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0;
+                    if (isReparsePoint)
+                    {
+                        // Windows 下不默认复制符号链接、联接点等重解析点，也不进入其目标目录。
+                        // 这样可以避免把链接目标误复制进来，并避免目录联接造成循环遍历。
+                        continue;
+                    }
+
+                    const std::string childNameUtf8 = WideToUtf8(std::wstring(name));
+                    if (childNameUtf8.empty())
+                    {
+                        continue;
+                    }
+                    const std::string childSrc = srcDirWithSlash + childNameUtf8;
+                    const std::string childDst = dstDirWithSlash + childNameUtf8;
+                    if (!CopyPathRecursive(childSrc, childDst, overwriteIfExists))
+                    {
+                        ok = false;
+                        break;
+                    }
+                } while (FindNextFileW(find, &data));
+
+                const DWORD findErr = GetLastError();
+                FindClose(find);
+                if (ok && findErr != ERROR_NO_MORE_FILES)
+                {
+                    ok = false;
+                }
+            }
+        }
+#else
+        const std::string srcDirWithSlash = EnsureTrailingSlash(srcDirPathUtf8);
+        const std::string dstDirWithSlash = EnsureTrailingSlash(dstDirPathUtf8);
+        DIR* dir = opendir(srcDirWithSlash.c_str());
+        if (!dir)
+        {
+            ok = false;
+        }
+        else
+        {
+            for (;;)
+            {
+                errno = 0;
+                struct dirent* entry = readdir(dir);
+                if (!entry)
+                {
+                    if (errno != 0)
+                    {
+                        ok = false;
+                    }
+                    break;
+                }
+
+                const char* name = entry->d_name;
+                if (IsDotOrDotDotA(name))
+                {
+                    continue;
+                }
+
+                const std::string childSrc = srcDirWithSlash + name;
+                const std::string childDst = dstDirWithSlash + name;
+                if (!CopyPathRecursive(childSrc, childDst, overwriteIfExists))
+                {
+                    ok = false;
+                    break;
+                }
+            }
+
+            if (closedir(dir) != 0)
+            {
+                ok = false;
+            }
+        }
+#endif
+
+        if (ok)
+        {
+            ok = CopyDirectoryMetadata(srcDirPathUtf8, dstDirPathUtf8);
+        }
+
+        if (!ok && dstCreatedByThisCall)
+        {
+            DeletePathAnyType(dstDirPathUtf8);
+        }
+        return ok;
+    }
+
+    static bool CopyPathRecursive(const std::string& srcPathUtf8, const std::string& dstPathUtf8, bool overwriteIfExists)
+    {
+        const GB_FileType srcType = GB_GetFileType(srcPathUtf8);
+        if (srcType == GB_FileType::NotExists)
+        {
+            return false;
+        }
+
+        if (!IsDestinationParentDirectoryReady(dstPathUtf8))
+        {
+            return false;
+        }
+
+        const GB_FileType dstType = GB_GetFileType(dstPathUtf8);
+        if (dstType != GB_FileType::NotExists)
+        {
+            if (!overwriteIfExists || !IsPathReplaceCompatible(srcType, dstPathUtf8))
+            {
+                return false;
+            }
+
+            if (srcType != GB_FileType::Directory)
+            {
+                return CopyPathToFinalReplacing(srcPathUtf8, dstPathUtf8, srcType, true);
+            }
+        }
+
+        if (srcType == GB_FileType::RegularFile)
+        {
+            return CopyRegularFilePreserveMetadata(srcPathUtf8, dstPathUtf8, false);
+        }
+        if (srcType == GB_FileType::Directory)
+        {
+            return CopyDirectoryRecursive(srcPathUtf8, dstPathUtf8, overwriteIfExists);
+        }
+        if (srcType == GB_FileType::SymbolicLink)
+        {
+#if defined(_WIN32)
+            return false;
+#else
+            return CopySymbolicLink(srcPathUtf8, dstPathUtf8, false);
+#endif
+        }
+
+        return false;
+    }
+
+    static bool CopyPathToFinalReplacing(const std::string& srcPathUtf8, const std::string& dstPathUtf8, GB_FileType srcType, bool overwriteIfExists)
+    {
+        const GB_FileType dstType = GB_GetFileType(dstPathUtf8);
+        if (dstType == GB_FileType::NotExists)
+        {
+            const std::string tempPathUtf8 = MakeMoveTempPath(dstPathUtf8);
+            if (tempPathUtf8.empty())
+            {
+                return false;
+            }
+
+            if (!CopyPathRecursive(srcPathUtf8, tempPathUtf8, false))
+            {
+                DeletePathAnyType(tempPathUtf8);
+                return false;
+            }
+
+            if (!SystemRenamePathNoFallback(tempPathUtf8, dstPathUtf8, false))
+            {
+                DeletePathAnyType(tempPathUtf8);
+                return false;
+            }
+
+            return true;
+        }
+
+        if (!overwriteIfExists || !IsPathReplaceCompatible(srcType, dstPathUtf8))
+        {
+            return false;
+        }
+
+        const std::string tempPathUtf8 = MakeMoveTempPath(dstPathUtf8);
+        if (tempPathUtf8.empty())
+        {
+            return false;
+        }
+
+        if (!CopyPathRecursive(srcPathUtf8, tempPathUtf8, false))
+        {
+            DeletePathAnyType(tempPathUtf8);
+            return false;
+        }
+
+        const std::string backupPathUtf8 = MakeMoveTempPath(dstPathUtf8);
+        if (backupPathUtf8.empty())
+        {
+            DeletePathAnyType(tempPathUtf8);
+            return false;
+        }
+
+#if defined(_WIN32)
+        const std::wstring dstW = Utf8ToWide(dstPathUtf8);
+        if (dstW.empty() || !ClearOverwriteBlockingAttributesIfNeeded(dstW))
+        {
+            DeletePathAnyType(tempPathUtf8);
+            return false;
+        }
+#endif
+
+        if (!SystemRenamePathNoFallback(dstPathUtf8, backupPathUtf8, false))
+        {
+            DeletePathAnyType(tempPathUtf8);
+            return false;
+        }
+
+        if (!SystemRenamePathNoFallback(tempPathUtf8, dstPathUtf8, false))
+        {
+            SystemRenamePathNoFallback(backupPathUtf8, dstPathUtf8, false);
+            DeletePathAnyType(tempPathUtf8);
+            return false;
+        }
+
+        if (!DeletePathAnyType(backupPathUtf8))
+        {
+            return false;
+        }
+
+        return true;
+    }
+
+    static bool MovePathByCopyThenDelete(const std::string& srcPathUtf8, const std::string& dstPathUtf8, GB_FileType srcType, bool overwriteIfExists)
+    {
+        if (!CopyPathToFinalReplacing(srcPathUtf8, dstPathUtf8, srcType, overwriteIfExists))
+        {
+            return false;
+        }
+
+        if (!DeletePathAnyType(srcPathUtf8))
+        {
+            return false;
+        }
+
+        return true;
+    }
+
+    static uint64_t SaturatingMultiplyUInt64(uint64_t leftValue, uint64_t rightValue)
+    {
+        if (leftValue == 0 || rightValue == 0)
+        {
+            return 0;
+        }
+        if (leftValue > std::numeric_limits<uint64_t>::max() / rightValue)
+        {
+            return std::numeric_limits<uint64_t>::max();
+        }
+        return leftValue * rightValue;
+    }
 
     static bool MatchBytesAt(const GB_ByteBuffer& buffer, size_t offset, const unsigned char* bytes, size_t bytesCount)
     {
@@ -1349,7 +2711,7 @@ namespace internal
         {
             return false;
         }
-        if (buffer.size() < offset + bytesCount)
+        if (offset > buffer.size() || bytesCount > buffer.size() - offset)
         {
             return false;
         }
@@ -1499,15 +2861,686 @@ namespace internal
     }
 }
 
-bool GB_IsFileExists(const std::string& filePathUtf8)
+GB_FileType GB_GetFileType(const std::string& pathUtf8)
 {
-    bool exists = false;
-    bool isDir = false;
-    if (!internal::IsDirByStat(filePathUtf8, exists, isDir))
+    if (!internal::IsValidNativePathString(pathUtf8))
+    {
+        return GB_FileType::NotExists;
+    }
+
+#if defined(_WIN32)
+    const std::wstring pathW = internal::Utf8ToWide(pathUtf8);
+    if (pathW.empty())
+    {
+        return GB_FileType::NotExists;
+    }
+
+    const DWORD attrs = GetFileAttributesW(pathW.c_str());
+    if (attrs == INVALID_FILE_ATTRIBUTES)
+    {
+        return GB_FileType::NotExists;
+    }
+
+    return internal::GetWindowsFileTypeByAttributes(pathW, attrs);
+#else
+    const std::string normalized = internal::ToOutputNorm(pathUtf8);
+
+    struct stat st;
+    if (lstat(normalized.c_str(), &st) != 0)
+    {
+        return GB_FileType::NotExists;
+    }
+
+    return internal::GetPosixFileTypeFromMode(st.st_mode);
+#endif
+}
+
+bool GB_IsPathExists(const std::string& pathUtf8)
+{
+    return GB_GetFileType(pathUtf8) != GB_FileType::NotExists;
+}
+
+bool GB_GetFileAttributes(const std::string& pathUtf8, GB_FileAttributes& outAttributes)
+{
+    outAttributes = GB_FileAttributes();
+    if (!internal::IsValidNativePathString(pathUtf8))
     {
         return false;
     }
-    return exists && !isDir;
+
+#if defined(_WIN32)
+    const std::wstring pathW = internal::Utf8ToWide(pathUtf8);
+    if (pathW.empty())
+    {
+        return false;
+    }
+
+    WIN32_FILE_ATTRIBUTE_DATA data;
+    if (!GetFileAttributesExW(pathW.c_str(), GetFileExInfoStandard, &data))
+    {
+        return false;
+    }
+
+    const DWORD attrs = data.dwFileAttributes;
+    outAttributes.fileType = internal::GetWindowsFileTypeByAttributes(pathW, attrs);
+    if (outAttributes.fileType == GB_FileType::RegularFile)
+    {
+        outAttributes.fileSizeByte = (static_cast<uint64_t>(data.nFileSizeHigh) << 32) | static_cast<uint64_t>(data.nFileSizeLow);
+    }
+    outAttributes.isReadOnly = (attrs & FILE_ATTRIBUTE_READONLY) != 0;
+    outAttributes.isHidden = (attrs & FILE_ATTRIBUTE_HIDDEN) != 0;
+    outAttributes.isSystem = (attrs & FILE_ATTRIBUTE_SYSTEM) != 0;
+    outAttributes.isArchive = (attrs & FILE_ATTRIBUTE_ARCHIVE) != 0;
+    outAttributes.isTemporary = (attrs & FILE_ATTRIBUTE_TEMPORARY) != 0;
+    outAttributes.createdTime = internal::FileTimeToDateTime(data.ftCreationTime);
+    outAttributes.lastAccessTime = internal::FileTimeToDateTime(data.ftLastAccessTime);
+    outAttributes.lastWriteTime = internal::FileTimeToDateTime(data.ftLastWriteTime);
+    return outAttributes.fileType != GB_FileType::NotExists;
+#else
+    const std::string normalized = internal::ToOutputNorm(pathUtf8);
+
+    struct stat st;
+    if (lstat(normalized.c_str(), &st) != 0)
+    {
+        return false;
+    }
+
+    outAttributes.fileType = internal::GetPosixFileTypeFromMode(st.st_mode);
+    if (outAttributes.fileType == GB_FileType::RegularFile && st.st_size > 0)
+    {
+        outAttributes.fileSizeByte = static_cast<uint64_t>(st.st_size);
+    }
+    outAttributes.isReadOnly = (st.st_mode & (S_IWUSR | S_IWGRP | S_IWOTH)) == 0;
+
+    const std::string fileNameUtf8 = GB_GetFileName(normalized, true);
+    outAttributes.isHidden = fileNameUtf8.size() > 1 && fileNameUtf8[0] == '.';
+    outAttributes.isSystem = false;
+    outAttributes.isArchive = false;
+    outAttributes.isTemporary = false;
+    outAttributes.createdTime = GB_DateTime::Invalid;
+    outAttributes.lastAccessTime = internal::PosixTimeToDateTime(st.st_atime);
+    outAttributes.lastWriteTime = internal::PosixTimeToDateTime(st.st_mtime);
+    return true;
+#endif
+}
+
+bool GB_SetFileAttributes(const std::string& pathUtf8, const GB_FileAttributeModifyOptions& modifyOptions)
+{
+    if (!internal::IsValidNativePathString(pathUtf8))
+    {
+        return false;
+    }
+
+#if defined(_WIN32)
+    const std::wstring pathW = internal::Utf8ToWide(pathUtf8);
+    if (pathW.empty())
+    {
+        return false;
+    }
+
+    DWORD attrs = GetFileAttributesW(pathW.c_str());
+    if (attrs == INVALID_FILE_ATTRIBUTES)
+    {
+        return false;
+    }
+
+    const bool hasTimeChange = modifyOptions.changeCreatedTime || modifyOptions.changeLastAccessTime || modifyOptions.changeLastWriteTime;
+    const bool hasAttributeChange = modifyOptions.changeReadOnly || modifyOptions.changeHidden || modifyOptions.changeSystem
+        || modifyOptions.changeArchive || modifyOptions.changeTemporary;
+
+    if (!hasTimeChange && !hasAttributeChange)
+    {
+        return true;
+    }
+
+    if (modifyOptions.changeReadOnly && !modifyOptions.readOnly && (attrs & FILE_ATTRIBUTE_READONLY) != 0)
+    {
+        const DWORD attrsWithoutReadOnly = attrs & ~FILE_ATTRIBUTE_READONLY;
+        if (!internal::SetSettableFileAttributes(pathW, attrsWithoutReadOnly))
+        {
+            return false;
+        }
+        attrs = attrsWithoutReadOnly;
+    }
+
+    if (hasTimeChange)
+    {
+        FILETIME createdFileTime;
+        FILETIME lastAccessFileTime;
+        FILETIME lastWriteFileTime;
+        const FILETIME* createdFileTimePtr = nullptr;
+        const FILETIME* lastAccessFileTimePtr = nullptr;
+        const FILETIME* lastWriteFileTimePtr = nullptr;
+
+        if (modifyOptions.changeCreatedTime)
+        {
+            if (!internal::DateTimeToFileTime(modifyOptions.createdTime, createdFileTime))
+            {
+                return false;
+            }
+            createdFileTimePtr = &createdFileTime;
+        }
+        if (modifyOptions.changeLastAccessTime)
+        {
+            if (!internal::DateTimeToFileTime(modifyOptions.lastAccessTime, lastAccessFileTime))
+            {
+                return false;
+            }
+            lastAccessFileTimePtr = &lastAccessFileTime;
+        }
+        if (modifyOptions.changeLastWriteTime)
+        {
+            if (!internal::DateTimeToFileTime(modifyOptions.lastWriteTime, lastWriteFileTime))
+            {
+                return false;
+            }
+            lastWriteFileTimePtr = &lastWriteFileTime;
+        }
+
+        const HANDLE handle = CreateFileW(pathW.c_str(), FILE_WRITE_ATTRIBUTES,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
+        if (handle == INVALID_HANDLE_VALUE)
+        {
+            return false;
+        }
+
+        const BOOL ok = SetFileTime(handle, createdFileTimePtr, lastAccessFileTimePtr, lastWriteFileTimePtr);
+        CloseHandle(handle);
+        if (!ok)
+        {
+            return false;
+        }
+    }
+
+    if (hasAttributeChange)
+    {
+        DWORD newAttrs = attrs;
+        if (modifyOptions.changeReadOnly)
+        {
+            newAttrs = modifyOptions.readOnly ? (newAttrs | FILE_ATTRIBUTE_READONLY) : (newAttrs & ~FILE_ATTRIBUTE_READONLY);
+        }
+        if (modifyOptions.changeHidden)
+        {
+            newAttrs = modifyOptions.hidden ? (newAttrs | FILE_ATTRIBUTE_HIDDEN) : (newAttrs & ~FILE_ATTRIBUTE_HIDDEN);
+        }
+        if (modifyOptions.changeSystem)
+        {
+            newAttrs = modifyOptions.system ? (newAttrs | FILE_ATTRIBUTE_SYSTEM) : (newAttrs & ~FILE_ATTRIBUTE_SYSTEM);
+        }
+        if (modifyOptions.changeArchive)
+        {
+            newAttrs = modifyOptions.archive ? (newAttrs | FILE_ATTRIBUTE_ARCHIVE) : (newAttrs & ~FILE_ATTRIBUTE_ARCHIVE);
+        }
+        if (modifyOptions.changeTemporary)
+        {
+            newAttrs = modifyOptions.temporary ? (newAttrs | FILE_ATTRIBUTE_TEMPORARY) : (newAttrs & ~FILE_ATTRIBUTE_TEMPORARY);
+        }
+
+        if (newAttrs != attrs)
+        {
+            if (!internal::SetSettableFileAttributes(pathW, newAttrs))
+            {
+                return false;
+            }
+        }
+    }
+
+    return true;
+#else
+    if (modifyOptions.changeHidden || modifyOptions.changeSystem || modifyOptions.changeArchive
+        || modifyOptions.changeTemporary || modifyOptions.changeCreatedTime)
+    {
+        return false;
+    }
+
+    const bool hasTimeChange = modifyOptions.changeLastAccessTime || modifyOptions.changeLastWriteTime;
+    const bool hasAttributeChange = modifyOptions.changeReadOnly;
+    if (!hasTimeChange && !hasAttributeChange)
+    {
+        return GB_GetFileType(pathUtf8) != GB_FileType::NotExists;
+    }
+
+    const std::string normalized = internal::ToOutputNorm(pathUtf8);
+
+    struct stat st;
+    if (lstat(normalized.c_str(), &st) != 0)
+    {
+        return false;
+    }
+
+    if (S_ISLNK(st.st_mode))
+    {
+        return false;
+    }
+
+    if (modifyOptions.changeReadOnly)
+    {
+        mode_t newMode = st.st_mode;
+        if (modifyOptions.readOnly)
+        {
+            newMode &= static_cast<mode_t>(~(S_IWUSR | S_IWGRP | S_IWOTH));
+        }
+        else
+        {
+            newMode |= S_IWUSR;
+        }
+
+        if (newMode != st.st_mode)
+        {
+            if (chmod(normalized.c_str(), newMode) != 0)
+            {
+                return false;
+            }
+            st.st_mode = newMode;
+        }
+    }
+
+    if (hasTimeChange)
+    {
+        timeval times[2];
+        times[0].tv_sec = st.st_atime;
+        times[0].tv_usec = 0;
+        times[1].tv_sec = st.st_mtime;
+        times[1].tv_usec = 0;
+
+        if (modifyOptions.changeLastAccessTime)
+        {
+            if (!internal::DateTimeToTimeval(modifyOptions.lastAccessTime, times[0]))
+            {
+                return false;
+            }
+        }
+        if (modifyOptions.changeLastWriteTime)
+        {
+            if (!internal::DateTimeToTimeval(modifyOptions.lastWriteTime, times[1]))
+            {
+                return false;
+            }
+        }
+
+        if (utimes(normalized.c_str(), times) != 0)
+        {
+            return false;
+        }
+    }
+
+    return true;
+#endif
+}
+
+bool GB_CanReadFile(const std::string& filePathUtf8)
+{
+    if (!GB_IsFileExists(filePathUtf8))
+    {
+        return false;
+    }
+
+#if defined(_WIN32)
+    return internal::TryOpenFileWithAccess(filePathUtf8, GENERIC_READ);
+#else
+    return internal::TryOpenFileWithFlags(filePathUtf8, O_RDONLY);
+#endif
+}
+
+bool GB_CanWriteFile(const std::string& filePathUtf8)
+{
+    if (!GB_IsFileExists(filePathUtf8))
+    {
+        return false;
+    }
+
+#if defined(_WIN32)
+    return internal::TryOpenFileWithAccess(filePathUtf8, GENERIC_WRITE);
+#else
+    return internal::TryOpenFileWithFlags(filePathUtf8, O_WRONLY);
+#endif
+}
+
+bool GB_CanReadWriteFile(const std::string& filePathUtf8)
+{
+    if (!GB_IsFileExists(filePathUtf8))
+    {
+        return false;
+    }
+
+#if defined(_WIN32)
+    return internal::TryOpenFileWithAccess(filePathUtf8, GENERIC_READ | GENERIC_WRITE);
+#else
+    return internal::TryOpenFileWithFlags(filePathUtf8, O_RDWR);
+#endif
+}
+
+bool GB_RenamePath(const std::string& pathUtf8, const std::string& newNameUtf8, bool overwriteIfExists)
+{
+    if (!internal::IsValidNativePathString(pathUtf8) || !internal::IsValidNativePathString(newNameUtf8))
+    {
+        return false;
+    }
+    if (newNameUtf8 == "." || newNameUtf8 == ".." || internal::ContainsPathSlash(newNameUtf8))
+    {
+        return false;
+    }
+
+    const std::string trimmedPath = internal::StripTrailingSlashesButKeepRoot(pathUtf8);
+    if (trimmedPath.empty() || internal::IsAbsoluteRootPath(trimmedPath))
+    {
+        return false;
+    }
+
+    const std::string dirPathUtf8 = GB_GetDirectoryPath(trimmedPath);
+    const std::string dstPathUtf8 = dirPathUtf8.empty() ? newNameUtf8 : (dirPathUtf8 + newNameUtf8);
+    return GB_MovePath(trimmedPath, dstPathUtf8, overwriteIfExists);
+}
+
+bool GB_MovePath(const std::string& srcPathUtf8, const std::string& dstPathUtf8, bool overwriteIfExists)
+{
+    if (!internal::IsValidNativePathString(srcPathUtf8) || !internal::IsValidNativePathString(dstPathUtf8))
+    {
+        return false;
+    }
+
+    const std::string srcTrimmed = internal::StripTrailingSlashesButKeepRoot(srcPathUtf8);
+    const std::string dstTrimmed = internal::StripTrailingSlashesButKeepRoot(dstPathUtf8);
+    if (srcTrimmed.empty() || dstTrimmed.empty())
+    {
+        return false;
+    }
+    if (internal::IsAbsoluteRootPath(srcTrimmed))
+    {
+        return false;
+    }
+
+    const GB_FileType srcType = GB_GetFileType(srcTrimmed);
+    if (srcType == GB_FileType::NotExists)
+    {
+        return false;
+    }
+    if (internal::IsSamePathLexically(srcTrimmed, dstTrimmed))
+    {
+        return true;
+    }
+
+    bool isSameExistingPath = false;
+    if (internal::TryCheckSameExistingPath(srcTrimmed, dstTrimmed, isSameExistingPath) && isSameExistingPath)
+    {
+        return true;
+    }
+
+    if (!internal::IsDestinationParentDirectoryReady(dstTrimmed))
+    {
+        return false;
+    }
+
+    if (srcType == GB_FileType::Directory && internal::IsSubPathLexically(srcTrimmed, dstTrimmed))
+    {
+        return false;
+    }
+
+    if (!overwriteIfExists && GB_GetFileType(dstTrimmed) != GB_FileType::NotExists)
+    {
+        return false;
+    }
+
+    if (!internal::IsPathReplaceCompatible(srcType, dstTrimmed))
+    {
+        return false;
+    }
+
+    const bool allowNativeCopyAcrossVolume =
+#if defined(_WIN32)
+        (srcType == GB_FileType::RegularFile);
+#else
+        false;
+#endif
+
+    if (internal::SystemRenamePathNoFallback(srcTrimmed, dstTrimmed, overwriteIfExists, allowNativeCopyAcrossVolume))
+    {
+        return true;
+    }
+
+    // 原生移动失败后，退化为“复制到目标路径 + 删除源路径”。
+    // 这主要用于跨分区/跨文件系统场景，同时也能覆盖 Windows 目录跨卷移动不支持的问题。
+    if (srcType == GB_FileType::Other)
+    {
+        return false;
+    }
+
+    return internal::MovePathByCopyThenDelete(srcTrimmed, dstTrimmed, srcType, overwriteIfExists);
+}
+
+std::string GB_GetCurrentDirectory()
+{
+#if defined(_WIN32)
+    const DWORD required = GetCurrentDirectoryW(0, nullptr);
+    if (required == 0)
+    {
+        return "";
+    }
+
+    std::wstring buffer;
+    buffer.resize(static_cast<size_t>(required), L'\0');
+    const DWORD written = GetCurrentDirectoryW(required, &buffer[0]);
+    if (written == 0 || written >= required)
+    {
+        return "";
+    }
+
+    buffer.resize(static_cast<size_t>(written));
+    return internal::NormalizeDirectoryPathUtf8(GB_WStringToUtf8(buffer));
+#else
+    std::vector<char> buffer;
+    buffer.resize(512);
+
+    for (;;)
+    {
+        if (getcwd(buffer.data(), buffer.size()) != nullptr)
+        {
+            return internal::NormalizeDirectoryPathUtf8(std::string(buffer.data()));
+        }
+        if (errno != ERANGE)
+        {
+            return "";
+        }
+        if (buffer.size() > 65536)
+        {
+            return "";
+        }
+        buffer.resize(buffer.size() * 2);
+    }
+#endif
+}
+
+std::string GB_GetShortcutTargetPath(const std::string& shortcutPathUtf8)
+{
+    if (shortcutPathUtf8.empty())
+    {
+        return "";
+    }
+
+#if defined(_WIN32)
+    const std::wstring shortcutPathW = internal::Utf8ToWide(shortcutPathUtf8);
+    if (shortcutPathW.empty())
+    {
+        return "";
+    }
+
+    const HRESULT initHr = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+    if (FAILED(initHr) && initHr != RPC_E_CHANGED_MODE)
+    {
+        return "";
+    }
+
+    const bool needCoUninitialize = SUCCEEDED(initHr);
+    IShellLinkW* shellLink = nullptr;
+    IPersistFile* persistFile = nullptr;
+    std::string result;
+
+    do
+    {
+        HRESULT hr = CoCreateInstance(CLSID_ShellLink, nullptr, CLSCTX_INPROC_SERVER, IID_IShellLinkW, reinterpret_cast<void**>(&shellLink));
+        if (FAILED(hr) || !shellLink)
+        {
+            break;
+        }
+
+        hr = shellLink->QueryInterface(IID_IPersistFile, reinterpret_cast<void**>(&persistFile));
+        if (FAILED(hr) || !persistFile)
+        {
+            break;
+        }
+
+        hr = persistFile->Load(shortcutPathW.c_str(), STGM_READ);
+        if (FAILED(hr))
+        {
+            break;
+        }
+
+        std::vector<wchar_t> targetBuffer;
+        targetBuffer.resize(32768, L'\0');
+        WIN32_FIND_DATAW findData;
+        std::memset(&findData, 0, sizeof(findData));
+
+        hr = shellLink->GetPath(targetBuffer.data(), static_cast<int>(targetBuffer.size()), &findData, SLGP_RAWPATH);
+        if (FAILED(hr) || targetBuffer[0] == L'\0')
+        {
+            std::fill(targetBuffer.begin(), targetBuffer.end(), L'\0');
+            std::memset(&findData, 0, sizeof(findData));
+            hr = shellLink->GetPath(targetBuffer.data(), static_cast<int>(targetBuffer.size()), &findData, 0);
+        }
+        if (FAILED(hr) || targetBuffer[0] == L'\0')
+        {
+            break;
+        }
+
+        std::wstring targetPathW(targetBuffer.data());
+        std::wstring expandedTargetPathW;
+        if (targetPathW.find(L'%') != std::wstring::npos && internal::ExpandEnvironmentString(targetPathW, expandedTargetPathW))
+        {
+            targetPathW.swap(expandedTargetPathW);
+        }
+
+        std::string targetPathUtf8 = GB_WStringToUtf8(targetPathW);
+        internal::ReplaceBackslashWithSlash(targetPathUtf8);
+        const bool targetIsDir = internal::EndsWithSlash(targetPathUtf8) || GB_IsDirectoryExists(targetPathUtf8);
+        result = internal::BuildPathString(internal::ParseAndNormalizePathLexical(targetPathUtf8), targetIsDir);
+    } while (false);
+
+    if (persistFile)
+    {
+        persistFile->Release();
+    }
+    if (shellLink)
+    {
+        shellLink->Release();
+    }
+    if (needCoUninitialize)
+    {
+        CoUninitialize();
+    }
+
+    return result;
+#else
+    return "";
+#endif
+}
+
+bool GB_GetDiskSpaceInfo(const std::string& pathUtf8, GB_DiskSpaceInfo& outSpaceInfo)
+{
+    outSpaceInfo = GB_DiskSpaceInfo();
+
+    if (internal::ContainsNullByte(pathUtf8))
+    {
+        return false;
+    }
+
+    std::string queryPathUtf8 = pathUtf8;
+    if (queryPathUtf8.empty())
+    {
+        queryPathUtf8 = GB_GetCurrentDirectory();
+    }
+    if (queryPathUtf8.empty())
+    {
+        return false;
+    }
+
+    const GB_FileType queryFileType = GB_GetFileType(queryPathUtf8);
+    if (queryFileType != GB_FileType::NotExists && !GB_IsDirectoryExists(queryPathUtf8))
+    {
+        queryPathUtf8 = GB_GetDirectoryPath(queryPathUtf8);
+        if (queryPathUtf8.empty())
+        {
+            queryPathUtf8 = ".";
+        }
+    }
+    else if (queryFileType == GB_FileType::NotExists)
+    {
+        std::string candidatePathUtf8 = internal::StripTrailingSlashesButKeepRoot(queryPathUtf8);
+        for (;;)
+        {
+            std::string parentPathUtf8 = GB_GetDirectoryPath(candidatePathUtf8);
+            if (parentPathUtf8.empty())
+            {
+                candidatePathUtf8 = ".";
+                break;
+            }
+
+            parentPathUtf8 = internal::StripTrailingSlashesButKeepRoot(parentPathUtf8);
+            if (parentPathUtf8.empty() || parentPathUtf8 == candidatePathUtf8)
+            {
+                candidatePathUtf8 = parentPathUtf8.empty() ? "." : parentPathUtf8;
+                break;
+            }
+
+            if (GB_GetFileType(parentPathUtf8) != GB_FileType::NotExists)
+            {
+                candidatePathUtf8 = parentPathUtf8;
+                break;
+            }
+            candidatePathUtf8 = parentPathUtf8;
+        }
+        queryPathUtf8 = candidatePathUtf8;
+    }
+
+#if defined(_WIN32)
+    const std::wstring pathW = internal::Utf8ToWide(queryPathUtf8);
+    if (pathW.empty())
+    {
+        return false;
+    }
+
+    ULARGE_INTEGER availableSpace;
+    ULARGE_INTEGER totalSpace;
+    ULARGE_INTEGER freeSpace;
+    if (!GetDiskFreeSpaceExW(pathW.c_str(), &availableSpace, &totalSpace, &freeSpace))
+    {
+        return false;
+    }
+
+    outSpaceInfo.availableSpaceByte = static_cast<uint64_t>(availableSpace.QuadPart);
+    outSpaceInfo.freeSpaceByte = static_cast<uint64_t>(freeSpace.QuadPart);
+    outSpaceInfo.totalSpaceByte = static_cast<uint64_t>(totalSpace.QuadPart);
+    return true;
+#else
+    const std::string normalized = internal::ToOutputNorm(queryPathUtf8);
+
+    struct statvfs spaceInfo;
+    if (statvfs(normalized.c_str(), &spaceInfo) != 0)
+    {
+        return false;
+    }
+
+    const uint64_t fragmentSize = static_cast<uint64_t>(spaceInfo.f_frsize != 0 ? spaceInfo.f_frsize : spaceInfo.f_bsize);
+    outSpaceInfo.availableSpaceByte = internal::SaturatingMultiplyUInt64(static_cast<uint64_t>(spaceInfo.f_bavail), fragmentSize);
+    outSpaceInfo.freeSpaceByte = internal::SaturatingMultiplyUInt64(static_cast<uint64_t>(spaceInfo.f_bfree), fragmentSize);
+    outSpaceInfo.totalSpaceByte = internal::SaturatingMultiplyUInt64(static_cast<uint64_t>(spaceInfo.f_blocks), fragmentSize);
+    return true;
+#endif
+}
+
+bool GB_IsFileExists(const std::string& filePathUtf8)
+{
+    return GB_GetFileType(filePathUtf8) == GB_FileType::RegularFile;
 }
 
 bool GB_IsDirectoryExists(const std::string& dirPathUtf8)
@@ -1523,7 +3556,7 @@ bool GB_IsDirectoryExists(const std::string& dirPathUtf8)
 
 bool GB_CreateDirectory(const std::string& dirPathUtf8)
 {
-    if (dirPathUtf8.empty())
+    if (!internal::IsValidNativePathString(dirPathUtf8))
     {
         return false;
     }
@@ -1553,7 +3586,7 @@ bool GB_IsEmptyDirectory(const std::string& dirPathUtf8)
         return false;
     }
 
-    HANDLE find = FindFirstFileW(patternW.c_str(), &data);
+    HANDLE find = internal::FindFirstFileExBasicWithFallback(patternW, data);
     if (find == INVALID_HANDLE_VALUE)
     {
         const DWORD err = GetLastError();
@@ -1580,8 +3613,9 @@ bool GB_IsEmptyDirectory(const std::string& dirPathUtf8)
         break;
     } while (FindNextFileW(find, &data));
 
+    const DWORD findErr = empty ? GetLastError() : ERROR_NO_MORE_FILES;
     FindClose(find);
-    return empty;
+    return empty && findErr == ERROR_NO_MORE_FILES;
 #else
     const std::string dirWithSlash = internal::EnsureTrailingSlash(dirPathUtf8);
     if (dirWithSlash.empty())
@@ -1596,15 +3630,12 @@ bool GB_IsEmptyDirectory(const std::string& dirPathUtf8)
     }
 
     bool empty = true;
+    errno = 0;
     struct dirent* entry = nullptr;
     while ((entry = readdir(dir)) != nullptr)
     {
         const char* name = entry->d_name;
-        if (!name)
-        {
-            continue;
-        }
-        if (std::strcmp(name, ".") == 0 || std::strcmp(name, "..") == 0)
+        if (internal::IsDotOrDotDotA(name))
         {
             continue;
         }
@@ -1612,14 +3643,15 @@ bool GB_IsEmptyDirectory(const std::string& dirPathUtf8)
         break;
     }
 
-    closedir(dir);
-    return empty;
+    const int readDirErrno = errno;
+    const int closeDirResult = closedir(dir);
+    return empty && readDirErrno == 0 && closeDirResult == 0;
 #endif
 }
 
 bool GB_DeleteDirectory(const std::string& dirPathUtf8)
 {
-    if (dirPathUtf8.empty())
+    if (!internal::IsValidNativePathString(dirPathUtf8))
     {
         return false;
     }
@@ -1630,18 +3662,29 @@ bool GB_DeleteDirectory(const std::string& dirPathUtf8)
         return false;
     }
 
-    // Refuse to delete absolute roots: "/", "C:/", "//server/share/".
-    if (internal::IsAbsoluteRootPath(trimmedPath))
+    // Refuse to delete absolute roots, "." and "..".
+    if (internal::IsUnsafeDeleteTargetPath(trimmedPath))
     {
         return false;
     }
 
 #if defined(_WIN32)
-    bool exists = false;
-    bool isDir = false;
-    if (!internal::IsDirByStat(trimmedPath, exists, isDir) || !exists || !isDir)
+    const std::wstring pathW = internal::Utf8ToWide(trimmedPath);
+    if (pathW.empty())
     {
         return false;
+    }
+
+    const DWORD attrs = GetFileAttributesW(pathW.c_str());
+    if (attrs == INVALID_FILE_ATTRIBUTES || (attrs & FILE_ATTRIBUTE_DIRECTORY) == 0)
+    {
+        return false;
+    }
+
+    if ((attrs & FILE_ATTRIBUTE_REPARSE_POINT) != 0)
+    {
+        // 若删除对象本身就是目录符号链接/联接点，只删除重解析点本身，绝不递归进入其目标。
+        return internal::RemoveEmptyDir(trimmedPath);
     }
 
     if (!internal::DeleteDirContents(trimmedPath))
@@ -1650,8 +3693,9 @@ bool GB_DeleteDirectory(const std::string& dirPathUtf8)
     }
     return internal::RemoveEmptyDir(trimmedPath);
 #else
+    const std::string pathNormalized = internal::ToOutputNorm(trimmedPath);
     struct stat st;
-    if (lstat(trimmedPath.c_str(), &st) != 0)
+    if (lstat(pathNormalized.c_str(), &st) != 0)
     {
         return false;
     }
@@ -1659,7 +3703,6 @@ bool GB_DeleteDirectory(const std::string& dirPathUtf8)
     if (S_ISLNK(st.st_mode))
     {
         // Do not follow symlinked directories; delete the link itself.
-        const std::string pathNormalized = internal::ToOutputNorm(trimmedPath);
         return unlink(pathNormalized.c_str()) == 0;
     }
 
@@ -1672,13 +3715,13 @@ bool GB_DeleteDirectory(const std::string& dirPathUtf8)
     {
         return false;
     }
-    return rmdir(trimmedPath.c_str()) == 0;
+    return rmdir(pathNormalized.c_str()) == 0;
 #endif
 }
 
 bool GB_DeleteFile(const std::string& filePathUtf8)
 {
-    if (!GB_IsFileExists(filePathUtf8))
+    if (GB_GetFileType(filePathUtf8) != GB_FileType::RegularFile)
     {
         return false;
     }
@@ -1691,76 +3734,72 @@ bool GB_DeleteFile(const std::string& filePathUtf8)
 #endif
 }
 
+bool GB_DeletePath(const std::string& pathUtf8)
+{
+    if (!internal::IsValidNativePathString(pathUtf8))
+    {
+        return false;
+    }
+
+    const std::string trimmedPath = internal::StripTrailingSlashesButKeepRoot(pathUtf8);
+    if (trimmedPath.empty() || internal::IsUnsafeDeleteTargetPath(trimmedPath))
+    {
+        return false;
+    }
+
+    return internal::DeletePathAnyType(trimmedPath);
+}
+
 bool GB_CopyFile(const std::string& srcFilePathUtf8, const std::string& dstFilePathUtf8)
 {
-    if (!GB_IsFileExists(srcFilePathUtf8))
+    if (GB_GetFileType(srcFilePathUtf8) != GB_FileType::RegularFile)
     {
         return false;
     }
 
-    if (dstFilePathUtf8.empty())
+    return GB_CopyPath(srcFilePathUtf8, dstFilePathUtf8, true);
+}
+
+bool GB_CopyPath(const std::string& srcPathUtf8, const std::string& dstPathUtf8, bool overwriteIfExists)
+{
+    if (!internal::IsValidNativePathString(srcPathUtf8) || !internal::IsValidNativePathString(dstPathUtf8))
     {
         return false;
     }
 
-#if defined(_WIN32)
-    const std::wstring srcW = internal::Utf8ToWide(srcFilePathUtf8);
-    const std::wstring dstW = internal::Utf8ToWide(dstFilePathUtf8);
-    if (srcW.empty() || dstW.empty())
+    const std::string srcTrimmed = internal::StripTrailingSlashesButKeepRoot(srcPathUtf8);
+    const std::string dstTrimmed = internal::StripTrailingSlashesButKeepRoot(dstPathUtf8);
+    if (srcTrimmed.empty() || dstTrimmed.empty())
+    {
+        return false;
+    }
+    if (internal::IsAbsoluteRootPath(srcTrimmed))
     {
         return false;
     }
 
-    return CopyFileW(srcW.c_str(), dstW.c_str(), FALSE) != 0;
-#else
-    const std::string srcNormalized = internal::ToOutputNorm(srcFilePathUtf8);
+    const GB_FileType srcType = GB_GetFileType(srcTrimmed);
+    if (srcType == GB_FileType::NotExists || srcType == GB_FileType::Other)
+    {
+        return false;
+    }
+    if (internal::IsSamePathLexically(srcTrimmed, dstTrimmed))
+    {
+        return true;
+    }
 
-    std::FILE* src = std::fopen(srcNormalized.c_str(), "rb");
-    if (!src)
+    bool isSameExistingPath = false;
+    if (internal::TryCheckSameExistingPath(srcTrimmed, dstTrimmed, isSameExistingPath) && isSameExistingPath)
+    {
+        return true;
+    }
+
+    if (srcType == GB_FileType::Directory && internal::IsSubPathLexically(srcTrimmed, dstTrimmed))
     {
         return false;
     }
 
-    const std::string dstNormalized = internal::ToOutputNorm(dstFilePathUtf8);
-
-    std::FILE* dst = std::fopen(dstNormalized.c_str(), "wb");
-    if (!dst)
-    {
-        std::fclose(src);
-        return false;
-    }
-
-    std::vector<char> buffer;
-    buffer.resize(1024 * 1024);
-
-    bool ok = true;
-    for (;;)
-    {
-        const size_t bytesRead = std::fread(buffer.data(), 1, buffer.size(), src);
-        if (bytesRead > 0)
-        {
-            const size_t bytesWritten = std::fwrite(buffer.data(), 1, bytesRead, dst);
-            if (bytesWritten != bytesRead)
-            {
-                ok = false;
-                break;
-            }
-        }
-
-        if (bytesRead < buffer.size())
-        {
-            if (std::ferror(src))
-            {
-                ok = false;
-            }
-            break;
-        }
-    }
-
-    std::fclose(src);
-    std::fclose(dst);
-    return ok;
-#endif
+    return internal::CopyPathToFinalReplacing(srcTrimmed, dstTrimmed, srcType, overwriteIfExists);
 }
 
 std::vector<std::string> GB_GetFilesList(const std::string& dirPathUtf8, bool recursive)
@@ -1778,13 +3817,17 @@ std::string GB_GetFileName(const std::string& filePathUtf8, bool withExt)
     }
 
     const std::string trimmedPath = internal::StripTrailingSlashesButKeepRoot(filePathUtf8);
-    if (trimmedPath.empty())
+    if (trimmedPath.empty() || internal::IsRootPathString(trimmedPath))
     {
         return "";
     }
 
     const size_t sepPos = trimmedPath.find_last_of('/');
     const std::string fileNameWithExt = (sepPos == std::string::npos) ? trimmedPath : trimmedPath.substr(sepPos + 1);
+    if (internal::IsDotOrDotDotName(fileNameWithExt))
+    {
+        return "";
+    }
 
     if (withExt)
     {
@@ -1792,7 +3835,7 @@ std::string GB_GetFileName(const std::string& filePathUtf8, bool withExt)
     }
 
     const size_t dotPos = fileNameWithExt.find_last_of('.');
-    if (dotPos == std::string::npos)
+    if (dotPos == std::string::npos || dotPos == 0)
     {
         return fileNameWithExt;
     }
@@ -1808,41 +3851,48 @@ std::string GB_GetFileExt(const std::string& filePathUtf8)
     }
 
     const std::string trimmedPath = internal::StripTrailingSlashesButKeepRoot(filePathUtf8);
-    if (trimmedPath.empty())
+    if (trimmedPath.empty() || internal::IsRootPathString(trimmedPath))
     {
         return "";
     }
 
     const size_t sepPos = trimmedPath.find_last_of('/');
-    const size_t dotPos = trimmedPath.find_last_of('.');
-    if (dotPos == std::string::npos)
-    {
-        return "";
-    }
-    if (sepPos != std::string::npos && dotPos <= sepPos)
+    const std::string fileNameWithExt = (sepPos == std::string::npos) ? trimmedPath : trimmedPath.substr(sepPos + 1);
+    if (internal::IsDotOrDotDotName(fileNameWithExt))
     {
         return "";
     }
 
-    return trimmedPath.substr(dotPos);
+    const size_t dotPos = fileNameWithExt.find_last_of('.');
+    if (dotPos == std::string::npos || dotPos == 0 || dotPos + 1 == fileNameWithExt.size())
+    {
+        return "";
+    }
+
+    return fileNameWithExt.substr(dotPos);
 }
 
 std::string GB_GetDirectoryPath(const std::string& filePathUtf8)
 {
-    if (filePathUtf8.empty())
+    if (filePathUtf8.empty() || internal::ContainsNullByte(filePathUtf8))
     {
         return "";
     }
 
-    const size_t pos = filePathUtf8.find_last_of("/\\");
+    const std::string trimmedPath = internal::StripTrailingSlashesButKeepRoot(filePathUtf8);
+    if (trimmedPath.empty() || internal::IsRootPathString(trimmedPath))
+    {
+        return "";
+    }
+
+    const size_t pos = trimmedPath.find_last_of('/');
     if (pos == std::string::npos)
     {
         return "";
     }
 
-    std::string dir = filePathUtf8.substr(0, pos + 1);
-    internal::ReplaceBackslashWithSlash(dir);
-    return dir;
+    const std::string dir = trimmedPath.substr(0, pos + 1);
+    return internal::EnsureTrailingSlash(dir);
 }
 
 size_t GB_GetFileSizeByte(const std::string& filePathUtf8)
@@ -1953,7 +4003,7 @@ std::string GB_GetExeDirectory()
 
 bool GB_CreateFileRecursive(const std::string& filePathUtf8, bool overwriteIfExists)
 {
-    if (filePathUtf8.empty())
+    if (!internal::IsValidNativePathString(filePathUtf8))
     {
         return false;
     }
@@ -1987,6 +4037,11 @@ bool GB_CreateFileRecursive(const std::string& filePathUtf8, bool overwriteIfExi
         return false;
     }
 
+    if (overwriteIfExists && !internal::ClearOverwriteBlockingAttributesIfNeeded(fileW))
+    {
+        return false;
+    }
+
     const DWORD disposition = overwriteIfExists ? CREATE_ALWAYS : CREATE_NEW;
     const HANDLE handle = CreateFileW(fileW.c_str(), GENERIC_WRITE,
         FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, disposition,
@@ -2010,6 +4065,10 @@ bool GB_CreateFileRecursive(const std::string& filePathUtf8, bool overwriteIfExi
     }
 
     const std::string filePathNormalized = internal::ToOutputNorm(filePathUtf8);
+    if (internal::ContainsNullByte(filePathNormalized))
+    {
+        return false;
+    }
 
     const int fd = open(filePathNormalized.c_str(), flags, 0644);
     if (fd < 0)
@@ -2141,23 +4200,35 @@ std::string GB_JoinPath(const std::string& leftPathUtf8, const std::string& righ
 std::string GB_GetTempDirectory()
 {
 #if defined(_WIN32)
-    const DWORD required = GetTempPathW(0, nullptr);
+    DWORD required = internal::GetTempPathBySystemPolicyW(0, nullptr);
     if (required == 0)
     {
         return "";
     }
 
-    std::vector<wchar_t> buffer;
-    buffer.resize(static_cast<size_t>(required) + 1, L'\0');
-    const DWORD written = GetTempPathW(static_cast<DWORD>(buffer.size()), buffer.data());
-    if (written == 0 || written >= buffer.size())
+    for (;;)
     {
-        return "";
-    }
+        std::vector<wchar_t> buffer;
+        buffer.resize(static_cast<size_t>(required) + 1, L'\0');
 
-    const std::wstring pathW(buffer.data(), written);
-    std::string pathUtf8 = GB_WStringToUtf8(pathW);
-    return internal::NormalizeDirectoryPathUtf8(pathUtf8);
+        const DWORD written = internal::GetTempPathBySystemPolicyW(static_cast<DWORD>(buffer.size()), buffer.data());
+        if (written == 0)
+        {
+            return "";
+        }
+        if (written < buffer.size())
+        {
+            const std::wstring pathW(buffer.data(), written);
+            std::string pathUtf8 = GB_WStringToUtf8(pathW);
+            return internal::NormalizeDirectoryPathUtf8(pathUtf8);
+        }
+
+        required = written;
+        if (required > 32768)
+        {
+            return "";
+        }
+    }
 #else
     std::string tmpDir = internal::GetEnvVarUtf8("TMPDIR");
     if (tmpDir.empty())

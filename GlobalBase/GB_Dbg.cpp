@@ -31,21 +31,40 @@
 #   pragma comment(lib, "Dbghelp.lib")
 #endif
 
+#if (defined(_WIN32) || defined(_WIN64)) && (defined(_M_X64) || defined(__x86_64__))
+#   define GB_DBG_WINDOWS_X64 1
+#endif
+
 namespace
 {
     const size_t GB_DbgMaxReasonableFrameCount = 1024;
+    const size_t GB_DbgStackBufferFrameCount = 128;
 
 #if defined(_WIN32) || defined(_WIN64)
     const size_t GB_DbgInitialPathBufferLength = 1024;
     const size_t GB_DbgMaxPathBufferLength = 32768;
+    const DWORD GB_DbgMaxSymbolNameLength = 1024;
     const uint32_t GB_DbgExceptionPossibleDeadlock = 0xC0000194u;
     const uint32_t GB_DbgExceptionCppException = 0xE06D7363u;
     const uint32_t GB_DbgExceptionClrException = 0xE0434352u;
 #endif
 
+#if defined(_WIN32) || defined(_WIN64)
     size_t NormalizeFrameCount(size_t maxFrameCount)
     {
         return (std::min)(maxFrameCount, GB_DbgMaxReasonableFrameCount);
+    }
+#endif
+
+    size_t SafeAddSizeT(size_t leftValue, size_t rightValue)
+    {
+        const size_t maxValue = (std::numeric_limits<size_t>::max)();
+        if (leftValue > maxValue - rightValue)
+        {
+            return maxValue;
+        }
+
+        return leftValue + rightValue;
     }
 
     std::string FormatHexValue(uint64_t value, size_t width)
@@ -61,28 +80,41 @@ namespace
     }
 
 #if defined(_WIN32) || defined(_WIN64)
-    std::wstring Utf8ToWideString(const std::string& textUtf8)
+    bool TryUtf8ToWideString(const std::string& textUtf8, std::wstring& wideString)
     {
+        wideString.clear();
         if (textUtf8.empty())
         {
-            return std::wstring();
+            return true;
         }
 
         if (textUtf8.size() > static_cast<size_t>((std::numeric_limits<int>::max)()))
         {
-            return std::wstring();
+            return false;
         }
 
         const int byteCount = static_cast<int>(textUtf8.size());
         const int wideLength = ::MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, textUtf8.data(), byteCount, nullptr, 0);
         if (wideLength <= 0)
         {
-            return std::wstring();
+            return false;
         }
 
-        std::wstring wideString(static_cast<size_t>(wideLength), L'\0');
-        const int convertedLength = ::MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, textUtf8.data(), byteCount, &wideString[0], wideLength);
+        std::wstring result(static_cast<size_t>(wideLength), L'\0');
+        const int convertedLength = ::MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, textUtf8.data(), byteCount, &result[0], wideLength);
         if (convertedLength != wideLength)
+        {
+            return false;
+        }
+
+        wideString.swap(result);
+        return true;
+    }
+
+    std::wstring Utf8ToWideString(const std::string& textUtf8)
+    {
+        std::wstring wideString;
+        if (!TryUtf8ToWideString(textUtf8, wideString))
         {
             return std::wstring();
         }
@@ -156,13 +188,34 @@ namespace
         return filePath.substr(pos + 1);
     }
 
-    std::wstring GetModuleFilePath(HMODULE moduleHandle)
+    std::wstring GetDirectoryFromPath(const std::wstring& filePath)
     {
-        if (moduleHandle == nullptr)
+        const size_t pos = filePath.find_last_of(L"\\/");
+        if (pos == std::wstring::npos)
         {
             return std::wstring();
         }
 
+        return filePath.substr(0, pos);
+    }
+
+    void AppendSymbolPathPart(std::wstring& symbolSearchPath, const std::wstring& pathPart)
+    {
+        if (pathPart.empty())
+        {
+            return;
+        }
+
+        if (!symbolSearchPath.empty())
+        {
+            symbolSearchPath.push_back(L';');
+        }
+
+        symbolSearchPath.append(pathPart);
+    }
+
+    std::wstring GetModuleFilePath(HMODULE moduleHandle)
+    {
         for (size_t bufferLength = GB_DbgInitialPathBufferLength; bufferLength <= GB_DbgMaxPathBufferLength; bufferLength *= 2)
         {
             std::vector<wchar_t> buffer(bufferLength, L'\0');
@@ -173,13 +226,67 @@ namespace
                 return std::wstring();
             }
 
-            if (copiedLength + 1 < buffer.size())
+            if (copiedLength < buffer.size())
             {
                 return std::wstring(buffer.data(), copiedLength);
             }
         }
 
         return std::wstring();
+    }
+
+    std::wstring GetCurrentDirectoryString()
+    {
+        const DWORD requiredLength = ::GetCurrentDirectoryW(0, nullptr);
+        if (requiredLength == 0)
+        {
+            return std::wstring();
+        }
+
+        std::vector<wchar_t> buffer(static_cast<size_t>(requiredLength) + 1, L'\0');
+        const DWORD copiedLength = ::GetCurrentDirectoryW(static_cast<DWORD>(buffer.size()), buffer.data());
+        if (copiedLength == 0 || copiedLength >= buffer.size())
+        {
+            return std::wstring();
+        }
+
+        return std::wstring(buffer.data(), copiedLength);
+    }
+
+    std::wstring GetEnvironmentVariableString(const wchar_t* variableName)
+    {
+        if (variableName == nullptr || variableName[0] == L'\0')
+        {
+            return std::wstring();
+        }
+
+        const DWORD requiredLength = ::GetEnvironmentVariableW(variableName, nullptr, 0);
+        if (requiredLength == 0)
+        {
+            return std::wstring();
+        }
+
+        std::vector<wchar_t> buffer(static_cast<size_t>(requiredLength) + 1, L'\0');
+        const DWORD copiedLength = ::GetEnvironmentVariableW(variableName, buffer.data(), static_cast<DWORD>(buffer.size()));
+        if (copiedLength == 0 || copiedLength >= buffer.size())
+        {
+            return std::wstring();
+        }
+
+        return std::wstring(buffer.data(), copiedLength);
+    }
+
+    std::wstring BuildDefaultSymbolSearchPath()
+    {
+        std::wstring symbolSearchPath;
+
+        const std::wstring executablePath = GetModuleFilePath(nullptr);
+        AppendSymbolPathPart(symbolSearchPath, GetDirectoryFromPath(executablePath));
+        AppendSymbolPathPart(symbolSearchPath, GetCurrentDirectoryString());
+        AppendSymbolPathPart(symbolSearchPath, GetEnvironmentVariableString(L"_NT_SYMBOL_PATH"));
+        AppendSymbolPathPart(symbolSearchPath, GetEnvironmentVariableString(L"_NT_ALTERNATE_SYMBOL_PATH"));
+
+        return symbolSearchPath;
     }
 
     uint32_t GetCurrentSystemErrorCode()
@@ -227,6 +334,16 @@ namespace
         return static_cast<ULONG>((std::min)(value, maxUlongValue));
     }
 
+    void* AddressToPointer(uint64_t address)
+    {
+        if (address == 0 || address > static_cast<uint64_t>((std::numeric_limits<uintptr_t>::max)()))
+        {
+            return nullptr;
+        }
+
+        return reinterpret_cast<void*>(static_cast<uintptr_t>(address));
+    }
+
     void AppendFrameAddress(std::vector<uint64_t>& addresses, uint64_t address, size_t maxFrameCount)
     {
         if (address == 0 || addresses.size() >= maxFrameCount)
@@ -242,6 +359,100 @@ namespace
         addresses.push_back(address);
     }
 
+    bool ReadUint64FromCurrentProcess(uint64_t address, uint64_t& value)
+    {
+        value = 0;
+        if (address == 0 || address > static_cast<uint64_t>((std::numeric_limits<uintptr_t>::max)()))
+        {
+            return false;
+        }
+
+        SIZE_T bytesRead = 0;
+        const BOOL success = ::ReadProcessMemory(::GetCurrentProcess(), reinterpret_cast<LPCVOID>(static_cast<uintptr_t>(address)), &value, sizeof(value), &bytesRead);
+        return success == TRUE && bytesRead == sizeof(value);
+    }
+
+    bool UnwindOneFrameX64(CONTEXT& context)
+    {
+#if defined(GB_DBG_WINDOWS_X64)
+        const uint64_t oldRip = static_cast<uint64_t>(context.Rip);
+        if (oldRip == 0)
+        {
+            return false;
+        }
+
+        DWORD64 imageBase = 0;
+        PRUNTIME_FUNCTION runtimeFunction = ::RtlLookupFunctionEntry(static_cast<DWORD64>(context.Rip), &imageBase, nullptr);
+        if (runtimeFunction != nullptr)
+        {
+            PVOID handlerData = nullptr;
+            DWORD64 establisherFrame = 0;
+            ::RtlVirtualUnwind(UNW_FLAG_NHANDLER, imageBase, static_cast<DWORD64>(context.Rip), runtimeFunction, &context, &handlerData, &establisherFrame, nullptr);
+            return context.Rip != 0 && static_cast<uint64_t>(context.Rip) != oldRip;
+        }
+
+        uint64_t returnAddress = 0;
+        if (!ReadUint64FromCurrentProcess(static_cast<uint64_t>(context.Rsp), returnAddress))
+        {
+            return false;
+        }
+
+        context.Rip = static_cast<DWORD64>(returnAddress);
+        context.Rsp = static_cast<DWORD64>(context.Rsp + sizeof(uint64_t));
+        return returnAddress != 0 && returnAddress != oldRip;
+#else
+        (void)context;
+        return false;
+#endif
+    }
+
+    std::vector<uint64_t> CaptureStackAddressesFromContextByUnwind(const void* contextRecord, size_t maxFrameCount)
+    {
+#if defined(GB_DBG_WINDOWS_X64)
+        const size_t normalizedMaxFrameCount = NormalizeFrameCount(maxFrameCount);
+        if (contextRecord == nullptr || normalizedMaxFrameCount == 0)
+        {
+            return std::vector<uint64_t>();
+        }
+
+        CONTEXT context = *reinterpret_cast<const CONTEXT*>(contextRecord);
+
+        std::vector<uint64_t> addresses;
+        addresses.reserve(normalizedMaxFrameCount);
+        AppendFrameAddress(addresses, static_cast<uint64_t>(context.Rip), normalizedMaxFrameCount);
+
+        size_t duplicateFrameCount = 0;
+        while (addresses.size() < normalizedMaxFrameCount)
+        {
+            const bool success = UnwindOneFrameX64(context);
+            if (!success || context.Rip == 0)
+            {
+                break;
+            }
+
+            const size_t oldFrameCount = addresses.size();
+            AppendFrameAddress(addresses, static_cast<uint64_t>(context.Rip), normalizedMaxFrameCount);
+            if (addresses.size() == oldFrameCount)
+            {
+                duplicateFrameCount++;
+                if (duplicateFrameCount > 1)
+                {
+                    break;
+                }
+                continue;
+            }
+
+            duplicateFrameCount = 0;
+        }
+
+        return addresses;
+#else
+        (void)contextRecord;
+        (void)maxFrameCount;
+        return std::vector<uint64_t>();
+#endif
+    }
+
     struct GB_DbgRuntimeModuleInfo
     {
         HMODULE moduleHandle = nullptr;
@@ -254,20 +465,16 @@ namespace
     bool GetRuntimeModuleInfo(uint64_t address, GB_DbgRuntimeModuleInfo& moduleInfo)
     {
         moduleInfo = GB_DbgRuntimeModuleInfo();
-        if (address == 0)
+
+        void* addressPointer = AddressToPointer(address);
+        if (addressPointer == nullptr)
         {
             return false;
         }
 
-        MEMORY_BASIC_INFORMATION memoryInfo;
-        std::memset(&memoryInfo, 0, sizeof(memoryInfo));
-        if (::VirtualQuery(reinterpret_cast<LPCVOID>(static_cast<uintptr_t>(address)), &memoryInfo, sizeof(memoryInfo)) == 0)
-        {
-            return false;
-        }
-
-        const HMODULE moduleHandle = reinterpret_cast<HMODULE>(memoryInfo.AllocationBase);
-        if (moduleHandle == nullptr)
+        HMODULE moduleHandle = nullptr;
+        const DWORD flags = GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT;
+        if (!::GetModuleHandleExW(flags, reinterpret_cast<LPCWSTR>(addressPointer), &moduleHandle) || moduleHandle == nullptr)
         {
             return false;
         }
@@ -326,6 +533,31 @@ namespace
         HANDLE m_fileHandle = nullptr;
     };
 
+
+    class GB_DbgLocalMemoryScope
+    {
+    public:
+        explicit GB_DbgLocalMemoryScope(HLOCAL localMemory)
+            : m_localMemory(localMemory)
+        {
+        }
+
+        ~GB_DbgLocalMemoryScope()
+        {
+            if (m_localMemory != nullptr)
+            {
+                ::LocalFree(m_localMemory);
+                m_localMemory = nullptr;
+            }
+        }
+
+        GB_DbgLocalMemoryScope(const GB_DbgLocalMemoryScope&) = delete;
+        GB_DbgLocalMemoryScope& operator = (const GB_DbgLocalMemoryScope&) = delete;
+
+    private:
+        HLOCAL m_localMemory = nullptr;
+    };
+
     class GB_DbgSymbolEngine
     {
     public:
@@ -338,13 +570,23 @@ namespace
         bool Initialize(const GB_DbgSymbolOptions& options)
         {
             std::lock_guard<std::recursive_mutex> lock(m_mutex);
-            if (m_initialized)
+            if (m_initialized && m_referenceCount > 0)
             {
-                if (m_referenceCount < (std::numeric_limits<size_t>::max)())
+                if (m_referenceCount == (std::numeric_limits<size_t>::max)())
                 {
-                    m_referenceCount++;
+                    return false;
                 }
+
+                m_referenceCount++;
                 return true;
+            }
+
+            if (m_initialized && m_referenceCount == 0)
+            {
+                ::SymCleanup(m_processHandle);
+                m_initialized = false;
+                m_initializedOptions = GB_DbgSymbolOptions();
+                m_symbolBuffer.clear();
             }
 
             if (!InitializeLocked(options))
@@ -378,6 +620,7 @@ namespace
             m_initialized = false;
             m_referenceCount = 0;
             m_initializedOptions = GB_DbgSymbolOptions();
+            m_symbolBuffer.clear();
         }
 
         bool RefreshModuleList()
@@ -397,68 +640,67 @@ namespace
             return m_initialized;
         }
 
-        GB_DbgStackTrace CaptureCurrentStackTrace(size_t skipFrameCount, size_t maxFrameCount)
+        std::vector<uint64_t> CaptureCurrentStackAddresses(size_t skipFrameCount, size_t maxFrameCount)
         {
-            GB_DbgStackTrace stackTrace;
-
-#if defined(_M_X64)
-            const size_t normalizedMaxFrameCount = NormalizeFrameCount(maxFrameCount);
-            if (normalizedMaxFrameCount == 0)
-            {
-                return stackTrace;
-            }
-
-            std::vector<void*> rawAddresses(normalizedMaxFrameCount, nullptr);
-            const size_t internalSkipFrameCount = skipFrameCount + 2;
-            const USHORT capturedFrameCount = ::CaptureStackBackTrace(SafeToUlong(internalSkipFrameCount), SafeToUlong(normalizedMaxFrameCount), rawAddresses.data(), nullptr);
-
-            std::vector<uint64_t> addresses;
-            addresses.reserve(capturedFrameCount);
-            for (USHORT i = 0; i < capturedFrameCount; i++)
-            {
-                const uint64_t address = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(rawAddresses[i]));
-                AppendFrameAddress(addresses, address, normalizedMaxFrameCount);
-            }
-
-            ResolveAddresses(addresses, stackTrace);
+#if defined(GB_DBG_WINDOWS_X64)
+            return CaptureCurrentStackAddressesInternal(skipFrameCount, 3, maxFrameCount);
 #else
             (void)skipFrameCount;
             (void)maxFrameCount;
+            return std::vector<uint64_t>();
 #endif
-            return stackTrace;
         }
 
-        GB_DbgStackTrace CaptureStackTraceFromContext(const void* contextRecord, size_t maxFrameCount)
+        GB_DbgStackTrace CaptureCurrentStackTrace(size_t skipFrameCount, size_t maxFrameCount, bool resolveSymbols)
         {
-            GB_DbgStackTrace stackTrace;
-
-#if defined(_M_X64)
-            const size_t normalizedMaxFrameCount = NormalizeFrameCount(maxFrameCount);
-            if (contextRecord == nullptr || normalizedMaxFrameCount == 0)
+#if defined(GB_DBG_WINDOWS_X64)
+            const std::vector<uint64_t> addresses = CaptureCurrentStackAddressesInternal(skipFrameCount, 3, maxFrameCount);
+            if (resolveSymbols)
             {
-                return stackTrace;
+                return ResolveAddresses(addresses);
             }
 
-            CONTEXT context = *reinterpret_cast<const CONTEXT*>(contextRecord);
+            return BuildUnresolvedStackTrace(addresses);
+#else
+            (void)skipFrameCount;
+            (void)maxFrameCount;
+            (void)resolveSymbols;
+            return GB_DbgStackTrace();
+#endif
+        }
 
-            std::vector<uint64_t> addresses;
-            addresses.reserve(normalizedMaxFrameCount);
-            AppendFrameAddress(addresses, static_cast<uint64_t>(context.Rip), normalizedMaxFrameCount);
-
-            {
-                std::lock_guard<std::recursive_mutex> lock(m_mutex);
-                if (EnsureInitializedLocked())
-                {
-                    CaptureStackAddressesFromContextLocked(context, normalizedMaxFrameCount, addresses);
-                }
-            }
-
-            ResolveAddresses(addresses, stackTrace);
+        std::vector<uint64_t> CaptureStackAddressesFromContext(const void* contextRecord, size_t maxFrameCount)
+        {
+#if defined(GB_DBG_WINDOWS_X64)
+            return CaptureStackAddressesFromContextByUnwind(contextRecord, maxFrameCount);
 #else
             (void)contextRecord;
             (void)maxFrameCount;
+            return std::vector<uint64_t>();
 #endif
-            return stackTrace;
+        }
+
+        GB_DbgStackTrace CaptureStackTraceFromContext(const void* contextRecord, size_t maxFrameCount, bool resolveSymbols)
+        {
+#if defined(GB_DBG_WINDOWS_X64)
+            const std::vector<uint64_t> addresses = CaptureStackAddressesFromContext(contextRecord, maxFrameCount);
+            if (resolveSymbols)
+            {
+                return ResolveAddresses(addresses);
+            }
+
+            return BuildUnresolvedStackTrace(addresses);
+#else
+            (void)contextRecord;
+            (void)maxFrameCount;
+            (void)resolveSymbols;
+            return GB_DbgStackTrace();
+#endif
+        }
+
+        GB_DbgStackTrace ResolveStackTraceAddresses(const std::vector<uint64_t>& addresses)
+        {
+            return ResolveAddresses(addresses);
         }
 
         bool ResolveAddress(uint64_t address, GB_DbgStackFrame& frame)
@@ -495,8 +737,8 @@ namespace
                 return false;
             }
 
-            const std::wstring dumpFilePath = Utf8ToWideString(dumpFilePathUtf8);
-            if (dumpFilePath.empty())
+            std::wstring dumpFilePath;
+            if (!TryUtf8ToWideString(dumpFilePathUtf8, dumpFilePath) || dumpFilePath.empty())
             {
                 return false;
             }
@@ -601,9 +843,30 @@ namespace
                 symOptions &= ~SYMOPT_FAIL_CRITICAL_ERRORS;
             }
 
+            if (options.noSymbolPrompts)
+            {
+                symOptions |= SYMOPT_NO_PROMPTS;
+            }
+            else
+            {
+                symOptions &= ~SYMOPT_NO_PROMPTS;
+            }
+
             ::SymSetOptions(symOptions);
 
-            const std::wstring symbolSearchPath = Utf8ToWideString(options.symbolSearchPathUtf8);
+            std::wstring symbolSearchPath;
+            if (!options.symbolSearchPathUtf8.empty())
+            {
+                if (!TryUtf8ToWideString(options.symbolSearchPathUtf8, symbolSearchPath))
+                {
+                    return false;
+                }
+            }
+            else
+            {
+                symbolSearchPath = BuildDefaultSymbolSearchPath();
+            }
+
             const wchar_t* symbolSearchPathPtr = symbolSearchPath.empty() ? nullptr : symbolSearchPath.c_str();
             const BOOL invadeProcess = options.loadModules ? TRUE : FALSE;
 
@@ -617,51 +880,55 @@ namespace
             return true;
         }
 
-        void CaptureStackAddressesFromContextLocked(CONTEXT context, size_t maxFrameCount, std::vector<uint64_t>& addresses)
+        std::vector<uint64_t> CaptureCurrentStackAddressesInternal(size_t skipFrameCount, size_t internalFrameCount, size_t maxFrameCount)
         {
-#if defined(_M_X64)
-            STACKFRAME64 stackFrame;
-            std::memset(&stackFrame, 0, sizeof(stackFrame));
-            stackFrame.AddrPC.Offset = context.Rip;
-            stackFrame.AddrPC.Mode = AddrModeFlat;
-            stackFrame.AddrStack.Offset = context.Rsp;
-            stackFrame.AddrStack.Mode = AddrModeFlat;
-            stackFrame.AddrFrame.Offset = context.Rbp;
-            stackFrame.AddrFrame.Mode = AddrModeFlat;
-
-            size_t duplicateFrameCount = 0;
-            while (addresses.size() < maxFrameCount)
+            const size_t normalizedMaxFrameCount = NormalizeFrameCount(maxFrameCount);
+            if (normalizedMaxFrameCount == 0)
             {
-                const BOOL success = ::StackWalk64(IMAGE_FILE_MACHINE_AMD64, m_processHandle, ::GetCurrentThread(), &stackFrame, &context, nullptr, ::SymFunctionTableAccess64, ::SymGetModuleBase64, nullptr);
-                if (!success || stackFrame.AddrPC.Offset == 0)
-                {
-                    break;
-                }
-
-                const size_t oldFrameCount = addresses.size();
-                AppendFrameAddress(addresses, static_cast<uint64_t>(stackFrame.AddrPC.Offset), maxFrameCount);
-                if (addresses.size() == oldFrameCount)
-                {
-                    duplicateFrameCount++;
-                    if (duplicateFrameCount > 1)
-                    {
-                        break;
-                    }
-                    continue;
-                }
-
-                duplicateFrameCount = 0;
+                return std::vector<uint64_t>();
             }
-#else
-            (void)context;
-            (void)maxFrameCount;
-            (void)addresses;
-#endif
+
+            void* stackRawAddresses[GB_DbgStackBufferFrameCount] = {};
+            std::vector<void*> heapRawAddresses;
+            void** rawAddresses = stackRawAddresses;
+            if (normalizedMaxFrameCount > GB_DbgStackBufferFrameCount)
+            {
+                heapRawAddresses.assign(normalizedMaxFrameCount, nullptr);
+                rawAddresses = heapRawAddresses.data();
+            }
+
+            const size_t internalSkipFrameCount = SafeAddSizeT(skipFrameCount, internalFrameCount);
+            const USHORT capturedFrameCount = ::CaptureStackBackTrace(SafeToUlong(internalSkipFrameCount), SafeToUlong(normalizedMaxFrameCount), rawAddresses, nullptr);
+
+            std::vector<uint64_t> addresses;
+            addresses.reserve(capturedFrameCount);
+            for (USHORT i = 0; i < capturedFrameCount; i++)
+            {
+                const uint64_t address = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(rawAddresses[i]));
+                AppendFrameAddress(addresses, address, normalizedMaxFrameCount);
+            }
+
+            return addresses;
         }
 
-        void ResolveAddresses(const std::vector<uint64_t>& addresses, GB_DbgStackTrace& stackTrace)
+        GB_DbgStackTrace BuildUnresolvedStackTrace(const std::vector<uint64_t>& addresses) const
         {
-            stackTrace.frames.clear();
+            GB_DbgStackTrace stackTrace;
+            stackTrace.frames.reserve(addresses.size());
+
+            for (const uint64_t address : addresses)
+            {
+                GB_DbgStackFrame frame;
+                frame.address = address;
+                stackTrace.frames.push_back(frame);
+            }
+
+            return stackTrace;
+        }
+
+        GB_DbgStackTrace ResolveAddresses(const std::vector<uint64_t>& addresses)
+        {
+            GB_DbgStackTrace stackTrace;
             stackTrace.frames.reserve(addresses.size());
 
             std::lock_guard<std::recursive_mutex> lock(m_mutex);
@@ -684,6 +951,8 @@ namespace
                 }
                 stackTrace.frames.push_back(frame);
             }
+
+            return stackTrace;
         }
 
         void ResolveAddressLocked(uint64_t address, GB_DbgStackFrame& frame)
@@ -697,18 +966,30 @@ namespace
             }
 
             GB_DbgRuntimeModuleInfo runtimeModuleInfo;
-            const bool hasRuntimeModuleInfo = GetRuntimeModuleInfo(address, runtimeModuleInfo);
-            if (::SymGetModuleBase64(m_processHandle, static_cast<DWORD64>(address)) == 0 && hasRuntimeModuleInfo)
+            bool hasRuntimeModuleInfo = false;
+            if (::SymGetModuleBase64(m_processHandle, static_cast<DWORD64>(address)) == 0)
             {
-                const wchar_t* modulePath = runtimeModuleInfo.modulePath.empty() ? nullptr : runtimeModuleInfo.modulePath.c_str();
-                const wchar_t* moduleName = runtimeModuleInfo.moduleName.empty() ? nullptr : runtimeModuleInfo.moduleName.c_str();
-                ::SymLoadModuleExW(m_processHandle, nullptr, modulePath, moduleName, static_cast<DWORD64>(runtimeModuleInfo.moduleBase), 0, nullptr, 0);
+                hasRuntimeModuleInfo = GetRuntimeModuleInfo(address, runtimeModuleInfo);
+                if (hasRuntimeModuleInfo)
+                {
+                    const wchar_t* modulePath = runtimeModuleInfo.modulePath.empty() ? nullptr : runtimeModuleInfo.modulePath.c_str();
+                    const wchar_t* moduleName = runtimeModuleInfo.moduleName.empty() ? nullptr : runtimeModuleInfo.moduleName.c_str();
+                    ::SymLoadModuleExW(m_processHandle, nullptr, modulePath, moduleName, static_cast<DWORD64>(runtimeModuleInfo.moduleBase), 0, nullptr, 0);
+                }
             }
 
             ResolveModuleByDbgHelpLocked(address, frame);
-            if (!frame.hasModule && hasRuntimeModuleInfo)
+            if (!frame.hasModule)
             {
-                FillFrameModuleByRuntimeInfo(runtimeModuleInfo, frame);
+                if (!hasRuntimeModuleInfo)
+                {
+                    hasRuntimeModuleInfo = GetRuntimeModuleInfo(address, runtimeModuleInfo);
+                }
+
+                if (hasRuntimeModuleInfo)
+                {
+                    FillFrameModuleByRuntimeInfo(runtimeModuleInfo, frame);
+                }
             }
 
             ResolveSymbolByDbgHelpLocked(address, frame);
@@ -741,20 +1022,38 @@ namespace
             frame.hasModule = !frame.moduleNameUtf8.empty() || !frame.modulePathUtf8.empty();
         }
 
+        bool EnsureSymbolBufferLocked()
+        {
+            const size_t symbolBufferSize = sizeof(SYMBOL_INFOW) + (static_cast<size_t>(GB_DbgMaxSymbolNameLength) + 1) * sizeof(wchar_t);
+            if (m_symbolBuffer.size() >= symbolBufferSize)
+            {
+                return true;
+            }
+
+            try
+            {
+                m_symbolBuffer.resize(symbolBufferSize);
+            }
+            catch (...)
+            {
+                m_symbolBuffer.clear();
+                return false;
+            }
+
+            return true;
+        }
+
         void ResolveSymbolByDbgHelpLocked(uint64_t address, GB_DbgStackFrame& frame)
         {
-            const DWORD maxSymbolNameLength = 1024;
-            const size_t symbolBufferSize = sizeof(SYMBOL_INFOW) + static_cast<size_t>(maxSymbolNameLength) * sizeof(wchar_t);
-            std::unique_ptr<unsigned char[]> symbolBuffer(new (std::nothrow) unsigned char[symbolBufferSize]);
-            if (!symbolBuffer)
+            if (!EnsureSymbolBufferLocked())
             {
                 return;
             }
 
-            std::memset(symbolBuffer.get(), 0, symbolBufferSize);
-            SYMBOL_INFOW* symbolInfo = reinterpret_cast<SYMBOL_INFOW*>(symbolBuffer.get());
+            std::memset(m_symbolBuffer.data(), 0, m_symbolBuffer.size());
+            SYMBOL_INFOW* symbolInfo = reinterpret_cast<SYMBOL_INFOW*>(m_symbolBuffer.data());
             symbolInfo->SizeOfStruct = sizeof(SYMBOL_INFOW);
-            symbolInfo->MaxNameLen = maxSymbolNameLength;
+            symbolInfo->MaxNameLen = GB_DbgMaxSymbolNameLength;
 
             DWORD64 symbolDisplacement = 0;
             if (!::SymFromAddrW(m_processHandle, static_cast<DWORD64>(address), &symbolDisplacement, symbolInfo))
@@ -802,6 +1101,7 @@ namespace
         bool m_initialized = false;
         size_t m_referenceCount = 0;
         GB_DbgSymbolOptions m_initializedOptions;
+        std::vector<unsigned char> m_symbolBuffer;
         mutable std::recursive_mutex m_mutex;
     };
 #endif
@@ -828,7 +1128,14 @@ bool GB_DbgSymbolScope::IsInitialized() const
 bool GB_DbgInitializeSymbols(const GB_DbgSymbolOptions& options)
 {
 #if defined(_WIN32) || defined(_WIN64)
-    return GB_DbgSymbolEngine::Instance().Initialize(options);
+    try
+    {
+        return GB_DbgSymbolEngine::Instance().Initialize(options);
+    }
+    catch (...)
+    {
+        return false;
+    }
 #else
     (void)options;
     return false;
@@ -838,14 +1145,27 @@ bool GB_DbgInitializeSymbols(const GB_DbgSymbolOptions& options)
 void GB_DbgCleanupSymbols()
 {
 #if defined(_WIN32) || defined(_WIN64)
-    GB_DbgSymbolEngine::Instance().Cleanup();
+    try
+    {
+        GB_DbgSymbolEngine::Instance().Cleanup();
+    }
+    catch (...)
+    {
+    }
 #endif
 }
 
 bool GB_DbgRefreshSymbols()
 {
 #if defined(_WIN32) || defined(_WIN64)
-    return GB_DbgSymbolEngine::Instance().RefreshModuleList();
+    try
+    {
+        return GB_DbgSymbolEngine::Instance().RefreshModuleList();
+    }
+    catch (...)
+    {
+        return false;
+    }
 #else
     return false;
 #endif
@@ -854,7 +1174,14 @@ bool GB_DbgRefreshSymbols()
 bool GB_DbgIsSymbolEngineInitialized()
 {
 #if defined(_WIN32) || defined(_WIN64)
-    return GB_DbgSymbolEngine::Instance().IsInitialized();
+    try
+    {
+        return GB_DbgSymbolEngine::Instance().IsInitialized();
+    }
+    catch (...)
+    {
+        return false;
+    }
 #else
     return false;
 #endif
@@ -886,54 +1213,152 @@ void GB_DbgBreakIfDebuggerPresent()
     }
 }
 
-GB_DbgStackTrace GB_DbgCaptureStackTrace(size_t skipFrameCount, size_t maxFrameCount)
+GB_DbgStackTrace GB_DbgCaptureStackTrace(size_t skipFrameCount, size_t maxFrameCount, bool resolveSymbols)
 {
 #if defined(_WIN32) || defined(_WIN64)
-    return GB_DbgSymbolEngine::Instance().CaptureCurrentStackTrace(skipFrameCount, maxFrameCount);
+    try
+    {
+        return GB_DbgSymbolEngine::Instance().CaptureCurrentStackTrace(skipFrameCount, maxFrameCount, resolveSymbols);
+    }
+    catch (...)
+    {
+        return GB_DbgStackTrace();
+    }
 #else
     (void)skipFrameCount;
     (void)maxFrameCount;
+    (void)resolveSymbols;
     return GB_DbgStackTrace();
 #endif
 }
 
-GB_DbgStackTrace GB_DbgCaptureStackTraceFromContext(const void* contextRecord, size_t maxFrameCount)
+std::vector<uint64_t> GB_DbgCaptureStackTraceAddresses(size_t skipFrameCount, size_t maxFrameCount)
 {
 #if defined(_WIN32) || defined(_WIN64)
-    return GB_DbgSymbolEngine::Instance().CaptureStackTraceFromContext(contextRecord, maxFrameCount);
+    try
+    {
+        return GB_DbgSymbolEngine::Instance().CaptureCurrentStackAddresses(skipFrameCount, maxFrameCount);
+    }
+    catch (...)
+    {
+        return std::vector<uint64_t>();
+    }
+#else
+    (void)skipFrameCount;
+    (void)maxFrameCount;
+    return std::vector<uint64_t>();
+#endif
+}
+
+GB_DbgStackTrace GB_DbgCaptureStackTraceFromContext(const void* contextRecord, size_t maxFrameCount, bool resolveSymbols)
+{
+#if defined(_WIN32) || defined(_WIN64)
+    try
+    {
+        return GB_DbgSymbolEngine::Instance().CaptureStackTraceFromContext(contextRecord, maxFrameCount, resolveSymbols);
+    }
+    catch (...)
+    {
+        return GB_DbgStackTrace();
+    }
 #else
     (void)contextRecord;
     (void)maxFrameCount;
+    (void)resolveSymbols;
     return GB_DbgStackTrace();
 #endif
 }
 
-GB_DbgStackTrace GB_DbgCaptureStackTraceFromExceptionPointers(const void* exceptionPointers, size_t maxFrameCount)
+std::vector<uint64_t> GB_DbgCaptureStackTraceAddressesFromContext(const void* contextRecord, size_t maxFrameCount)
 {
 #if defined(_WIN32) || defined(_WIN64)
-    if (exceptionPointers == nullptr)
+    try
+    {
+        return GB_DbgSymbolEngine::Instance().CaptureStackAddressesFromContext(contextRecord, maxFrameCount);
+    }
+    catch (...)
+    {
+        return std::vector<uint64_t>();
+    }
+#else
+    (void)contextRecord;
+    (void)maxFrameCount;
+    return std::vector<uint64_t>();
+#endif
+}
+
+GB_DbgStackTrace GB_DbgCaptureStackTraceFromExceptionPointers(const void* exceptionPointers, size_t maxFrameCount, bool resolveSymbols)
+{
+#if defined(_WIN32) || defined(_WIN64)
+    try
+    {
+        if (exceptionPointers == nullptr)
+        {
+            return GB_DbgStackTrace();
+        }
+
+        const EXCEPTION_POINTERS* sehExceptionPointers = reinterpret_cast<const EXCEPTION_POINTERS*>(exceptionPointers);
+        if (sehExceptionPointers->ContextRecord == nullptr)
+        {
+            return GB_DbgStackTrace();
+        }
+
+        return GB_DbgCaptureStackTraceFromContext(sehExceptionPointers->ContextRecord, maxFrameCount, resolveSymbols);
+    }
+    catch (...)
     {
         return GB_DbgStackTrace();
     }
-
-    const EXCEPTION_POINTERS* sehExceptionPointers = reinterpret_cast<const EXCEPTION_POINTERS*>(exceptionPointers);
-    if (sehExceptionPointers->ContextRecord == nullptr)
-    {
-        return GB_DbgStackTrace();
-    }
-
-    return GB_DbgCaptureStackTraceFromContext(sehExceptionPointers->ContextRecord, maxFrameCount);
 #else
     (void)exceptionPointers;
     (void)maxFrameCount;
+    (void)resolveSymbols;
     return GB_DbgStackTrace();
+#endif
+}
+
+std::vector<uint64_t> GB_DbgCaptureStackTraceAddressesFromExceptionPointers(const void* exceptionPointers, size_t maxFrameCount)
+{
+#if defined(_WIN32) || defined(_WIN64)
+    try
+    {
+        if (exceptionPointers == nullptr)
+        {
+            return std::vector<uint64_t>();
+        }
+
+        const EXCEPTION_POINTERS* sehExceptionPointers = reinterpret_cast<const EXCEPTION_POINTERS*>(exceptionPointers);
+        if (sehExceptionPointers->ContextRecord == nullptr)
+        {
+            return std::vector<uint64_t>();
+        }
+
+        return GB_DbgCaptureStackTraceAddressesFromContext(sehExceptionPointers->ContextRecord, maxFrameCount);
+    }
+    catch (...)
+    {
+        return std::vector<uint64_t>();
+    }
+#else
+    (void)exceptionPointers;
+    (void)maxFrameCount;
+    return std::vector<uint64_t>();
 #endif
 }
 
 bool GB_DbgResolveAddress(uint64_t address, GB_DbgStackFrame& frame)
 {
 #if defined(_WIN32) || defined(_WIN64)
-    return GB_DbgSymbolEngine::Instance().ResolveAddress(address, frame);
+    try
+    {
+        return GB_DbgSymbolEngine::Instance().ResolveAddress(address, frame);
+    }
+    catch (...)
+    {
+        frame = GB_DbgStackFrame();
+        frame.address = address;
+        return false;
+    }
 #else
     frame = GB_DbgStackFrame();
     frame.address = address;
@@ -941,89 +1366,131 @@ bool GB_DbgResolveAddress(uint64_t address, GB_DbgStackFrame& frame)
 #endif
 }
 
+
+GB_DbgStackTrace GB_DbgResolveStackTraceAddresses(const std::vector<uint64_t>& addresses)
+{
+#if defined(_WIN32) || defined(_WIN64)
+    try
+    {
+        return GB_DbgSymbolEngine::Instance().ResolveStackTraceAddresses(addresses);
+    }
+    catch (...)
+    {
+        GB_DbgStackTrace stackTrace;
+        stackTrace.frames.reserve(addresses.size());
+        for (const uint64_t address : addresses)
+        {
+            GB_DbgStackFrame frame;
+            frame.address = address;
+            stackTrace.frames.push_back(frame);
+        }
+        return stackTrace;
+    }
+#else
+    GB_DbgStackTrace stackTrace;
+    stackTrace.frames.reserve(addresses.size());
+    for (const uint64_t address : addresses)
+    {
+        GB_DbgStackFrame frame;
+        frame.address = address;
+        stackTrace.frames.push_back(frame);
+    }
+    return stackTrace;
+#endif
+}
+
 std::string GB_DbgFormatStackTrace(const GB_DbgStackTrace& stackTrace, bool withFrameIndex)
 {
-    std::ostringstream stream;
-
-    for (size_t i = 0; i < stackTrace.frames.size(); i++)
+    try
     {
-        const GB_DbgStackFrame& frame = stackTrace.frames[i];
+        std::ostringstream stream;
 
-        if (withFrameIndex)
+        for (size_t i = 0; i < stackTrace.frames.size(); i++)
         {
-            stream << "#" << std::setw(2) << std::setfill('0') << i << " ";
-        }
+            const GB_DbgStackFrame& frame = stackTrace.frames[i];
 
-        stream << FormatAddress(frame.address);
-
-        if (frame.hasModule && !frame.moduleNameUtf8.empty())
-        {
-            stream << " " << frame.moduleNameUtf8 << "!";
-        }
-        else
-        {
-            stream << " ";
-        }
-
-        if (frame.hasFunction)
-        {
-            stream << frame.functionNameUtf8;
-            if (frame.symbolDisplacement != 0)
+            if (withFrameIndex)
             {
-                stream << " + " << FormatHexValue(frame.symbolDisplacement, 0);
+                stream << "#" << std::setw(2) << std::setfill('0') << i << " ";
             }
-        }
-        else
-        {
-            stream << "(Function name unavailable)";
-        }
 
-        if (frame.hasSourceLocation)
-        {
-            stream << " [" << frame.sourceFilePathUtf8 << ":" << frame.sourceLine;
-            if (frame.lineDisplacement != 0)
+            stream << FormatAddress(frame.address);
+
+            if (frame.hasModule && !frame.moduleNameUtf8.empty())
             {
-                stream << " + " << frame.lineDisplacement;
+                stream << " " << frame.moduleNameUtf8 << "!";
             }
-            stream << "]";
-        }
-        else if (frame.hasModule && frame.moduleNameUtf8.empty() && !frame.modulePathUtf8.empty())
-        {
-            stream << " [" << frame.modulePathUtf8 << "]";
+            else
+            {
+                stream << " ";
+            }
+
+            if (frame.hasFunction)
+            {
+                stream << frame.functionNameUtf8;
+                if (frame.symbolDisplacement != 0)
+                {
+                    stream << " + " << FormatHexValue(frame.symbolDisplacement, 0);
+                }
+            }
+            else
+            {
+                stream << "(Function name unavailable)";
+            }
+
+            if (frame.hasSourceLocation)
+            {
+                stream << " [" << frame.sourceFilePathUtf8 << ":" << frame.sourceLine;
+                if (frame.lineDisplacement != 0)
+                {
+                    stream << " + " << frame.lineDisplacement;
+                }
+                stream << "]";
+            }
+            else if (frame.hasModule && frame.moduleNameUtf8.empty() && !frame.modulePathUtf8.empty())
+            {
+                stream << " [" << frame.modulePathUtf8 << "]";
+            }
+
+            stream << "\n";
         }
 
-        stream << "\n";
+        return stream.str();
     }
-
-    return stream.str();
+    catch (...)
+    {
+        return std::string();
+    }
 }
 
 std::string GB_DbgFormatSystemErrorMessage(uint32_t errorCode)
 {
+    try
+    {
 #if defined(_WIN32) || defined(_WIN64)
-    wchar_t* messageBuffer = nullptr;
-    const DWORD flags = FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS;
-    const DWORD messageLength = ::FormatMessageW(flags, nullptr, static_cast<DWORD>(errorCode), MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT), reinterpret_cast<LPWSTR>(&messageBuffer), 0, nullptr);
+        wchar_t* messageBuffer = nullptr;
+        const DWORD flags = FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS;
+        const DWORD messageLength = ::FormatMessageW(flags, nullptr, static_cast<DWORD>(errorCode), MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT), reinterpret_cast<LPWSTR>(&messageBuffer), 0, nullptr);
 
-    if (messageLength > 0 && messageBuffer != nullptr)
-    {
-        const std::wstring message = TrimSystemMessage(std::wstring(messageBuffer, messageLength));
-        ::LocalFree(messageBuffer);
+        GB_DbgLocalMemoryScope messageBufferScope(messageBuffer);
+        if (messageLength > 0 && messageBuffer != nullptr)
+        {
+            const std::wstring message = TrimSystemMessage(std::wstring(messageBuffer, messageLength));
 
-        std::ostringstream stream;
-        stream << WideStringToUtf8(message) << " (" << FormatHexValue(errorCode, 8) << ")";
-        return stream.str();
-    }
-
-    if (messageBuffer != nullptr)
-    {
-        ::LocalFree(messageBuffer);
-    }
+            std::ostringstream stream;
+            stream << WideStringToUtf8(message) << " (" << FormatHexValue(errorCode, 8) << ")";
+            return stream.str();
+        }
 #endif
 
-    std::ostringstream stream;
-    stream << "Unknown system error (" << FormatHexValue(errorCode, 8) << ")";
-    return stream.str();
+        std::ostringstream stream;
+        stream << "Unknown system error (" << FormatHexValue(errorCode, 8) << ")";
+        return stream.str();
+    }
+    catch (...)
+    {
+        return std::string("Unknown system error");
+    }
 }
 
 std::string GB_DbgGetLastSystemErrorMessage()
@@ -1038,19 +1505,25 @@ std::string GB_DbgGetLastSystemErrorMessage()
 void GB_DbgOutputDebugStringUtf8(const std::string& textUtf8)
 {
 #if defined(_WIN32) || defined(_WIN64)
-    if (textUtf8.empty())
+    try
     {
-        return;
-    }
+        if (textUtf8.empty())
+        {
+            return;
+        }
 
-    const std::wstring wideText = Utf8ToWideString(textUtf8);
-    if (!wideText.empty())
-    {
-        ::OutputDebugStringW(wideText.c_str());
+        const std::wstring wideText = Utf8ToWideString(textUtf8);
+        if (!wideText.empty())
+        {
+            ::OutputDebugStringW(wideText.c_str());
+        }
+        else
+        {
+            ::OutputDebugStringA(textUtf8.c_str());
+        }
     }
-    else
+    catch (...)
     {
-        ::OutputDebugStringA(textUtf8.c_str());
     }
 #else
     (void)textUtf8;
@@ -1059,7 +1532,7 @@ void GB_DbgOutputDebugStringUtf8(const std::string& textUtf8)
 
 void GB_DbgOutputCurrentStackTrace(size_t skipFrameCount, size_t maxFrameCount)
 {
-    const GB_DbgStackTrace stackTrace = GB_DbgCaptureStackTrace(skipFrameCount + 1, maxFrameCount);
+    const GB_DbgStackTrace stackTrace = GB_DbgCaptureStackTrace(SafeAddSizeT(skipFrameCount, 1), maxFrameCount);
     GB_DbgOutputDebugStringUtf8(GB_DbgFormatStackTrace(stackTrace));
 }
 
@@ -1198,7 +1671,14 @@ std::string GB_DbgGetExceptionCodeDescription(uint32_t exceptionCode)
 bool GB_DbgWriteMiniDump(const std::string& dumpFilePathUtf8, const void* exceptionPointers, GB_DbgMiniDumpLevel level)
 {
 #if defined(_WIN32) || defined(_WIN64)
-    return GB_DbgSymbolEngine::Instance().WriteMiniDump(dumpFilePathUtf8, exceptionPointers, 0, level);
+    try
+    {
+        return GB_DbgSymbolEngine::Instance().WriteMiniDump(dumpFilePathUtf8, exceptionPointers, 0, level);
+    }
+    catch (...)
+    {
+        return false;
+    }
 #else
     (void)dumpFilePathUtf8;
     (void)exceptionPointers;
@@ -1210,7 +1690,14 @@ bool GB_DbgWriteMiniDump(const std::string& dumpFilePathUtf8, const void* except
 bool GB_DbgWriteMiniDumpEx(const std::string& dumpFilePathUtf8, const void* exceptionPointers, uint32_t exceptionThreadId, GB_DbgMiniDumpLevel level)
 {
 #if defined(_WIN32) || defined(_WIN64)
-    return GB_DbgSymbolEngine::Instance().WriteMiniDump(dumpFilePathUtf8, exceptionPointers, exceptionThreadId, level);
+    try
+    {
+        return GB_DbgSymbolEngine::Instance().WriteMiniDump(dumpFilePathUtf8, exceptionPointers, exceptionThreadId, level);
+    }
+    catch (...)
+    {
+        return false;
+    }
 #else
     (void)dumpFilePathUtf8;
     (void)exceptionPointers;
