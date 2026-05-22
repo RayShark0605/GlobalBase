@@ -7,6 +7,12 @@
 #include <cstring>
 #include <algorithm>
 #include <utility>
+#include <sstream>
+#include <iomanip>
+#include <locale>
+#include <cmath>
+#include <type_traits>
+#include <stdexcept>
 
 #ifdef _WIN32
 #define NOMINMAX
@@ -65,6 +71,71 @@ namespace
 
         return GB_CreateDirectory(directoryPathUtf8);
     }
+
+#ifdef _WIN32
+    DWORD BuildWindowsFileFlagsAndAttributes(const std::wstring& filePathUtf16, DWORD fileFlags)
+    {
+        DWORD fileAttributes = FILE_ATTRIBUTE_NORMAL;
+        const DWORD existingAttributes = ::GetFileAttributesW(filePathUtf16.c_str());
+        if (existingAttributes != INVALID_FILE_ATTRIBUTES && (existingAttributes & FILE_ATTRIBUTE_DIRECTORY) == 0)
+        {
+            fileAttributes = existingAttributes & (FILE_ATTRIBUTE_ARCHIVE | FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_NOT_CONTENT_INDEXED | FILE_ATTRIBUTE_READONLY | FILE_ATTRIBUTE_SYSTEM | FILE_ATTRIBUTE_TEMPORARY);
+            if (fileAttributes == 0)
+            {
+                fileAttributes = FILE_ATTRIBUTE_NORMAL;
+            }
+        }
+
+        return fileAttributes | fileFlags;
+    }
+
+    bool WriteAllBytesToWindowsFile(HANDLE fileHandle, const void* data, std::size_t byteSize, bool appendMode)
+    {
+        if (byteSize == 0)
+        {
+            return true;
+        }
+
+        if (data == nullptr)
+        {
+            return false;
+        }
+
+        const unsigned char* dataBytes = static_cast<const unsigned char*>(data);
+        std::size_t totalWrittenBytes = 0;
+        const DWORD chunkBytes = 64u * 1024u * 1024u;
+
+        while (totalWrittenBytes < byteSize)
+        {
+            const std::size_t remainingBytes = byteSize - totalWrittenBytes;
+            const DWORD toWrite = static_cast<DWORD>(remainingBytes > chunkBytes ? chunkBytes : remainingBytes);
+
+            DWORD currentWrittenBytes = 0;
+            BOOL writeOk = FALSE;
+            if (appendMode)
+            {
+                OVERLAPPED overlapped;
+                std::memset(&overlapped, 0, sizeof(overlapped));
+                overlapped.Offset = 0xFFFFFFFF;
+                overlapped.OffsetHigh = 0xFFFFFFFF;
+                writeOk = ::WriteFile(fileHandle, dataBytes + totalWrittenBytes, toWrite, &currentWrittenBytes, &overlapped);
+            }
+            else
+            {
+                writeOk = ::WriteFile(fileHandle, dataBytes + totalWrittenBytes, toWrite, &currentWrittenBytes, nullptr);
+            }
+
+            if (writeOk == FALSE || currentWrittenBytes == 0)
+            {
+                return false;
+            }
+
+            totalWrittenBytes += static_cast<std::size_t>(currentWrittenBytes);
+        }
+
+        return true;
+    }
+#endif
 }
 
 bool GB_WriteUtf8ToFile(const std::string& filePathUtf8, const std::string& utf8Content, bool appendMode, bool addBomIfNewFile)
@@ -74,7 +145,6 @@ bool GB_WriteUtf8ToFile(const std::string& filePathUtf8, const std::string& utf8
         return false;
     }
 
-    const bool existedBefore = GB_IsFileExists(filePathUtf8);
     if (!EnsureParentDirectoryBeforeSimpleWrite(filePathUtf8))
     {
         return false;
@@ -91,55 +161,33 @@ bool GB_WriteUtf8ToFile(const std::string& filePathUtf8, const std::string& utf8
     const DWORD shareMode = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
     const DWORD creationDisposition = appendMode ? OPEN_ALWAYS : CREATE_ALWAYS; // 追加：存在即开，不存在即建；非追加：直接截断重建
     HANDLE hFile = ::CreateFileW(pathW.c_str(), desiredAccess, shareMode, nullptr,
-        creationDisposition, FILE_ATTRIBUTE_NORMAL, nullptr);
+        creationDisposition, BuildWindowsFileFlagsAndAttributes(pathW, FILE_FLAG_SEQUENTIAL_SCAN), nullptr);
     if (hFile == INVALID_HANDLE_VALUE)
     {
         return false;
     }
 
+    const DWORD openResult = ::GetLastError();
+    const bool createdByThisOpen = openResult != ERROR_ALREADY_EXISTS;
     bool ok = true;
 
-    // 追加模式且原文件已存在时，将文件指针移动到末尾
-    if (appendMode && existedBefore)
-    {
-        LARGE_INTEGER zero;
-        zero.QuadPart = 0;
-        if (!::SetFilePointerEx(hFile, zero, nullptr, FILE_END)) // 64 位安全移动文件指针
-        {
-            ::CloseHandle(hFile);
-            return false;
-        }
-    }
-
-    // 新文件且需要 BOM 时写入 BOM（UTF-8 可选 BOM）
-    if (!existedBefore && addBomIfNewFile)
+    // 新文件且需要 BOM 时写入 BOM（UTF-8 可选 BOM）。
+    // CREATE_ALWAYS 覆盖已有文件时，GetLastError() 会返回 ERROR_ALREADY_EXISTS，此时保持旧接口“原本不存在才写 BOM”的语义。
+    if (createdByThisOpen && addBomIfNewFile)
     {
         const BYTE bom[3] = { 0xEF, 0xBB, 0xBF };
-        DWORD written = 0;
-        if (!::WriteFile(hFile, bom, 3, &written, nullptr) || written != 3)
+        if (!WriteAllBytesToWindowsFile(hFile, bom, sizeof(bom), appendMode))
         {
             ok = false;
         }
     }
 
-    // 分块写入内容，避免 DWORD 写入长度上限
+    // 分块写入内容，避免 DWORD 写入长度上限；追加模式下使用 EOF Overlapped 写入，避免只移动一次文件指针带来的竞态。
     if (ok && !utf8Content.empty())
     {
-        const char* dataPtr = utf8Content.data();
-        size_t remaining = utf8Content.size();
-        const DWORD kChunk = 64 * 1024 * 1024; // 64 MiB/次
-
-        while (remaining > 0)
+        if (!WriteAllBytesToWindowsFile(hFile, utf8Content.data(), utf8Content.size(), appendMode))
         {
-            const DWORD toWrite = static_cast<DWORD>(remaining > kChunk ? kChunk : remaining);
-            DWORD written = 0;
-            if (!::WriteFile(hFile, dataPtr, toWrite, &written, nullptr) || written != toWrite)
-            {
-                ok = false;
-                break;
-            }
-            dataPtr += toWrite;
-            remaining -= toWrite;
+            ok = false;
         }
     }
 
@@ -147,6 +195,8 @@ bool GB_WriteUtf8ToFile(const std::string& filePathUtf8, const std::string& utf8
     return ok && closed != FALSE;
 
 #else
+    const bool existedBefore = GB_IsFileExists(filePathUtf8);
+
     // POSIX/Linux：路径本质是字节序列；系统默认 UTF-8，本实现直接以二进制方式写入
     std::ios_base::openmode mode = std::ios::binary | std::ios::out;
     if (appendMode)
@@ -197,8 +247,9 @@ bool GB_WriteUtf8ToFile(const std::string& filePathUtf8, const std::string& utf8
     }
 
     ofs.flush();
-    const bool ok = static_cast<bool>(ofs);
+    bool ok = static_cast<bool>(ofs);
     ofs.close();
+    ok = ok && static_cast<bool>(ofs);
     return ok;
 #endif
 }
@@ -265,30 +316,267 @@ namespace
 
         return GB_TextEncodingByBom::Unknown;
     }
+
+    std::size_t GetTextEncodingBomSize(GB_TextEncodingByBom encoding)
+    {
+        if (encoding == GB_TextEncodingByBom::Utf8)
+        {
+            return 3;
+        }
+        if (encoding == GB_TextEncodingByBom::Utf16Le || encoding == GB_TextEncodingByBom::Utf16Be)
+        {
+            return 2;
+        }
+        if (encoding == GB_TextEncodingByBom::Utf32Le || encoding == GB_TextEncodingByBom::Utf32Be)
+        {
+            return 4;
+        }
+
+        return 0;
+    }
+
+    std::string MakeStringWithoutBom(const std::string& fileData, GB_TextEncodingByBom encoding)
+    {
+        const std::size_t bomSize = GetTextEncodingBomSize(encoding);
+        if (bomSize == 0)
+        {
+            return fileData;
+        }
+
+        if (fileData.size() <= bomSize)
+        {
+            return std::string();
+        }
+
+        return std::string(fileData.data() + bomSize, fileData.size() - bomSize);
+    }
+}
+
+namespace
+{
+    template<typename TByteContainer>
+    bool ReadWholeFileBytesImpl(const std::string& filePathUtf8, TByteContainer& outData)
+    {
+        if (filePathUtf8.empty())
+        {
+            return false;
+        }
+
+#ifdef _WIN32
+        const std::wstring pathW = Utf8ToUtf16(filePathUtf8);
+        if (pathW.empty())
+        {
+            return false;
+        }
+
+        const DWORD desiredAccess = GENERIC_READ;
+        const DWORD shareMode = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
+        HANDLE fileHandle = ::CreateFileW(pathW.c_str(), desiredAccess, shareMode, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
+        if (fileHandle == INVALID_HANDLE_VALUE)
+        {
+            return false;
+        }
+
+        LARGE_INTEGER fileSizeLi;
+        if (!::GetFileSizeEx(fileHandle, &fileSizeLi) || fileSizeLi.QuadPart < 0)
+        {
+            ::CloseHandle(fileHandle);
+            return false;
+        }
+
+        const std::uint64_t fileSize64 = static_cast<std::uint64_t>(fileSizeLi.QuadPart);
+        if (fileSize64 > static_cast<std::uint64_t>((std::numeric_limits<std::size_t>::max)()))
+        {
+            ::CloseHandle(fileHandle);
+            return false;
+        }
+
+        TByteContainer buffer;
+        try
+        {
+            buffer.resize(static_cast<std::size_t>(fileSize64));
+        }
+        catch (...)
+        {
+            ::CloseHandle(fileHandle);
+            return false;
+        }
+
+        char* writePtr = buffer.empty() ? nullptr : reinterpret_cast<char*>(&buffer[0]);
+        std::size_t remainingBytes = buffer.size();
+        const DWORD chunkBytes = 64u * 1024u * 1024u;
+
+        while (remainingBytes > 0)
+        {
+            const DWORD toRead = static_cast<DWORD>(remainingBytes > chunkBytes ? chunkBytes : remainingBytes);
+            DWORD readBytes = 0;
+            if (!::ReadFile(fileHandle, writePtr, toRead, &readBytes, nullptr))
+            {
+                ::CloseHandle(fileHandle);
+                return false;
+            }
+            if (readBytes == 0)
+            {
+                ::CloseHandle(fileHandle);
+                return false;
+            }
+
+            writePtr += readBytes;
+            remainingBytes -= readBytes;
+        }
+
+        if (::CloseHandle(fileHandle) == FALSE)
+        {
+            return false;
+        }
+
+        outData = std::move(buffer);
+        return true;
+#else
+        int fileDescriptor = ::open(
+            filePathUtf8.c_str(),
+            O_RDONLY
+#  ifdef O_CLOEXEC
+            | O_CLOEXEC
+#  endif
+        );
+        if (fileDescriptor < 0)
+        {
+            return false;
+        }
+
+        struct stat fileStat;
+        if (::fstat(fileDescriptor, &fileStat) != 0)
+        {
+            ::close(fileDescriptor);
+            return false;
+        }
+        if (!S_ISREG(fileStat.st_mode))
+        {
+            ::close(fileDescriptor);
+            return false;
+        }
+        if (fileStat.st_size < 0)
+        {
+            ::close(fileDescriptor);
+            return false;
+        }
+
+        const std::uint64_t fileSize64 = static_cast<std::uint64_t>(fileStat.st_size);
+        if (fileSize64 > static_cast<std::uint64_t>((std::numeric_limits<std::size_t>::max)()))
+        {
+            ::close(fileDescriptor);
+            return false;
+        }
+
+        TByteContainer buffer;
+        try
+        {
+            buffer.resize(static_cast<std::size_t>(fileSize64));
+        }
+        catch (...)
+        {
+            ::close(fileDescriptor);
+            return false;
+        }
+
+        char* writePtr = buffer.empty() ? nullptr : reinterpret_cast<char*>(&buffer[0]);
+        std::size_t totalReadBytes = 0;
+        const std::size_t chunkBytes = 64u * 1024u * 1024u;
+
+        while (totalReadBytes < buffer.size())
+        {
+            const std::size_t remainingBytes = buffer.size() - totalReadBytes;
+            const std::size_t toRead = remainingBytes > chunkBytes ? chunkBytes : remainingBytes;
+
+            const ssize_t readBytes = ::read(fileDescriptor, writePtr + totalReadBytes, toRead);
+            if (readBytes < 0)
+            {
+                if (errno == EINTR)
+                {
+                    continue;
+                }
+                ::close(fileDescriptor);
+                return false;
+            }
+            if (readBytes == 0)
+            {
+                ::close(fileDescriptor);
+                return false;
+            }
+
+            totalReadBytes += static_cast<std::size_t>(readBytes);
+        }
+
+        if (::close(fileDescriptor) != 0)
+        {
+            return false;
+        }
+
+        outData = std::move(buffer);
+        return true;
+#endif
+    }
+}
+
+bool GB_ReadBinaryFromFile(const std::string& filePathUtf8, GB_ByteBuffer& outData)
+{
+    GB_ByteBuffer result;
+    if (!ReadWholeFileBytesImpl(filePathUtf8, result))
+    {
+        return false;
+    }
+
+    outData = std::move(result);
+    return true;
+}
+
+GB_ByteBuffer GB_ReadBinaryFromFile(const std::string& filePathUtf8)
+{
+    GB_ByteBuffer data;
+    if (!GB_ReadBinaryFromFile(filePathUtf8, data))
+    {
+        return {};
+    }
+
+    return data;
+}
+
+bool GB_ReadFromFile(const std::string& filePathUtf8, std::string& outData)
+{
+    std::string result;
+    if (!ReadWholeFileBytesImpl(filePathUtf8, result))
+    {
+        return false;
+    }
+
+    outData = std::move(result);
+    return true;
 }
 
 std::string GB_ReadFromFile(const std::string& filePathUtf8)
 {
-    const GB_ByteBuffer fileBytes = GB_ReadBinaryFromFile(filePathUtf8);
-    if (fileBytes.empty())
+    std::string data;
+    if (!GB_ReadFromFile(filePathUtf8, data))
     {
         return std::string();
     }
 
-    if (fileBytes.size() > std::string().max_size())
-    {
-        return std::string();
-    }
-
-    return std::string(reinterpret_cast<const char*>(fileBytes.data()), fileBytes.size());
+    return data;
 }
 
-std::string GB_ReadUtf8FromFile(const std::string& filePathUtf8, const std::string& fileEncodingName)
+bool GB_ReadUtf8FromFile(const std::string& filePathUtf8, std::string& outText, const std::string& fileEncodingName)
 {
-    const std::string fileData = GB_ReadFromFile(filePathUtf8);
+    std::string fileData;
+    if (!GB_ReadFromFile(filePathUtf8, fileData))
+    {
+        return false;
+    }
+
     if (fileData.empty())
     {
-        return std::string();
+        outText.clear();
+        return true;
     }
 
     try
@@ -296,171 +584,50 @@ std::string GB_ReadUtf8FromFile(const std::string& filePathUtf8, const std::stri
         const GB_TextEncodingByBom bomEncoding = DetectTextEncodingByBom(fileData);
         if (bomEncoding == GB_TextEncodingByBom::Utf8)
         {
-            return GB_BytesToUtf8(fileData, "utf-8-sig");
+            outText = GB_BytesToUtf8(MakeStringWithoutBom(fileData, bomEncoding), "utf-8");
+            return true;
         }
         if (bomEncoding == GB_TextEncodingByBom::Utf16Le)
         {
-            return GB_BytesToUtf8(fileData, "utf-16le");
+            outText = GB_BytesToUtf8(MakeStringWithoutBom(fileData, bomEncoding), "utf-16le");
+            return true;
         }
         if (bomEncoding == GB_TextEncodingByBom::Utf16Be)
         {
-            return GB_BytesToUtf8(fileData, "utf-16be");
+            outText = GB_BytesToUtf8(MakeStringWithoutBom(fileData, bomEncoding), "utf-16be");
+            return true;
         }
         if (bomEncoding == GB_TextEncodingByBom::Utf32Le)
         {
-            return GB_BytesToUtf8(fileData, "utf-32le");
+            outText = GB_BytesToUtf8(MakeStringWithoutBom(fileData, bomEncoding), "utf-32le");
+            return true;
         }
         if (bomEncoding == GB_TextEncodingByBom::Utf32Be)
         {
-            return GB_BytesToUtf8(fileData, "utf-32be");
+            outText = GB_BytesToUtf8(MakeStringWithoutBom(fileData, bomEncoding), "utf-32be");
+            return true;
         }
 
         const std::string sourceEncodingName = fileEncodingName.empty() ? std::string("utf-8") : fileEncodingName;
-        return GB_BytesToUtf8(fileData, sourceEncodingName);
+        outText = GB_BytesToUtf8(fileData, sourceEncodingName);
+        return true;
     }
     catch (...)
     {
-        return fileData;
+        outText = std::move(fileData);
+        return true;
     }
 }
 
-std::vector<unsigned char> GB_ReadBinaryFromFile(const std::string& filePathUtf8)
+std::string GB_ReadUtf8FromFile(const std::string& filePathUtf8, const std::string& fileEncodingName)
 {
-    if (filePathUtf8.empty())
+    std::string text;
+    if (!GB_ReadUtf8FromFile(filePathUtf8, text, fileEncodingName))
     {
-        return {};
+        return std::string();
     }
 
-#ifdef _WIN32
-    const std::wstring pathW = Utf8ToUtf16(filePathUtf8);
-    if (pathW.empty())
-    {
-        return {};
-    }
-
-    const DWORD desiredAccess = GENERIC_READ;
-    const DWORD shareMode = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
-    HANDLE hFile = ::CreateFileW(pathW.c_str(), desiredAccess, shareMode, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
-    if (hFile == INVALID_HANDLE_VALUE)
-    {
-        return {};
-    }
-
-    LARGE_INTEGER fileSizeLi;
-    if (!::GetFileSizeEx(hFile, &fileSizeLi) || fileSizeLi.QuadPart < 0)
-    {
-        ::CloseHandle(hFile);
-        return {};
-    }
-
-    const uint64_t fileSize64 = static_cast<uint64_t>(fileSizeLi.QuadPart);
-    if (fileSize64 > static_cast<uint64_t>(std::numeric_limits<size_t>::max()))
-    {
-        ::CloseHandle(hFile);
-        return {};
-    }
-
-    GB_ByteBuffer buffer(static_cast<size_t>(fileSize64));
-
-    unsigned char* writePtr = buffer.data();
-    size_t remaining = buffer.size();
-    const DWORD kChunkBytes = 64u * 1024u * 1024u;
-
-    while (remaining > 0)
-    {
-        const DWORD toRead = static_cast<DWORD>(remaining > kChunkBytes ? kChunkBytes : remaining);
-        DWORD readBytes = 0;
-        if (!::ReadFile(hFile, writePtr, toRead, &readBytes, nullptr))
-        {
-            ::CloseHandle(hFile);
-            return {};
-        }
-        if (readBytes != toRead)
-        {
-            // 文件可能在读取过程中被截断/变更，或者发生了异常 EOF
-            ::CloseHandle(hFile);
-            return {};
-        }
-
-        writePtr += readBytes;
-        remaining -= readBytes;
-    }
-
-    ::CloseHandle(hFile);
-    return buffer;
-
-#else
-    int fd = ::open(
-        filePathUtf8.c_str(),
-        O_RDONLY
-#  ifdef O_CLOEXEC
-        | O_CLOEXEC
-#  endif
-    );
-    if (fd < 0)
-    {
-        return {};
-    }
-
-    struct stat st;
-    if (::fstat(fd, &st) != 0)
-    {
-        ::close(fd);
-        return {};
-    }
-    if (!S_ISREG(st.st_mode))
-    {
-        ::close(fd);
-        return {};
-    }
-
-    // off_t 是有符号类型，对于普通文件不应为负，此处做防御性检查
-    if (st.st_size < 0)
-    {
-        ::close(fd);
-        return {};
-    }
-
-    const uint64_t fileSize64 = static_cast<uint64_t>(st.st_size);
-    if (fileSize64 > static_cast<uint64_t>(std::numeric_limits<size_t>::max()))
-    {
-        ::close(fd);
-        return {};
-    }
-
-    std::vector<unsigned char> buffer;
-    buffer.resize(static_cast<size_t>(fileSize64));
-
-    size_t totalRead = 0;
-    const size_t kChunkBytes = 64u * 1024u * 1024u;
-
-    while (totalRead < buffer.size())
-    {
-        const size_t remaining = buffer.size() - totalRead;
-        const size_t toRead = remaining > kChunkBytes ? kChunkBytes : remaining;
-
-        const ssize_t n = ::read(fd, buffer.data() + totalRead, toRead);
-        if (n < 0)
-        {
-            if (errno == EINTR)
-            {
-                continue;
-            }
-            ::close(fd);
-            return {};
-        }
-        if (n == 0)
-        {
-            // 异常 EOF：文件在读取过程中被截断/变更
-            ::close(fd);
-            return {};
-        }
-        totalRead += static_cast<size_t>(n);
-    }
-
-    ::close(fd);
-    return buffer;
-#endif
+    return text;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -516,7 +683,7 @@ static bool WriteBinaryToFileImpl(const void* rawData, size_t byteSize, const st
         shareMode,
         nullptr,
         CREATE_ALWAYS,
-        FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN, // 顺序访问 hint
+        BuildWindowsFileFlagsAndAttributes(filePathUtf16, FILE_FLAG_SEQUENTIAL_SCAN), // 顺序访问 hint
         nullptr);
 
     if (fileHandle == INVALID_HANDLE_VALUE)
@@ -566,6 +733,19 @@ static bool WriteBinaryToFileImpl(const void* rawData, size_t byteSize, const st
     return ok && closeOk != FALSE;
 
 #else
+    struct stat existingFileStat;
+    if (::stat(filePathUtf8.c_str(), &existingFileStat) == 0)
+    {
+        if (!S_ISREG(existingFileStat.st_mode))
+        {
+            return false;
+        }
+    }
+    else if (errno != ENOENT)
+    {
+        return false;
+    }
+
     int openFlags = O_WRONLY | O_CREAT | O_TRUNC;
 #ifdef O_CLOEXEC
     openFlags |= O_CLOEXEC;
@@ -574,6 +754,13 @@ static bool WriteBinaryToFileImpl(const void* rawData, size_t byteSize, const st
     const int fileDescriptor = ::open(filePathUtf8.c_str(), openFlags, 0644);
     if (fileDescriptor < 0)
     {
+        return false;
+    }
+
+    struct stat openedFileStat;
+    if (::fstat(fileDescriptor, &openedFileStat) != 0 || !S_ISREG(openedFileStat.st_mode))
+    {
+        ::close(fileDescriptor);
         return false;
     }
 
@@ -625,39 +812,61 @@ static bool WriteBinaryToFileImpl(const void* rawData, size_t byteSize, const st
 
 bool GB_WriteBinaryToFile(const GB_ByteBuffer& data, const std::string& filePathUtf8)
 {
-    return WriteBinaryToFileImpl(data.data(), data.size(), filePathUtf8);
+    const void* rawData = data.empty() ? nullptr : data.data();
+    return WriteBinaryToFileImpl(rawData, data.size(), filePathUtf8);
 }
 
 bool GB_WriteBinaryToFile(const std::string& data, const std::string& filePathUtf8)
 {
     // 直接将 string 的原始内存传入底层函数，避免额外的内存分配和数据拷贝
-    return WriteBinaryToFileImpl(data.data(), data.size(), filePathUtf8);
+    const void* rawData = data.empty() ? nullptr : data.data();
+    return WriteBinaryToFileImpl(rawData, data.size(), filePathUtf8);
+}
+
+namespace
+{
+    void ResizeByteBufferForAppend(GB_ByteBuffer& buffer, std::size_t appendBytes)
+    {
+        const std::size_t oldSize = buffer.size();
+        if (appendBytes > buffer.max_size() - oldSize)
+        {
+            throw std::length_error("GB_ByteBufferIO append size is too large.");
+        }
+
+        buffer.resize(oldSize + appendBytes);
+    }
 }
 
 void GB_ByteBufferIO::AppendUInt16LE(GB_ByteBuffer& buffer, uint16_t value)
 {
-    buffer.push_back(static_cast<unsigned char>((value >> 0) & 0xFF));
-    buffer.push_back(static_cast<unsigned char>((value >> 8) & 0xFF));
+    const std::size_t oldSize = buffer.size();
+    ResizeByteBufferForAppend(buffer, 2);
+    buffer[oldSize] = static_cast<unsigned char>((value >> 0) & 0xFF);
+    buffer[oldSize + 1] = static_cast<unsigned char>((value >> 8) & 0xFF);
 }
 
 void GB_ByteBufferIO::AppendUInt32LE(GB_ByteBuffer& buffer, uint32_t value)
 {
-    buffer.push_back(static_cast<unsigned char>((value >> 0) & 0xFF));
-    buffer.push_back(static_cast<unsigned char>((value >> 8) & 0xFF));
-    buffer.push_back(static_cast<unsigned char>((value >> 16) & 0xFF));
-    buffer.push_back(static_cast<unsigned char>((value >> 24) & 0xFF));
+    const std::size_t oldSize = buffer.size();
+    ResizeByteBufferForAppend(buffer, 4);
+    buffer[oldSize] = static_cast<unsigned char>((value >> 0) & 0xFF);
+    buffer[oldSize + 1] = static_cast<unsigned char>((value >> 8) & 0xFF);
+    buffer[oldSize + 2] = static_cast<unsigned char>((value >> 16) & 0xFF);
+    buffer[oldSize + 3] = static_cast<unsigned char>((value >> 24) & 0xFF);
 }
 
 void GB_ByteBufferIO::AppendUInt64LE(GB_ByteBuffer& buffer, uint64_t value)
 {
-    buffer.push_back(static_cast<unsigned char>((value >> 0) & 0xFF));
-    buffer.push_back(static_cast<unsigned char>((value >> 8) & 0xFF));
-    buffer.push_back(static_cast<unsigned char>((value >> 16) & 0xFF));
-    buffer.push_back(static_cast<unsigned char>((value >> 24) & 0xFF));
-    buffer.push_back(static_cast<unsigned char>((value >> 32) & 0xFF));
-    buffer.push_back(static_cast<unsigned char>((value >> 40) & 0xFF));
-    buffer.push_back(static_cast<unsigned char>((value >> 48) & 0xFF));
-    buffer.push_back(static_cast<unsigned char>((value >> 56) & 0xFF));
+    const std::size_t oldSize = buffer.size();
+    ResizeByteBufferForAppend(buffer, 8);
+    buffer[oldSize] = static_cast<unsigned char>((value >> 0) & 0xFF);
+    buffer[oldSize + 1] = static_cast<unsigned char>((value >> 8) & 0xFF);
+    buffer[oldSize + 2] = static_cast<unsigned char>((value >> 16) & 0xFF);
+    buffer[oldSize + 3] = static_cast<unsigned char>((value >> 24) & 0xFF);
+    buffer[oldSize + 4] = static_cast<unsigned char>((value >> 32) & 0xFF);
+    buffer[oldSize + 5] = static_cast<unsigned char>((value >> 40) & 0xFF);
+    buffer[oldSize + 6] = static_cast<unsigned char>((value >> 48) & 0xFF);
+    buffer[oldSize + 7] = static_cast<unsigned char>((value >> 56) & 0xFF);
 }
 
 void GB_ByteBufferIO::AppendDoubleLE(GB_ByteBuffer& buffer, double value)
@@ -668,7 +877,7 @@ void GB_ByteBufferIO::AppendDoubleLE(GB_ByteBuffer& buffer, double value)
     AppendUInt64LE(buffer, bits);
 }
 
-bool GB_ByteBufferIO::ReadUInt16LE(const GB_ByteBuffer& buffer, size_t& offset, uint16_t& value)
+bool GB_ByteBufferIO::ReadUInt16LE(const GB_ByteBuffer& buffer, std::size_t& offset, uint16_t& value)
 {
     if (offset > buffer.size() || buffer.size() - offset < 2)
     {
@@ -681,7 +890,7 @@ bool GB_ByteBufferIO::ReadUInt16LE(const GB_ByteBuffer& buffer, size_t& offset, 
     return true;
 }
 
-bool GB_ByteBufferIO::ReadUInt32LE(const GB_ByteBuffer& buffer, size_t& offset, uint32_t& value)
+bool GB_ByteBufferIO::ReadUInt32LE(const GB_ByteBuffer& buffer, std::size_t& offset, uint32_t& value)
 {
     if (offset > buffer.size() || buffer.size() - offset < 4)
     {
@@ -697,7 +906,7 @@ bool GB_ByteBufferIO::ReadUInt32LE(const GB_ByteBuffer& buffer, size_t& offset, 
     return true;
 }
 
-bool GB_ByteBufferIO::ReadUInt64LE(const GB_ByteBuffer& buffer, size_t& offset, uint64_t& value)
+bool GB_ByteBufferIO::ReadUInt64LE(const GB_ByteBuffer& buffer, std::size_t& offset, uint64_t& value)
 {
     if (offset > buffer.size() || buffer.size() - offset < 8)
     {
@@ -717,7 +926,7 @@ bool GB_ByteBufferIO::ReadUInt64LE(const GB_ByteBuffer& buffer, size_t& offset, 
     return true;
 }
 
-bool GB_ByteBufferIO::ReadDoubleLE(const GB_ByteBuffer& buffer, size_t& offset, double& value)
+bool GB_ByteBufferIO::ReadDoubleLE(const GB_ByteBuffer& buffer, std::size_t& offset, double& value)
 {
     uint64_t bits = 0;
     if (!ReadUInt64LE(buffer, offset, bits))
@@ -731,6 +940,11 @@ bool GB_ByteBufferIO::ReadDoubleLE(const GB_ByteBuffer& buffer, size_t& offset, 
 
 namespace
 {
+    bool IsValidStreamAccessMode(GB_StreamAccessMode accessMode)
+    {
+        return accessMode == GB_StreamAccessMode::ReadOnly || accessMode == GB_StreamAccessMode::WriteOnly || accessMode == GB_StreamAccessMode::ReadWrite;
+    }
+
     bool IsReadableAccess(GB_StreamAccessMode accessMode)
     {
         return accessMode == GB_StreamAccessMode::ReadOnly || accessMode == GB_StreamAccessMode::ReadWrite;
@@ -741,10 +955,18 @@ namespace
         return accessMode == GB_StreamAccessMode::WriteOnly || accessMode == GB_StreamAccessMode::ReadWrite;
     }
 
+    bool IsValidFileShareMode(GB_FileShareMode shareMode)
+    {
+        const unsigned int rawValue = static_cast<unsigned int>(shareMode);
+        return (rawValue & ~static_cast<unsigned int>(GB_FileShareMode::All)) == 0;
+    }
+
+#ifdef _WIN32
     bool HasShareMode(GB_FileShareMode shareMode, GB_FileShareMode testMode)
     {
         return (static_cast<unsigned int>(shareMode) & static_cast<unsigned int>(testMode)) != 0;
     }
+#endif
 
     bool IsPathLikeDirectory(const std::string& pathUtf8)
     {
@@ -766,6 +988,29 @@ namespace
         }
 
         return GB_CreateDirectory(directoryPathUtf8);
+    }
+
+    bool IsMemoryRangeOverlapped(const void* firstData, std::size_t firstSize, const void* secondData, std::size_t secondSize)
+    {
+        if (firstData == nullptr || secondData == nullptr || firstSize == 0 || secondSize == 0)
+        {
+            return false;
+        }
+
+        const std::uintptr_t firstBegin = reinterpret_cast<std::uintptr_t>(firstData);
+        const std::uintptr_t secondBegin = reinterpret_cast<std::uintptr_t>(secondData);
+        if (firstBegin > (std::numeric_limits<std::uintptr_t>::max)() - firstSize)
+        {
+            return true;
+        }
+        if (secondBegin > (std::numeric_limits<std::uintptr_t>::max)() - secondSize)
+        {
+            return true;
+        }
+
+        const std::uintptr_t firstEnd = firstBegin + firstSize;
+        const std::uintptr_t secondEnd = secondBegin + secondSize;
+        return firstBegin < secondEnd && secondBegin < firstEnd;
     }
 
     bool WriteVarUInt64ToStream(GB_Stream& stream, std::uint64_t value)
@@ -820,8 +1065,9 @@ namespace
     template<typename TValue>
     bool WriteIntegralValueToStream(GB_Stream& stream, TValue value)
     {
+        typedef typename std::make_unsigned<TValue>::type TUnsignedValue;
         unsigned char data[sizeof(TValue)];
-        const unsigned long long unsignedValue = static_cast<unsigned long long>(value);
+        const TUnsignedValue unsignedValue = static_cast<TUnsignedValue>(value);
         for (std::size_t index = 0; index < sizeof(TValue); index++)
         {
             data[index] = static_cast<unsigned char>((unsignedValue >> (index * 8)) & 0xFF);
@@ -833,32 +1079,130 @@ namespace
     template<typename TValue>
     bool ReadIntegralValueFromStream(GB_Stream& stream, TValue& outValue)
     {
+        typedef typename std::make_unsigned<TValue>::type TUnsignedValue;
         unsigned char data[sizeof(TValue)];
         if (!stream.ReadExactBytes(data, sizeof(data)))
         {
             return false;
         }
 
-        unsigned long long unsignedValue = 0;
+        TUnsignedValue unsignedValue = 0;
         for (std::size_t index = 0; index < sizeof(TValue); index++)
         {
-            unsignedValue |= static_cast<unsigned long long>(data[index]) << (index * 8);
+            unsignedValue = static_cast<TUnsignedValue>(unsignedValue | (static_cast<TUnsignedValue>(data[index]) << (index * 8)));
         }
 
         outValue = static_cast<TValue>(unsignedValue);
         return true;
     }
 
-    template<typename TValue>
-    bool WriteObjectBytesToStream(GB_Stream& stream, const TValue& value)
+    bool WriteLongValueToStream(GB_Stream& stream, long value)
     {
-        return stream.WriteBytes(&value, sizeof(TValue));
+        return WriteIntegralValueToStream(stream, static_cast<std::int64_t>(value));
     }
 
-    template<typename TValue>
-    bool ReadObjectBytesFromStream(GB_Stream& stream, TValue& outValue)
+    bool ReadLongValueFromStream(GB_Stream& stream, long& outValue)
     {
-        return stream.ReadExactBytes(&outValue, sizeof(TValue));
+        std::int64_t value = 0;
+        if (!ReadIntegralValueFromStream(stream, value))
+        {
+            return false;
+        }
+
+        if (value < static_cast<std::int64_t>((std::numeric_limits<long>::min)()) || value > static_cast<std::int64_t>((std::numeric_limits<long>::max)()))
+        {
+            return false;
+        }
+
+        outValue = static_cast<long>(value);
+        return true;
+    }
+
+    bool WriteUnsignedLongValueToStream(GB_Stream& stream, unsigned long value)
+    {
+        return WriteIntegralValueToStream(stream, static_cast<std::uint64_t>(value));
+    }
+
+    bool ReadUnsignedLongValueFromStream(GB_Stream& stream, unsigned long& outValue)
+    {
+        std::uint64_t value = 0;
+        if (!ReadIntegralValueFromStream(stream, value))
+        {
+            return false;
+        }
+
+        if (value > static_cast<std::uint64_t>((std::numeric_limits<unsigned long>::max)()))
+        {
+            return false;
+        }
+
+        outValue = static_cast<unsigned long>(value);
+        return true;
+    }
+
+    bool WriteLongDoubleValueToStream(GB_Stream& stream, long double value)
+    {
+        if (std::isnan(value))
+        {
+            return stream.WriteString("nan");
+        }
+        if (std::isinf(value))
+        {
+            return stream.WriteString(std::signbit(value) ? "-inf" : "inf");
+        }
+
+        std::ostringstream converter;
+        converter.imbue(std::locale::classic());
+        converter << std::setprecision(std::numeric_limits<long double>::max_digits10) << value;
+        if (!converter)
+        {
+            return false;
+        }
+
+        return stream.WriteString(converter.str());
+    }
+
+    bool ReadLongDoubleValueFromStream(GB_Stream& stream, long double& outValue)
+    {
+        std::string text;
+        if (!stream.ReadString(text, 256))
+        {
+            return false;
+        }
+
+        if (text == "nan")
+        {
+            outValue = std::numeric_limits<long double>::quiet_NaN();
+            return true;
+        }
+        if (text == "inf")
+        {
+            outValue = std::numeric_limits<long double>::infinity();
+            return true;
+        }
+        if (text == "-inf")
+        {
+            outValue = -std::numeric_limits<long double>::infinity();
+            return true;
+        }
+
+        std::istringstream converter(text);
+        converter.imbue(std::locale::classic());
+        long double value = 0.0L;
+        converter >> value;
+        if (!converter)
+        {
+            return false;
+        }
+
+        converter >> std::ws;
+        if (!converter.eof())
+        {
+            return false;
+        }
+
+        outValue = value;
+        return true;
     }
 
     enum class GB_StreamVariantEncodingTag : unsigned char
@@ -1114,46 +1458,43 @@ bool GB_Stream::ReadExactBytes(void* outData, std::size_t byteSize)
 
 bool GB_Stream::ReadBytes(std::size_t byteSize, GB_ByteBuffer& outData)
 {
-    outData.clear();
     if (byteSize == 0)
     {
+        outData.clear();
         return true;
     }
 
+    GB_ByteBuffer result;
     try
     {
-        outData.resize(byteSize);
+        result.resize(byteSize);
     }
     catch (...)
     {
-        outData.clear();
         return false;
     }
 
     std::size_t readBytes = 0;
-    if (!ReadBytes(outData.data(), byteSize, readBytes))
+    if (!ReadBytes(result.data(), byteSize, readBytes))
     {
-        outData.clear();
         return false;
     }
 
     try
     {
-        outData.resize(readBytes);
+        result.resize(readBytes);
     }
     catch (...)
     {
-        outData.clear();
         return false;
     }
 
+    outData = std::move(result);
     return true;
 }
 
 bool GB_Stream::ReadToEnd(GB_ByteBuffer& outData, std::uint64_t maxBytes)
 {
-    outData.clear();
-
     std::uint64_t position = 0;
     std::uint64_t length = 0;
     if (!Tell(position) || !Length(length))
@@ -1163,6 +1504,7 @@ bool GB_Stream::ReadToEnd(GB_ByteBuffer& outData, std::uint64_t maxBytes)
 
     if (position >= length)
     {
+        outData.clear();
         return true;
     }
 
@@ -1177,22 +1519,22 @@ bool GB_Stream::ReadToEnd(GB_ByteBuffer& outData, std::uint64_t maxBytes)
         return false;
     }
 
+    GB_ByteBuffer result;
     try
     {
-        outData.resize(static_cast<std::size_t>(remainBytes));
+        result.resize(static_cast<std::size_t>(remainBytes));
     }
     catch (...)
     {
-        outData.clear();
         return false;
     }
 
-    if (!ReadExactBytes(outData.data(), outData.size()))
+    if (!ReadExactBytes(result.data(), result.size()))
     {
-        outData.clear();
         return false;
     }
 
+    outData = std::move(result);
     return true;
 }
 
@@ -1228,8 +1570,6 @@ bool GB_Stream::WriteByteBuffer(const GB_ByteBuffer& data)
 
 bool GB_Stream::ReadByteBuffer(GB_ByteBuffer& outData, std::uint64_t maxBytes)
 {
-    outData.clear();
-
     std::uint64_t byteSize = 0;
     if (!ReadVarUInt64FromStream(*this, byteSize))
     {
@@ -1246,27 +1586,22 @@ bool GB_Stream::ReadByteBuffer(GB_ByteBuffer& outData, std::uint64_t maxBytes)
         return false;
     }
 
+    GB_ByteBuffer result;
     try
     {
-        outData.resize(static_cast<std::size_t>(byteSize));
+        result.resize(static_cast<std::size_t>(byteSize));
     }
     catch (...)
     {
-        outData.clear();
         return false;
     }
 
-    if (outData.empty())
+    if (!result.empty() && !ReadExactBytes(result.data(), result.size()))
     {
-        return true;
-    }
-
-    if (!ReadExactBytes(outData.data(), outData.size()))
-    {
-        outData.clear();
         return false;
     }
 
+    outData = std::move(result);
     return true;
 }
 
@@ -1282,8 +1617,6 @@ bool GB_Stream::WriteString(const std::string& text)
 
 bool GB_Stream::ReadString(std::string& outText, std::uint64_t maxBytes)
 {
-    outText.clear();
-
     std::uint64_t byteSize = 0;
     if (!ReadVarUInt64FromStream(*this, byteSize))
     {
@@ -1300,27 +1633,22 @@ bool GB_Stream::ReadString(std::string& outText, std::uint64_t maxBytes)
         return false;
     }
 
+    std::string result;
     try
     {
-        outText.resize(static_cast<std::size_t>(byteSize));
+        result.resize(static_cast<std::size_t>(byteSize));
     }
     catch (...)
     {
-        outText.clear();
         return false;
     }
 
-    if (outText.empty())
+    if (!result.empty() && !ReadExactBytes(&result[0], result.size()))
     {
-        return true;
-    }
-
-    if (!ReadExactBytes(&outText[0], outText.size()))
-    {
-        outText.clear();
         return false;
     }
 
+    outText = std::move(result);
     return true;
 }
 
@@ -1366,11 +1694,11 @@ bool GB_Stream::WriteVariant(const GB_Variant& value)
     }
     if (const long* valuePtr = value.AnyCast<long>())
     {
-        return WriteVariantTagToStream(*this, GB_StreamVariantEncodingTag::Long) && WriteIntegralValueToStream(*this, *valuePtr);
+        return WriteVariantTagToStream(*this, GB_StreamVariantEncodingTag::Long) && WriteLongValueToStream(*this, *valuePtr);
     }
     if (const unsigned long* valuePtr = value.AnyCast<unsigned long>())
     {
-        return WriteVariantTagToStream(*this, GB_StreamVariantEncodingTag::UnsignedLong) && WriteIntegralValueToStream(*this, *valuePtr);
+        return WriteVariantTagToStream(*this, GB_StreamVariantEncodingTag::UnsignedLong) && WriteUnsignedLongValueToStream(*this, *valuePtr);
     }
     if (const long long* valuePtr = value.AnyCast<long long>())
     {
@@ -1393,7 +1721,7 @@ bool GB_Stream::WriteVariant(const GB_Variant& value)
 
     if (const long double* valuePtr = value.AnyCast<long double>())
     {
-        return WriteVariantTagToStream(*this, GB_StreamVariantEncodingTag::LongDouble) && WriteObjectBytesToStream(*this, *valuePtr);
+        return WriteVariantTagToStream(*this, GB_StreamVariantEncodingTag::LongDouble) && WriteLongDoubleValueToStream(*this, *valuePtr);
     }
 
     if (const std::string* valuePtr = value.AnyCast<std::string>())
@@ -1506,7 +1834,7 @@ bool GB_Stream::ReadVariant(GB_Variant& outValue, std::uint64_t maxBytes)
     case GB_StreamVariantEncodingTag::Long:
     {
         long typedValue = 0;
-        if (!ReadIntegralValueFromStream(*this, typedValue))
+        if (!ReadLongValueFromStream(*this, typedValue))
         {
             return false;
         }
@@ -1516,7 +1844,7 @@ bool GB_Stream::ReadVariant(GB_Variant& outValue, std::uint64_t maxBytes)
     case GB_StreamVariantEncodingTag::UnsignedLong:
     {
         unsigned long typedValue = 0;
-        if (!ReadIntegralValueFromStream(*this, typedValue))
+        if (!ReadUnsignedLongValueFromStream(*this, typedValue))
         {
             return false;
         }
@@ -1566,7 +1894,7 @@ bool GB_Stream::ReadVariant(GB_Variant& outValue, std::uint64_t maxBytes)
     case GB_StreamVariantEncodingTag::LongDouble:
     {
         long double typedValue = 0.0L;
-        if (!ReadObjectBytesFromStream(*this, typedValue))
+        if (!ReadLongDoubleValueFromStream(*this, typedValue))
         {
             return false;
         }
@@ -1665,7 +1993,14 @@ bool GB_FileStream::Open(const std::string& filePathUtf8, const GB_FileStreamOpe
     Close();
     if (impl_ == nullptr)
     {
-        impl_ = new Impl();
+        try
+        {
+            impl_ = new Impl();
+        }
+        catch (...)
+        {
+            return false;
+        }
     }
 
     if (filePathUtf8.empty() || IsPathLikeDirectory(filePathUtf8))
@@ -1673,22 +2008,30 @@ bool GB_FileStream::Open(const std::string& filePathUtf8, const GB_FileStreamOpe
         return false;
     }
 
-    if (!IsReadableAccess(options.accessMode) && !IsWritableAccess(options.accessMode))
+    if (!IsValidStreamAccessMode(options.accessMode))
     {
         return false;
     }
 
-    if (options.openMode == GB_FileStreamOpenMode::TruncateExisting && !IsWritableAccess(options.accessMode))
+    if (!IsValidFileShareMode(options.shareMode))
     {
         return false;
     }
 
-    const bool mayCreateOrWriteFile = options.openMode == GB_FileStreamOpenMode::CreateNew
+    if ((options.openMode == GB_FileStreamOpenMode::CreateAlways || options.openMode == GB_FileStreamOpenMode::TruncateExisting) && !IsWritableAccess(options.accessMode))
+    {
+        return false;
+    }
+
+    if (options.appendMode && !IsWritableAccess(options.accessMode))
+    {
+        return false;
+    }
+
+    const bool mayCreateFile = options.openMode == GB_FileStreamOpenMode::CreateNew
         || options.openMode == GB_FileStreamOpenMode::CreateAlways
-        || options.openMode == GB_FileStreamOpenMode::OpenAlways
-        || options.openMode == GB_FileStreamOpenMode::TruncateExisting
-        || IsWritableAccess(options.accessMode);
-    if (options.createParentDirectories && mayCreateOrWriteFile)
+        || options.openMode == GB_FileStreamOpenMode::OpenAlways;
+    if (options.createParentDirectories && mayCreateFile)
     {
         if (!EnsureParentDirectoryForFile(filePathUtf8))
         {
@@ -1753,7 +2096,7 @@ bool GB_FileStream::Open(const std::string& filePathUtf8, const GB_FileStreamOpe
         return false;
     }
 
-    DWORD flagsAndAttributes = FILE_ATTRIBUTE_NORMAL;
+    DWORD flagsAndAttributes = 0;
     if (options.sequentialAccessHint)
     {
         flagsAndAttributes |= FILE_FLAG_SEQUENTIAL_SCAN;
@@ -1762,6 +2105,7 @@ bool GB_FileStream::Open(const std::string& filePathUtf8, const GB_FileStreamOpe
     {
         flagsAndAttributes |= FILE_FLAG_WRITE_THROUGH;
     }
+    flagsAndAttributes = BuildWindowsFileFlagsAndAttributes(filePathUtf16, flagsAndAttributes);
 
     HANDLE fileHandle = ::CreateFileW(filePathUtf16.c_str(), desiredAccess, shareMode, nullptr, creationDisposition, flagsAndAttributes, nullptr);
     if (fileHandle == INVALID_HANDLE_VALUE)
@@ -1816,6 +2160,10 @@ bool GB_FileStream::Open(const std::string& filePathUtf8, const GB_FileStreamOpe
 #ifdef O_CLOEXEC
     openFlags |= O_CLOEXEC;
 #endif
+    if (options.appendMode)
+    {
+        openFlags |= O_APPEND;
+    }
 #ifdef O_SYNC
     if (options.writeThrough)
     {
@@ -1823,9 +2171,29 @@ bool GB_FileStream::Open(const std::string& filePathUtf8, const GB_FileStreamOpe
     }
 #endif
 
+    struct stat existingFileStat;
+    if (::stat(filePathUtf8.c_str(), &existingFileStat) == 0)
+    {
+        if (!S_ISREG(existingFileStat.st_mode))
+        {
+            return false;
+        }
+    }
+    else if (errno != ENOENT)
+    {
+        return false;
+    }
+
     const int fileDescriptor = ::open(filePathUtf8.c_str(), openFlags, 0644);
     if (fileDescriptor < 0)
     {
+        return false;
+    }
+
+    struct stat fileStat;
+    if (::fstat(fileDescriptor, &fileStat) != 0 || !S_ISREG(fileStat.st_mode))
+    {
+        ::close(fileDescriptor);
         return false;
     }
 
@@ -2210,6 +2578,11 @@ bool GB_FileStream::WriteBytes(const void* data, std::size_t byteSize)
     const unsigned char* inputBytes = static_cast<const unsigned char*>(data);
     std::size_t totalWrittenBytes = 0;
 #ifdef _WIN32
+    if (impl_->options.appendMode)
+    {
+        return WriteAllBytesToWindowsFile(impl_->fileHandle, data, byteSize, true);
+    }
+
     const DWORD chunkBytes = 64u * 1024u * 1024u;
     while (totalWrittenBytes < byteSize)
     {
@@ -2265,19 +2638,19 @@ struct GB_MemoryStream::Impl
     {
     }
 
-    Impl(GB_StreamAccessMode streamAccessMode) : externalBuffer(nullptr), position(0), accessMode(streamAccessMode), isOpen(true)
+    Impl(GB_StreamAccessMode streamAccessMode) : externalBuffer(nullptr), position(0), accessMode(streamAccessMode), isOpen(IsValidStreamAccessMode(streamAccessMode))
     {
     }
 
-    Impl(const GB_ByteBuffer& streamBuffer, GB_StreamAccessMode streamAccessMode) : buffer(streamBuffer), externalBuffer(nullptr), position(0), accessMode(streamAccessMode), isOpen(true)
+    Impl(const GB_ByteBuffer& streamBuffer, GB_StreamAccessMode streamAccessMode) : buffer(streamBuffer), externalBuffer(nullptr), position(0), accessMode(streamAccessMode), isOpen(IsValidStreamAccessMode(streamAccessMode))
     {
     }
 
-    Impl(GB_ByteBuffer& streamBuffer, GB_StreamAccessMode streamAccessMode) : externalBuffer(&streamBuffer), position(0), accessMode(streamAccessMode), isOpen(true)
+    Impl(GB_ByteBuffer& streamBuffer, GB_StreamAccessMode streamAccessMode) : externalBuffer(&streamBuffer), position(0), accessMode(streamAccessMode), isOpen(IsValidStreamAccessMode(streamAccessMode))
     {
     }
 
-    Impl(GB_ByteBuffer&& streamBuffer, GB_StreamAccessMode streamAccessMode) : buffer(std::move(streamBuffer)), externalBuffer(nullptr), position(0), accessMode(streamAccessMode), isOpen(true)
+    Impl(GB_ByteBuffer&& streamBuffer, GB_StreamAccessMode streamAccessMode) : buffer(std::move(streamBuffer)), externalBuffer(nullptr), position(0), accessMode(streamAccessMode), isOpen(IsValidStreamAccessMode(streamAccessMode))
     {
     }
 
@@ -2358,7 +2731,7 @@ void GB_MemoryStream::Open(GB_StreamAccessMode accessMode)
     impl_->buffer.clear();
     impl_->position = 0;
     impl_->accessMode = accessMode;
-    impl_->isOpen = true;
+    impl_->isOpen = IsValidStreamAccessMode(accessMode);
 }
 
 void GB_MemoryStream::Reset(const GB_ByteBuffer& data, GB_StreamAccessMode accessMode)
@@ -2373,7 +2746,7 @@ void GB_MemoryStream::Reset(const GB_ByteBuffer& data, GB_StreamAccessMode acces
     impl_->buffer = data;
     impl_->position = 0;
     impl_->accessMode = accessMode;
-    impl_->isOpen = true;
+    impl_->isOpen = IsValidStreamAccessMode(accessMode);
 }
 
 void GB_MemoryStream::Reset(GB_ByteBuffer& data, GB_StreamAccessMode accessMode)
@@ -2388,7 +2761,7 @@ void GB_MemoryStream::Reset(GB_ByteBuffer& data, GB_StreamAccessMode accessMode)
     impl_->externalBuffer = &data;
     impl_->position = 0;
     impl_->accessMode = accessMode;
-    impl_->isOpen = true;
+    impl_->isOpen = IsValidStreamAccessMode(accessMode);
 }
 
 void GB_MemoryStream::Reset(GB_ByteBuffer&& data, GB_StreamAccessMode accessMode)
@@ -2403,7 +2776,7 @@ void GB_MemoryStream::Reset(GB_ByteBuffer&& data, GB_StreamAccessMode accessMode
     impl_->buffer = std::move(data);
     impl_->position = 0;
     impl_->accessMode = accessMode;
-    impl_->isOpen = true;
+    impl_->isOpen = IsValidStreamAccessMode(accessMode);
 }
 
 const GB_ByteBuffer& GB_MemoryStream::GetBuffer() const
@@ -2636,6 +3009,23 @@ bool GB_MemoryStream::WriteBytes(const void* data, std::size_t byteSize)
         return false;
     }
 
+    const void* sourceData = data;
+    GB_ByteBuffer sourceCopy;
+    const GB_ByteBuffer& currentBuffer = impl_->Buffer();
+    if (!currentBuffer.empty() && IsMemoryRangeOverlapped(data, byteSize, currentBuffer.data(), currentBuffer.size()))
+    {
+        try
+        {
+            const unsigned char* sourceBytes = static_cast<const unsigned char*>(data);
+            sourceCopy.assign(sourceBytes, sourceBytes + byteSize);
+            sourceData = sourceCopy.data();
+        }
+        catch (...)
+        {
+            return false;
+        }
+    }
+
     try
     {
         if (endPosition > static_cast<std::uint64_t>(impl_->Buffer().size()))
@@ -2643,7 +3033,7 @@ bool GB_MemoryStream::WriteBytes(const void* data, std::size_t byteSize)
             impl_->Buffer().resize(static_cast<std::size_t>(endPosition));
         }
 
-        std::memcpy(impl_->Buffer().data() + static_cast<std::size_t>(impl_->position), data, byteSize);
+        std::memcpy(impl_->Buffer().data() + static_cast<std::size_t>(impl_->position), sourceData, byteSize);
     }
     catch (...)
     {

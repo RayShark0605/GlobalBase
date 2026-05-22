@@ -43,6 +43,19 @@ GLOBALBASE_PORT bool GB_WriteUtf8ToFile(const std::string& filePathUtf8, const s
 GLOBALBASE_PORT std::string GB_ReadFromFile(const std::string& filePathUtf8);
 
 /**
+ * @brief 以原始字节方式读取整个文件，并直接构造成 std::string 输出。
+ *
+ * @param filePathUtf8 文件路径（UTF-8）。
+ * @param outData      输出文件的原始字节内容；成功时会被替换，失败时保持原值不变。
+ * @return true  读取成功，包括空文件；
+ * @return false 读取失败或内容超出 std::string 可表示范围。
+ *
+ * @remarks
+ *  该重载用于区分“空文件”和“读取失败”。
+ */
+GLOBALBASE_PORT bool GB_ReadFromFile(const std::string& filePathUtf8, std::string& outData);
+
+/**
  * @brief 读取文本文件并转换为 UTF-8 字符串。
  *
  * @param filePathUtf8      文件路径（UTF-8）。
@@ -56,6 +69,20 @@ GLOBALBASE_PORT std::string GB_ReadFromFile(const std::string& filePathUtf8);
  *  - 调用者应保证传入的编码名称与文件实际编码一致，否则结果可能出现乱码。
  */
 GLOBALBASE_PORT std::string GB_ReadUtf8FromFile(const std::string& filePathUtf8, const std::string& fileEncodingName = "utf-8");
+
+/**
+ * @brief 读取文本文件并转换为 UTF-8 字符串。
+ *
+ * @param filePathUtf8     文件路径（UTF-8）。
+ * @param outText          输出转换后的 UTF-8 文本；成功时会被替换，失败时保持原值不变。
+ * @param fileEncodingName 文件原始编码名称；若文件带 BOM，则优先按 BOM 识别。
+ * @return true  读取成功，包括空文件；
+ * @return false 读取失败或内存分配失败。
+ *
+ * @remarks
+ *  若转码失败，本函数会退化为返回原始字节串并视为成功，以尽量保留原始内容。
+ */
+GLOBALBASE_PORT bool GB_ReadUtf8FromFile(const std::string& filePathUtf8, std::string& outText, const std::string& fileEncodingName = "utf-8");
 
 /**
  * @brief 将二进制字节缓冲区完整写入文件。
@@ -98,6 +125,19 @@ GLOBALBASE_PORT bool GB_WriteBinaryToFile(const std::string& data, const std::st
  *  - 本函数仅面向“完整读入内存”的场景，不适合超大文件的流式处理。
  */
 GLOBALBASE_PORT GB_ByteBuffer GB_ReadBinaryFromFile(const std::string& filePathUtf8);
+
+/**
+ * @brief 以二进制方式读取整个文件。
+ *
+ * @param filePathUtf8 文件路径（UTF-8）。
+ * @param outData      输出文件全部字节内容；成功时会被替换，失败时保持原值不变。
+ * @return true  读取成功，包括空文件；
+ * @return false 读取失败。
+ *
+ * @remarks
+ *  该重载用于区分“空文件”和“读取失败”。
+ */
+GLOBALBASE_PORT bool GB_ReadBinaryFromFile(const std::string& filePathUtf8, GB_ByteBuffer& outData);
 
 /**
  * @brief 面向 GB_ByteBuffer 的基础二进制读写辅助工具。
@@ -154,7 +194,7 @@ public:
      * @return true  读取成功；
      * @return false 缓冲区剩余字节不足 2。
      */
-    static bool ReadUInt16LE(const GB_ByteBuffer& buffer, size_t& offset, uint16_t& value);
+    static bool ReadUInt16LE(const GB_ByteBuffer& buffer, std::size_t& offset, uint16_t& value);
 
     /**
      * @brief 从缓冲区的当前偏移位置读取一个小端序 uint32_t。
@@ -165,7 +205,7 @@ public:
      * @return true  读取成功；
      * @return false 缓冲区剩余字节不足 4。
      */
-    static bool ReadUInt32LE(const GB_ByteBuffer& buffer, size_t& offset, uint32_t& value);
+    static bool ReadUInt32LE(const GB_ByteBuffer& buffer, std::size_t& offset, uint32_t& value);
 
     /**
      * @brief 从缓冲区的当前偏移位置读取一个小端序 uint64_t。
@@ -176,7 +216,7 @@ public:
      * @return true  读取成功；
      * @return false 缓冲区剩余字节不足 8。
      */
-    static bool ReadUInt64LE(const GB_ByteBuffer& buffer, size_t& offset, uint64_t& value);
+    static bool ReadUInt64LE(const GB_ByteBuffer& buffer, std::size_t& offset, uint64_t& value);
 
     /**
      * @brief 从缓冲区的当前偏移位置读取一个按小端序存储的 double。
@@ -190,7 +230,7 @@ public:
      * @remarks
      *  本函数按 IEEE 754 原始比特位恢复 double，不做额外数值校验。
      */
-    static bool ReadDoubleLE(const GB_ByteBuffer& buffer, size_t& offset, double& value);
+    static bool ReadDoubleLE(const GB_ByteBuffer& buffer, std::size_t& offset, double& value);
 };
 
 
@@ -232,6 +272,7 @@ enum class GB_FileStreamOpenMode
     OpenAlways,
 
     // 打开已有文件并截断为 0 字节；文件不存在则打开失败。
+    // 注意：CreateAlways 与 TruncateExisting 都要求访问权限包含写入权限。
     TruncateExisting
 };
 
@@ -279,8 +320,11 @@ struct GLOBALBASE_PORT GB_FileStreamOpenOptions
     // 打开前是否自动创建父目录。仅当 openMode 可能创建或写入文件时建议开启。
     bool createParentDirectories = true;
 
-    // 打开后是否把当前位置移动到文件末尾，适合追加写入场景。
+    // 打开后是否把当前位置移动到文件末尾。该选项只移动一次文件指针，不保证多线程/多进程追加写入的原子性。
     bool seekToEndAfterOpen = false;
+
+    // 是否以追加语义写入。启用后，每次 WriteBytes() 都追加到文件末尾；Windows 使用 EOF Overlapped 写入，POSIX 使用 O_APPEND。
+    bool appendMode = false;
 
     // 是否向操作系统声明“顺序访问”倾向。适合大文件线性读写。
     bool sequentialAccessHint = false;
@@ -462,7 +506,7 @@ public:
      * @brief 从当前位置读取最多 byteSize 个字节到 GB_ByteBuffer。
      *
      * @param byteSize 期望读取的最大字节数。
-     * @param outData 输出缓冲区，函数开始时会被清空。
+     * @param outData 输出缓冲区。成功时替换为实际读取的数据；失败时尽量保持原值不变。
      * @return true  读取过程未发生底层错误；
      * @return false 分配失败或底层读取失败。
      */
@@ -471,7 +515,7 @@ public:
     /**
      * @brief 从当前位置读取到流末尾。
      *
-     * @param outData 输出缓冲区，函数开始时会被清空。
+     * @param outData 输出缓冲区。成功时替换为读取到的剩余数据；失败时尽量保持原值不变。
      * @param maxBytes 最大允许读取字节数，0 表示不限制。
      * @return true  读取成功；
      * @return false 长度查询失败、超过 maxBytes、分配失败或读取失败。
@@ -499,7 +543,7 @@ public:
     /**
      * @brief 读取带长度前缀的二进制缓冲区。
      *
-     * @param outData 输出缓冲区，函数开始时会被清空。
+     * @param outData 输出缓冲区。成功时替换为读取到的数据；失败时尽量保持原值不变。
      * @param maxBytes 最大允许读取字节数，0 表示不限制。
      */
     bool ReadByteBuffer(GB_ByteBuffer& outData, std::uint64_t maxBytes = 0);
@@ -515,7 +559,7 @@ public:
     /**
      * @brief 读取带长度前缀的字符串原始字节。
      *
-     * @param outText 输出字符串，函数开始时会被清空。
+     * @param outText 输出字符串。成功时替换为读取到的数据；失败时尽量保持原值不变。
      * @param maxBytes 最大允许读取字节数，0 表示不限制。
      */
     bool ReadString(std::string& outText, std::uint64_t maxBytes = 0);
@@ -569,6 +613,8 @@ public:
     GB_FileStream(GB_FileStream&& other) noexcept;
     GB_FileStream& operator=(GB_FileStream&& other) noexcept;
 
+    using GB_Stream::Tell;
+    using GB_Stream::Length;
     using GB_Stream::ReadBytes;
     using GB_Stream::WriteBytes;
 
@@ -662,6 +708,8 @@ public:
     GB_MemoryStream(GB_MemoryStream&& other) noexcept;
     GB_MemoryStream& operator=(GB_MemoryStream&& other) noexcept;
 
+    using GB_Stream::Tell;
+    using GB_Stream::Length;
     using GB_Stream::ReadBytes;
     using GB_Stream::WriteBytes;
 
