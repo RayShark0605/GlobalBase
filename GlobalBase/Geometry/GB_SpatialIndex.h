@@ -29,7 +29,8 @@ class GB_Polyline;
  * @details
  * GB_SpatialIndex 面向“根据二维范围快速筛选对象”的工程场景：
  * - 每条记录以 GB_Rectangle 作为索引范围，以 uint64_t 作为稳定标识，以 GB_Variant 承载用户数据；
- * - 查询接口支持 GB_Rectangle、GB_Polygon、GB_Polyline，Polygon/Polyline 查询按其轴对齐包围盒范围执行；
+ * - 查询接口支持 GB_Rectangle、GB_Polygon、GB_Polyline，Polygon/Polyline 查询先使用轴对齐包围盒粗过滤，再基于真实几何做细过滤；
+ * - Polygon 查询按面对象处理，少于 3 个有效顶点、显式首尾重复后仍退化、面积为 0 的输入会被视为无效查询；
  * - 内部采用不可变快照（Copy-On-Write Snapshot）设计，查询线程只读取当前快照，不获取读写锁；
  * - 构建、插入、删除、清空属于写操作，会通过写互斥锁串行化，并在构建完成后一次性发布新快照；
  * - 适合千万级数据的批量构建和大量并发查询，少量动态写入可用 Insert/Remove，大量更新应优先重新批量 Build。
@@ -82,7 +83,7 @@ public:
     struct GLOBALBASE_PORT Record
     {
         /** @brief 调用方维护的稳定标识。GB_SpatialIndex 不要求唯一，但 RemoveById 会删除所有同 id 记录。 */
-        std::uint64_t id;
+        std::uint64_t id = 0;
 
         /** @brief 用于索引的二维范围。 */
         GB_Rectangle range;
@@ -109,51 +110,63 @@ public:
     /** @brief 批量构建选项。 */
     struct BuildOptions
     {
-        /** @brief 分裂策略。默认 RStar，适合读多写少和批量构建。 */
-		SplitAlgorithm splitAlgorithm = SplitAlgorithm::RStar;
+        BuildOptions();
+
+        /**
+         * @brief 分裂策略。默认 RStar。
+         *
+         * @note 当前实现对写操作采用“过滤记录 + 批量重建 R 树 + 发布快照”的方式。
+         *       Boost.Geometry R-tree 使用迭代器范围构造时会走批量 packing 路径，
+         *       因此该选项主要作为节点参数类型保留，查询性能通常更受 nodeCapacity 和数据分布影响。
+         */
+        SplitAlgorithm splitAlgorithm;
 
         /** @brief 节点容量。默认 16，通常适合二维范围查询。 */
-        NodeCapacity nodeCapacity = NodeCapacity::Normal16;
+        NodeCapacity nodeCapacity;
 
         /** @brief 是否跳过无效范围记录。为 false 时只要存在无效记录，Build 失败且不改变旧索引。 */
-        bool skipInvalidRecords = true;
+        bool skipInvalidRecords;
 
         /** @brief 是否在构建后对记录数组做 shrink_to_fit。千万级数据且后续不频繁写入时可设为 true。 */
-        bool shrinkRecordsToFit = false;
+        bool shrinkRecordsToFit;
 
         /** @brief 用于并行准备 R 树输入值的线程数。0 表示根据硬件并发数自动选择。 */
-        std::size_t buildThreadCount = 0;
+        std::size_t buildThreadCount;
 
         /** @brief 记录数达到该阈值才启用并行准备。 */
-        std::size_t parallelBuildThreshold = 200000;
+        std::size_t parallelBuildThreshold;
     };
 
     /** @brief 查询选项。 */
     struct QueryOptions
     {
-        /** @brief 容差。大于 0 时会扩大候选范围并用 GB_Rectangle 做二次关系判断。 */
-        double tolerance = 0;
+        QueryOptions();
+
+        /** @brief 容差。大于 0 时会扩大候选范围并用 GB_Rectangle 做二次关系判断；Polygon/Polyline 查询也会在细过滤中使用该容差。 */
+        double tolerance;
 
         /** @brief 最多返回数量。0 表示不限制。 */
-        std::size_t maxResults = 0;
+        std::size_t maxResults;
 
         /** @brief QueryRecords 是否拷贝 GB_Variant。仅需要 id 时应调用 QueryIds，或把该值设为 false。 */
-		bool includeValue = true;
+        bool includeValue;
 
-        /** @brief 是否使用线程局部候选缓存，减少高频查询时的临时分配。 */
-		bool useThreadLocalCache = true;
+        /** @brief 是否使用线程局部结果索引缓存，减少高频查询时的临时分配。 */
+        bool useThreadLocalCache;
 
         /** @brief 线程局部缓存容量超过该值时，查询结束后释放缓存，防止极大范围查询造成长期占用。 */
-		std::size_t maxThreadLocalCacheCapacity = 1048576;
+        std::size_t maxThreadLocalCacheCapacity;
     };
 
     /** @brief 构建统计信息。 */
     struct BuildStatistics
     {
-		bool succeeded = false;
-		std::size_t inputRecordCount = 0;
-		std::size_t acceptedRecordCount = 0;
-		std::size_t skippedInvalidRecordCount = 0;
+        BuildStatistics();
+
+        bool succeeded;
+        std::size_t inputRecordCount;
+        std::size_t acceptedRecordCount;
+        std::size_t skippedInvalidRecordCount;
     };
 
     typedef std::function<bool(const Record& record)> RecordFilter;
@@ -208,19 +221,19 @@ public:
     /** @brief 基于矩形范围查询记录。 */
     std::vector<QueryResult> QueryRecords(const GB_Rectangle& range, QueryRelation relation = QueryRelation::Intersects, const QueryOptions& options = QueryOptions()) const;
 
-    /** @brief 基于多边形包围盒范围查询记录。 */
+    /** @brief 基于多边形真实几何查询记录。内部先按包围盒粗过滤，再做多边形细过滤。 */
     std::vector<QueryResult> QueryRecords(const GB_Polygon& polygon, QueryRelation relation = QueryRelation::Intersects, const QueryOptions& options = QueryOptions()) const;
 
-    /** @brief 基于多段线包围盒范围查询记录。 */
+    /** @brief 基于多段线真实几何查询记录。内部先按包围盒粗过滤，再做多段线细过滤。 */
     std::vector<QueryResult> QueryRecords(const GB_Polyline& polyline, QueryRelation relation = QueryRelation::Intersects, const QueryOptions& options = QueryOptions()) const;
 
     /** @brief 基于矩形范围查询 id。 */
     std::vector<std::uint64_t> QueryIds(const GB_Rectangle& range, QueryRelation relation = QueryRelation::Intersects, const QueryOptions& options = QueryOptions()) const;
 
-    /** @brief 基于多边形包围盒范围查询 id。 */
+    /** @brief 基于多边形真实几何查询 id。内部先按包围盒粗过滤，再做多边形细过滤。 */
     std::vector<std::uint64_t> QueryIds(const GB_Polygon& polygon, QueryRelation relation = QueryRelation::Intersects, const QueryOptions& options = QueryOptions()) const;
 
-    /** @brief 基于多段线包围盒范围查询 id。 */
+    /** @brief 基于多段线真实几何查询 id。内部先按包围盒粗过滤，再做多段线细过滤。 */
     std::vector<std::uint64_t> QueryIds(const GB_Polyline& polyline, QueryRelation relation = QueryRelation::Intersects, const QueryOptions& options = QueryOptions()) const;
 
     /** @brief 基于矩形范围查询，并使用调用方过滤器做二次过滤。 */
@@ -257,6 +270,9 @@ private:
 
     std::shared_ptr<const Impl> LoadSnapshot() const;
     void StoreSnapshot(const std::shared_ptr<const Impl>& impl);
+
+    std::vector<QueryResult> QueryRecordsInternal(const GB_Rectangle& range, const RecordFilter& filter, QueryRelation relation, const QueryOptions& options, bool filterHandlesRelation) const;
+    std::vector<std::uint64_t> QueryIdsInternal(const GB_Rectangle& range, const RecordFilter& filter, QueryRelation relation, const QueryOptions& options, bool filterHandlesRelation) const;
 
 private:
     mutable std::mutex writeMutex_;
