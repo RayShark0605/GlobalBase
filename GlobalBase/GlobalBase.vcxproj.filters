@@ -150,12 +150,12 @@
     <ClInclude Include="GB_Dbg.h">
       <Filter>头文件</Filter>
     </ClInclude>
+    <ClInclude Include="Geometry\GB_SpatialIndex.h">
+      <Filter>头文件\Geometry</Filter>
+    </ClInclude>
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="GB_Utf8String.cpp">
-      <Filter>源文件</Filter>
-    </ClCompile>
-    <ClCompile Include="GB_Utility.cpp">
       <Filter>源文件</Filter>
     </ClCompile>
     <ClCompile Include="GB_SysInfo.cpp">
@@ -262,6 +262,9 @@
     </ClCompile>
     <ClCompile Include="GB_Dbg.cpp">
       <Filter>源文件</Filter>
+    </ClCompile>
+    <ClCompile Include="Geometry\GB_SpatialIndex.cpp">
+      <Filter>源文件\Geometry</Filter>
     </ClCompile>
   </ItemGroup>
 </Project>

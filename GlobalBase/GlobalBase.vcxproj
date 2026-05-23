@@ -55,6 +55,7 @@
     <ClInclude Include="Geometry\GB_Polygon.h" />
     <ClInclude Include="Geometry\GB_Polyline.h" />
     <ClInclude Include="Geometry\GB_Rectangle.h" />
+    <ClInclude Include="Geometry\GB_SpatialIndex.h" />
     <ClInclude Include="Geometry\GB_Vector2d.h" />
     <ClInclude Include="GB_BaseTypes.h" />
     <ClInclude Include="GlobalBasePort.h" />
@@ -87,7 +88,6 @@
     <ClCompile Include="GB_ThreadPool.cpp" />
     <ClCompile Include="GB_Timer.cpp" />
     <ClCompile Include="GB_Utf8String.cpp" />
-    <ClCompile Include="GB_Utility.cpp" />
     <ClCompile Include="GB_Variant.cpp" />
     <ClCompile Include="Geometry\GB_GeometryInterface.cpp" />
     <ClCompile Include="Geometry\GB_LineSegment.cpp" />
@@ -96,6 +96,7 @@
     <ClCompile Include="Geometry\GB_Polygon.cpp" />
     <ClCompile Include="Geometry\GB_Polyline.cpp" />
     <ClCompile Include="Geometry\GB_Rectangle.cpp" />
+    <ClCompile Include="Geometry\GB_SpatialIndex.cpp" />
     <ClCompile Include="Geometry\GB_Vector2d.cpp" />
   </ItemGroup>
   <PropertyGroup Label="Globals">
