@@ -74,7 +74,8 @@ namespace
             return range;
         }
 
-        return range.Buffered(absTolerance, absTolerance);
+        const GB_Rectangle queryRange = range.Buffered(absTolerance, absTolerance);
+        return IsValidRange(queryRange) ? queryRange : GB_Rectangle::Invalid;
     }
 
     GB_Rectangle MakeInnerQueryRange(const GB_Rectangle& range, double tolerance)
@@ -374,16 +375,17 @@ namespace
             return false;
         }
 
+        const double segmentLength = std::sqrt(lengthSquared);
+        const double scaledTolerance = absTolerance * std::max(segmentLength, 1.0);
         const double crossValue = std::abs(CrossProduct(segment.point1, segment.point2, point));
-        const double distanceTolerance = absTolerance * std::max(std::sqrt(lengthSquared), 1.0);
-        if (crossValue > distanceTolerance)
+        if (crossValue > scaledTolerance)
         {
             return false;
         }
 
         const double dot1 = DotProduct(segment.point1, segment.point2, point);
         const double dot2 = DotProduct(segment.point2, segment.point1, point);
-        return dot1 >= -absTolerance * std::max(std::sqrt(lengthSquared), 1.0) && dot2 >= -absTolerance * std::max(std::sqrt(lengthSquared), 1.0);
+        return dot1 >= -scaledTolerance && dot2 >= -scaledTolerance;
     }
 
     bool IsPointOnInfiniteLine(const GB_Point2d& point, const Segment2d& line, double tolerance)
@@ -808,9 +810,22 @@ namespace
 
         std::vector<GB_Point2d> polylineVertices = polyline.GetVertices();
         preparedPolyline.vertices = NormalizePolylineVertices(std::move(polylineVertices));
-        if (preparedPolyline.vertices.size() < 2)
+        if (preparedPolyline.vertices.empty())
         {
-            preparedPolyline.vertices.clear();
+            return preparedPolyline;
+        }
+
+        if (preparedPolyline.vertices.size() == 1)
+        {
+            preparedPolyline.boundingBox = ComputeBoundingBox(preparedPolyline.vertices);
+            if (!IsValidRange(preparedPolyline.boundingBox))
+            {
+                preparedPolyline.vertices.clear();
+                return preparedPolyline;
+            }
+
+            preparedPolyline.segments.push_back(Segment2d(preparedPolyline.vertices[0], preparedPolyline.vertices[0]));
+            preparedPolyline.isValid = true;
             return preparedPolyline;
         }
 
@@ -1333,7 +1348,7 @@ namespace
         std::vector<std::thread>& threads_;
     };
 
-    class LimitedIndexOutputIterator
+    class IndexOutputIterator
     {
     public:
         typedef std::output_iterator_tag iterator_category;
@@ -1342,44 +1357,34 @@ namespace
         typedef void pointer;
         typedef void reference;
 
-        LimitedIndexOutputIterator(std::vector<std::size_t>& outputIndexes, std::size_t maxCount)
-            : outputIndexes_(&outputIndexes), maxCount_(maxCount)
+        explicit IndexOutputIterator(std::vector<std::size_t>& outputIndexes)
+            : outputIndexes_(&outputIndexes)
         {
         }
 
-        LimitedIndexOutputIterator& operator=(const TreeValue& value)
+        IndexOutputIterator& operator=(const TreeValue& value)
         {
-            if (outputIndexes_ == nullptr)
-            {
-                return *this;
-            }
-
-            if (maxCount_ == 0 || outputIndexes_->size() < maxCount_)
-            {
-                outputIndexes_->push_back(value.second);
-            }
-
+            outputIndexes_->push_back(value.second);
             return *this;
         }
 
-        LimitedIndexOutputIterator& operator*()
+        IndexOutputIterator& operator*()
         {
             return *this;
         }
 
-        LimitedIndexOutputIterator& operator++()
+        IndexOutputIterator& operator++()
         {
             return *this;
         }
 
-        LimitedIndexOutputIterator operator++(int)
+        IndexOutputIterator operator++(int)
         {
             return *this;
         }
 
     private:
         std::vector<std::size_t>* outputIndexes_ = nullptr;
-        std::size_t maxCount_ = 0;
     };
 
     enum class TreeQueryMode : std::uint8_t
@@ -1447,7 +1452,7 @@ namespace
                 return;
             }
 
-            LimitedIndexOutputIterator outputIterator(outIndexes, 0);
+            IndexOutputIterator outputIterator(outIndexes);
             tree_.query(predicate, outputIterator);
         }
 
@@ -1717,7 +1722,59 @@ namespace
         return std::move(inputRecords);
     }
 
-    thread_local std::vector<std::size_t> threadLocalCandidateIndexes;
+    struct ThreadLocalCandidateIndexCache
+    {
+        bool isInUse = false;
+        std::vector<std::size_t> indexes;
+    };
+
+    thread_local ThreadLocalCandidateIndexCache threadLocalCandidateIndexCache;
+
+    class CandidateIndexBufferScope
+    {
+    public:
+        explicit CandidateIndexBufferScope(bool useThreadLocalCache)
+        {
+            if (useThreadLocalCache && !threadLocalCandidateIndexCache.isInUse)
+            {
+                useThreadLocalCache_ = true;
+                threadLocalCandidateIndexCache.isInUse = true;
+                indexes_ = &threadLocalCandidateIndexCache.indexes;
+            }
+            else
+            {
+                indexes_ = &localIndexes_;
+            }
+
+            indexes_->clear();
+        }
+
+        ~CandidateIndexBufferScope()
+        {
+            if (useThreadLocalCache_)
+            {
+                threadLocalCandidateIndexCache.isInUse = false;
+            }
+        }
+
+        std::vector<std::size_t>& Indexes()
+        {
+            return *indexes_;
+        }
+
+        void ReleaseThreadLocalCacheIfNeeded(std::size_t maxCapacity)
+        {
+            if (useThreadLocalCache_ && indexes_->capacity() > maxCapacity)
+            {
+                std::vector<std::size_t>().swap(*indexes_);
+            }
+        }
+
+    private:
+        bool useThreadLocalCache_ = false;
+        std::vector<std::size_t>* indexes_ = nullptr;
+        std::vector<std::size_t> localIndexes_;
+    };
 }
 
 struct GB_SpatialIndex::Impl
@@ -1827,7 +1884,6 @@ GB_SpatialIndex::GB_SpatialIndex(GB_SpatialIndex&& other) noexcept
 {
     std::lock_guard<std::mutex> otherLockGuard(other.writeMutex_);
     StoreSnapshot(other.LoadSnapshot());
-    other.StoreSnapshot(std::shared_ptr<const Impl>());
 }
 
 GB_SpatialIndex& GB_SpatialIndex::operator=(const GB_SpatialIndex& other)
@@ -1855,7 +1911,6 @@ GB_SpatialIndex& GB_SpatialIndex::operator=(GB_SpatialIndex&& other) noexcept
     std::lock(lockGuard, otherLockGuard);
 
     StoreSnapshot(other.LoadSnapshot());
-    other.StoreSnapshot(std::shared_ptr<const Impl>());
     return *this;
 }
 
@@ -2431,9 +2486,8 @@ std::vector<GB_SpatialIndex::QueryResult> GB_SpatialIndex::QueryRecordsInternal(
         return results;
     }
 
-    std::vector<std::size_t> localMatchedIndexes;
-    std::vector<std::size_t>& matchedIndexes = options.useThreadLocalCache ? threadLocalCandidateIndexes : localMatchedIndexes;
-    matchedIndexes.clear();
+    CandidateIndexBufferScope candidateIndexBufferScope(options.useThreadLocalCache);
+    std::vector<std::size_t>& matchedIndexes = candidateIndexBufferScope.Indexes();
     if (options.maxResults != 0 && matchedIndexes.capacity() < options.maxResults)
     {
         matchedIndexes.reserve(std::min(options.maxResults, snapshot->records.size()));
@@ -2486,10 +2540,7 @@ std::vector<GB_SpatialIndex::QueryResult> GB_SpatialIndex::QueryRecordsInternal(
         results.push_back(std::move(result));
     }
 
-    if (options.useThreadLocalCache && matchedIndexes.capacity() > options.maxThreadLocalCacheCapacity)
-    {
-        std::vector<std::size_t>().swap(matchedIndexes);
-    }
+    candidateIndexBufferScope.ReleaseThreadLocalCacheIfNeeded(options.maxThreadLocalCacheCapacity);
 
     return results;
 }
@@ -2515,9 +2566,8 @@ std::vector<std::uint64_t> GB_SpatialIndex::QueryIdsInternal(const GB_Rectangle&
         return results;
     }
 
-    std::vector<std::size_t> localMatchedIndexes;
-    std::vector<std::size_t>& matchedIndexes = options.useThreadLocalCache ? threadLocalCandidateIndexes : localMatchedIndexes;
-    matchedIndexes.clear();
+    CandidateIndexBufferScope candidateIndexBufferScope(options.useThreadLocalCache);
+    std::vector<std::size_t>& matchedIndexes = candidateIndexBufferScope.Indexes();
     if (options.maxResults != 0 && matchedIndexes.capacity() < options.maxResults)
     {
         matchedIndexes.reserve(std::min(options.maxResults, snapshot->records.size()));
@@ -2561,10 +2611,7 @@ std::vector<std::uint64_t> GB_SpatialIndex::QueryIdsInternal(const GB_Rectangle&
         results.push_back(snapshot->records[recordIndex].id);
     }
 
-    if (options.useThreadLocalCache && matchedIndexes.capacity() > options.maxThreadLocalCacheCapacity)
-    {
-        std::vector<std::size_t>().swap(matchedIndexes);
-    }
+    candidateIndexBufferScope.ReleaseThreadLocalCacheIfNeeded(options.maxThreadLocalCacheCapacity);
 
     return results;
 }

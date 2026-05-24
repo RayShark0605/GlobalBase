@@ -31,6 +31,7 @@ class GB_Polyline;
  * - 每条记录以 GB_Rectangle 作为索引范围，以 uint64_t 作为稳定标识，以 GB_Variant 承载用户数据；
  * - 查询接口支持 GB_Rectangle、GB_Polygon、GB_Polyline，Polygon/Polyline 查询先使用轴对齐包围盒粗过滤，再基于真实几何做细过滤；
  * - Polygon 查询按面对象处理，少于 3 个有效顶点、显式首尾重复后仍退化、面积为 0 的输入会被视为无效查询；
+ * - Polyline 查询按线对象处理，所有有效顶点重合时按单点查询处理；
  * - 内部采用不可变快照（Copy-On-Write Snapshot）设计，查询线程只读取当前快照，不获取读写锁；
  * - 构建、插入、删除、清空属于写操作，会通过写互斥锁串行化，并在构建完成后一次性发布新快照；
  * - 适合千万级数据的批量构建和大量并发查询，少量动态写入可用 Insert/Remove，大量更新应优先重新批量 Build。
@@ -151,7 +152,7 @@ public:
         /** @brief QueryRecords 是否拷贝 GB_Variant。仅需要 id 时应调用 QueryIds，或把该值设为 false。 */
         bool includeValue;
 
-        /** @brief 是否使用线程局部结果索引缓存，减少高频查询时的临时分配。 */
+        /** @brief 是否使用线程局部结果索引缓存，减少高频查询时的临时分配。内部已处理同线程嵌套查询场景。 */
         bool useThreadLocalCache;
 
         /** @brief 线程局部缓存容量超过该值时，查询结束后释放缓存，防止极大范围查询造成长期占用。 */
