@@ -40,6 +40,10 @@ namespace
     typedef bg::model::point<double, 2, bg::cs::cartesian> BoostPoint;
     typedef bg::model::box<BoostPoint> BoostBox;
     typedef std::pair<BoostBox, std::size_t> TreeValue;
+    typedef std::pair<BoostBox, std::size_t> SegmentTreeValue;
+    typedef bgi::rtree<SegmentTreeValue, bgi::rstar<16, 8>> SegmentTree;
+
+    const std::size_t MinSegmentTreeSize = 64;
 
     bool IsFinite(double value)
     {
@@ -54,6 +58,20 @@ namespace
     BoostBox ToBoostBox(const GB_Rectangle& range)
     {
         return BoostBox(BoostPoint(range.minX, range.minY), BoostPoint(range.maxX, range.maxY));
+    }
+
+    double ClampLongDoubleToFiniteDouble(long double value)
+    {
+        const long double maxValue = static_cast<long double>(std::numeric_limits<double>::max());
+        if (value > maxValue)
+        {
+            return std::numeric_limits<double>::max();
+        }
+        if (value < -maxValue)
+        {
+            return -std::numeric_limits<double>::max();
+        }
+        return static_cast<double>(value);
     }
 
     GB_Rectangle MakeQueryRange(const GB_Rectangle& range, double tolerance)
@@ -74,7 +92,12 @@ namespace
             return range;
         }
 
-        const GB_Rectangle queryRange = range.Buffered(absTolerance, absTolerance);
+        const long double expandedMinX = static_cast<long double>(range.minX) - static_cast<long double>(absTolerance);
+        const long double expandedMinY = static_cast<long double>(range.minY) - static_cast<long double>(absTolerance);
+        const long double expandedMaxX = static_cast<long double>(range.maxX) + static_cast<long double>(absTolerance);
+        const long double expandedMaxY = static_cast<long double>(range.maxY) + static_cast<long double>(absTolerance);
+
+        const GB_Rectangle queryRange(ClampLongDoubleToFiniteDouble(expandedMinX), ClampLongDoubleToFiniteDouble(expandedMinY), ClampLongDoubleToFiniteDouble(expandedMaxX), ClampLongDoubleToFiniteDouble(expandedMaxY));
         return IsValidRange(queryRange) ? queryRange : GB_Rectangle::Invalid;
     }
 
@@ -157,6 +180,50 @@ namespace
         }
     };
 
+    std::unique_ptr<SegmentTree> CreateSegmentTree(const std::vector<Segment2d>& segments)
+    {
+        if (segments.size() < MinSegmentTreeSize)
+        {
+            return std::unique_ptr<SegmentTree>();
+        }
+
+        std::vector<SegmentTreeValue> values;
+        values.reserve(segments.size());
+        for (std::size_t i = 0; i < segments.size(); i++)
+        {
+            if (segments[i].IsValid())
+            {
+                values.emplace_back(ToBoostBox(segments[i].range), i);
+            }
+        }
+
+        if (values.empty())
+        {
+            return std::unique_ptr<SegmentTree>();
+        }
+
+        return std::unique_ptr<SegmentTree>(new SegmentTree(values.begin(), values.end()));
+    }
+
+    template<typename TVisitor>
+    void VisitSegmentTree(const SegmentTree& tree, const GB_Rectangle& range, double tolerance, const TVisitor& visitor)
+    {
+        const GB_Rectangle queryRange = MakeQueryRange(range, tolerance);
+        if (!IsValidRange(queryRange))
+        {
+            return;
+        }
+
+        const BoostBox queryBox = ToBoostBox(queryRange);
+        for (auto iterator = tree.qbegin(bgi::intersects(queryBox)); iterator != tree.qend(); iterator++)
+        {
+            if (!visitor(iterator->second))
+            {
+                break;
+            }
+        }
+    }
+
     bool ArePointsExactlyEqual(const GB_Point2d& point1, const GB_Point2d& point2)
     {
         return IsValidPoint(point1) && IsValidPoint(point2) && point1.x == point2.x && point1.y == point2.y;
@@ -194,12 +261,12 @@ namespace
         }
 
         const long double area = area2 * 0.5L;
-        if (!std::isfinite(static_cast<double>(area)))
+        if (!std::isfinite(area))
         {
             return std::numeric_limits<double>::quiet_NaN();
         }
 
-        return static_cast<double>(area);
+        return ClampLongDoubleToFiniteDouble(area);
     }
 
     std::vector<GB_Point2d> NormalizePolygonVertices(std::vector<GB_Point2d>&& vertices)
@@ -258,9 +325,12 @@ namespace
     struct PreparedPolygon
     {
         bool isValid = false;
+        bool isAxisAlignedRectangle = false;
         GB_Rectangle boundingBox;
+        GB_Rectangle axisAlignedRectangle;
         std::vector<GB_Point2d> vertices;
         std::vector<Segment2d> edges;
+        std::unique_ptr<SegmentTree> edgeTree;
     };
 
     struct PreparedPolyline
@@ -269,7 +339,43 @@ namespace
         GB_Rectangle boundingBox;
         std::vector<GB_Point2d> vertices;
         std::vector<Segment2d> segments;
+        std::unique_ptr<SegmentTree> segmentTree;
     };
+
+    double SquaredLengthFromComponents(double deltaX, double deltaY)
+    {
+        if (std::isnan(deltaX) || std::isnan(deltaY))
+        {
+            return std::numeric_limits<double>::quiet_NaN();
+        }
+
+        if (!std::isfinite(deltaX) || !std::isfinite(deltaY))
+        {
+            return std::numeric_limits<double>::max();
+        }
+
+        const double scale = std::max(std::abs(deltaX), std::abs(deltaY));
+        if (scale <= 0.0)
+        {
+            return 0.0;
+        }
+
+        const double scaledX = deltaX / scale;
+        const double scaledY = deltaY / scale;
+        const double scaledLengthSquared = scaledX * scaledX + scaledY * scaledY;
+        if (!std::isfinite(scaledLengthSquared))
+        {
+            return std::numeric_limits<double>::max();
+        }
+
+        const double sqrtMax = std::sqrt(std::numeric_limits<double>::max());
+        if (scale > sqrtMax / std::sqrt(std::max(scaledLengthSquared, std::numeric_limits<double>::min())))
+        {
+            return std::numeric_limits<double>::max();
+        }
+
+        return scale * scale * scaledLengthSquared;
+    }
 
     double PointDistanceSquared(const GB_Point2d& point1, const GB_Point2d& point2)
     {
@@ -278,9 +384,7 @@ namespace
             return std::numeric_limits<double>::quiet_NaN();
         }
 
-        const double dx = point1.x - point2.x;
-        const double dy = point1.y - point2.y;
-        return dx * dx + dy * dy;
+        return SquaredLengthFromComponents(point1.x - point2.x, point1.y - point2.y);
     }
 
     double SegmentLengthSquared(const Segment2d& segment)
@@ -290,12 +394,20 @@ namespace
 
     double CrossProduct(const GB_Point2d& origin, const GB_Point2d& point1, const GB_Point2d& point2)
     {
-        return (point1.x - origin.x) * (point2.y - origin.y) - (point1.y - origin.y) * (point2.x - origin.x);
+        const long double vector1X = static_cast<long double>(point1.x) - static_cast<long double>(origin.x);
+        const long double vector1Y = static_cast<long double>(point1.y) - static_cast<long double>(origin.y);
+        const long double vector2X = static_cast<long double>(point2.x) - static_cast<long double>(origin.x);
+        const long double vector2Y = static_cast<long double>(point2.y) - static_cast<long double>(origin.y);
+        return ClampLongDoubleToFiniteDouble(vector1X * vector2Y - vector1Y * vector2X);
     }
 
     double DotProduct(const GB_Point2d& origin, const GB_Point2d& point1, const GB_Point2d& point2)
     {
-        return (point1.x - origin.x) * (point2.x - origin.x) + (point1.y - origin.y) * (point2.y - origin.y);
+        const long double vector1X = static_cast<long double>(point1.x) - static_cast<long double>(origin.x);
+        const long double vector1Y = static_cast<long double>(point1.y) - static_cast<long double>(origin.y);
+        const long double vector2X = static_cast<long double>(point2.x) - static_cast<long double>(origin.x);
+        const long double vector2Y = static_cast<long double>(point2.y) - static_cast<long double>(origin.y);
+        return ClampLongDoubleToFiniteDouble(vector1X * vector2X + vector1Y * vector2Y);
     }
 
     double GetParameterTolerance(const Segment2d& segment, double tolerance)
@@ -498,6 +610,11 @@ namespace
             return false;
         }
 
+        if (range.IsContains(segment.range, tolerance))
+        {
+            return true;
+        }
+
         if (range.IsContains(segment.point1, tolerance) || range.IsContains(segment.point2, tolerance))
         {
             return true;
@@ -669,24 +786,29 @@ namespace
 
     void SortAndUniqueParameters(std::vector<double>& parameters, double parameterTolerance)
     {
+        if (parameters.empty())
+        {
+            return;
+        }
+
         for (std::size_t i = 0; i < parameters.size(); i++)
         {
             parameters[i] = ClampDouble(parameters[i], 0.0, 1.0);
         }
 
         std::sort(parameters.begin(), parameters.end());
-        std::vector<double> uniqueParameters;
-        uniqueParameters.reserve(parameters.size());
 
-        for (std::size_t i = 0; i < parameters.size(); i++)
+        std::size_t writeIndex = 1;
+        for (std::size_t readIndex = 1; readIndex < parameters.size(); readIndex++)
         {
-            if (uniqueParameters.empty() || std::abs(parameters[i] - uniqueParameters.back()) > parameterTolerance)
+            if (std::abs(parameters[readIndex] - parameters[writeIndex - 1]) > parameterTolerance)
             {
-                uniqueParameters.push_back(parameters[i]);
+                parameters[writeIndex] = parameters[readIndex];
+                writeIndex++;
             }
         }
 
-        parameters.swap(uniqueParameters);
+        parameters.resize(writeIndex);
     }
 
     enum class PointPolygonLocation : std::uint8_t
@@ -757,6 +879,16 @@ namespace
             return preparedPolygon;
         }
 
+        GB_Rectangle axisAlignedRectangle;
+        if (polygon.TryGetAxisAlignedRectangle(axisAlignedRectangle) && IsValidRange(axisAlignedRectangle))
+        {
+            preparedPolygon.isValid = true;
+            preparedPolygon.isAxisAlignedRectangle = true;
+            preparedPolygon.boundingBox = axisAlignedRectangle;
+            preparedPolygon.axisAlignedRectangle = axisAlignedRectangle;
+            return preparedPolygon;
+        }
+
         preparedPolygon.vertices = NormalizePolygonVertices(polygon.GetVerticesAsDouble());
         if (preparedPolygon.vertices.size() < 3)
         {
@@ -796,6 +928,7 @@ namespace
             return preparedPolygon;
         }
 
+        preparedPolygon.edgeTree = CreateSegmentTree(preparedPolygon.edges);
         preparedPolygon.isValid = true;
         return preparedPolygon;
     }
@@ -852,6 +985,7 @@ namespace
             return preparedPolyline;
         }
 
+        preparedPolyline.segmentTree = CreateSegmentTree(preparedPolyline.segments);
         preparedPolyline.isValid = true;
         return preparedPolyline;
     }
@@ -863,6 +997,11 @@ namespace
             return false;
         }
 
+        if (range.IsContains(polygon.boundingBox, tolerance))
+        {
+            return true;
+        }
+
         const std::array<GB_Point2d, 4> corners = GetRectangleCorners(range);
         for (std::size_t i = 0; i < corners.size(); i++)
         {
@@ -872,28 +1011,40 @@ namespace
             }
         }
 
-        for (std::size_t i = 0; i < polygon.vertices.size(); i++)
-        {
-            if (range.IsContains(polygon.vertices[i], tolerance))
+        bool foundIntersection = false;
+        const auto checkEdge = [&polygon, &range, tolerance, &foundIntersection](std::size_t edgeIndex) -> bool
             {
-                return true;
-            }
-        }
-
-        const std::array<Segment2d, 4> rectangleEdges = GetRectangleEdges(range);
-        for (std::size_t i = 0; i < polygon.edges.size(); i++)
-        {
-            if (!polygon.edges[i].range.IsIntersects(range, tolerance))
-            {
-                continue;
-            }
-
-            for (std::size_t j = 0; j < rectangleEdges.size(); j++)
-            {
-                if (SegmentsIntersect(polygon.edges[i], rectangleEdges[j], tolerance))
+                if (edgeIndex >= polygon.edges.size())
                 {
                     return true;
                 }
+
+                const Segment2d& edge = polygon.edges[edgeIndex];
+                if (!edge.range.IsIntersects(range, tolerance))
+                {
+                    return true;
+                }
+
+                if (SegmentIntersectsRectangle(edge, range, tolerance))
+                {
+                    foundIntersection = true;
+                    return false;
+                }
+
+                return true;
+            };
+
+        if (polygon.edgeTree.get() != nullptr)
+        {
+            VisitSegmentTree(*polygon.edgeTree, range, tolerance, checkEdge);
+            return foundIntersection;
+        }
+
+        for (std::size_t i = 0; i < polygon.edges.size(); i++)
+        {
+            if (!checkEdge(i))
+            {
+                return true;
             }
         }
 
@@ -923,13 +1074,29 @@ namespace
         }
 
         std::vector<double> parameters;
-        parameters.reserve(polygon.edges.size() + 2);
+        parameters.reserve(std::min<std::size_t>(polygon.edges.size() + 2, 64));
         parameters.push_back(0.0);
         parameters.push_back(1.0);
 
-        for (std::size_t i = 0; i < polygon.edges.size(); i++)
+        const auto appendParameters = [&segment, &polygon, &parameters, tolerance](std::size_t edgeIndex) -> bool
+            {
+                if (edgeIndex < polygon.edges.size())
+                {
+                    AppendIntersectionParametersOnFirstSegment(segment, polygon.edges[edgeIndex], parameters, tolerance);
+                }
+                return true;
+            };
+
+        if (polygon.edgeTree.get() != nullptr)
         {
-            AppendIntersectionParametersOnFirstSegment(segment, polygon.edges[i], parameters, tolerance);
+            VisitSegmentTree(*polygon.edgeTree, segment.range, tolerance, appendParameters);
+        }
+        else
+        {
+            for (std::size_t i = 0; i < polygon.edges.size(); i++)
+            {
+                appendParameters(i);
+            }
         }
 
         const double parameterTolerance = GetParameterTolerance(segment, tolerance);
@@ -955,7 +1122,7 @@ namespace
 
     bool RectangleCoveredByPolygon(const GB_Rectangle& range, const PreparedPolygon& polygon, double tolerance)
     {
-        if (!IsValidRange(range) || !polygon.isValid || !polygon.boundingBox.IsIntersects(range, tolerance))
+        if (!IsValidRange(range) || !polygon.isValid || !polygon.boundingBox.IsContains(range, tolerance))
         {
             return false;
         }
@@ -992,20 +1159,45 @@ namespace
             }
         }
 
-        for (std::size_t i = 0; i < polygon.edges.size(); i++)
-        {
-            if (!polygon.edges[i].range.IsIntersects(range, tolerance))
+        bool hasInteriorIntersection = false;
+        const auto checkInteriorIntersection = [&polygon, &range, tolerance, &hasInteriorIntersection](std::size_t edgeIndex) -> bool
             {
-                continue;
-            }
+                if (edgeIndex >= polygon.edges.size())
+                {
+                    return true;
+                }
 
-            if (SegmentIntersectsRectangleInterior(polygon.edges[i], range, tolerance))
+                const Segment2d& edge = polygon.edges[edgeIndex];
+                if (!edge.range.IsIntersects(range, tolerance))
+                {
+                    return true;
+                }
+
+                if (SegmentIntersectsRectangleInterior(edge, range, tolerance))
+                {
+                    hasInteriorIntersection = true;
+                    return false;
+                }
+
+                return true;
+            };
+
+        if (polygon.edgeTree.get() != nullptr)
+        {
+            VisitSegmentTree(*polygon.edgeTree, range, tolerance, checkInteriorIntersection);
+        }
+        else
+        {
+            for (std::size_t i = 0; i < polygon.edges.size(); i++)
             {
-                return false;
+                if (!checkInteriorIntersection(i))
+                {
+                    break;
+                }
             }
         }
 
-        return true;
+        return !hasInteriorIntersection;
     }
 
     bool RectangleContainsPolygon(const GB_Rectangle& range, const PreparedPolygon& polygon, double tolerance)
@@ -1013,14 +1205,6 @@ namespace
         if (!IsValidRange(range) || !polygon.isValid || !range.IsContains(polygon.boundingBox, tolerance))
         {
             return false;
-        }
-
-        for (std::size_t i = 0; i < polygon.vertices.size(); i++)
-        {
-            if (!range.IsContains(polygon.vertices[i], tolerance))
-            {
-                return false;
-            }
         }
 
         return true;
@@ -1033,14 +1217,43 @@ namespace
             return false;
         }
 
+        if (range.IsContains(polyline.boundingBox, tolerance))
+        {
+            return true;
+        }
+
+        bool foundIntersection = false;
+        const auto checkSegment = [&polyline, &range, tolerance, &foundIntersection](std::size_t segmentIndex) -> bool
+            {
+                if (segmentIndex >= polyline.segments.size())
+                {
+                    return true;
+                }
+
+                const Segment2d& currentSegment = polyline.segments[segmentIndex];
+                if (!currentSegment.range.IsIntersects(range, tolerance))
+                {
+                    return true;
+                }
+
+                if (SegmentIntersectsRectangle(currentSegment, range, tolerance))
+                {
+                    foundIntersection = true;
+                    return false;
+                }
+
+                return true;
+            };
+
+        if (polyline.segmentTree.get() != nullptr)
+        {
+            VisitSegmentTree(*polyline.segmentTree, range, tolerance, checkSegment);
+            return foundIntersection;
+        }
+
         for (std::size_t i = 0; i < polyline.segments.size(); i++)
         {
-            if (!polyline.segments[i].range.IsIntersects(range, tolerance))
-            {
-                continue;
-            }
-
-            if (SegmentIntersectsRectangle(polyline.segments[i], range, tolerance))
+            if (!checkSegment(i))
             {
                 return true;
             }
@@ -1065,9 +1278,26 @@ namespace
 
         if (lengthSquared <= absTolerance * absTolerance)
         {
+            bool foundPoint = false;
+            const auto checkPointSegment = [&segment, &polyline, tolerance, &foundPoint](std::size_t segmentIndex) -> bool
+                {
+                    if (segmentIndex < polyline.segments.size() && IsPointOnSegment(segment.point1, polyline.segments[segmentIndex], tolerance))
+                    {
+                        foundPoint = true;
+                        return false;
+                    }
+                    return true;
+                };
+
+            if (polyline.segmentTree.get() != nullptr)
+            {
+                VisitSegmentTree(*polyline.segmentTree, segment.range, tolerance, checkPointSegment);
+                return foundPoint;
+            }
+
             for (std::size_t i = 0; i < polyline.segments.size(); i++)
             {
-                if (IsPointOnSegment(segment.point1, polyline.segments[i], tolerance))
+                if (!checkPointSegment(i))
                 {
                     return true;
                 }
@@ -1076,33 +1306,52 @@ namespace
         }
 
         std::vector<std::pair<double, double>> intervals;
-        intervals.reserve(polyline.segments.size());
+        intervals.reserve(std::min<std::size_t>(polyline.segments.size(), 64));
 
-        for (std::size_t i = 0; i < polyline.segments.size(); i++)
+        const auto appendInterval = [&segment, &polyline, &intervals, tolerance](std::size_t segmentIndex) -> bool
+            {
+                if (segmentIndex >= polyline.segments.size())
+                {
+                    return true;
+                }
+
+                const Segment2d& polylineSegment = polyline.segments[segmentIndex];
+                if (!polylineSegment.IsValid() || !polylineSegment.range.IsIntersects(segment.range, tolerance))
+                {
+                    return true;
+                }
+
+                if (!IsPointOnInfiniteLine(polylineSegment.point1, segment, tolerance) || !IsPointOnInfiniteLine(polylineSegment.point2, segment, tolerance))
+                {
+                    return true;
+                }
+
+                double beginParameter = ParameterOnSegmentLine(polylineSegment.point1, segment);
+                double endParameter = ParameterOnSegmentLine(polylineSegment.point2, segment);
+                if (beginParameter > endParameter)
+                {
+                    std::swap(beginParameter, endParameter);
+                }
+
+                beginParameter = std::max(0.0, beginParameter);
+                endParameter = std::min(1.0, endParameter);
+                if (beginParameter <= endParameter)
+                {
+                    intervals.push_back(std::make_pair(beginParameter, endParameter));
+                }
+
+                return true;
+            };
+
+        if (polyline.segmentTree.get() != nullptr)
         {
-            const Segment2d& polylineSegment = polyline.segments[i];
-            if (!polylineSegment.IsValid() || !polylineSegment.range.IsIntersects(segment.range, tolerance))
+            VisitSegmentTree(*polyline.segmentTree, segment.range, tolerance, appendInterval);
+        }
+        else
+        {
+            for (std::size_t i = 0; i < polyline.segments.size(); i++)
             {
-                continue;
-            }
-
-            if (!IsPointOnInfiniteLine(polylineSegment.point1, segment, tolerance) || !IsPointOnInfiniteLine(polylineSegment.point2, segment, tolerance))
-            {
-                continue;
-            }
-
-            double beginParameter = ParameterOnSegmentLine(polylineSegment.point1, segment);
-            double endParameter = ParameterOnSegmentLine(polylineSegment.point2, segment);
-            if (beginParameter > endParameter)
-            {
-                std::swap(beginParameter, endParameter);
-            }
-
-            beginParameter = std::max(0.0, beginParameter);
-            endParameter = std::min(1.0, endParameter);
-            if (beginParameter <= endParameter)
-            {
-                intervals.push_back(std::make_pair(beginParameter, endParameter));
+                appendInterval(i);
             }
         }
 
@@ -1157,7 +1406,7 @@ namespace
 
     bool RectangleCoveredByPolyline(const GB_Rectangle& range, const PreparedPolyline& polyline, double tolerance)
     {
-        if (!IsValidRange(range) || !polyline.isValid || !range.IsIntersects(polyline.boundingBox, tolerance))
+        if (!IsValidRange(range) || !polyline.isValid || !polyline.boundingBox.IsContains(range, tolerance))
         {
             return false;
         }
@@ -1172,14 +1421,39 @@ namespace
 
         if (width <= absTolerance && height <= absTolerance)
         {
+            bool foundPoint = false;
+            const GB_Point2d center = range.Center();
+            const auto checkSegment = [&polyline, &range, &center, tolerance, &foundPoint](std::size_t segmentIndex) -> bool
+                {
+                    if (segmentIndex >= polyline.segments.size())
+                    {
+                        return true;
+                    }
+
+                    const Segment2d& currentSegment = polyline.segments[segmentIndex];
+                    if (!currentSegment.range.IsIntersects(range, tolerance))
+                    {
+                        return true;
+                    }
+
+                    if (IsPointOnSegment(center, currentSegment, tolerance))
+                    {
+                        foundPoint = true;
+                        return false;
+                    }
+
+                    return true;
+                };
+
+            if (polyline.segmentTree.get() != nullptr)
+            {
+                VisitSegmentTree(*polyline.segmentTree, range, tolerance, checkSegment);
+                return foundPoint;
+            }
+
             for (std::size_t i = 0; i < polyline.segments.size(); i++)
             {
-                if (!polyline.segments[i].range.IsIntersects(range, tolerance))
-                {
-                    continue;
-                }
-
-                if (IsPointOnSegment(range.Center(), polyline.segments[i], tolerance))
+                if (!checkSegment(i))
                 {
                     return true;
                 }
@@ -1207,19 +1481,26 @@ namespace
             return false;
         }
 
-        for (std::size_t i = 0; i < polyline.vertices.size(); i++)
-        {
-            if (!range.IsContains(polyline.vertices[i], tolerance))
-            {
-                return false;
-            }
-        }
-
         return true;
     }
 
     bool MatchPolygonRelation(const GB_Rectangle& recordRange, const PreparedPolygon& polygon, GB_SpatialIndex::QueryRelation relation, double tolerance)
     {
+        if (polygon.isAxisAlignedRectangle)
+        {
+            switch (relation)
+            {
+            case GB_SpatialIndex::QueryRelation::Intersects:
+                return recordRange.IsIntersects(polygon.axisAlignedRectangle, tolerance);
+            case GB_SpatialIndex::QueryRelation::CoveredByQuery:
+                return polygon.axisAlignedRectangle.IsContains(recordRange, tolerance);
+            case GB_SpatialIndex::QueryRelation::ContainsQuery:
+                return recordRange.IsContains(polygon.axisAlignedRectangle, tolerance);
+            default:
+                return false;
+            }
+        }
+
         switch (relation)
         {
         case GB_SpatialIndex::QueryRelation::Intersects:
@@ -1348,45 +1629,6 @@ namespace
         std::vector<std::thread>& threads_;
     };
 
-    class IndexOutputIterator
-    {
-    public:
-        typedef std::output_iterator_tag iterator_category;
-        typedef void value_type;
-        typedef void difference_type;
-        typedef void pointer;
-        typedef void reference;
-
-        explicit IndexOutputIterator(std::vector<std::size_t>& outputIndexes)
-            : outputIndexes_(&outputIndexes)
-        {
-        }
-
-        IndexOutputIterator& operator=(const TreeValue& value)
-        {
-            outputIndexes_->push_back(value.second);
-            return *this;
-        }
-
-        IndexOutputIterator& operator*()
-        {
-            return *this;
-        }
-
-        IndexOutputIterator& operator++()
-        {
-            return *this;
-        }
-
-        IndexOutputIterator operator++(int)
-        {
-            return *this;
-        }
-
-    private:
-        std::vector<std::size_t>* outputIndexes_ = nullptr;
-    };
-
     enum class TreeQueryMode : std::uint8_t
     {
         Intersects = 0,
@@ -1395,6 +1637,7 @@ namespace
     };
 
     typedef std::function<bool(std::size_t recordIndex)> TreeIndexFilter;
+    typedef std::function<bool(std::size_t recordIndex)> TreeIndexConsumer;
 
     class ITreeWrapper
     {
@@ -1403,7 +1646,8 @@ namespace
         {
         }
 
-        virtual void Query(const BoostBox& queryBox, TreeQueryMode queryMode, const TreeIndexFilter& filter, std::vector<std::size_t>& outIndexes, std::size_t maxCount) const = 0;
+        virtual void ForEach(const BoostBox& queryBox, TreeQueryMode queryMode, const TreeIndexFilter& filter, const TreeIndexConsumer& consumer) const = 0;
+        virtual std::unique_ptr<ITreeWrapper> CloneWithInsertedValues(const std::vector<TreeValue>& values) const = 0;
     };
 
     template<typename TParameters>
@@ -1415,26 +1659,41 @@ namespace
         {
         }
 
-        virtual void Query(const BoostBox& queryBox, TreeQueryMode queryMode, const TreeIndexFilter& filter, std::vector<std::size_t>& outIndexes, std::size_t maxCount) const override
+        virtual void ForEach(const BoostBox& queryBox, TreeQueryMode queryMode, const TreeIndexFilter& filter, const TreeIndexConsumer& consumer) const override
         {
+            if (!consumer)
+            {
+                return;
+            }
+
             switch (queryMode)
             {
             case TreeQueryMode::CoveredBy:
-                QueryByPredicate(bgi::covered_by(queryBox), filter, outIndexes, maxCount);
+                ForEachByPredicate(bgi::covered_by(queryBox), filter, consumer);
                 return;
             case TreeQueryMode::Covers:
-                QueryByPredicate(bgi::covers(queryBox), filter, outIndexes, maxCount);
+                ForEachByPredicate(bgi::covers(queryBox), filter, consumer);
                 return;
             case TreeQueryMode::Intersects:
             default:
-                QueryByPredicate(bgi::intersects(queryBox), filter, outIndexes, maxCount);
+                ForEachByPredicate(bgi::intersects(queryBox), filter, consumer);
                 return;
             }
         }
 
+        virtual std::unique_ptr<ITreeWrapper> CloneWithInsertedValues(const std::vector<TreeValue>& values) const override
+        {
+            std::unique_ptr<TreeWrapper<TParameters>> result(new TreeWrapper<TParameters>(*this));
+            for (std::size_t i = 0; i < values.size(); i++)
+            {
+                result->tree_.insert(values[i]);
+            }
+            return std::unique_ptr<ITreeWrapper>(result.release());
+        }
+
     private:
         template<typename TPredicate>
-        void QueryByPredicate(const TPredicate& predicate, const TreeIndexFilter& filter, std::vector<std::size_t>& outIndexes, std::size_t maxCount) const
+        void ForEachByPredicate(const TPredicate& predicate, const TreeIndexFilter& filter, const TreeIndexConsumer& consumer) const
         {
             if (filter)
             {
@@ -1442,27 +1701,19 @@ namespace
                     {
                         return filter(value.second);
                     });
-                QueryByIterator(combinedPredicate, outIndexes, maxCount);
+                ForEachByIterator(combinedPredicate, consumer);
                 return;
             }
 
-            if (maxCount != 0)
-            {
-                QueryByIterator(predicate, outIndexes, maxCount);
-                return;
-            }
-
-            IndexOutputIterator outputIterator(outIndexes);
-            tree_.query(predicate, outputIterator);
+            ForEachByIterator(predicate, consumer);
         }
 
         template<typename TPredicate>
-        void QueryByIterator(const TPredicate& predicate, std::vector<std::size_t>& outIndexes, std::size_t maxCount) const
+        void ForEachByIterator(const TPredicate& predicate, const TreeIndexConsumer& consumer) const
         {
             for (auto iterator = tree_.qbegin(predicate); iterator != tree_.qend(); iterator++)
             {
-                outIndexes.push_back(iterator->second);
-                if (maxCount != 0 && outIndexes.size() >= maxCount)
+                if (!consumer(iterator->second))
                 {
                     break;
                 }
@@ -1511,33 +1762,42 @@ namespace
             query.queryMode = TreeQueryMode::Covers;
             return query;
         case GB_SpatialIndex::QueryRelation::Intersects:
-        default:
             query.range = MakeQueryRange(range, tolerance);
+            query.queryMode = TreeQueryMode::Intersects;
+            return query;
+        default:
+            query.range = GB_Rectangle::Invalid;
             query.queryMode = TreeQueryMode::Intersects;
             return query;
         }
     }
 
-    std::vector<TreeValue> BuildTreeValues(const std::vector<GB_SpatialIndex::Record>& records, const GB_SpatialIndex::BuildOptions& options)
+    std::vector<TreeValue> BuildTreeValues(const std::vector<GB_SpatialIndex::Record>& records, const GB_SpatialIndex::BuildOptions& options, std::size_t beginIndex, std::size_t endIndex)
     {
         std::vector<TreeValue> values;
-        if (records.empty())
+        if (records.empty() || beginIndex >= endIndex || beginIndex >= records.size())
         {
             return values;
         }
 
-        const std::size_t threadCount = GetBuildThreadCount(options, records.size());
+        if (endIndex > records.size())
+        {
+            endIndex = records.size();
+        }
+
+        const std::size_t valueCount = endIndex - beginIndex;
+        const std::size_t threadCount = GetBuildThreadCount(options, valueCount);
         if (threadCount <= 1)
         {
-            values.reserve(records.size());
-            for (std::size_t i = 0; i < records.size(); i++)
+            values.reserve(valueCount);
+            for (std::size_t i = beginIndex; i < endIndex; i++)
             {
                 values.emplace_back(ToBoostBox(records[i].range), i);
             }
             return values;
         }
 
-        values.resize(records.size());
+        values.resize(valueCount);
 
         std::vector<std::thread> threads;
         threads.reserve(threadCount);
@@ -1545,14 +1805,15 @@ namespace
 
         for (std::size_t threadIndex = 0; threadIndex < threadCount; threadIndex++)
         {
-            const std::size_t beginIndex = records.size() * threadIndex / threadCount;
-            const std::size_t endIndex = records.size() * (threadIndex + 1) / threadCount;
+            const std::size_t localBeginIndex = valueCount * threadIndex / threadCount;
+            const std::size_t localEndIndex = valueCount * (threadIndex + 1) / threadCount;
 
-            threads.push_back(std::thread([beginIndex, endIndex, &records, &values]()
+            threads.push_back(std::thread([beginIndex, localBeginIndex, localEndIndex, &records, &values]()
                 {
-                    for (std::size_t i = beginIndex; i < endIndex; i++)
+                    for (std::size_t localIndex = localBeginIndex; localIndex < localEndIndex; localIndex++)
                     {
-                        values[i] = TreeValue(ToBoostBox(records[i].range), i);
+                        const std::size_t recordIndex = beginIndex + localIndex;
+                        values[localIndex] = TreeValue(ToBoostBox(records[recordIndex].range), recordIndex);
                     }
                 }));
         }
@@ -1565,6 +1826,11 @@ namespace
         return values;
     }
 
+    std::vector<TreeValue> BuildTreeValues(const std::vector<GB_SpatialIndex::Record>& records, const GB_SpatialIndex::BuildOptions& options)
+    {
+        return BuildTreeValues(records, options, 0, records.size());
+    }
+
     template<typename TParameters>
     std::unique_ptr<ITreeWrapper> CreateTreeWithParameters(const std::vector<TreeValue>& values, const TParameters& parameters)
     {
@@ -1574,7 +1840,7 @@ namespace
     template<std::size_t MaxElements>
     std::unique_ptr<ITreeWrapper> CreateTreeWithCapacity(const std::vector<TreeValue>& values, GB_SpatialIndex::SplitAlgorithm splitAlgorithm)
     {
-        constexpr std::size_t minElements = (MaxElements < 4) ? 1 : (MaxElements / 4);
+        constexpr std::size_t minElements = (MaxElements < 4) ? 1 : (MaxElements / 2);
 
         switch (splitAlgorithm)
         {
@@ -1722,72 +1988,22 @@ namespace
         return std::move(inputRecords);
     }
 
-    struct ThreadLocalCandidateIndexCache
-    {
-        bool isInUse = false;
-        std::vector<std::size_t> indexes;
-    };
-
-    thread_local ThreadLocalCandidateIndexCache threadLocalCandidateIndexCache;
-
-    class CandidateIndexBufferScope
-    {
-    public:
-        explicit CandidateIndexBufferScope(bool useThreadLocalCache)
-        {
-            if (useThreadLocalCache && !threadLocalCandidateIndexCache.isInUse)
-            {
-                useThreadLocalCache_ = true;
-                threadLocalCandidateIndexCache.isInUse = true;
-                indexes_ = &threadLocalCandidateIndexCache.indexes;
-            }
-            else
-            {
-                indexes_ = &localIndexes_;
-            }
-
-            indexes_->clear();
-        }
-
-        ~CandidateIndexBufferScope()
-        {
-            if (useThreadLocalCache_)
-            {
-                threadLocalCandidateIndexCache.isInUse = false;
-            }
-        }
-
-        std::vector<std::size_t>& Indexes()
-        {
-            return *indexes_;
-        }
-
-        void ReleaseThreadLocalCacheIfNeeded(std::size_t maxCapacity)
-        {
-            if (useThreadLocalCache_ && indexes_->capacity() > maxCapacity)
-            {
-                std::vector<std::size_t>().swap(*indexes_);
-            }
-        }
-
-    private:
-        bool useThreadLocalCache_ = false;
-        std::vector<std::size_t>* indexes_ = nullptr;
-        std::vector<std::size_t> localIndexes_;
-    };
 }
 
 struct GB_SpatialIndex::Impl
 {
     std::vector<Record> records;
     std::unique_ptr<ITreeWrapper> tree;
+    SplitAlgorithm splitAlgorithm;
+    NodeCapacity nodeCapacity;
 
     Impl()
+        : splitAlgorithm(SplitAlgorithm::RStar), nodeCapacity(NodeCapacity::Normal16)
     {
     }
 
     explicit Impl(std::vector<Record>&& inputRecords, const BuildOptions& options)
-        : records(std::move(inputRecords))
+        : records(std::move(inputRecords)), splitAlgorithm(options.splitAlgorithm), nodeCapacity(options.nodeCapacity)
     {
         if (records.empty())
         {
@@ -1801,6 +2017,20 @@ struct GB_SpatialIndex::Impl
 
         const std::vector<TreeValue> values = BuildTreeValues(records, options);
         tree = CreateTree(values, options);
+    }
+
+    Impl(std::vector<Record>&& inputRecords, std::unique_ptr<ITreeWrapper>&& inputTree, const BuildOptions& options)
+        : records(std::move(inputRecords)), tree(std::move(inputTree)), splitAlgorithm(options.splitAlgorithm), nodeCapacity(options.nodeCapacity)
+    {
+        if (options.shrinkRecordsToFit)
+        {
+            records.shrink_to_fit();
+        }
+    }
+
+    bool HasSameTreeOptions(const BuildOptions& options) const
+    {
+        return splitAlgorithm == options.splitAlgorithm && nodeCapacity == options.nodeCapacity;
     }
 
     bool IsValid() const
@@ -1820,16 +2050,16 @@ GB_SpatialIndex::BuildOptions::BuildOptions()
     skipInvalidRecords(true),
     shrinkRecordsToFit(false),
     buildThreadCount(0),
-    parallelBuildThreshold(200000)
+    parallelBuildThreshold(200000),
+    preferIncrementalInsert(true),
+    incrementalInsertThreshold(1024)
 {
 }
 
 GB_SpatialIndex::QueryOptions::QueryOptions()
     : tolerance(0.0),
     maxResults(0),
-    includeValue(true),
-    useThreadLocalCache(true),
-    maxThreadLocalCacheCapacity(1048576)
+    includeValue(true)
 {
 }
 
@@ -1884,6 +2114,7 @@ GB_SpatialIndex::GB_SpatialIndex(GB_SpatialIndex&& other) noexcept
 {
     std::lock_guard<std::mutex> otherLockGuard(other.writeMutex_);
     StoreSnapshot(other.LoadSnapshot());
+    other.StoreSnapshot(std::make_shared<Impl>());
 }
 
 GB_SpatialIndex& GB_SpatialIndex::operator=(const GB_SpatialIndex& other)
@@ -1911,6 +2142,7 @@ GB_SpatialIndex& GB_SpatialIndex::operator=(GB_SpatialIndex&& other) noexcept
     std::lock(lockGuard, otherLockGuard);
 
     StoreSnapshot(other.LoadSnapshot());
+    other.StoreSnapshot(std::make_shared<Impl>());
     return *this;
 }
 
@@ -1922,6 +2154,33 @@ std::shared_ptr<const GB_SpatialIndex::Impl> GB_SpatialIndex::LoadSnapshot() con
 void GB_SpatialIndex::StoreSnapshot(const std::shared_ptr<const Impl>& impl)
 {
     std::atomic_store_explicit(&impl_, impl, std::memory_order_release);
+}
+
+std::shared_ptr<const GB_SpatialIndex::Impl> GB_SpatialIndex::CreateImplByAppendingRecords(const std::shared_ptr<const Impl>& snapshot, std::vector<Record>&& newRecords, const BuildOptions& options)
+{
+    const std::size_t oldRecordCount = snapshot != nullptr ? snapshot->records.size() : 0;
+
+    std::vector<Record> records;
+    records.reserve(oldRecordCount + newRecords.size());
+    if (snapshot != nullptr)
+    {
+        records.insert(records.end(), snapshot->records.begin(), snapshot->records.end());
+    }
+
+    for (std::size_t i = 0; i < newRecords.size(); i++)
+    {
+        records.push_back(std::move(newRecords[i]));
+    }
+
+    const bool shouldUseIncrementalInsert = options.preferIncrementalInsert && options.incrementalInsertThreshold != 0 && newRecords.size() <= options.incrementalInsertThreshold && snapshot != nullptr && !snapshot->records.empty() && snapshot->tree.get() != nullptr && snapshot->HasSameTreeOptions(options);
+    if (shouldUseIncrementalInsert)
+    {
+        const std::vector<TreeValue> appendedValues = BuildTreeValues(records, options, oldRecordCount, records.size());
+        std::unique_ptr<ITreeWrapper> newTree = snapshot->tree->CloneWithInsertedValues(appendedValues);
+        return std::make_shared<Impl>(std::move(records), std::move(newTree), options);
+    }
+
+    return std::make_shared<Impl>(std::move(records), options);
 }
 
 void GB_SpatialIndex::Clear()
@@ -2063,19 +2322,10 @@ bool GB_SpatialIndex::Insert(const Record& record, const BuildOptions& options)
         std::lock_guard<std::mutex> lockGuard(writeMutex_);
 
         const std::shared_ptr<const Impl> snapshot = LoadSnapshot();
-        std::vector<Record> records;
-        if (snapshot != nullptr)
-        {
-            records.reserve(snapshot->records.size() + 1);
-            records.insert(records.end(), snapshot->records.begin(), snapshot->records.end());
-        }
-        else
-        {
-            records.reserve(1);
-        }
-
-        records.push_back(record);
-        std::shared_ptr<const Impl> newImpl = std::make_shared<Impl>(std::move(records), options);
+        std::vector<Record> newRecords;
+        newRecords.reserve(1);
+        newRecords.push_back(record);
+        std::shared_ptr<const Impl> newImpl = CreateImplByAppendingRecords(snapshot, std::move(newRecords), options);
         if (newImpl == nullptr || !newImpl->IsValid())
         {
             return false;
@@ -2102,19 +2352,10 @@ bool GB_SpatialIndex::Insert(Record&& record, const BuildOptions& options)
         std::lock_guard<std::mutex> lockGuard(writeMutex_);
 
         const std::shared_ptr<const Impl> snapshot = LoadSnapshot();
-        std::vector<Record> records;
-        if (snapshot != nullptr)
-        {
-            records.reserve(snapshot->records.size() + 1);
-            records.insert(records.end(), snapshot->records.begin(), snapshot->records.end());
-        }
-        else
-        {
-            records.reserve(1);
-        }
-
-        records.push_back(std::move(record));
-        std::shared_ptr<const Impl> newImpl = std::make_shared<Impl>(std::move(records), options);
+        std::vector<Record> newRecords;
+        newRecords.reserve(1);
+        newRecords.push_back(std::move(record));
+        std::shared_ptr<const Impl> newImpl = CreateImplByAppendingRecords(snapshot, std::move(newRecords), options);
         if (newImpl == nullptr || !newImpl->IsValid())
         {
             return false;
@@ -2159,17 +2400,7 @@ bool GB_SpatialIndex::Insert(const std::vector<Record>& inputRecords, const Buil
         std::lock_guard<std::mutex> lockGuard(writeMutex_);
 
         const std::shared_ptr<const Impl> snapshot = LoadSnapshot();
-        std::vector<Record> records;
-        const std::size_t oldRecordCount = snapshot != nullptr ? snapshot->records.size() : 0;
-        records.reserve(oldRecordCount + newRecords.size());
-        if (snapshot != nullptr)
-        {
-            records.insert(records.end(), snapshot->records.begin(), snapshot->records.end());
-        }
-
-        records.insert(records.end(), newRecords.begin(), newRecords.end());
-
-        std::shared_ptr<const Impl> newImpl = std::make_shared<Impl>(std::move(records), options);
+        std::shared_ptr<const Impl> newImpl = CreateImplByAppendingRecords(snapshot, std::move(newRecords), options);
         if (newImpl == nullptr || !newImpl->IsValid())
         {
             statistics.succeeded = false;
@@ -2229,20 +2460,7 @@ bool GB_SpatialIndex::Insert(std::vector<Record>&& inputRecords, const BuildOpti
         std::lock_guard<std::mutex> lockGuard(writeMutex_);
 
         const std::shared_ptr<const Impl> snapshot = LoadSnapshot();
-        std::vector<Record> records;
-        const std::size_t oldRecordCount = snapshot != nullptr ? snapshot->records.size() : 0;
-        records.reserve(oldRecordCount + newRecords.size());
-        if (snapshot != nullptr)
-        {
-            records.insert(records.end(), snapshot->records.begin(), snapshot->records.end());
-        }
-
-        for (std::size_t i = 0; i < newRecords.size(); i++)
-        {
-            records.push_back(std::move(newRecords[i]));
-        }
-
-        std::shared_ptr<const Impl> newImpl = std::make_shared<Impl>(std::move(records), options);
+        std::shared_ptr<const Impl> newImpl = CreateImplByAppendingRecords(snapshot, std::move(newRecords), options);
         if (newImpl == nullptr || !newImpl->IsValid())
         {
             statistics.succeeded = false;
@@ -2324,6 +2542,11 @@ std::size_t GB_SpatialIndex::RemoveByIds(const std::vector<std::uint64_t>& ids, 
     if (ids.empty())
     {
         return 0;
+    }
+
+    if (ids.size() == 1)
+    {
+        return RemoveById(ids.front(), options);
     }
 
     try
@@ -2486,11 +2709,13 @@ std::vector<GB_SpatialIndex::QueryResult> GB_SpatialIndex::QueryRecordsInternal(
         return results;
     }
 
-    CandidateIndexBufferScope candidateIndexBufferScope(options.useThreadLocalCache);
-    std::vector<std::size_t>& matchedIndexes = candidateIndexBufferScope.Indexes();
-    if (options.maxResults != 0 && matchedIndexes.capacity() < options.maxResults)
+    if (options.maxResults != 0)
     {
-        matchedIndexes.reserve(std::min(options.maxResults, snapshot->records.size()));
+        results.reserve(std::min(options.maxResults, snapshot->records.size()));
+    }
+    else
+    {
+        results.reserve(std::min<std::size_t>(snapshot->records.size(), 256));
     }
 
     const double tolerance = options.tolerance;
@@ -2517,30 +2742,29 @@ std::vector<GB_SpatialIndex::QueryResult> GB_SpatialIndex::QueryRecordsInternal(
             };
     }
 
-    snapshot->tree->Query(ToBoostBox(candidateQuery.range), candidateQuery.queryMode, indexFilter, matchedIndexes, options.maxResults);
-
-    results.reserve(matchedIndexes.size());
-    for (std::size_t i = 0; i < matchedIndexes.size(); i++)
-    {
-        const std::size_t recordIndex = matchedIndexes[i];
-        if (recordIndex >= snapshot->records.size())
+    const bool includeValue = options.includeValue;
+    const std::size_t maxResults = options.maxResults;
+    const TreeIndexConsumer consumer = [&snapshot, &results, includeValue, maxResults](std::size_t recordIndex) -> bool
         {
-            continue;
-        }
+            if (recordIndex >= snapshot->records.size())
+            {
+                return true;
+            }
 
-        const Record& record = snapshot->records[recordIndex];
-        QueryResult result;
-        result.id = record.id;
-        result.range = record.range;
-        if (options.includeValue)
-        {
-            result.value = record.value;
-        }
+            const Record& record = snapshot->records[recordIndex];
+            QueryResult result;
+            result.id = record.id;
+            result.range = record.range;
+            if (includeValue)
+            {
+                result.value = record.value;
+            }
 
-        results.push_back(std::move(result));
-    }
+            results.push_back(std::move(result));
+            return maxResults == 0 || results.size() < maxResults;
+        };
 
-    candidateIndexBufferScope.ReleaseThreadLocalCacheIfNeeded(options.maxThreadLocalCacheCapacity);
+    snapshot->tree->ForEach(ToBoostBox(candidateQuery.range), candidateQuery.queryMode, indexFilter, consumer);
 
     return results;
 }
@@ -2566,11 +2790,13 @@ std::vector<std::uint64_t> GB_SpatialIndex::QueryIdsInternal(const GB_Rectangle&
         return results;
     }
 
-    CandidateIndexBufferScope candidateIndexBufferScope(options.useThreadLocalCache);
-    std::vector<std::size_t>& matchedIndexes = candidateIndexBufferScope.Indexes();
-    if (options.maxResults != 0 && matchedIndexes.capacity() < options.maxResults)
+    if (options.maxResults != 0)
     {
-        matchedIndexes.reserve(std::min(options.maxResults, snapshot->records.size()));
+        results.reserve(std::min(options.maxResults, snapshot->records.size()));
+    }
+    else
+    {
+        results.reserve(std::min<std::size_t>(snapshot->records.size(), 256));
     }
 
     const double tolerance = options.tolerance;
@@ -2597,23 +2823,294 @@ std::vector<std::uint64_t> GB_SpatialIndex::QueryIdsInternal(const GB_Rectangle&
             };
     }
 
-    snapshot->tree->Query(ToBoostBox(candidateQuery.range), candidateQuery.queryMode, indexFilter, matchedIndexes, options.maxResults);
-
-    results.reserve(matchedIndexes.size());
-    for (std::size_t i = 0; i < matchedIndexes.size(); i++)
-    {
-        const std::size_t recordIndex = matchedIndexes[i];
-        if (recordIndex >= snapshot->records.size())
+    const std::size_t maxResults = options.maxResults;
+    const TreeIndexConsumer consumer = [&snapshot, &results, maxResults](std::size_t recordIndex) -> bool
         {
-            continue;
-        }
+            if (recordIndex >= snapshot->records.size())
+            {
+                return true;
+            }
 
-        results.push_back(snapshot->records[recordIndex].id);
-    }
+            results.push_back(snapshot->records[recordIndex].id);
+            return maxResults == 0 || results.size() < maxResults;
+        };
 
-    candidateIndexBufferScope.ReleaseThreadLocalCacheIfNeeded(options.maxThreadLocalCacheCapacity);
+    snapshot->tree->ForEach(ToBoostBox(candidateQuery.range), candidateQuery.queryMode, indexFilter, consumer);
 
     return results;
+}
+
+
+std::size_t GB_SpatialIndex::ForEachRecord(const GB_Rectangle& range, const QueryResultVisitor& visitor, QueryRelation relation, const QueryOptions& options) const
+{
+    return ForEachRecordInternal(range, RecordFilter(), visitor, relation, options, false);
+}
+
+std::size_t GB_SpatialIndex::ForEachRecord(const GB_Polygon& polygon, const QueryResultVisitor& visitor, QueryRelation relation, const QueryOptions& options) const
+{
+    const PreparedPolygon preparedPolygon = PreparePolygon(polygon);
+    if (!preparedPolygon.isValid)
+    {
+        return 0;
+    }
+
+    const double tolerance = options.tolerance;
+    const RecordFilter filter = [&preparedPolygon, relation, tolerance](const Record& record) -> bool
+        {
+            return MatchPolygonRelation(record.range, preparedPolygon, relation, tolerance);
+        };
+
+    return ForEachRecordInternal(preparedPolygon.boundingBox, filter, visitor, relation, options, true);
+}
+
+std::size_t GB_SpatialIndex::ForEachRecord(const GB_Polyline& polyline, const QueryResultVisitor& visitor, QueryRelation relation, const QueryOptions& options) const
+{
+    const PreparedPolyline preparedPolyline = PreparePolyline(polyline);
+    if (!preparedPolyline.isValid)
+    {
+        return 0;
+    }
+
+    const double tolerance = options.tolerance;
+    const RecordFilter filter = [&preparedPolyline, relation, tolerance](const Record& record) -> bool
+        {
+            return MatchPolylineRelation(record.range, preparedPolyline, relation, tolerance);
+        };
+
+    return ForEachRecordInternal(preparedPolyline.boundingBox, filter, visitor, relation, options, true);
+}
+
+std::size_t GB_SpatialIndex::ForEachRecord(const GB_Rectangle& range, const RecordFilter& filter, const QueryResultVisitor& visitor, QueryRelation relation, const QueryOptions& options) const
+{
+    return ForEachRecordInternal(range, filter, visitor, relation, options, false);
+}
+
+std::size_t GB_SpatialIndex::ForEachId(const GB_Rectangle& range, const IdVisitor& visitor, QueryRelation relation, const QueryOptions& options) const
+{
+    return ForEachIdInternal(range, RecordFilter(), visitor, relation, options, false);
+}
+
+std::size_t GB_SpatialIndex::ForEachId(const GB_Polygon& polygon, const IdVisitor& visitor, QueryRelation relation, const QueryOptions& options) const
+{
+    const PreparedPolygon preparedPolygon = PreparePolygon(polygon);
+    if (!preparedPolygon.isValid)
+    {
+        return 0;
+    }
+
+    const double tolerance = options.tolerance;
+    const RecordFilter filter = [&preparedPolygon, relation, tolerance](const Record& record) -> bool
+        {
+            return MatchPolygonRelation(record.range, preparedPolygon, relation, tolerance);
+        };
+
+    return ForEachIdInternal(preparedPolygon.boundingBox, filter, visitor, relation, options, true);
+}
+
+std::size_t GB_SpatialIndex::ForEachId(const GB_Polyline& polyline, const IdVisitor& visitor, QueryRelation relation, const QueryOptions& options) const
+{
+    const PreparedPolyline preparedPolyline = PreparePolyline(polyline);
+    if (!preparedPolyline.isValid)
+    {
+        return 0;
+    }
+
+    const double tolerance = options.tolerance;
+    const RecordFilter filter = [&preparedPolyline, relation, tolerance](const Record& record) -> bool
+        {
+            return MatchPolylineRelation(record.range, preparedPolyline, relation, tolerance);
+        };
+
+    return ForEachIdInternal(preparedPolyline.boundingBox, filter, visitor, relation, options, true);
+}
+
+std::size_t GB_SpatialIndex::ForEachId(const GB_Rectangle& range, const RecordFilter& filter, const IdVisitor& visitor, QueryRelation relation, const QueryOptions& options) const
+{
+    return ForEachIdInternal(range, filter, visitor, relation, options, false);
+}
+
+std::size_t GB_SpatialIndex::QueryCount(const GB_Rectangle& range, QueryRelation relation, const QueryOptions& options) const
+{
+    return QueryCount(range, RecordFilter(), relation, options);
+}
+
+std::size_t GB_SpatialIndex::QueryCount(const GB_Polygon& polygon, QueryRelation relation, const QueryOptions& options) const
+{
+    std::size_t count = 0;
+    QueryOptions countOptions = options;
+    countOptions.includeValue = false;
+    ForEachId(polygon, [&count](std::uint64_t) -> bool
+        {
+            count++;
+            return true;
+        }, relation, countOptions);
+    return count;
+}
+
+std::size_t GB_SpatialIndex::QueryCount(const GB_Polyline& polyline, QueryRelation relation, const QueryOptions& options) const
+{
+    std::size_t count = 0;
+    QueryOptions countOptions = options;
+    countOptions.includeValue = false;
+    ForEachId(polyline, [&count](std::uint64_t) -> bool
+        {
+            count++;
+            return true;
+        }, relation, countOptions);
+    return count;
+}
+
+std::size_t GB_SpatialIndex::QueryCount(const GB_Rectangle& range, const RecordFilter& filter, QueryRelation relation, const QueryOptions& options) const
+{
+    std::size_t count = 0;
+    QueryOptions countOptions = options;
+    countOptions.includeValue = false;
+    ForEachId(range, filter, [&count](std::uint64_t) -> bool
+        {
+            count++;
+            return true;
+        }, relation, countOptions);
+    return count;
+}
+
+std::size_t GB_SpatialIndex::ForEachRecordInternal(const GB_Rectangle& range, const RecordFilter& filter, const QueryResultVisitor& visitor, QueryRelation relation, const QueryOptions& options, bool filterHandlesRelation) const
+{
+    if (!visitor)
+    {
+        return 0;
+    }
+
+    const CandidateTreeQuery candidateQuery = MakeCandidateTreeQuery(range, relation, options.tolerance);
+    if (!IsValidRange(candidateQuery.range))
+    {
+        return 0;
+    }
+
+    const std::shared_ptr<const Impl> snapshot = LoadSnapshot();
+    if (snapshot == nullptr || snapshot->tree.get() == nullptr || snapshot->records.empty())
+    {
+        return 0;
+    }
+
+    const double tolerance = options.tolerance;
+    const bool hasFilter = static_cast<bool>(filter);
+    const bool needsRelationCheck = !filterHandlesRelation && AbsTolerance(tolerance) > 0.0;
+    TreeIndexFilter indexFilter;
+
+    if (hasFilter || needsRelationCheck)
+    {
+        indexFilter = [&snapshot, &range, relation, tolerance, &filter, filterHandlesRelation](std::size_t recordIndex) -> bool
+            {
+                if (recordIndex >= snapshot->records.size())
+                {
+                    return false;
+                }
+
+                const Record& record = snapshot->records[recordIndex];
+                if (!filterHandlesRelation && !MatchRelation(record.range, range, relation, tolerance))
+                {
+                    return false;
+                }
+
+                return !filter || filter(record);
+            };
+    }
+
+    const bool includeValue = options.includeValue;
+    const std::size_t maxResults = options.maxResults;
+    std::size_t visitedCount = 0;
+    const TreeIndexConsumer consumer = [&snapshot, &visitor, includeValue, maxResults, &visitedCount](std::size_t recordIndex) -> bool
+        {
+            if (recordIndex >= snapshot->records.size())
+            {
+                return true;
+            }
+
+            const Record& record = snapshot->records[recordIndex];
+            QueryResult result;
+            result.id = record.id;
+            result.range = record.range;
+            if (includeValue)
+            {
+                result.value = record.value;
+            }
+
+            visitedCount++;
+            if (!visitor(result))
+            {
+                return false;
+            }
+
+            return maxResults == 0 || visitedCount < maxResults;
+        };
+
+    snapshot->tree->ForEach(ToBoostBox(candidateQuery.range), candidateQuery.queryMode, indexFilter, consumer);
+    return visitedCount;
+}
+
+std::size_t GB_SpatialIndex::ForEachIdInternal(const GB_Rectangle& range, const RecordFilter& filter, const IdVisitor& visitor, QueryRelation relation, const QueryOptions& options, bool filterHandlesRelation) const
+{
+    if (!visitor)
+    {
+        return 0;
+    }
+
+    const CandidateTreeQuery candidateQuery = MakeCandidateTreeQuery(range, relation, options.tolerance);
+    if (!IsValidRange(candidateQuery.range))
+    {
+        return 0;
+    }
+
+    const std::shared_ptr<const Impl> snapshot = LoadSnapshot();
+    if (snapshot == nullptr || snapshot->tree.get() == nullptr || snapshot->records.empty())
+    {
+        return 0;
+    }
+
+    const double tolerance = options.tolerance;
+    const bool hasFilter = static_cast<bool>(filter);
+    const bool needsRelationCheck = !filterHandlesRelation && AbsTolerance(tolerance) > 0.0;
+    TreeIndexFilter indexFilter;
+
+    if (hasFilter || needsRelationCheck)
+    {
+        indexFilter = [&snapshot, &range, relation, tolerance, &filter, filterHandlesRelation](std::size_t recordIndex) -> bool
+            {
+                if (recordIndex >= snapshot->records.size())
+                {
+                    return false;
+                }
+
+                const Record& record = snapshot->records[recordIndex];
+                if (!filterHandlesRelation && !MatchRelation(record.range, range, relation, tolerance))
+                {
+                    return false;
+                }
+
+                return !filter || filter(record);
+            };
+    }
+
+    const std::size_t maxResults = options.maxResults;
+    std::size_t visitedCount = 0;
+    const TreeIndexConsumer consumer = [&snapshot, &visitor, maxResults, &visitedCount](std::size_t recordIndex) -> bool
+        {
+            if (recordIndex >= snapshot->records.size())
+            {
+                return true;
+            }
+
+            visitedCount++;
+            if (!visitor(snapshot->records[recordIndex].id))
+            {
+                return false;
+            }
+
+            return maxResults == 0 || visitedCount < maxResults;
+        };
+
+    snapshot->tree->ForEach(ToBoostBox(candidateQuery.range), candidateQuery.queryMode, indexFilter, consumer);
+    return visitedCount;
 }
 
 GB_SpatialIndex::Record GB_SpatialIndex::MakeRecord(std::uint64_t id, const GB_Rectangle& range)

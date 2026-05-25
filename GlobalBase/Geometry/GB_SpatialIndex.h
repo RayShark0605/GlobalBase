@@ -30,7 +30,10 @@ class GB_Polyline;
  * GB_SpatialIndex 面向“根据二维范围快速筛选对象”的工程场景：
  * - 每条记录以 GB_Rectangle 作为索引范围，以 uint64_t 作为稳定标识，以 GB_Variant 承载用户数据；
  * - 查询接口支持 GB_Rectangle、GB_Polygon、GB_Polyline，Polygon/Polyline 查询先使用轴对齐包围盒粗过滤，再基于真实几何做细过滤；
+ * - Polygon 若本身是轴对齐矩形，会自动降级为矩形关系判断，避免不必要的逐边几何计算；
+ * - 复杂 Polygon/Polyline 查询会为查询几何临时构建边索引，并对“记录范围完全包含查询包围盒”等常见场景做快速判定；
  * - Polygon 查询按面对象处理，少于 3 个有效顶点、显式首尾重复后仍退化、面积为 0 的输入会被视为无效查询；
+ * - Polygon/Polyline 细过滤只判断“记录矩形范围”与查询几何的关系，不负责验证外部实体真实几何；
  * - Polyline 查询按线对象处理，所有有效顶点重合时按单点查询处理；
  * - 内部采用不可变快照（Copy-On-Write Snapshot）设计，查询线程只读取当前快照，不获取读写锁；
  * - 构建、插入、删除、清空属于写操作，会通过写互斥锁串行化，并在构建完成后一次性发布新快照；
@@ -117,8 +120,9 @@ public:
          * @brief 分裂策略。默认 RStar。
          *
          * @note 当前实现对写操作采用“过滤记录 + 批量重建 R 树 + 发布快照”的方式。
-         *       Boost.Geometry R-tree 使用迭代器范围构造时会走批量 packing 路径，
-         *       因此该选项主要作为节点参数类型保留，查询性能通常更受 nodeCapacity 和数据分布影响。
+         *       批量构建时仍由 Boost.Geometry R-tree 通过范围构造完成 packing；
+         *       分裂策略主要影响后续节点参数与少量动态变更后的树形质量。
+         *       当前实现使用 MaxElements/2 作为节点最小填充量，优先保证查询阶段的节点质量。
          */
         SplitAlgorithm splitAlgorithm;
 
@@ -136,6 +140,19 @@ public:
 
         /** @brief 记录数达到该阈值才启用并行准备。 */
         std::size_t parallelBuildThreshold;
+
+        /**
+         * @brief 少量追加记录时是否优先复制旧 R 树并增量插入新节点。
+         *
+         * @details
+         * 该选项只影响 Insert/批量追加，不影响 Build。启用后，如果旧索引的节点容量和分裂策略与本次 options 一致，
+         * 且本次追加数量不超过 incrementalInsertThreshold，则避免全量 bulk rebuild。
+         * 对“偶发少量追加”更快；对“大批量导入”仍应使用 Build 或让本阈值较小以保持 packing 树质量。
+         */
+        bool preferIncrementalInsert;
+
+        /** @brief 追加记录数不超过该阈值时才尝试增量插入。0 表示禁用增量插入。 */
+        std::size_t incrementalInsertThreshold;
     };
 
     /** @brief 查询选项。 */
@@ -151,12 +168,6 @@ public:
 
         /** @brief QueryRecords 是否拷贝 GB_Variant。仅需要 id 时应调用 QueryIds，或把该值设为 false。 */
         bool includeValue;
-
-        /** @brief 是否使用线程局部结果索引缓存，减少高频查询时的临时分配。内部已处理同线程嵌套查询场景。 */
-        bool useThreadLocalCache;
-
-        /** @brief 线程局部缓存容量超过该值时，查询结束后释放缓存，防止极大范围查询造成长期占用。 */
-        std::size_t maxThreadLocalCacheCapacity;
     };
 
     /** @brief 构建统计信息。 */
@@ -171,6 +182,12 @@ public:
     };
 
     typedef std::function<bool(const Record& record)> RecordFilter;
+
+    /** @brief 查询结果访问器。返回 false 表示立即停止继续遍历。 */
+    typedef std::function<bool(const QueryResult& result)> QueryResultVisitor;
+
+    /** @brief 查询 id 访问器。返回 false 表示立即停止继续遍历。 */
+    typedef std::function<bool(std::uint64_t id)> IdVisitor;
 
     GB_SpatialIndex();
     ~GB_SpatialIndex();
@@ -243,6 +260,42 @@ public:
     /** @brief 基于矩形范围查询 id，并使用调用方过滤器做二次过滤。 */
     std::vector<std::uint64_t> QueryIds(const GB_Rectangle& range, const RecordFilter& filter, QueryRelation relation = QueryRelation::Intersects, const QueryOptions& options = QueryOptions()) const;
 
+    /** @brief 基于矩形范围流式访问记录，避免构造大结果数组。visitor 返回 false 时立即停止。 */
+    std::size_t ForEachRecord(const GB_Rectangle& range, const QueryResultVisitor& visitor, QueryRelation relation = QueryRelation::Intersects, const QueryOptions& options = QueryOptions()) const;
+
+    /** @brief 基于多边形真实几何流式访问记录，避免构造大结果数组。visitor 返回 false 时立即停止。 */
+    std::size_t ForEachRecord(const GB_Polygon& polygon, const QueryResultVisitor& visitor, QueryRelation relation = QueryRelation::Intersects, const QueryOptions& options = QueryOptions()) const;
+
+    /** @brief 基于多段线真实几何流式访问记录，避免构造大结果数组。visitor 返回 false 时立即停止。 */
+    std::size_t ForEachRecord(const GB_Polyline& polyline, const QueryResultVisitor& visitor, QueryRelation relation = QueryRelation::Intersects, const QueryOptions& options = QueryOptions()) const;
+
+    /** @brief 基于矩形范围流式访问记录，并使用调用方过滤器做二次过滤。visitor 返回 false 时立即停止。 */
+    std::size_t ForEachRecord(const GB_Rectangle& range, const RecordFilter& filter, const QueryResultVisitor& visitor, QueryRelation relation = QueryRelation::Intersects, const QueryOptions& options = QueryOptions()) const;
+
+    /** @brief 基于矩形范围流式访问 id，避免构造大结果数组。visitor 返回 false 时立即停止。 */
+    std::size_t ForEachId(const GB_Rectangle& range, const IdVisitor& visitor, QueryRelation relation = QueryRelation::Intersects, const QueryOptions& options = QueryOptions()) const;
+
+    /** @brief 基于多边形真实几何流式访问 id，避免构造大结果数组。visitor 返回 false 时立即停止。 */
+    std::size_t ForEachId(const GB_Polygon& polygon, const IdVisitor& visitor, QueryRelation relation = QueryRelation::Intersects, const QueryOptions& options = QueryOptions()) const;
+
+    /** @brief 基于多段线真实几何流式访问 id，避免构造大结果数组。visitor 返回 false 时立即停止。 */
+    std::size_t ForEachId(const GB_Polyline& polyline, const IdVisitor& visitor, QueryRelation relation = QueryRelation::Intersects, const QueryOptions& options = QueryOptions()) const;
+
+    /** @brief 基于矩形范围流式访问 id，并使用调用方过滤器做二次过滤。visitor 返回 false 时立即停止。 */
+    std::size_t ForEachId(const GB_Rectangle& range, const RecordFilter& filter, const IdVisitor& visitor, QueryRelation relation = QueryRelation::Intersects, const QueryOptions& options = QueryOptions()) const;
+
+    /** @brief 基于矩形范围统计命中数量。受 relation、filter、tolerance 和 maxResults 约束。 */
+    std::size_t QueryCount(const GB_Rectangle& range, QueryRelation relation = QueryRelation::Intersects, const QueryOptions& options = QueryOptions()) const;
+
+    /** @brief 基于多边形真实几何统计命中数量。受 relation、tolerance 和 maxResults 约束。 */
+    std::size_t QueryCount(const GB_Polygon& polygon, QueryRelation relation = QueryRelation::Intersects, const QueryOptions& options = QueryOptions()) const;
+
+    /** @brief 基于多段线真实几何统计命中数量。受 relation、tolerance 和 maxResults 约束。 */
+    std::size_t QueryCount(const GB_Polyline& polyline, QueryRelation relation = QueryRelation::Intersects, const QueryOptions& options = QueryOptions()) const;
+
+    /** @brief 基于矩形范围统计命中数量，并使用调用方过滤器做二次过滤。受 relation、filter、tolerance 和 maxResults 约束。 */
+    std::size_t QueryCount(const GB_Rectangle& range, const RecordFilter& filter, QueryRelation relation = QueryRelation::Intersects, const QueryOptions& options = QueryOptions()) const;
+
     /** @brief 便捷构造记录。 */
     static Record MakeRecord(std::uint64_t id, const GB_Rectangle& range);
 
@@ -271,9 +324,12 @@ private:
 
     std::shared_ptr<const Impl> LoadSnapshot() const;
     void StoreSnapshot(const std::shared_ptr<const Impl>& impl);
+    static std::shared_ptr<const Impl> CreateImplByAppendingRecords(const std::shared_ptr<const Impl>& snapshot, std::vector<Record>&& newRecords, const BuildOptions& options);
 
     std::vector<QueryResult> QueryRecordsInternal(const GB_Rectangle& range, const RecordFilter& filter, QueryRelation relation, const QueryOptions& options, bool filterHandlesRelation) const;
     std::vector<std::uint64_t> QueryIdsInternal(const GB_Rectangle& range, const RecordFilter& filter, QueryRelation relation, const QueryOptions& options, bool filterHandlesRelation) const;
+    std::size_t ForEachRecordInternal(const GB_Rectangle& range, const RecordFilter& filter, const QueryResultVisitor& visitor, QueryRelation relation, const QueryOptions& options, bool filterHandlesRelation) const;
+    std::size_t ForEachIdInternal(const GB_Rectangle& range, const RecordFilter& filter, const IdVisitor& visitor, QueryRelation relation, const QueryOptions& options, bool filterHandlesRelation) const;
 
 private:
     mutable std::mutex writeMutex_;
