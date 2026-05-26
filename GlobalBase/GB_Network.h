@@ -59,13 +59,13 @@ struct GB_NetworkProxySettings
     std::string proxyUserNameUtf8 = "";              // 代理用户名（UTF-8）
     std::string proxyPasswordUtf8 = "";              // 代理密码（UTF-8）
 
-    std::string noProxyUtf8 = "";                     // 不走代理的主机列表（CURLOPT_NOPROXY）。逗号分隔，如 "localhost,127.0.0.1,*.company.com"
+    std::string noProxyUtf8 = "";                     // 不走代理的主机列表（CURLOPT_NOPROXY）。逗号分隔，如 "localhost,127.0.0.1,.company.com"；兼容输入 "*.company.com"
 
     bool proxyTunnel = true;                          // HTTPS 目标是否对 HTTP/HTTPS 代理启用隧道（CONNECT）
 };
 
 /**
- * @brief URL 请求选项（当前实现主要用于 HTTP/HTTPS GET）。
+ * @brief URL 请求选项（用于 HTTP/HTTPS GET/POST 以及文件下载）。
  */
 struct GB_NetworkRequestOptions
 {
@@ -81,9 +81,17 @@ struct GB_NetworkRequestOptions
     int maxRedirects = 10;                              // 最大重定向次数（followRedirects=true 时有效）
 
     unsigned int connectTimeoutMs = 5000;               // 连接超时（毫秒）
-    unsigned int totalTimeoutMs = 0;                    // 总超时（毫秒，包含连接 + 传输），如果是下载大文件建议设置成 0
+    unsigned int totalTimeoutMs = 0;                    // 总超时（毫秒，包含连接 + 传输）。0 表示不限制总传输时长
+    unsigned int lowSpeedLimitBytesPerSecond = 0;       // 低速传输阈值（字节/秒）。0 表示不启用低速判定
+    unsigned int lowSpeedTimeSeconds = 0;               // 持续低于 lowSpeedLimitBytesPerSecond 的秒数。0 表示不启用低速判定
 
     bool enableHttp2 = true;                            // 是否允许 libcurl 通过 ALPN 等方式协商 HTTP/2（若当前构建支持）
+
+    bool enableTcpKeepAlive = true;                     // 是否启用 TCP KeepAlive（用于长连接/大文件下载场景）
+
+    size_t minParallelDownloadBytes = 32ULL * 1024ULL * 1024ULL; // 启用并行 Range 下载的最小文件大小。0 表示只要服务端支持 Range 就允许并行
+    size_t minParallelChunkBytes = 4ULL * 1024ULL * 1024ULL;     // 并行下载单分片建议最小字节数，用于限制过度拆分
+    size_t maxParallelConnections = 8;                  // 并行 Range 下载最多连接数。小于 2 时禁用并行下载
 
     bool verifyTlsPeer = true;                          // 是否校验证书链（CURLOPT_SSL_VERIFYPEER）
     bool verifyTlsHost = true;                          // 是否校验证书主机名（CURLOPT_SSL_VERIFYHOST）
@@ -119,7 +127,7 @@ struct GB_NetworkResponse
 };
 
 /**
- * @brief 根据 URL 发起请求并获取返回数据（当前实现为 HTTP/HTTPS GET）。
+ * @brief 根据 URL 发起 HTTP/HTTPS GET 请求并获取返回数据。
  *
  * 为降低误用风险，内部会限制协议为 http/https，并限制重定向协议为 http/https。
  *
@@ -128,6 +136,64 @@ struct GB_NetworkResponse
  * @return GB_NetworkResponse 请求结果。
  */
 GLOBALBASE_PORT GB_NetworkResponse GB_RequestUrlData(const std::string& urlUtf8, const GB_NetworkRequestOptions& options = GB_NetworkRequestOptions());
+
+/**
+ * @brief 根据 URL 发起 HTTP/HTTPS POST 请求并获取返回数据。
+ *
+ * @remarks
+ * - requestBody 为“原始字节流”，允许包含 '\0'。
+ * - contentTypeUtf8 为空时不主动追加 Content-Type 头，此时 libcurl 的普通 POST 默认行为通常为 application/x-www-form-urlencoded。
+ * - contentTypeUtf8 非空时只需要传入媒体类型值，例如 "application/json" 或 "application/x-www-form-urlencoded"。
+ * - 如果 options.headersUtf8 中已经包含 Content-Type，则优先使用 options.headersUtf8 中的设置，避免重复追加。
+ *
+ * 为降低误用风险，内部会限制协议为 http/https，并限制重定向协议为 http/https。
+ *
+ * @param urlUtf8 目标 URL（UTF-8）。
+ * @param requestBody 请求体（原始字节流）。
+ * @param contentTypeUtf8 Content-Type 媒体类型值（UTF-8）。为空表示不主动设置。
+ * @param options 请求选项。
+ * @return GB_NetworkResponse 请求结果。
+ */
+GLOBALBASE_PORT GB_NetworkResponse GB_PostUrlData(const std::string& urlUtf8, const std::string& requestBody, const std::string& contentTypeUtf8, const GB_NetworkRequestOptions& options = GB_NetworkRequestOptions());
+
+/**
+ * @brief 根据 URL 发起 HTTP/HTTPS POST 请求并获取返回数据。
+ *
+ * @param urlUtf8 目标 URL（UTF-8）。
+ * @param requestBody 请求体（原始字节流）。
+ * @param options 请求选项。
+ * @return GB_NetworkResponse 请求结果。
+ */
+GLOBALBASE_PORT GB_NetworkResponse GB_PostUrlData(const std::string& urlUtf8, const std::string& requestBody, const GB_NetworkRequestOptions& options = GB_NetworkRequestOptions());
+
+/**
+ * @brief 根据 URL 发起 HTTP/HTTPS POST 请求并获取返回数据。
+ *
+ * @remarks
+ * - requestBody 为“原始字节流”，允许包含 '\0'。
+ * - contentTypeUtf8 为空时不主动追加 Content-Type 头，此时 libcurl 的普通 POST 默认行为通常为 application/x-www-form-urlencoded。
+ * - contentTypeUtf8 非空时只需要传入媒体类型值，例如 "application/json" 或 "application/x-www-form-urlencoded"。
+ * - 如果 options.headersUtf8 中已经包含 Content-Type，则优先使用 options.headersUtf8 中的设置，避免重复追加。
+ *
+ * 为降低误用风险，内部会限制协议为 http/https，并限制重定向协议为 http/https。
+ *
+ * @param urlUtf8 目标 URL（UTF-8）。
+ * @param requestBody 请求体（原始字节流）。
+ * @param contentTypeUtf8 Content-Type 媒体类型值（UTF-8）。为空表示不主动设置。
+ * @param options 请求选项。
+ * @return GB_NetworkResponse 请求结果。
+ */
+GLOBALBASE_PORT GB_NetworkResponse GB_PostUrlData(const std::string& urlUtf8, const GB_ByteBuffer& requestBody, const std::string& contentTypeUtf8, const GB_NetworkRequestOptions& options = GB_NetworkRequestOptions());
+
+/**
+ * @brief 根据 URL 发起 HTTP/HTTPS POST 请求并获取返回数据。
+ *
+ * @param urlUtf8 目标 URL（UTF-8）。
+ * @param requestBody 请求体（原始字节流）。
+ * @param options 请求选项。
+ * @return GB_NetworkResponse 请求结果。
+ */
+GLOBALBASE_PORT GB_NetworkResponse GB_PostUrlData(const std::string& urlUtf8, const GB_ByteBuffer& requestBody, const GB_NetworkRequestOptions& options = GB_NetworkRequestOptions());
 
 /**
  * @brief 清空 Windows 系统代理解析缓存。

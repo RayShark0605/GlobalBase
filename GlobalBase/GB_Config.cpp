@@ -1049,7 +1049,7 @@ bool GB_IsExistsChildConfig(const string& configPathUtf8, const string& childCon
     {
         return false;
     }
-    for (const GB_ConfigItem& childItem : item.childenItems)
+    for (const GB_ConfigItem& childItem : item.childrenItems)
     {
         if (childItem.nameUtf8 == childConfigNameUtf8)
         {
@@ -2225,7 +2225,7 @@ bool GB_GetConfigItem(const string& configPathUtf8, GB_ConfigItem& configItem, b
             if (!recursive)
             {
                 // 非递归：仅列出直接子键名，不下钻，不读取其键值
-                outItem.childenItems.emplace_back(std::move(child));
+                outItem.childrenItems.emplace_back(std::move(child));
                 continue;
             }
 
@@ -2233,7 +2233,7 @@ bool GB_GetConfigItem(const string& configPathUtf8, GB_ConfigItem& configItem, b
 
             if (Recurse(rootKey, childPathW, child))
             {
-                outItem.childenItems.emplace_back(std::move(child));
+                outItem.childrenItems.emplace_back(std::move(child));
             }
         }
 
@@ -2332,7 +2332,7 @@ bool GB_GetConfigItem(const string& configPathUtf8, GB_ConfigItem& configItem, b
                     const string childPrefix = head.empty() ? kvChild.first : (head + "/" + kvChild.first);
                     BuildTree(childPrefix, childItem);
                 }
-                outItem.childenItems.emplace_back(std::move(childItem));
+                outItem.childrenItems.emplace_back(std::move(childItem));
             }
         };
 

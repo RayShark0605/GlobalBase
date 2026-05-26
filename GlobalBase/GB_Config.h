@@ -93,7 +93,7 @@ GLOBALBASE_PORT bool GB_RenameConfigValue(const std::string& configPathUtf8, con
 struct GB_ConfigItem
 {
 	std::string nameUtf8 = "";
-	std::vector<GB_ConfigItem> childenItems;
+	std::vector<GB_ConfigItem> childrenItems;
 	std::vector<GB_ConfigValue> values;
 };
 
