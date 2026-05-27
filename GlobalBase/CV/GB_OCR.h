@@ -458,7 +458,7 @@ struct GB_OCROptions
 	/**
 	 * @brief 识别置信度阈值。
 	 */
-	double recConfidenceThresh = 0.0;
+	double recConfidenceThresh = 0.8;
 
 	/**
 	 * @brief 是否按常规阅读顺序对结果排序。
