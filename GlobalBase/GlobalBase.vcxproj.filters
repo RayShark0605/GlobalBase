@@ -31,6 +31,12 @@
     <Filter Include="源文件\Desktop">
       <UniqueIdentifier>{9ab71077-78ef-4c64-8c9a-c83244157f45}</UniqueIdentifier>
     </Filter>
+    <Filter Include="头文件\Desktop\Automation">
+      <UniqueIdentifier>{dc70fcde-9325-419f-9b97-d63f0c479e51}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="源文件\Desktop\Automation">
+      <UniqueIdentifier>{99668c0c-5b8b-4b47-a140-5e3c07be282b}</UniqueIdentifier>
+    </Filter>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="GB_BaseTypes.h">
@@ -126,20 +132,11 @@
     <ClInclude Include="GB_FormatParser.h">
       <Filter>头文件</Filter>
     </ClInclude>
-    <ClInclude Include="Desktop\GB_Screen.h">
-      <Filter>头文件\Desktop</Filter>
-    </ClInclude>
-    <ClInclude Include="Desktop\GB_Mouse.h">
-      <Filter>头文件\Desktop</Filter>
-    </ClInclude>
     <ClInclude Include="Geometry\GB_LineSegment.h">
       <Filter>头文件\Geometry</Filter>
     </ClInclude>
     <ClInclude Include="Geometry\GB_Polyline.h">
       <Filter>头文件\Geometry</Filter>
-    </ClInclude>
-    <ClInclude Include="Desktop\GB_Keyboard.h">
-      <Filter>头文件\Desktop</Filter>
     </ClInclude>
     <ClInclude Include="CV\GB_OCR.h">
       <Filter>头文件\CV</Filter>
@@ -152,6 +149,30 @@
     </ClInclude>
     <ClInclude Include="Geometry\GB_SpatialIndex.h">
       <Filter>头文件\Geometry</Filter>
+    </ClInclude>
+    <ClInclude Include="Desktop\GB_Keyboard.h">
+      <Filter>头文件\Desktop\Automation</Filter>
+    </ClInclude>
+    <ClInclude Include="Desktop\GB_Mouse.h">
+      <Filter>头文件\Desktop\Automation</Filter>
+    </ClInclude>
+    <ClInclude Include="Desktop\GB_Screen.h">
+      <Filter>头文件\Desktop\Automation</Filter>
+    </ClInclude>
+    <ClInclude Include="Desktop\GB_SystemError.h">
+      <Filter>头文件\Desktop</Filter>
+    </ClInclude>
+    <ClInclude Include="Desktop\GB_SystemResult.h">
+      <Filter>头文件\Desktop</Filter>
+    </ClInclude>
+    <ClInclude Include="Desktop\GB_WinHandleScope.h">
+      <Filter>头文件\Desktop</Filter>
+    </ClInclude>
+    <ClInclude Include="Desktop\GB_ComScope.h">
+      <Filter>头文件\Desktop</Filter>
+    </ClInclude>
+    <ClInclude Include="Desktop\GB_PrivilegeScope.h">
+      <Filter>头文件\Desktop</Filter>
     </ClInclude>
   </ItemGroup>
   <ItemGroup>
@@ -239,20 +260,11 @@
     <ClCompile Include="GB_FormatParser.cpp">
       <Filter>源文件</Filter>
     </ClCompile>
-    <ClCompile Include="Desktop\GB_Screen.cpp">
-      <Filter>源文件\Desktop</Filter>
-    </ClCompile>
-    <ClCompile Include="Desktop\GB_Mouse.cpp">
-      <Filter>源文件\Desktop</Filter>
-    </ClCompile>
     <ClCompile Include="Geometry\GB_LineSegment.cpp">
       <Filter>源文件\Geometry</Filter>
     </ClCompile>
     <ClCompile Include="Geometry\GB_Polyline.cpp">
       <Filter>源文件\Geometry</Filter>
-    </ClCompile>
-    <ClCompile Include="Desktop\GB_Keyboard.cpp">
-      <Filter>源文件\Desktop</Filter>
     </ClCompile>
     <ClCompile Include="CV\GB_OCR.cpp">
       <Filter>源文件\CV</Filter>
@@ -265,6 +277,30 @@
     </ClCompile>
     <ClCompile Include="Geometry\GB_SpatialIndex.cpp">
       <Filter>源文件\Geometry</Filter>
+    </ClCompile>
+    <ClCompile Include="Desktop\GB_Keyboard.cpp">
+      <Filter>源文件\Desktop\Automation</Filter>
+    </ClCompile>
+    <ClCompile Include="Desktop\GB_Mouse.cpp">
+      <Filter>源文件\Desktop\Automation</Filter>
+    </ClCompile>
+    <ClCompile Include="Desktop\GB_Screen.cpp">
+      <Filter>源文件\Desktop\Automation</Filter>
+    </ClCompile>
+    <ClCompile Include="Desktop\GB_SystemError.cpp">
+      <Filter>源文件\Desktop</Filter>
+    </ClCompile>
+    <ClCompile Include="Desktop\GB_SystemResult.cpp">
+      <Filter>源文件\Desktop</Filter>
+    </ClCompile>
+    <ClCompile Include="Desktop\GB_WinHandleScope.cpp">
+      <Filter>源文件\Desktop</Filter>
+    </ClCompile>
+    <ClCompile Include="Desktop\GB_ComScope.cpp">
+      <Filter>源文件\Desktop</Filter>
+    </ClCompile>
+    <ClCompile Include="Desktop\GB_PrivilegeScope.cpp">
+      <Filter>源文件\Desktop</Filter>
     </ClCompile>
   </ItemGroup>
 </Project>
