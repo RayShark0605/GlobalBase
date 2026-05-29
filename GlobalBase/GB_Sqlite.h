@@ -550,6 +550,63 @@ using GB_SqliteNamedParameters = std::map<std::string, GB_Variant>;
  */
 using GB_SqliteRowCallback = std::function<bool(const std::vector<GB_SqliteColumnInfo>& columns, const std::vector<GB_Variant>& values)>;
 
+
+/**
+ * @brief SQLite 自定义 SQL 函数注册选项。
+ *
+ * @details
+ * 本结构用于控制 sqlite3_create_function_v2() 注册函数时的参数数量和函数属性。
+ * 当前封装统一注册 UTF-8 标量函数，函数参数和返回值通过 GB_Variant 传递。
+ */
+struct GLOBALBASE_PORT GB_SqliteFunctionOptions
+{
+    /**
+     * @brief 函数参数数量。
+     *
+     * @remarks
+     * -1 表示接受可变数量参数；0 到 127 表示固定参数数量。
+     */
+    int argumentCount = -1;
+
+    /**
+     * @brief 是否声明为确定性函数。
+     *
+     * @remarks
+     * 对同一组输入总是返回同一结果且无外部状态依赖的函数可设为 true，便于 SQLite 查询规划器优化。
+     */
+    bool deterministic = false;
+
+    /**
+     * @brief 是否仅允许在顶层直接 SQL 中调用。
+     *
+     * @remarks
+     * 对可能产生副作用、访问外部系统或暴露敏感信息的函数，建议设为 true，避免被 VIEW、TRIGGER、CHECK 等 schema 内表达式间接触发。
+     */
+    bool directOnly = false;
+
+    /**
+     * @brief 是否声明为安全无副作用函数。
+     *
+     * @remarks
+     * 只有经过审计、无副作用且不会泄露敏感信息的函数才应设为 true。
+     */
+    bool innocuous = false;
+};
+
+/**
+ * @brief SQLite 标量 SQL 函数回调。
+ *
+ * @param arguments SQL 调用传入的参数列表。SQL NULL 会转换为空 GB_Variant。
+ * @param outResult 输出函数返回值。保持为空 GB_Variant 时返回 SQL NULL。
+ * @param outErrorMessageUtf8 输出错误信息。返回 false 时会通过 sqlite3_result_error() 传回 SQLite。
+ * @return true 函数执行成功；
+ * @return false 函数执行失败。
+ *
+ * @remarks
+ * 回调可能在执行 SQL 的线程中被 SQLite 同步调用。回调内部应尽量保持轻量，不建议递归调用同一个 GB_Sqlite 对象执行可能修改 schema 或连接状态的操作。
+ */
+using GB_SqliteScalarFunctionCallback = std::function<bool(const std::vector<GB_Variant>& arguments, GB_Variant& outResult, std::string& outErrorMessageUtf8)>;
+
 class GLOBALBASE_PORT GB_SqliteTransaction;
 
 /**
@@ -767,6 +824,46 @@ public:
      * @return false 分离失败。
      */
     bool DetachDatabase(const std::string& schemaNameUtf8);
+
+
+    /**
+     * @brief 注册一个 SQLite 标量 SQL 函数。
+     *
+     * @param functionNameUtf8 函数名称，UTF-8 编码，不包含括号和参数列表。
+     * @param callback 标量函数回调。
+     * @param options 函数注册选项。
+     * @return true 注册成功；
+     * @return false 注册失败。
+     *
+     * @remarks
+     * SQLite 的自定义函数是连接级状态。本接口会把函数同步注册到写连接和所有读连接；若数据库尚未打开，函数定义会被保存，并在后续 Open() 时自动注册到每条内部连接。
+     */
+    bool RegisterScalarFunction(const std::string& functionNameUtf8, const GB_SqliteScalarFunctionCallback& callback, const GB_SqliteFunctionOptions& options = GB_SqliteFunctionOptions());
+
+    /**
+     * @brief 注册一个 SQLite 标量 SQL 函数。
+     *
+     * @param functionNameUtf8 函数名称，UTF-8 编码。
+     * @param argumentCount 函数参数数量；-1 表示可变参数数量，0 到 127 表示固定参数数量。
+     * @param callback 标量函数回调。
+     * @param deterministic 是否声明为确定性函数。
+     * @return true 注册成功；
+     * @return false 注册失败。
+     */
+    bool RegisterScalarFunction(const std::string& functionNameUtf8, int argumentCount, const GB_SqliteScalarFunctionCallback& callback, bool deterministic = false);
+
+    /**
+     * @brief 注销一个由 RegisterScalarFunction() 注册的 SQLite SQL 函数。
+     *
+     * @param functionNameUtf8 函数名称，UTF-8 编码。
+     * @param argumentCount 函数参数数量；-1 表示可变参数数量，0 到 127 表示固定参数数量。
+     * @return true 注销成功或该函数本来就未注册；
+     * @return false 注销失败。
+     *
+     * @remarks
+     * 注销时会同步更新写连接和所有读连接，并清空语句缓存，避免旧预编译语句继续引用旧函数定义。
+     */
+    bool UnregisterSqlFunction(const std::string& functionNameUtf8, int argumentCount = -1);
 
 
     /**

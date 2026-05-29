@@ -841,6 +841,7 @@ namespace
         sqlite3* database = nullptr;
         GB_SqliteStatementCache statementCache;
         bool readOnly = false;
+        bool queryOnly = false;
 
         ~GB_SqliteConnection()
         {
@@ -933,6 +934,410 @@ namespace
         sqlite3_stmt* statement_ = nullptr;
         bool cached_ = false;
     };
+
+    struct GB_SqliteScalarFunctionDefinition
+    {
+        std::string nameUtf8;
+        GB_SqliteFunctionOptions options;
+        GB_SqliteScalarFunctionCallback callback;
+    };
+
+    using GB_SqliteScalarFunctionDefinitionPtr = std::shared_ptr<GB_SqliteScalarFunctionDefinition>;
+
+    static std::string BuildScalarFunctionKey(const std::string& functionNameUtf8, int argumentCount)
+    {
+        return ToLowerAsciiString(functionNameUtf8) + "\x1F" + ToString(argumentCount);
+    }
+
+    static bool ValidateScalarFunctionOptions(const GB_SqliteFunctionOptions& options, GB_SqliteError& outError)
+    {
+        if (options.argumentCount < -1 || options.argumentCount > 127)
+        {
+            outError = MakeUserError("SQLite function argument count must be -1 or between 0 and 127.");
+            return false;
+        }
+
+        outError.Clear();
+        return true;
+    }
+
+    static bool ValidateScalarFunctionName(const std::string& functionNameUtf8, GB_SqliteError& outError)
+    {
+        if (functionNameUtf8.empty())
+        {
+            outError = MakeUserError("SQLite function name is empty.");
+            return false;
+        }
+
+        if (ContainsNullCharacter(functionNameUtf8))
+        {
+            outError = MakeUserError("SQLite function name contains null character.");
+            return false;
+        }
+
+        if (functionNameUtf8.size() > 255)
+        {
+            outError = MakeUserError("SQLite function name is too long. SQLite limits function names to 255 UTF-8 bytes.");
+            return false;
+        }
+
+        outError.Clear();
+        return true;
+    }
+
+    static bool BuildSqliteFunctionFlags(const GB_SqliteFunctionOptions& options, int& outFlags, GB_SqliteError& outError)
+    {
+        int flags = SQLITE_UTF8;
+
+        if (options.deterministic)
+        {
+#ifdef SQLITE_DETERMINISTIC
+            flags |= SQLITE_DETERMINISTIC;
+#else
+            outError = MakeUserError("Current SQLite header does not support SQLITE_DETERMINISTIC.");
+            return false;
+#endif
+        }
+
+        if (options.directOnly)
+        {
+#ifdef SQLITE_DIRECTONLY
+            flags |= SQLITE_DIRECTONLY;
+#else
+            outError = MakeUserError("Current SQLite header does not support SQLITE_DIRECTONLY.");
+            return false;
+#endif
+        }
+
+        if (options.innocuous)
+        {
+#ifdef SQLITE_INNOCUOUS
+            flags |= SQLITE_INNOCUOUS;
+#else
+            outError = MakeUserError("Current SQLite header does not support SQLITE_INNOCUOUS.");
+            return false;
+#endif
+        }
+
+        outFlags = flags;
+        outError.Clear();
+        return true;
+    }
+
+    static GB_Variant GetSqliteFunctionArgument(sqlite3_value* value)
+    {
+        if (value == nullptr)
+        {
+            return GB_Variant();
+        }
+
+        const int valueType = sqlite3_value_type(value);
+        switch (valueType)
+        {
+        case SQLITE_INTEGER:
+            return GB_Variant(static_cast<long long>(sqlite3_value_int64(value)));
+        case SQLITE_FLOAT:
+            return GB_Variant(sqlite3_value_double(value));
+        case SQLITE_TEXT:
+        {
+            const unsigned char* textPtr = sqlite3_value_text(value);
+            const int byteCount = sqlite3_value_bytes(value);
+            if (textPtr == nullptr || byteCount <= 0)
+            {
+                return GB_Variant(std::string());
+            }
+            return GB_Variant(std::string(reinterpret_cast<const char*>(textPtr), static_cast<std::size_t>(byteCount)));
+        }
+        case SQLITE_BLOB:
+        {
+            const int byteCount = sqlite3_value_bytes(value);
+            const void* blobPtr = sqlite3_value_blob(value);
+            if (blobPtr == nullptr || byteCount <= 0)
+            {
+                return GB_Variant(GB_ByteBuffer());
+            }
+
+            const unsigned char* beginPtr = static_cast<const unsigned char*>(blobPtr);
+            const unsigned char* endPtr = beginPtr + byteCount;
+            GB_ByteBuffer buffer;
+            buffer.assign(beginPtr, endPtr);
+            return GB_Variant(std::move(buffer));
+        }
+        case SQLITE_NULL:
+        default:
+            return GB_Variant();
+        }
+    }
+
+    static void SetSqliteFunctionError(sqlite3_context* context, const std::string& messageUtf8)
+    {
+        const std::string actualMessageUtf8 = messageUtf8.empty() ? std::string("SQLite custom function failed.") : messageUtf8;
+        sqlite3_result_error(context, actualMessageUtf8.c_str(), -1);
+    }
+
+    static void SetSqliteFunctionResult(sqlite3_context* context, const GB_Variant& value)
+    {
+        if (value.IsEmpty() || value.Type() == GB_VariantType::Empty)
+        {
+            sqlite3_result_null(context);
+            return;
+        }
+
+        bool ok = false;
+        switch (value.Type())
+        {
+        case GB_VariantType::Bool:
+        {
+            const bool boolValue = value.ToBool(&ok);
+            if (!ok)
+            {
+                SetSqliteFunctionError(context, "Failed to convert GB_Variant result to bool.");
+                return;
+            }
+            sqlite3_result_int64(context, boolValue ? 1 : 0);
+            return;
+        }
+        case GB_VariantType::Int32:
+        case GB_VariantType::Int64:
+        {
+            const long long intValue = value.ToInt64(&ok);
+            if (!ok)
+            {
+                SetSqliteFunctionError(context, "Failed to convert GB_Variant result to signed integer.");
+                return;
+            }
+            sqlite3_result_int64(context, static_cast<sqlite3_int64>(intValue));
+            return;
+        }
+        case GB_VariantType::UInt32:
+        case GB_VariantType::UInt64:
+        {
+            const unsigned long long uintValue = value.ToUInt64(&ok);
+            if (!ok)
+            {
+                SetSqliteFunctionError(context, "Failed to convert GB_Variant result to unsigned integer.");
+                return;
+            }
+
+            if (uintValue <= static_cast<unsigned long long>(std::numeric_limits<long long>::max()))
+            {
+                sqlite3_result_int64(context, static_cast<sqlite3_int64>(uintValue));
+                return;
+            }
+
+            std::ostringstream stream;
+            stream << uintValue;
+            const std::string textUtf8 = stream.str();
+            sqlite3_result_text(context, textUtf8.c_str(), static_cast<int>(textUtf8.size()), SQLITE_TRANSIENT);
+            return;
+        }
+        case GB_VariantType::Float:
+        case GB_VariantType::Double:
+        {
+            const double doubleValue = value.ToDouble(&ok);
+            if (!ok)
+            {
+                SetSqliteFunctionError(context, "Failed to convert GB_Variant result to double.");
+                return;
+            }
+            sqlite3_result_double(context, doubleValue);
+            return;
+        }
+        case GB_VariantType::String:
+        {
+            const std::string* textValue = value.AnyCast<std::string>();
+            const std::string textUtf8 = textValue != nullptr ? *textValue : value.ToString(&ok);
+            if (textValue == nullptr && !ok)
+            {
+                SetSqliteFunctionError(context, "Failed to convert GB_Variant result to UTF-8 string.");
+                return;
+            }
+
+            if (textUtf8.size() > static_cast<std::size_t>(std::numeric_limits<int>::max()))
+            {
+                sqlite3_result_error_toobig(context);
+                return;
+            }
+
+            sqlite3_result_text(context, textUtf8.c_str(), static_cast<int>(textUtf8.size()), SQLITE_TRANSIENT);
+            return;
+        }
+        case GB_VariantType::Binary:
+        {
+            const GB_ByteBuffer* bytesValue = value.AnyCast<GB_ByteBuffer>();
+            const GB_ByteBuffer bytes = bytesValue != nullptr ? *bytesValue : value.ToBinary(&ok);
+            if (bytesValue == nullptr && !ok)
+            {
+                SetSqliteFunctionError(context, "Failed to convert GB_Variant result to binary buffer.");
+                return;
+            }
+
+            if (bytes.size() > static_cast<std::size_t>(std::numeric_limits<int>::max()))
+            {
+                sqlite3_result_error_toobig(context);
+                return;
+            }
+
+            const void* dataPtr = bytes.empty() ? static_cast<const void*>("") : static_cast<const void*>(bytes.data());
+            sqlite3_result_blob(context, dataPtr, static_cast<int>(bytes.size()), SQLITE_TRANSIENT);
+            return;
+        }
+        case GB_VariantType::Custom:
+        {
+            GB_ByteBuffer bytes;
+            if (!value.Serialize(bytes))
+            {
+                SetSqliteFunctionError(context, "Failed to serialize custom GB_Variant result.");
+                return;
+            }
+
+            if (bytes.size() > static_cast<std::size_t>(std::numeric_limits<int>::max()))
+            {
+                sqlite3_result_error_toobig(context);
+                return;
+            }
+
+            const void* dataPtr = bytes.empty() ? static_cast<const void*>("") : static_cast<const void*>(bytes.data());
+            sqlite3_result_blob(context, dataPtr, static_cast<int>(bytes.size()), SQLITE_TRANSIENT);
+            return;
+        }
+        default:
+            sqlite3_result_null(context);
+            return;
+        }
+    }
+
+    static void DestroyScalarFunctionUserData(void* userData)
+    {
+        GB_SqliteScalarFunctionDefinitionPtr* definitionPtr = static_cast<GB_SqliteScalarFunctionDefinitionPtr*>(userData);
+        delete definitionPtr;
+    }
+
+    static void SqliteScalarFunctionCallback(sqlite3_context* context, int argumentCount, sqlite3_value** values)
+    {
+        GB_SqliteScalarFunctionDefinitionPtr* definitionPtr = static_cast<GB_SqliteScalarFunctionDefinitionPtr*>(sqlite3_user_data(context));
+        if (definitionPtr == nullptr || !(*definitionPtr) || !(*definitionPtr)->callback)
+        {
+            SetSqliteFunctionError(context, "SQLite custom scalar function callback is empty.");
+            return;
+        }
+
+        std::vector<GB_Variant> arguments;
+        try
+        {
+            arguments.reserve(static_cast<std::size_t>(std::max(argumentCount, 0)));
+            for (int index = 0; index < argumentCount; index++)
+            {
+                arguments.push_back(GetSqliteFunctionArgument(values[index]));
+            }
+        }
+        catch (const std::bad_alloc&)
+        {
+            sqlite3_result_error_nomem(context);
+            return;
+        }
+        catch (...)
+        {
+            SetSqliteFunctionError(context, "Failed to convert SQLite custom function arguments.");
+            return;
+        }
+
+        GB_Variant result;
+        std::string errorMessageUtf8;
+        bool ok = false;
+        try
+        {
+            ok = (*definitionPtr)->callback(arguments, result, errorMessageUtf8);
+        }
+        catch (const std::bad_alloc&)
+        {
+            sqlite3_result_error_nomem(context);
+            return;
+        }
+        catch (...)
+        {
+            SetSqliteFunctionError(context, "SQLite custom scalar function callback threw an exception.");
+            return;
+        }
+
+        if (!ok)
+        {
+            SetSqliteFunctionError(context, errorMessageUtf8.empty() ? std::string("SQLite custom scalar function returned false.") : errorMessageUtf8);
+            return;
+        }
+
+        try
+        {
+            SetSqliteFunctionResult(context, result);
+        }
+        catch (const std::bad_alloc&)
+        {
+            sqlite3_result_error_nomem(context);
+        }
+        catch (...)
+        {
+            SetSqliteFunctionError(context, "Failed to convert SQLite custom function result.");
+        }
+    }
+
+    static bool RegisterScalarFunctionOnConnection(GB_SqliteConnection& connection, const GB_SqliteScalarFunctionDefinitionPtr& definition, GB_SqliteError& outError)
+    {
+        if (connection.database == nullptr)
+        {
+            outError = MakeUserError("SQLite connection is not open.");
+            return false;
+        }
+
+        if (!definition || !definition->callback)
+        {
+            outError = MakeUserError("SQLite scalar function callback is empty.");
+            return false;
+        }
+
+        int flags = SQLITE_UTF8;
+        if (!BuildSqliteFunctionFlags(definition->options, flags, outError))
+        {
+            return false;
+        }
+
+        GB_SqliteScalarFunctionDefinitionPtr* userData = new (std::nothrow) GB_SqliteScalarFunctionDefinitionPtr(definition);
+        if (userData == nullptr)
+        {
+            outError = MakeBadAllocError("register SQLite scalar function: " + definition->nameUtf8);
+            return false;
+        }
+
+        const int code = sqlite3_create_function_v2(connection.database, definition->nameUtf8.c_str(), definition->options.argumentCount, flags, userData, SqliteScalarFunctionCallback, nullptr, nullptr, DestroyScalarFunctionUserData);
+        if (code != SQLITE_OK)
+        {
+            delete userData;
+            userData = nullptr;
+            outError = MakeError(connection.database, code, std::string(), "Failed to register SQLite scalar function: " + definition->nameUtf8);
+            return false;
+        }
+
+        outError.Clear();
+        return true;
+    }
+
+    static bool UnregisterSqlFunctionOnConnection(GB_SqliteConnection& connection, const std::string& functionNameUtf8, int argumentCount, GB_SqliteError& outError)
+    {
+        if (connection.database == nullptr)
+        {
+            outError = MakeUserError("SQLite connection is not open.");
+            return false;
+        }
+
+        const int code = sqlite3_create_function_v2(connection.database, functionNameUtf8.c_str(), argumentCount, SQLITE_UTF8, nullptr, nullptr, nullptr, nullptr, nullptr);
+        if (code != SQLITE_OK)
+        {
+            outError = MakeError(connection.database, code, std::string(), "Failed to unregister SQLite function: " + functionNameUtf8);
+            return false;
+        }
+
+        outError.Clear();
+        return true;
+    }
 
     class GB_SqliteOptionalWriteLockGuard
     {
@@ -1130,7 +1535,17 @@ namespace
             statement = connection.statementCache.Find(sqlUtf8);
             if (statement != nullptr)
             {
-                cached = true;
+                const int resetCode = sqlite3_reset(statement);
+                sqlite3_clear_bindings(statement);
+                if (resetCode == SQLITE_OK)
+                {
+                    cached = true;
+                }
+                else
+                {
+                    connection.statementCache.Remove(sqlUtf8);
+                    statement = nullptr;
+                }
             }
         }
 
@@ -1659,6 +2074,7 @@ struct GB_Sqlite::Impl
     std::string databasePathUtf8;
     GB_SqliteOptions options;
     bool useSingleConnectionForReads = false;
+    std::map<std::string, GB_SqliteScalarFunctionDefinitionPtr> registeredScalarFunctions;
 
     std::unique_ptr<GB_SqliteConnection> writeConnection;
     std::vector<std::unique_ptr<GB_SqliteConnection>> readConnections;
@@ -1705,10 +2121,25 @@ struct GB_Sqlite::Impl
         return sqlite3_db_readonly(writeConnection->database, "main") == 0;
     }
 
+    bool ApplyRegisteredScalarFunctionsToConnection(GB_SqliteConnection& connection, GB_SqliteError& outError)
+    {
+        for (std::map<std::string, GB_SqliteScalarFunctionDefinitionPtr>::const_iterator iter = registeredScalarFunctions.begin(); iter != registeredScalarFunctions.end(); iter++)
+        {
+            if (!RegisterScalarFunctionOnConnection(connection, iter->second, outError))
+            {
+                return false;
+            }
+        }
+
+        outError.Clear();
+        return true;
+    }
+
     bool OpenConnection(const std::string& databasePathUtf8Value, bool readOnly, std::unique_ptr<GB_SqliteConnection>& outConnection, GB_SqliteError& outError)
     {
         std::unique_ptr<GB_SqliteConnection> connection(new GB_SqliteConnection());
         connection->readOnly = readOnly;
+        connection->queryOnly = readOnly;
         connection->statementCache.SetCapacity(options.enableStatementCache ? options.maxCachedStatementsPerConnection : 0);
 
         sqlite3* database = nullptr;
@@ -1746,6 +2177,11 @@ struct GB_Sqlite::Impl
         }
 
         if (!ApplyConnectionPragmas(*connection, databasePathUtf8Value, outError))
+        {
+            return false;
+        }
+
+        if (!ApplyRegisteredScalarFunctionsToConnection(*connection, outError))
         {
             return false;
         }
@@ -1822,7 +2258,7 @@ struct GB_Sqlite::Impl
             }
         }
 
-        if ((connection.readOnly || IsReadonlyOpenMode(options.openMode)) && options.enableQueryOnlyForReadConnections)
+        if (connection.queryOnly && options.enableQueryOnlyForReadConnections)
         {
             if (!DirectExec(connection.database, "PRAGMA query_only=ON", outError))
             {
@@ -3909,6 +4345,265 @@ bool GB_Sqlite::DetachDatabase(const std::string& schemaNameUtf8)
     }
 
     clearStatementCaches();
+    impl_->ClearLastError();
+    return true;
+}
+
+bool GB_Sqlite::RegisterScalarFunction(const std::string& functionNameUtf8, const GB_SqliteScalarFunctionCallback& callback, const GB_SqliteFunctionOptions& options)
+{
+    if (!impl_)
+    {
+        return false;
+    }
+
+    GB_SqliteError error;
+    if (!ValidateScalarFunctionName(functionNameUtf8, error) || !ValidateScalarFunctionOptions(options, error))
+    {
+        impl_->SetLastError(error);
+        return false;
+    }
+
+    int functionFlags = SQLITE_UTF8;
+    if (!BuildSqliteFunctionFlags(options, functionFlags, error))
+    {
+        impl_->SetLastError(error);
+        return false;
+    }
+
+    if (!callback)
+    {
+        impl_->SetLastError(MakeUserError("SQLite scalar function callback is empty."));
+        return false;
+    }
+
+    GB_SqliteScalarFunctionDefinitionPtr definition;
+    try
+    {
+        definition.reset(new GB_SqliteScalarFunctionDefinition());
+        definition->nameUtf8 = functionNameUtf8;
+        definition->options = options;
+        definition->callback = callback;
+    }
+    catch (const std::bad_alloc&)
+    {
+        impl_->SetLastError(MakeBadAllocError("create SQLite scalar function definition: " + functionNameUtf8));
+        return false;
+    }
+    catch (...)
+    {
+        impl_->SetLastError(MakeExceptionError("create SQLite scalar function definition: " + functionNameUtf8));
+        return false;
+    }
+
+    const std::string functionKey = BuildScalarFunctionKey(functionNameUtf8, options.argumentCount);
+
+    GB_ReadLockGuard lifecycleGuard(impl_->lifecycleLock);
+    GB_WriteLockGuard schemaGuard(impl_->schemaLock);
+
+    GB_SqliteScalarFunctionDefinitionPtr oldDefinition;
+    std::map<std::string, GB_SqliteScalarFunctionDefinitionPtr>::iterator oldIter = impl_->registeredScalarFunctions.find(functionKey);
+    if (oldIter != impl_->registeredScalarFunctions.end())
+    {
+        oldDefinition = oldIter->second;
+    }
+
+    std::vector<GB_SqliteConnection*> changedConnections;
+    const auto clearStatementCaches = [this]()
+        {
+            if (impl_->writeConnection)
+            {
+                impl_->writeConnection->statementCache.Clear();
+            }
+
+            for (std::size_t index = 0; index < impl_->readConnections.size(); index++)
+            {
+                if (impl_->readConnections[index])
+                {
+                    impl_->readConnections[index]->statementCache.Clear();
+                }
+            }
+
+            impl_->pendingReadStatementCacheClear = false;
+        };
+
+    const auto rollbackChangedConnections = [&changedConnections, &oldDefinition, &functionNameUtf8, &options, &clearStatementCaches]()
+        {
+            for (std::size_t index = 0; index < changedConnections.size(); index++)
+            {
+                GB_SqliteError ignoredError;
+                if (oldDefinition)
+                {
+                    (void)RegisterScalarFunctionOnConnection(*changedConnections[index], oldDefinition, ignoredError);
+                }
+                else
+                {
+                    (void)UnregisterSqlFunctionOnConnection(*changedConnections[index], functionNameUtf8, options.argumentCount, ignoredError);
+                }
+            }
+
+            clearStatementCaches();
+        };
+
+    if (impl_->isOpen && impl_->writeConnection)
+    {
+        std::lock_guard<std::mutex> writeLock(impl_->writeMutex);
+        std::lock_guard<std::mutex> readLock(impl_->readPoolMutex);
+
+        if (!RegisterScalarFunctionOnConnection(*impl_->writeConnection, definition, error))
+        {
+            impl_->SetLastError(error);
+            return false;
+        }
+        changedConnections.push_back(impl_->writeConnection.get());
+
+        for (std::size_t index = 0; index < impl_->readConnections.size(); index++)
+        {
+            if (!impl_->readConnections[index] || impl_->readConnections[index]->database == nullptr)
+            {
+                continue;
+            }
+
+            if (!RegisterScalarFunctionOnConnection(*impl_->readConnections[index], definition, error))
+            {
+                rollbackChangedConnections();
+                impl_->SetLastError(error);
+                return false;
+            }
+            changedConnections.push_back(impl_->readConnections[index].get());
+        }
+
+        clearStatementCaches();
+    }
+
+    try
+    {
+        impl_->registeredScalarFunctions[functionKey] = definition;
+    }
+    catch (const std::bad_alloc&)
+    {
+        if (!changedConnections.empty())
+        {
+            rollbackChangedConnections();
+        }
+        impl_->SetLastError(MakeBadAllocError("save SQLite scalar function definition: " + functionNameUtf8));
+        return false;
+    }
+    catch (...)
+    {
+        if (!changedConnections.empty())
+        {
+            rollbackChangedConnections();
+        }
+        impl_->SetLastError(MakeExceptionError("save SQLite scalar function definition: " + functionNameUtf8));
+        return false;
+    }
+
+    impl_->ClearLastError();
+    return true;
+}
+
+bool GB_Sqlite::RegisterScalarFunction(const std::string& functionNameUtf8, int argumentCount, const GB_SqliteScalarFunctionCallback& callback, bool deterministic)
+{
+    GB_SqliteFunctionOptions options;
+    options.argumentCount = argumentCount;
+    options.deterministic = deterministic;
+    return RegisterScalarFunction(functionNameUtf8, callback, options);
+}
+
+bool GB_Sqlite::UnregisterSqlFunction(const std::string& functionNameUtf8, int argumentCount)
+{
+    if (!impl_)
+    {
+        return false;
+    }
+
+    GB_SqliteError error;
+    GB_SqliteFunctionOptions options;
+    options.argumentCount = argumentCount;
+    if (!ValidateScalarFunctionName(functionNameUtf8, error) || !ValidateScalarFunctionOptions(options, error))
+    {
+        impl_->SetLastError(error);
+        return false;
+    }
+
+    const std::string functionKey = BuildScalarFunctionKey(functionNameUtf8, argumentCount);
+
+    GB_ReadLockGuard lifecycleGuard(impl_->lifecycleLock);
+    GB_WriteLockGuard schemaGuard(impl_->schemaLock);
+
+    std::map<std::string, GB_SqliteScalarFunctionDefinitionPtr>::iterator oldIter = impl_->registeredScalarFunctions.find(functionKey);
+    if (oldIter == impl_->registeredScalarFunctions.end())
+    {
+        impl_->ClearLastError();
+        return true;
+    }
+
+    const GB_SqliteScalarFunctionDefinitionPtr oldDefinition = oldIter->second;
+    std::vector<GB_SqliteConnection*> changedConnections;
+    const auto clearStatementCaches = [this]()
+        {
+            if (impl_->writeConnection)
+            {
+                impl_->writeConnection->statementCache.Clear();
+            }
+
+            for (std::size_t index = 0; index < impl_->readConnections.size(); index++)
+            {
+                if (impl_->readConnections[index])
+                {
+                    impl_->readConnections[index]->statementCache.Clear();
+                }
+            }
+
+            impl_->pendingReadStatementCacheClear = false;
+        };
+
+    const auto rollbackChangedConnections = [&changedConnections, &oldDefinition, &clearStatementCaches]()
+        {
+            for (std::size_t index = 0; index < changedConnections.size(); index++)
+            {
+                GB_SqliteError ignoredError;
+                if (oldDefinition)
+                {
+                    (void)RegisterScalarFunctionOnConnection(*changedConnections[index], oldDefinition, ignoredError);
+                }
+            }
+
+            clearStatementCaches();
+        };
+
+    if (impl_->isOpen && impl_->writeConnection)
+    {
+        std::lock_guard<std::mutex> writeLock(impl_->writeMutex);
+        std::lock_guard<std::mutex> readLock(impl_->readPoolMutex);
+
+        if (!UnregisterSqlFunctionOnConnection(*impl_->writeConnection, functionNameUtf8, argumentCount, error))
+        {
+            impl_->SetLastError(error);
+            return false;
+        }
+        changedConnections.push_back(impl_->writeConnection.get());
+
+        for (std::size_t index = 0; index < impl_->readConnections.size(); index++)
+        {
+            if (!impl_->readConnections[index] || impl_->readConnections[index]->database == nullptr)
+            {
+                continue;
+            }
+
+            if (!UnregisterSqlFunctionOnConnection(*impl_->readConnections[index], functionNameUtf8, argumentCount, error))
+            {
+                rollbackChangedConnections();
+                impl_->SetLastError(error);
+                return false;
+            }
+            changedConnections.push_back(impl_->readConnections[index].get());
+        }
+
+        clearStatementCaches();
+    }
+
+    impl_->registeredScalarFunctions.erase(oldIter);
     impl_->ClearLastError();
     return true;
 }
