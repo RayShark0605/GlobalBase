@@ -662,7 +662,8 @@ namespace
 
     static int PrepareSqlStatement(sqlite3* database, const std::string& sqlUtf8, bool persistent, sqlite3_stmt** outStatement, const char** outTail)
     {
-        const int sqlByteCount = static_cast<int>(sqlUtf8.size() + 1);
+        // sqlite3_prepare_v2/v3 的第三个参数是 int。对异常大的 SQL 文本使用 -1，避免 size_t 到 int 截断。
+        const int sqlByteCount = sqlUtf8.size() >= static_cast<std::size_t>(std::numeric_limits<int>::max()) ? -1 : static_cast<int>(sqlUtf8.size() + 1);
 #if defined(SQLITE_VERSION_NUMBER) && SQLITE_VERSION_NUMBER >= 3020000 && defined(SQLITE_PREPARE_PERSISTENT)
         const unsigned int prepareFlags = persistent ? SQLITE_PREPARE_PERSISTENT : 0;
         return sqlite3_prepare_v3(database, sqlUtf8.c_str(), sqlByteCount, prepareFlags, outStatement, outTail);
