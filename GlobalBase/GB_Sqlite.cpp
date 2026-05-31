@@ -2059,7 +2059,11 @@ namespace
     static void FillCurrentRow(sqlite3_stmt* statement, int columnCount, std::vector<GB_Variant>& outRow)
     {
         outRow.clear();
-        outRow.reserve(static_cast<std::size_t>(std::max(columnCount, 0)));
+        const std::size_t safeColumnCount = static_cast<std::size_t>(std::max(columnCount, 0));
+        if (outRow.capacity() < safeColumnCount)
+        {
+            outRow.reserve(safeColumnCount);
+        }
         for (int columnIndex = 0; columnIndex < columnCount; columnIndex++)
         {
             outRow.push_back(GetColumnValue(statement, columnIndex));
