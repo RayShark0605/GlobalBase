@@ -812,6 +812,39 @@ namespace
 		return bgrImage;
 	}
 
+	cv::Mat ConvertGBImageColorIfPossible(const GB_Image& image, GB_ImageColorConversion conversion)
+	{
+		const GB_Image convertedImage = image.ConvertColor(conversion);
+		if (convertedImage.IsEmpty())
+		{
+			return cv::Mat();
+		}
+
+		return convertedImage.ToCvMat(GB_ImageCopyMode::ShallowCopy);
+	}
+
+	cv::Mat NormalizeGBImageMatToOpenCvBgrLayout(const GB_Image& image, const cv::Mat& imageMat, bool blendAlphaWithWhiteBackground)
+	{
+		if (imageMat.empty())
+		{
+			return cv::Mat();
+		}
+
+		if (imageMat.channels() == 3)
+		{
+			const cv::Mat bgrMat = ConvertGBImageColorIfPossible(image, GB_ImageColorConversion::RgbToBgr);
+			return bgrMat.empty() ? imageMat : bgrMat;
+		}
+
+		if (imageMat.channels() == 4)
+		{
+			const cv::Mat convertedMat = ConvertGBImageColorIfPossible(image, blendAlphaWithWhiteBackground ? GB_ImageColorConversion::RgbaToBgra : GB_ImageColorConversion::RgbaToBgr);
+			return convertedMat.empty() ? imageMat : convertedMat;
+		}
+
+		return imageMat;
+	}
+
 	cv::Mat ConvertGBImageToBgrMat(const GB_Image& image, bool blendAlphaWithWhiteBackground)
 	{
 		if (image.IsEmpty() || image.GetWidth() == 0 || image.GetHeight() == 0)
@@ -820,6 +853,12 @@ namespace
 		}
 
 		cv::Mat imageMat = image.ToCvMat(GB_ImageCopyMode::ShallowCopy);
+		if (imageMat.empty())
+		{
+			return cv::Mat();
+		}
+
+		imageMat = NormalizeGBImageMatToOpenCvBgrLayout(image, imageMat, blendAlphaWithWhiteBackground);
 		if (imageMat.empty())
 		{
 			return cv::Mat();
@@ -1577,7 +1616,7 @@ namespace
 		return meanValue[0];
 	}
 
-	DetectedTextBox MakeBoxFromContour(const cv::Mat& probabilityMap, const std::vector<cv::Point>& contour, double detDbUnclipRatio, double detMinBoxSideLen, GB_OCRTextDetectionScoreMode detScoreMode, int originalImageWidth, int originalImageHeight)
+	DetectedTextBox MakeBoxFromContour(const cv::Mat& probabilityMap, const std::vector<cv::Point>& contour, double detDbBoxThresh, double detDbUnclipRatio, double detMinBoxSideLen, GB_OCRTextDetectionScoreMode detScoreMode, int originalImageWidth, int originalImageHeight)
 	{
 		DetectedTextBox textBox;
 		if (probabilityMap.empty() || contour.empty() || originalImageWidth <= 0 || originalImageHeight <= 0)
@@ -1603,6 +1642,10 @@ namespace
 		std::vector<cv::Point2f> scorePoints(rectanglePoints, rectanglePoints + 4);
 		scorePoints = OrderBoxPoints(scorePoints);
 		textBox.score = detScoreMode == GB_OCRTextDetectionScoreMode::Slow ? BoxScoreSlow(probabilityMap, contour) : BoxScoreFast(probabilityMap, scorePoints);
+		if (!std::isfinite(textBox.score) || textBox.score < detDbBoxThresh)
+		{
+			return textBox;
+		}
 
 		const double distance = contourArea * detDbUnclipRatio / contourPerimeter;
 		rotatedRect.size.width = static_cast<float>(std::max(1.0, static_cast<double>(rotatedRect.size.width) + distance * 2.0));
@@ -2720,7 +2763,7 @@ namespace
 				}
 
 				const std::vector<cv::Point>& contour = contours[static_cast<size_t>(contourAreaInfo.second)];
-				const DetectedTextBox textBox = MakeBoxFromContour(probabilityMap, contour, options.detDbUnclipRatio, options.detMinBoxSideLen, options.detScoreMode, sourceImage.cols, sourceImage.rows);
+				const DetectedTextBox textBox = MakeBoxFromContour(probabilityMap, contour, options.detDbBoxThresh, options.detDbUnclipRatio, options.detMinBoxSideLen, options.detScoreMode, sourceImage.cols, sourceImage.rows);
 				if (textBox.points.size() != 4 || textBox.score < options.detDbBoxThresh)
 				{
 					continue;
