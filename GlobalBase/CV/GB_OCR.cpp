@@ -1,10 +1,13 @@
 ﻿#include "GB_OCR.h"
 
+#include "../GB_Crypto.h"
 #include "../GB_FileSystem.h"
+#include "../GB_FormatParser.h"
 #include "../GB_Utf8String.h"
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -60,6 +63,10 @@ namespace
 		virtual bool Initialize(std::string& errorMessage) = 0;
 		virtual bool Recognize(const GB_Image& image, std::vector<GB_OCRTextBlock>& textBlocks, std::string& errorMessage) = 0;
 		virtual GB_OCRBackend GetBackendType() const = 0;
+		virtual bool CanFallbackOnFailure() const
+		{
+			return true;
+		}
 	};
 
 	struct DetectedTextBox
@@ -145,6 +152,14 @@ namespace
 		options.detClaheTileGridSize = std::max(1, options.detClaheTileGridSize);
 		options.recSharpenStrength = ClampDouble(options.recSharpenStrength, 0.0, 2.0);
 		options.recConfidenceThresh = ClampDouble(options.recConfidenceThresh, 0.0, 1.0);
+		if (options.baiduApiOptions.imageFileExtUtf8.empty())
+		{
+			options.baiduApiOptions.imageFileExtUtf8 = ".png";
+		}
+		else if (options.baiduApiOptions.imageFileExtUtf8[0] != '.')
+		{
+			options.baiduApiOptions.imageFileExtUtf8 = "." + options.baiduApiOptions.imageFileExtUtf8;
+		}
 		return options;
 	}
 
@@ -846,6 +861,247 @@ namespace
 		}
 
 		return bgrMat;
+	}
+
+	long long GetCurrentUnixTimeSeconds()
+	{
+		const std::chrono::system_clock::time_point now = std::chrono::system_clock::now();
+		return std::chrono::duration_cast<std::chrono::seconds>(now.time_since_epoch()).count();
+	}
+
+	bool IsBaiduOCRApiWithLocation(GB_BaiduOCRApiType apiType)
+	{
+		return apiType == GB_BaiduOCRApiType::GeneralWithLocation || apiType == GB_BaiduOCRApiType::AccurateWithLocation;
+	}
+
+	bool IsBaiduOCRGeneralApi(GB_BaiduOCRApiType apiType)
+	{
+		return apiType == GB_BaiduOCRApiType::GeneralBasic || apiType == GB_BaiduOCRApiType::GeneralWithLocation;
+	}
+
+	bool IsBaiduOCRAccurateApi(GB_BaiduOCRApiType apiType)
+	{
+		return apiType == GB_BaiduOCRApiType::AccurateBasic || apiType == GB_BaiduOCRApiType::AccurateWithLocation;
+	}
+
+	std::string GetBaiduOCRApiUrl(GB_BaiduOCRApiType apiType)
+	{
+		switch (apiType)
+		{
+		case GB_BaiduOCRApiType::GeneralBasic:
+			return "https://aip.baidubce.com/rest/2.0/ocr/v1/general_basic";
+		case GB_BaiduOCRApiType::GeneralWithLocation:
+			return "https://aip.baidubce.com/rest/2.0/ocr/v1/general";
+		case GB_BaiduOCRApiType::AccurateBasic:
+			return "https://aip.baidubce.com/rest/2.0/ocr/v1/accurate_basic";
+		case GB_BaiduOCRApiType::AccurateWithLocation:
+			return "https://aip.baidubce.com/rest/2.0/ocr/v1/accurate";
+		default:
+			return std::string();
+		}
+	}
+
+	const GB_VariantMap* TryGetVariantMapField(const GB_VariantMap& valueMap, const std::string& keyUtf8)
+	{
+		const GB_VariantMap::const_iterator iter = valueMap.find(keyUtf8);
+		if (iter == valueMap.end())
+		{
+			return nullptr;
+		}
+
+		return iter->second.AnyCast<GB_VariantMap>();
+	}
+
+	const GB_VariantList* TryGetVariantListField(const GB_VariantMap& valueMap, const std::string& keyUtf8)
+	{
+		const GB_VariantMap::const_iterator iter = valueMap.find(keyUtf8);
+		if (iter == valueMap.end())
+		{
+			return nullptr;
+		}
+
+		return iter->second.AnyCast<GB_VariantList>();
+	}
+
+	bool TryGetVariantStringField(const GB_VariantMap& valueMap, const std::string& keyUtf8, std::string& outValueUtf8)
+	{
+		const GB_VariantMap::const_iterator iter = valueMap.find(keyUtf8);
+		if (iter == valueMap.end())
+		{
+			return false;
+		}
+
+		bool ok = false;
+		const std::string valueUtf8 = iter->second.ToString(&ok);
+		if (!ok)
+		{
+			return false;
+		}
+
+		outValueUtf8 = valueUtf8;
+		return true;
+	}
+
+	bool TryGetVariantDoubleField(const GB_VariantMap& valueMap, const std::string& keyUtf8, double& outValue)
+	{
+		const GB_VariantMap::const_iterator iter = valueMap.find(keyUtf8);
+		if (iter == valueMap.end())
+		{
+			return false;
+		}
+
+		bool ok = false;
+		const double value = iter->second.ToDouble(&ok);
+		if (!ok)
+		{
+			return false;
+		}
+
+		outValue = value;
+		return true;
+	}
+
+	bool TryGetBaiduResponseErrorMessage(const GB_VariantMap& responseMap, std::string& outErrorMessage, std::string* outErrorCodeText = nullptr)
+	{
+		std::string errorCodeText;
+		std::string errorMessageText;
+		if (TryGetVariantStringField(responseMap, "error_code", errorCodeText))
+		{
+			TryGetVariantStringField(responseMap, "error_msg", errorMessageText);
+			outErrorMessage = GB_STR("百度 OCR API 返回错误 ") + errorCodeText + (errorMessageText.empty() ? std::string() : (": " + errorMessageText));
+			if (outErrorCodeText)
+			{
+				*outErrorCodeText = errorCodeText;
+			}
+			return true;
+		}
+
+		if (TryGetVariantStringField(responseMap, "error", errorCodeText))
+		{
+			TryGetVariantStringField(responseMap, "error_description", errorMessageText);
+			outErrorMessage = GB_STR("百度 OAuth 返回错误 ") + errorCodeText + (errorMessageText.empty() ? std::string() : (": " + errorMessageText));
+			if (outErrorCodeText)
+			{
+				*outErrorCodeText = errorCodeText;
+			}
+			return true;
+		}
+
+		return false;
+	}
+
+	bool TryBuildBaiduPolygonFromVertexesLocation(const GB_VariantMap& wordMap, std::vector<GB_Point2d>& outPoints)
+	{
+		outPoints.clear();
+		const GB_VariantList* const vertexList = TryGetVariantListField(wordMap, "vertexes_location");
+		if (vertexList == nullptr || vertexList->size() < 3)
+		{
+			return false;
+		}
+
+		outPoints.reserve(vertexList->size());
+		for (const GB_Variant& vertexValue : *vertexList)
+		{
+			const GB_VariantMap* const vertexMap = vertexValue.AnyCast<GB_VariantMap>();
+			if (vertexMap == nullptr)
+			{
+				outPoints.clear();
+				return false;
+			}
+
+			double x = 0.0;
+			double y = 0.0;
+			if (!TryGetVariantDoubleField(*vertexMap, "x", x) || !TryGetVariantDoubleField(*vertexMap, "y", y))
+			{
+				outPoints.clear();
+				return false;
+			}
+
+			outPoints.push_back(GB_Point2d(x, y));
+		}
+
+		return true;
+	}
+
+	bool TryBuildBaiduPolygonFromLocation(const GB_VariantMap& wordMap, std::vector<GB_Point2d>& outPoints, GB_Rectangle& outRectangle)
+	{
+		outPoints.clear();
+		outRectangle = GB_Rectangle::Invalid;
+
+		const GB_VariantMap* const locationMap = TryGetVariantMapField(wordMap, "location");
+		if (locationMap == nullptr)
+		{
+			return false;
+		}
+
+		double left = 0.0;
+		double top = 0.0;
+		double width = 0.0;
+		double height = 0.0;
+		if (!TryGetVariantDoubleField(*locationMap, "left", left) || !TryGetVariantDoubleField(*locationMap, "top", top) || !TryGetVariantDoubleField(*locationMap, "width", width) || !TryGetVariantDoubleField(*locationMap, "height", height))
+		{
+			return false;
+		}
+
+		const double right = left + std::max(0.0, width);
+		const double bottom = top + std::max(0.0, height);
+		outPoints.push_back(GB_Point2d(left, top));
+		outPoints.push_back(GB_Point2d(right, top));
+		outPoints.push_back(GB_Point2d(right, bottom));
+		outPoints.push_back(GB_Point2d(left, bottom));
+		outRectangle = GB_Rectangle(left, top, right, bottom);
+		return true;
+	}
+
+	void AppendBaiduFormParameter(std::string& requestBody, const std::string& keyUtf8, const std::string& valueUtf8)
+	{
+		if (!requestBody.empty())
+		{
+			requestBody.push_back('&');
+		}
+
+		requestBody += GB_UrlOperator::UrlEncode(keyUtf8, GB_UrlOperator::UrlEncodingMode::FormUrlEncoded);
+		requestBody.push_back('=');
+		requestBody += GB_UrlOperator::UrlEncode(valueUtf8, GB_UrlOperator::UrlEncodingMode::FormUrlEncoded);
+	}
+
+	std::string BuildBaiduOCRRequestBody(const GB_BaiduOCROptions& baiduOptions, const std::string& imageBase64)
+	{
+		std::string requestBody;
+		AppendBaiduFormParameter(requestBody, "image", imageBase64);
+		if (!baiduOptions.languageTypeUtf8.empty())
+		{
+			AppendBaiduFormParameter(requestBody, "language_type", baiduOptions.languageTypeUtf8);
+		}
+		if (baiduOptions.detectDirection)
+		{
+			AppendBaiduFormParameter(requestBody, "detect_direction", "true");
+		}
+		if (IsBaiduOCRGeneralApi(baiduOptions.apiType) && baiduOptions.detectLanguage)
+		{
+			AppendBaiduFormParameter(requestBody, "detect_language", "true");
+		}
+		if (baiduOptions.paragraph)
+		{
+			AppendBaiduFormParameter(requestBody, "paragraph", "true");
+		}
+		if (baiduOptions.probability)
+		{
+			AppendBaiduFormParameter(requestBody, "probability", "true");
+		}
+		if (IsBaiduOCRApiWithLocation(baiduOptions.apiType) && baiduOptions.recognizeGranularitySmall)
+		{
+			AppendBaiduFormParameter(requestBody, "recognize_granularity", "small");
+		}
+		if (IsBaiduOCRApiWithLocation(baiduOptions.apiType) && baiduOptions.vertexesLocation)
+		{
+			AppendBaiduFormParameter(requestBody, "vertexes_location", "true");
+		}
+		if (IsBaiduOCRAccurateApi(baiduOptions.apiType) && baiduOptions.multidirectionalRecognize)
+		{
+			AppendBaiduFormParameter(requestBody, "multidirectional_recognize", "true");
+		}
+		return requestBody;
 	}
 
 	int RoundToMultiple(int value, int multiple)
@@ -2930,6 +3186,287 @@ namespace
 		std::vector<float> clsInputDataCache;
 	};
 
+	class GB_BaiduOCRBackend : public IGB_OCRBackend
+	{
+	public:
+		explicit GB_BaiduOCRBackend(const GB_OCROptions& inputOptions)
+			: options(NormalizeOptions(inputOptions))
+		{
+		}
+
+		virtual bool Initialize(std::string& errorMessage) override
+		{
+			errorMessage.clear();
+			lastFailureAllowFallback = false;
+
+			if (GetBaiduOCRApiUrl(options.baiduApiOptions.apiType).empty())
+			{
+				return SetFailure(errorMessage, GB_STR("百度 OCR API 类型无效。"), false);
+			}
+
+			if (options.baiduApiOptions.accessTokenUtf8.empty() && (options.baiduApiOptions.apiKeyUtf8.empty() || options.baiduApiOptions.secretKeyUtf8.empty()))
+			{
+				return SetFailure(errorMessage, GB_STR("百度 OCR API 未配置 access_token，且 apiKeyUtf8/secretKeyUtf8 不完整。"), false);
+			}
+
+			if (options.baiduApiOptions.accessTokenUtf8.empty())
+			{
+				std::string accessTokenUtf8;
+				if (!EnsureAccessToken(accessTokenUtf8, errorMessage))
+				{
+					return false;
+				}
+			}
+
+			return true;
+		}
+
+		virtual bool Recognize(const GB_Image& image, std::vector<GB_OCRTextBlock>& textBlocks, std::string& errorMessage) override
+		{
+			textBlocks.clear();
+			errorMessage.clear();
+			lastFailureAllowFallback = false;
+
+			if (image.IsEmpty() || image.GetWidth() == 0 || image.GetHeight() == 0)
+			{
+				return SetFailure(errorMessage, GB_STR("输入图像为空，无法调用百度 OCR API。"), false);
+			}
+
+			GB_ByteBuffer encodedImageBytes;
+			if (!image.EncodeToMemory(encodedImageBytes, options.baiduApiOptions.imageFileExtUtf8, options.baiduApiOptions.imageSaveOptions) || encodedImageBytes.empty())
+			{
+				return SetFailure(errorMessage, GB_STR("输入图像编码失败，无法调用百度 OCR API。"), false);
+			}
+
+			const std::string imageBase64 = GB_Base64Encode(GB_ByteBufferToString(encodedImageBytes), false, false);
+			if (imageBase64.empty())
+			{
+				return SetFailure(errorMessage, GB_STR("输入图像 Base64 编码失败，无法调用百度 OCR API。"), false);
+			}
+
+			std::string accessTokenUtf8;
+			if (!EnsureAccessToken(accessTokenUtf8, errorMessage))
+			{
+				return false;
+			}
+
+			const std::string apiUrlUtf8 = GetBaiduOCRApiUrl(options.baiduApiOptions.apiType);
+			if (apiUrlUtf8.empty())
+			{
+				return SetFailure(errorMessage, GB_STR("百度 OCR API 类型无效。"), false);
+			}
+
+			const std::string requestUrlUtf8 = GB_UrlOperator::SetUrlQueryValue(apiUrlUtf8, "access_token", accessTokenUtf8, GB_UrlOperator::UrlQuerySetMode::ReplaceAll, GB_UrlOperator::UrlEncodingMode::Rfc3986);
+			const std::string requestBody = BuildBaiduOCRRequestBody(options.baiduApiOptions, imageBase64);
+			const GB_NetworkResponse response = GB_PostUrlData(requestUrlUtf8, requestBody, "application/x-www-form-urlencoded", options.baiduApiOptions.networkRequestOptions);
+			if (!response.ok)
+			{
+				return SetFailure(errorMessage, BuildBaiduNetworkErrorMessage(response, GB_STR("调用百度 OCR API 失败")), true);
+			}
+
+			GB_VariantMap responseMap;
+			std::string parseErrorMessage;
+			if (!GB_JsonParser::ParseToVariantMap(response.body, responseMap, &parseErrorMessage))
+			{
+				return SetFailure(errorMessage, GB_STR("解析百度 OCR API 响应 JSON 失败：") + parseErrorMessage, true);
+			}
+
+			std::string responseErrorMessage;
+			if (TryGetBaiduResponseErrorMessage(responseMap, responseErrorMessage))
+			{
+				return SetFailure(errorMessage, responseErrorMessage, true);
+			}
+
+			const GB_VariantList* const wordsResultList = TryGetVariantListField(responseMap, "words_result");
+			if (wordsResultList == nullptr)
+			{
+				return SetFailure(errorMessage, GB_STR("百度 OCR API 响应缺少 words_result 字段。"), true);
+			}
+
+			const bool withLocation = IsBaiduOCRApiWithLocation(options.baiduApiOptions.apiType);
+			for (const GB_Variant& wordValue : *wordsResultList)
+			{
+				const GB_VariantMap* const wordMap = wordValue.AnyCast<GB_VariantMap>();
+				if (wordMap == nullptr)
+				{
+					continue;
+				}
+
+				std::string textUtf8;
+				if (!TryGetVariantStringField(*wordMap, "words", textUtf8) || textUtf8.empty())
+				{
+					continue;
+				}
+
+				GB_OCRTextBlock textBlock;
+				textBlock.text = textUtf8;
+				ApplyBaiduProbability(*wordMap, textBlock);
+				if (withLocation)
+				{
+					ApplyBaiduLocation(*wordMap, textBlock);
+				}
+				textBlocks.push_back(textBlock);
+			}
+
+			if (options.sortTextBlocks && withLocation)
+			{
+				std::sort(textBlocks.begin(), textBlocks.end(), CompareTextBlocksReadingOrder);
+			}
+
+			return true;
+		}
+
+		virtual GB_OCRBackend GetBackendType() const override
+		{
+			return GB_OCRBackend::BaiduApi;
+		}
+
+		virtual bool CanFallbackOnFailure() const override
+		{
+			return lastFailureAllowFallback;
+		}
+
+	private:
+		bool EnsureAccessToken(std::string& outAccessTokenUtf8, std::string& errorMessage)
+		{
+			if (!options.baiduApiOptions.accessTokenUtf8.empty())
+			{
+				outAccessTokenUtf8 = options.baiduApiOptions.accessTokenUtf8;
+				return true;
+			}
+
+			const long long nowSeconds = GetCurrentUnixTimeSeconds();
+			const long long refreshAdvanceSeconds = static_cast<long long>(options.baiduApiOptions.accessTokenRefreshAdvanceSeconds);
+			if (!cachedAccessTokenUtf8.empty() && cachedAccessTokenExpireUnixSeconds > nowSeconds + refreshAdvanceSeconds)
+			{
+				outAccessTokenUtf8 = cachedAccessTokenUtf8;
+				return true;
+			}
+
+			if (options.baiduApiOptions.apiKeyUtf8.empty() || options.baiduApiOptions.secretKeyUtf8.empty())
+			{
+				return SetFailure(errorMessage, GB_STR("百度 OCR API 未配置 apiKeyUtf8/secretKeyUtf8，无法获取 access_token。"), false);
+			}
+
+			std::string requestBody;
+			AppendBaiduFormParameter(requestBody, "grant_type", "client_credentials");
+			AppendBaiduFormParameter(requestBody, "client_id", options.baiduApiOptions.apiKeyUtf8);
+			AppendBaiduFormParameter(requestBody, "client_secret", options.baiduApiOptions.secretKeyUtf8);
+
+			const GB_NetworkResponse response = GB_PostUrlData("https://aip.baidubce.com/oauth/2.0/token", requestBody, "application/x-www-form-urlencoded", options.baiduApiOptions.networkRequestOptions);
+			if (!response.ok)
+			{
+				return SetFailure(errorMessage, BuildBaiduNetworkErrorMessage(response, GB_STR("获取百度 access_token 失败")), true);
+			}
+
+			GB_VariantMap responseMap;
+			std::string parseErrorMessage;
+			if (!GB_JsonParser::ParseToVariantMap(response.body, responseMap, &parseErrorMessage))
+			{
+				return SetFailure(errorMessage, GB_STR("解析百度 access_token 响应 JSON 失败：") + parseErrorMessage, true);
+			}
+
+			std::string responseErrorMessage;
+			std::string responseErrorCode;
+			if (TryGetBaiduResponseErrorMessage(responseMap, responseErrorMessage, &responseErrorCode))
+			{
+				const bool allowFallback = responseErrorCode != "invalid_client" && responseErrorCode != "invalid_grant";
+				return SetFailure(errorMessage, responseErrorMessage, allowFallback);
+			}
+
+			std::string accessTokenUtf8;
+			if (!TryGetVariantStringField(responseMap, "access_token", accessTokenUtf8) || accessTokenUtf8.empty())
+			{
+				return SetFailure(errorMessage, GB_STR("百度 access_token 响应缺少 access_token 字段。"), true);
+			}
+
+			double expiresInSecondsDouble = 0.0;
+			if (TryGetVariantDoubleField(responseMap, "expires_in", expiresInSecondsDouble) && expiresInSecondsDouble > 0.0)
+			{
+				cachedAccessTokenExpireUnixSeconds = nowSeconds + static_cast<long long>(expiresInSecondsDouble);
+			}
+			else
+			{
+				cachedAccessTokenExpireUnixSeconds = 0;
+			}
+
+			cachedAccessTokenUtf8 = accessTokenUtf8;
+			outAccessTokenUtf8 = accessTokenUtf8;
+			return true;
+		}
+
+		bool SetFailure(std::string& errorMessage, const std::string& inputErrorMessage, bool allowFallback)
+		{
+			errorMessage = inputErrorMessage;
+			lastFailureAllowFallback = allowFallback;
+			return false;
+		}
+
+		static std::string BuildBaiduNetworkErrorMessage(const GB_NetworkResponse& response, const std::string& operationName)
+		{
+			std::string message = operationName;
+			if (!response.errorMessageUtf8.empty())
+			{
+				message += GB_STR("：") + response.errorMessageUtf8;
+			}
+			else if (response.httpStatusCode != 0)
+			{
+				message += GB_STR("，HTTP 状态码：") + std::to_string(response.httpStatusCode);
+			}
+			else
+			{
+				message += GB_STR("。");
+			}
+
+			if (response.curlErrorCode != 0)
+			{
+				message += GB_STR(" curl 错误码：") + std::to_string(response.curlErrorCode);
+			}
+
+			return message;
+		}
+
+		static void ApplyBaiduProbability(const GB_VariantMap& wordMap, GB_OCRTextBlock& textBlock)
+		{
+			const GB_VariantMap* const probabilityMap = TryGetVariantMapField(wordMap, "probability");
+			if (probabilityMap == nullptr)
+			{
+				return;
+			}
+
+			double averageConfidence = 0.0;
+			if (TryGetVariantDoubleField(*probabilityMap, "average", averageConfidence))
+			{
+				textBlock.recognitionConfidence = averageConfidence;
+				textBlock.confidence = averageConfidence;
+			}
+		}
+
+		static void ApplyBaiduLocation(const GB_VariantMap& wordMap, GB_OCRTextBlock& textBlock)
+		{
+			std::vector<GB_Point2d> polygonPoints;
+			if (TryBuildBaiduPolygonFromVertexesLocation(wordMap, polygonPoints))
+			{
+				textBlock.polygonPoints = polygonPoints;
+				textBlock.boundingRectangle = MakeBoundingRectangle(textBlock.polygonPoints);
+				return;
+			}
+
+			GB_Rectangle boundingRectangle;
+			if (TryBuildBaiduPolygonFromLocation(wordMap, polygonPoints, boundingRectangle))
+			{
+				textBlock.polygonPoints = polygonPoints;
+				textBlock.boundingRectangle = boundingRectangle;
+			}
+		}
+
+	private:
+		GB_OCROptions options;
+		std::string cachedAccessTokenUtf8;
+		long long cachedAccessTokenExpireUnixSeconds = 0;
+		bool lastFailureAllowFallback = false;
+	};
+
 	std::unique_ptr<IGB_OCRBackend> CreateBackend(const GB_OCROptions& options, GB_OCRBackend& actualBackend, std::string& errorMessage)
 	{
 		errorMessage.clear();
@@ -2955,15 +3492,9 @@ namespace
 			return std::unique_ptr<IGB_OCRBackend>(new GB_PPOCRv5MobileOnnxRuntimeBackend(options, GB_OCRBackend::PPOCRv5MobileOnnxRuntimeCpu));
 		case GB_OCRBackend::PPOCRv5MobileOnnxRuntimeCuda:
 			return std::unique_ptr<IGB_OCRBackend>(new GB_PPOCRv5MobileOnnxRuntimeBackend(options, GB_OCRBackend::PPOCRv5MobileOnnxRuntimeCuda));
-		case GB_OCRBackend::OpenCVTesseract:
-			errorMessage = GB_STR("OpenCV Tesseract OCR 后端尚未实现。");
-			return std::unique_ptr<IGB_OCRBackend>();
-		case GB_OCRBackend::OpenCVDnn:
-			errorMessage = GB_STR("OpenCV DNN OCR 后端尚未实现。");
-			return std::unique_ptr<IGB_OCRBackend>();
-		case GB_OCRBackend::OnlineApi:
-			errorMessage = GB_STR("在线 OCR API 后端尚未实现。");
-			return std::unique_ptr<IGB_OCRBackend>();
+		case GB_OCRBackend::BaiduApi:
+			actualBackend = GB_OCRBackend::BaiduApi;
+			return std::unique_ptr<IGB_OCRBackend>(new GB_BaiduOCRBackend(options));
 		default:
 			errorMessage = GB_STR("未知 OCR 后端。");
 			return std::unique_ptr<IGB_OCRBackend>();
@@ -3019,6 +3550,12 @@ public:
 			success = backend->Recognize(image, textBlocks, lastErrorMessage);
 		}
 
+		if (!success && backend && ShouldFallbackFromBaiduApiFailure(backend->CanFallbackOnFailure()))
+		{
+			const std::string baiduErrorMessage = lastErrorMessage;
+			success = RecognizeWithPPOCRv5MobileFallback(image, textBlocks, baiduErrorMessage);
+		}
+
 		outputActualBackend = actualBackend;
 		outputErrorMessage = lastErrorMessage;
 		return success;
@@ -3041,6 +3578,7 @@ public:
 
 		const GB_OCRBackend failedBackend = actualBackend;
 		const std::string firstErrorMessage = lastErrorMessage;
+		const bool canFallbackOnFailure = backend->CanFallbackOnFailure();
 		backend.reset();
 
 		if (options.backend == GB_OCRBackend::Auto && failedBackend == GB_OCRBackend::PPOCRv5MobileOnnxRuntimeCuda)
@@ -3061,7 +3599,92 @@ public:
 			return false;
 		}
 
+		if (ShouldFallbackFromBaiduApiFailure(canFallbackOnFailure))
+		{
+			return InitializePPOCRv5MobileFallback(firstErrorMessage);
+		}
+
 		actualBackend = GB_OCRBackend::Auto;
+		return false;
+	}
+
+	bool ShouldFallbackFromBaiduApiFailure(bool canFallbackOnFailure) const
+	{
+		return options.backend == GB_OCRBackend::BaiduApi && actualBackend == GB_OCRBackend::BaiduApi && options.baiduApiOptions.fallbackToPPOCRv5MobileOnFailure && canFallbackOnFailure;
+	}
+
+	bool InitializePPOCRv5MobileFallback(const std::string& firstErrorMessage)
+	{
+		GB_OCROptions fallbackOptions = options;
+		fallbackOptions.backend = GB_OCRBackend::Auto;
+		fallbackOptions.baiduApiOptions.fallbackToPPOCRv5MobileOnFailure = false;
+
+		GB_OCRBackend fallbackBackendType = GB_OCRBackend::Auto;
+		std::string fallbackErrorMessage;
+		std::unique_ptr<IGB_OCRBackend> fallbackBackend = CreateBackend(fallbackOptions, fallbackBackendType, fallbackErrorMessage);
+		if (!fallbackBackend)
+		{
+			backend.reset();
+			actualBackend = GB_OCRBackend::Auto;
+			lastErrorMessage = firstErrorMessage + GB_STR(" 自动回退 PP-OCRv5 mobile 后端也失败：") + fallbackErrorMessage;
+			return false;
+		}
+
+		if (!fallbackBackend->Initialize(fallbackErrorMessage))
+		{
+			const GB_OCRBackend failedFallbackBackendType = fallbackBackendType;
+			const std::string firstFallbackErrorMessage = fallbackErrorMessage;
+			fallbackBackend.reset();
+			if (failedFallbackBackendType == GB_OCRBackend::PPOCRv5MobileOnnxRuntimeCuda)
+			{
+				GB_OCROptions cpuFallbackOptions = fallbackOptions;
+				cpuFallbackOptions.backend = GB_OCRBackend::PPOCRv5MobileOnnxRuntimeCpu;
+				fallbackBackendType = GB_OCRBackend::Auto;
+				fallbackBackend = CreateBackend(cpuFallbackOptions, fallbackBackendType, fallbackErrorMessage);
+				if (fallbackBackend && fallbackBackend->Initialize(fallbackErrorMessage))
+				{
+					backend = std::move(fallbackBackend);
+					actualBackend = backend->GetBackendType();
+					lastErrorMessage.clear();
+					return true;
+				}
+
+				fallbackErrorMessage = firstFallbackErrorMessage + GB_STR(" 自动回退 CPU 后端也失败：") + fallbackErrorMessage;
+			}
+			else
+			{
+				fallbackErrorMessage = firstFallbackErrorMessage;
+			}
+
+			backend.reset();
+			actualBackend = GB_OCRBackend::Auto;
+			lastErrorMessage = firstErrorMessage + GB_STR(" 自动回退 PP-OCRv5 mobile 后端也失败：") + fallbackErrorMessage;
+			return false;
+		}
+
+		backend = std::move(fallbackBackend);
+		actualBackend = backend->GetBackendType();
+		lastErrorMessage.clear();
+		return true;
+	}
+
+	bool RecognizeWithPPOCRv5MobileFallback(const GB_Image& image, std::vector<GB_OCRTextBlock>& textBlocks, const std::string& baiduErrorMessage)
+	{
+		if (!InitializePPOCRv5MobileFallback(baiduErrorMessage))
+		{
+			textBlocks.clear();
+			return false;
+		}
+
+		if (backend && backend->Recognize(image, textBlocks, lastErrorMessage))
+		{
+			lastErrorMessage.clear();
+			return true;
+		}
+
+		const std::string fallbackErrorMessage = lastErrorMessage;
+		textBlocks.clear();
+		lastErrorMessage = baiduErrorMessage + GB_STR(" 自动回退 PP-OCRv5 mobile 后端也失败：") + fallbackErrorMessage;
 		return false;
 	}
 
@@ -3273,6 +3896,11 @@ bool GB_OCR::IsBackendAvailable(GB_OCRBackend backend)
 	if (backend == GB_OCRBackend::PPOCRv5MobileOnnxRuntimeCuda)
 	{
 		return IsDefaultPPOCRv5MobileModelAvailable() && IsOnnxRuntimeCudaExecutionProviderAvailable(GB_OCROptions());
+	}
+
+	if (backend == GB_OCRBackend::BaiduApi)
+	{
+		return true;
 	}
 
 	return false;

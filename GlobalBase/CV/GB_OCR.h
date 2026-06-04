@@ -2,6 +2,7 @@
 #define GLOBALBASE_OCR_H_H
 
 #include "../GlobalBasePort.h"
+#include "../GB_Network.h"
 #include "../Geometry/GB_Point2d.h"
 #include "../Geometry/GB_Rectangle.h"
 #include "GB_Image.h"
@@ -13,7 +14,7 @@
 /**
  * @brief OCR 后端类型。
  *
- * 当前已实现 PP-OCRv5_mobile_det + PP-OCRv5_mobile_rec + ONNX Runtime CPU/CUDA。
+ * 当前已实现 PP-OCRv5_mobile_det + PP-OCRv5_mobile_rec + ONNX Runtime CPU/CUDA，以及百度 OCR API。
  * Auto 会优先尝试 CUDA 后端，CUDA 不可用时自动退回 CPU 后端。
  */
 enum class GB_OCRBackend
@@ -40,19 +41,140 @@ enum class GB_OCRBackend
 	PPOCRv5MobileOnnxRuntimeCuda,
 
 	/**
-	 * @brief 预留：使用 OpenCV Tesseract OCR。
+	 * @brief 调用百度 OCR API。
 	 */
-	OpenCVTesseract,
+	BaiduApi
+};
+
+/**
+ * @brief 百度 OCR API 类型。
+ */
+enum class GB_BaiduOCRApiType
+{
+	/**
+	 * @brief 通用文字识别（标准版），不返回文字位置信息。
+	 */
+	GeneralBasic = 0,
 
 	/**
-	 * @brief 预留：使用 OpenCV DNN 加载 OCR 模型。
+	 * @brief 通用文字识别（标准含位置版）。
 	 */
-	OpenCVDnn,
+	GeneralWithLocation,
 
 	/**
-	 * @brief 预留：调用在线 OCR API。
+	 * @brief 通用文字识别（高精度版），不返回文字位置信息。
 	 */
-	OnlineApi
+	AccurateBasic,
+
+	/**
+	 * @brief 通用文字识别（高精度含位置版）。
+	 */
+	AccurateWithLocation
+};
+
+/**
+ * @brief 百度 OCR API 选项。
+ */
+struct GB_BaiduOCROptions
+{
+	/**
+	 * @brief 百度 OCR API 类型。
+	 *
+	 * 默认选择标准含位置版，以便尽量填充 GB_OCRTextBlock 的位置字段。
+	 */
+	GB_BaiduOCRApiType apiType = GB_BaiduOCRApiType::GeneralWithLocation;
+
+	/**
+	 * @brief 百度智能云应用的 API Key，UTF-8 编码。
+	 *
+	 * accessTokenUtf8 为空时，会使用 apiKeyUtf8 + secretKeyUtf8 自动获取 access_token。
+	 */
+	std::string apiKeyUtf8 = "";
+
+	/**
+	 * @brief 百度智能云应用的 Secret Key，UTF-8 编码。
+	 */
+	std::string secretKeyUtf8 = "";
+
+	/**
+	 * @brief 已经获取好的百度 access_token，UTF-8 编码。
+	 *
+	 * 非空时优先使用该 token，不再通过 apiKeyUtf8 + secretKeyUtf8 换取 token。
+	 */
+	std::string accessTokenUtf8 = "";
+
+	/**
+	 * @brief 识别语言类型。
+	 *
+	 * 常用值为 CHN_ENG。为空时不向百度 API 传递 language_type，让服务端使用默认值。
+	 */
+	std::string languageTypeUtf8 = "CHN_ENG";
+
+	/**
+	 * @brief 上传给百度 API 前的图像编码格式。
+	 *
+	 * 支持常见 OpenCV imencode 扩展名，例如 ".png"、".jpg"、".jpeg"、".bmp"。
+	 */
+	std::string imageFileExtUtf8 = ".png";
+
+	/**
+	 * @brief 图像编码选项。
+	 */
+	GB_ImageSaveOptions imageSaveOptions;
+
+	/**
+	 * @brief 是否检测文字朝向。
+	 */
+	bool detectDirection = false;
+
+	/**
+	 * @brief 是否检测语言。
+	 */
+	bool detectLanguage = false;
+
+	/**
+	 * @brief 是否输出段落信息。
+	 */
+	bool paragraph = false;
+
+	/**
+	 * @brief 是否请求百度 API 返回置信度信息。
+	 */
+	bool probability = true;
+
+	/**
+	 * @brief 含位置版接口是否按小粒度识别。
+	 *
+	 * true 时传递 recognize_granularity=small；false 时不传递该参数。
+	 */
+	bool recognizeGranularitySmall = false;
+
+	/**
+	 * @brief 含位置版接口是否请求四顶点位置信息。
+	 */
+	bool vertexesLocation = false;
+
+	/**
+	 * @brief 高精度接口是否开启行级别多方向文字识别。
+	 */
+	bool multidirectionalRecognize = false;
+
+	/**
+	 * @brief 百度 API 失败时，是否自动退回 PP-OCRv5 mobile Auto 后端。
+	 *
+	 * 该回退会沿用当前 PP-OCRv5 选项，并按 Auto 机制优先尝试 CUDA，失败时退回 CPU。
+	 */
+	bool fallbackToPPOCRv5MobileOnFailure = true;
+
+	/**
+	 * @brief access_token 过期前提前刷新的秒数。
+	 */
+	unsigned int accessTokenRefreshAdvanceSeconds = 300;
+
+	/**
+	 * @brief 百度 API 网络请求选项。
+	 */
+	GB_NetworkRequestOptions networkRequestOptions;
 };
 
 /**
@@ -217,6 +339,11 @@ struct GB_OCROptions
 	 * 全部路径均为空时，会尝试自动查找；clsModelPathUtf8 为可选项。
 	 */
 	GB_PPOCRv5MobileModelPaths ppocrv5MobileModelPaths;
+
+	/**
+	 * @brief 百度 OCR API 选项。
+	 */
+	GB_BaiduOCROptions baiduApiOptions;
 
 	/**
 	 * @brief ONNX Runtime intra-op 线程数，0 表示使用 ONNX Runtime 默认值。
