@@ -1,20 +1,22 @@
-﻿#include <iostream>
 #include "GB_RunTests.h"
-#include "GB_Utf8String.h"
-#include "Desktop/GB_Mouse.h"
-#include "Desktop/GB_Screen.h"
-#include "CV/GB_Image.h"
-#include <thread>
+
+#include <iostream>
 
 int main(int argc, char* argv[])
 {
-    const GB_Image templateImage("C:/Users/localuser/Desktop/template.png");
-    GB_Image mainImage;
-    GB_Screen::CaptureVirtualScreen(mainImage);
-	mainImage.SaveToFile("C:/Users/localuser/Desktop/screenshot.png");
-    const GB_ImageTemplateFindResult result = mainImage.FindTemplate(templateImage);
-    GB_Mouse::MoveTo(result.centerPoint, GB_MouseMoveCoordinateType::VirtualScreenPhysicalPixel);
-	GB_Mouse::ClickLeftButton();
+    (void)argc;
+    (void)argv;
 
+    int failedCount = 0;
+    failedCount += RunGB_Utf8StringTests();
+    failedCount += RunGB_SystemDeviceTests();
+
+    if (failedCount != 0)
+    {
+        std::cerr << "Test failed. Failed test group count: " << failedCount << std::endl;
+        return 1;
+    }
+
+    std::cout << "All tests passed." << std::endl;
     return 0;
 }

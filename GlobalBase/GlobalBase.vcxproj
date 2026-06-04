@@ -23,10 +23,12 @@
     <ClInclude Include="CV\GB_Image.h" />
     <ClInclude Include="CV\GB_OCR.h" />
     <ClInclude Include="Desktop\GB_ComScope.h" />
+    <ClInclude Include="Desktop\GB_EventDispatcher.h" />
     <ClInclude Include="Desktop\GB_Keyboard.h" />
     <ClInclude Include="Desktop\GB_Mouse.h" />
     <ClInclude Include="Desktop\GB_PrivilegeScope.h" />
     <ClInclude Include="Desktop\GB_Screen.h" />
+    <ClInclude Include="Desktop\GB_SystemDevice.h" />
     <ClInclude Include="Desktop\GB_SystemError.h" />
     <ClInclude Include="Desktop\GB_SystemResult.h" />
     <ClInclude Include="Desktop\GB_WinHandleScope.h" />
@@ -70,10 +72,12 @@
     <ClCompile Include="CV\GB_Image.cpp" />
     <ClCompile Include="CV\GB_OCR.cpp" />
     <ClCompile Include="Desktop\GB_ComScope.cpp" />
+    <ClCompile Include="Desktop\GB_EventDispatcher.cpp" />
     <ClCompile Include="Desktop\GB_Keyboard.cpp" />
     <ClCompile Include="Desktop\GB_Mouse.cpp" />
     <ClCompile Include="Desktop\GB_PrivilegeScope.cpp" />
     <ClCompile Include="Desktop\GB_Screen.cpp" />
+    <ClCompile Include="Desktop\GB_SystemDevice.cpp" />
     <ClCompile Include="Desktop\GB_SystemError.cpp" />
     <ClCompile Include="Desktop\GB_SystemResult.cpp" />
     <ClCompile Include="Desktop\GB_WinHandleScope.cpp" />

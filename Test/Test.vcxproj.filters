@@ -21,6 +21,9 @@
     <ClCompile Include="GB_Utf8String_Test.cpp">
       <Filter>源文件</Filter>
     </ClCompile>
+    <ClCompile Include="GB_SystemDevice_Test.cpp">
+      <Filter>源文件</Filter>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="GB_RunTests.h">

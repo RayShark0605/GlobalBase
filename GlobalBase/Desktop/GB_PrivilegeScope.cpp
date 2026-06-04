@@ -427,6 +427,37 @@ namespace
         return AdjustPrivilegeOnToken(tokenHandle, privilegeLuid, BuildRestoreAttributesFromPreviousInfo(previousPrivilegeInfo), previousState, previousStateLength, previousPrivilegeInfo.privilegeName, operationName);
     }
 
+    static GB_SystemResult CloseTokenHandleWithResult(void*& tokenHandle, const std::string& operationName)
+    {
+        if (tokenHandle == nullptr)
+        {
+            return GB_SystemResult::Succeeded(ResolveOperationName(operationName, u8"GB_PrivilegeScope::CloseTokenHandle"), u8"访问令牌句柄为空，无需关闭。");
+        }
+
+        GB_WinHandleScope tokenHandleScope = GB_WinHandleScope::FromKernelHandle(tokenHandle, u8"AccessToken");
+        tokenHandle = nullptr;
+
+        GB_SystemResult closeResult = tokenHandleScope.Close();
+        if (closeResult.IsFailed())
+        {
+            closeResult.WithOperationName(ResolveOperationName(operationName, u8"GB_PrivilegeScope::CloseTokenHandle"));
+            return closeResult;
+        }
+
+        return GB_SystemResult::Succeeded(ResolveOperationName(operationName, u8"GB_PrivilegeScope::CloseTokenHandle"), u8"已关闭访问令牌句柄。");
+    }
+
+    static void CloseTokenHandleSilently(void*& tokenHandle) noexcept
+    {
+        if (tokenHandle == nullptr)
+        {
+            return;
+        }
+
+        GB_WinHandleScope tokenHandleScope = GB_WinHandleScope::FromKernelHandle(tokenHandle, u8"AccessToken");
+        tokenHandle = nullptr;
+    }
+
     static void RestorePrivilegeOnTokenSilently(HANDLE tokenHandle, const GB_PrivilegeInfo& previousPrivilegeInfo) noexcept
     {
         if (tokenHandle == nullptr)
@@ -692,12 +723,16 @@ GB_SystemResult GB_PrivilegeScope::Restore()
     if (!restoreOnDestruct)
     {
 #if defined(_WIN32)
-        if (tokenHandle != nullptr)
-        {
-            (void)::CloseHandle(static_cast<HANDLE>(tokenHandle));
-        }
+        const GB_SystemResult closeResult = CloseTokenHandleWithResult(tokenHandle, u8"GB_PrivilegeScope::Restore.CloseToken");
 #endif
         ClearPrivilegeState();
+#if defined(_WIN32)
+        if (closeResult.IsFailed())
+        {
+            lastRestoreResult = closeResult;
+            return lastRestoreResult;
+        }
+#endif
         lastRestoreResult = MakeRestoreSkippedResult();
         return lastRestoreResult;
     }
@@ -705,12 +740,16 @@ GB_SystemResult GB_PrivilegeScope::Restore()
     if (!stateChanged)
     {
 #if defined(_WIN32)
-        if (tokenHandle != nullptr)
-        {
-            (void)::CloseHandle(static_cast<HANDLE>(tokenHandle));
-        }
+        const GB_SystemResult closeResult = CloseTokenHandleWithResult(tokenHandle, u8"GB_PrivilegeScope::Restore.CloseToken");
 #endif
         ClearPrivilegeState();
+#if defined(_WIN32)
+        if (closeResult.IsFailed())
+        {
+            lastRestoreResult = closeResult;
+            return lastRestoreResult;
+        }
+#endif
         lastRestoreResult = MakeNoStateChangedRestoreResult();
         return lastRestoreResult;
     }
@@ -728,8 +767,15 @@ GB_SystemResult GB_PrivilegeScope::Restore()
         return lastRestoreResult;
     }
 
+    const GB_SystemResult closeResult = CloseTokenHandleWithResult(tokenHandle, u8"GB_PrivilegeScope::Restore.CloseToken");
+    if (closeResult.IsFailed())
+    {
+        ClearPrivilegeState();
+        lastRestoreResult = closeResult;
+        return lastRestoreResult;
+    }
+
     lastRestoreResult = GB_SystemResult::Succeeded(u8"GB_PrivilegeScope::Restore", BuildRestoreDetailMessage(options, openedTokenTarget, previousPrivilegeInfo));
-    (void)::CloseHandle(static_cast<HANDLE>(tokenHandle));
     ClearPrivilegeState();
     return lastRestoreResult;
 #else
@@ -748,13 +794,17 @@ GB_SystemResult GB_PrivilegeScope::Detach()
     }
 
 #if defined(_WIN32)
-    if (tokenHandle != nullptr)
-    {
-        (void)::CloseHandle(static_cast<HANDLE>(tokenHandle));
-    }
+    const GB_SystemResult closeResult = CloseTokenHandleWithResult(tokenHandle, u8"GB_PrivilegeScope::Detach.CloseToken");
 #endif
 
     ClearPrivilegeState();
+#if defined(_WIN32)
+    if (closeResult.IsFailed())
+    {
+        lastRestoreResult = closeResult;
+        return lastRestoreResult;
+    }
+#endif
     lastRestoreResult = MakeDetachSucceededResult();
     return lastRestoreResult;
 }
@@ -1323,10 +1373,7 @@ void GB_PrivilegeScope::CloseSilently() noexcept
         RestorePrivilegeOnTokenSilently(static_cast<HANDLE>(tokenHandle), previousPrivilegeInfo);
     }
 
-    if (tokenHandle != nullptr)
-    {
-        (void)::CloseHandle(static_cast<HANDLE>(tokenHandle));
-    }
+    CloseTokenHandleSilently(tokenHandle);
 #endif
 
     ClearPrivilegeState();

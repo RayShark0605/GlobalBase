@@ -37,6 +37,12 @@
     <Filter Include="源文件\Desktop\Automation">
       <UniqueIdentifier>{99668c0c-5b8b-4b47-a140-5e3c07be282b}</UniqueIdentifier>
     </Filter>
+    <Filter Include="头文件\Desktop\System">
+      <UniqueIdentifier>{8c50d4f6-65c7-4a8d-9d5a-97d515574ea8}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="源文件\Desktop\System">
+      <UniqueIdentifier>{f57a0a44-f5ec-4f85-bec6-d02ce037e58d}</UniqueIdentifier>
+    </Filter>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="GB_BaseTypes.h">
@@ -171,8 +177,14 @@
     <ClInclude Include="Desktop\GB_ComScope.h">
       <Filter>头文件\Desktop</Filter>
     </ClInclude>
+    <ClInclude Include="Desktop\GB_EventDispatcher.h">
+      <Filter>头文件\Desktop</Filter>
+    </ClInclude>
     <ClInclude Include="Desktop\GB_PrivilegeScope.h">
       <Filter>头文件\Desktop</Filter>
+    </ClInclude>
+    <ClInclude Include="Desktop\GB_SystemDevice.h">
+      <Filter>头文件\Desktop\System</Filter>
     </ClInclude>
   </ItemGroup>
   <ItemGroup>
@@ -299,8 +311,14 @@
     <ClCompile Include="Desktop\GB_ComScope.cpp">
       <Filter>源文件\Desktop</Filter>
     </ClCompile>
+    <ClCompile Include="Desktop\GB_EventDispatcher.cpp">
+      <Filter>源文件\Desktop</Filter>
+    </ClCompile>
     <ClCompile Include="Desktop\GB_PrivilegeScope.cpp">
       <Filter>源文件\Desktop</Filter>
+    </ClCompile>
+    <ClCompile Include="Desktop\GB_SystemDevice.cpp">
+      <Filter>源文件\Desktop\System</Filter>
     </ClCompile>
   </ItemGroup>
 </Project>
