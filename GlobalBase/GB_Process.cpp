@@ -1,5 +1,6 @@
 ﻿#include "GB_Process.h"
 #include "GB_Utf8String.h"
+#include "Desktop/GB_WindowsCommandLineInternal.h"
 
 #include <algorithm>
 #include <chrono>
@@ -42,57 +43,6 @@
 namespace
 {
 #ifdef _WIN32
-    static std::wstring QuoteWindowsArg(const std::wstring& arg)
-    {
-        // 为了稳妥传参：按 CreateProcess 兼容的常见规则进行 quoting/escaping。
-        // 目标：确保参数中含空格/制表符/引号时不会被错误拆分。
-        // 注意：空参数必须写成 "" 才能在重启后保持 argv 语义一致。
-        const bool needQuotes = arg.empty() || (arg.find_first_of(L" \t\"") != std::wstring::npos);
-        if (!needQuotes)
-        {
-            return arg;
-        }
-
-        std::wstring result;
-        result.push_back(L'"');
-
-        size_t backslashCount = 0;
-        for (wchar_t ch : arg)
-        {
-            if (ch == L'\\')
-            {
-                backslashCount++;
-                continue;
-            }
-
-            if (ch == L'"')
-            {
-                // 先输出 2*n 个反斜杠，再输出转义引号
-                result.append(backslashCount * 2, L'\\');
-                backslashCount = 0;
-                result.append(L"\\\"");
-                continue;
-            }
-
-            // 普通字符：输出累计的反斜杠 + 字符
-            if (backslashCount > 0)
-            {
-                result.append(backslashCount, L'\\');
-                backslashCount = 0;
-            }
-            result.push_back(ch);
-        }
-
-        // 结尾反斜杠：在结束引号前需要翻倍
-        if (backslashCount > 0)
-        {
-            result.append(backslashCount * 2, L'\\');
-        }
-
-        result.push_back(L'"');
-        return result;
-    }
-
     static std::wstring BuildWindowsParametersFromCommandLine()
     {
         // 用 Unicode 命令行获取 argv（避免 GetCommandLineA 的代码页转换丢失风险）
@@ -131,7 +81,7 @@ namespace
             {
                 params.push_back(L' ');
             }
-            params += QuoteWindowsArg(argList[i]);
+            params += GB_WindowsCommandLineInternal::QuoteArgument(argList[i]);
         }
         return params;
     }
@@ -1914,12 +1864,12 @@ bool GB_StartProcess(const std::string& executablePathUtf8, const std::vector<st
         return false;
     }
 
-    std::wstring cmdLine = QuoteWindowsArg(exePathW);
+    std::wstring cmdLine = GB_WindowsCommandLineInternal::QuoteArgument(exePathW);
     for (const std::string& argUtf8 : argsUtf8)
     {
         const std::wstring argW = GB_Utf8ToWString(argUtf8);
         cmdLine.push_back(L' ');
-        cmdLine += QuoteWindowsArg(argW);
+        cmdLine += GB_WindowsCommandLineInternal::QuoteArgument(argW);
     }
 
     STARTUPINFOW si;

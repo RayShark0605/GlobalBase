@@ -31,7 +31,9 @@
     <ClInclude Include="Desktop\GB_SystemDevice.h" />
     <ClInclude Include="Desktop\GB_SystemError.h" />
     <ClInclude Include="Desktop\GB_SystemResult.h" />
+    <ClInclude Include="Desktop\GB_SystemShell.h" />
     <ClInclude Include="Desktop\GB_WinHandleScope.h" />
+    <ClInclude Include="Desktop\GB_WindowsCommandLineInternal.h" />
     <ClInclude Include="GB_Config.h" />
     <ClInclude Include="GB_Crypto.h" />
     <ClInclude Include="GB_DataCache.h" />
@@ -80,6 +82,7 @@
     <ClCompile Include="Desktop\GB_SystemDevice.cpp" />
     <ClCompile Include="Desktop\GB_SystemError.cpp" />
     <ClCompile Include="Desktop\GB_SystemResult.cpp" />
+    <ClCompile Include="Desktop\GB_SystemShell.cpp" />
     <ClCompile Include="Desktop\GB_WinHandleScope.cpp" />
     <ClCompile Include="GB_Config.cpp" />
     <ClCompile Include="GB_Crypto.cpp" />
