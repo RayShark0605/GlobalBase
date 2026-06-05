@@ -272,6 +272,7 @@ GB_SystemResult GB_EventDispatcher::Start()
         isAcceptingEvents = true;
         isStopping = false;
         isWorkerJoining = false;
+        workerDetachedBySelfStop = false;
 
         try
         {
@@ -328,12 +329,19 @@ GB_SystemResult GB_EventDispatcher::Stop(const GB_EventDispatcherStopMode stopMo
                 isWorkerJoining = true;
                 shouldJoinWorkerThread = true;
             }
+            else
+            {
+                workerThread.detach();
+                isWorkerJoining = true;
+                workerDetachedBySelfStop = true;
+            }
         }
         else
         {
             if (!isWorkerJoining)
             {
                 isWorkerStarted = false;
+                workerDetachedBySelfStop = false;
             }
         }
     }
@@ -352,6 +360,7 @@ GB_SystemResult GB_EventDispatcher::Stop(const GB_EventDispatcherStopMode stopMo
         std::lock_guard<std::mutex> lock(stateMutex);
         isWorkerStarted = false;
         isWorkerJoining = false;
+        workerDetachedBySelfStop = false;
     }
 
     if (calledFromWorkerThread)
@@ -892,6 +901,17 @@ void GB_EventDispatcher::WorkerLoop()
 
         DispatchPreparedEvent(event, false);
         FinishActiveDispatch();
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(stateMutex);
+        if (workerDetachedBySelfStop)
+        {
+            isWorkerStarted = false;
+            isWorkerJoining = false;
+            isStopping = false;
+            workerDetachedBySelfStop = false;
+        }
     }
 
     idleCond.notify_all();

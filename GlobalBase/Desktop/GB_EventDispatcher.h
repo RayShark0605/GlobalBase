@@ -225,6 +225,7 @@ private:
     bool isStopping = false;
     bool isWorkerStarted = false;
     bool isWorkerJoining = false;
+    bool workerDetachedBySelfStop = false;
     size_t activeDispatchCount = 0;
 
     uint64_t nextSubscriptionId = 1;

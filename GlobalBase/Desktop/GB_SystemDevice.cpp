@@ -2,15 +2,18 @@
 #include "../GB_Utf8String.h"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstddef>
 #include <cstdio>
 #include <cwchar>
 #include <cstring>
+#include <limits>
 #include <mutex>
 #include <new>
-#include <set>
 #include <thread>
+#include <unordered_set>
 #include <utility>
 
 #if defined(_WIN32)
@@ -18,15 +21,16 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
-#include <cfg.h>
 #include <cfgmgr32.h>
 #include <dbt.h>
 #include <initguid.h>
 #include <devpkey.h>
 #include <setupapi.h>
-#pragma comment(lib, "Setupapi.lib")
-#pragma comment(lib, "Cfgmgr32.lib")
-#pragma comment(lib, "User32.lib")
+#ifdef _MSC_VER
+#  pragma comment(lib, "Setupapi.lib")
+#  pragma comment(lib, "Cfgmgr32.lib")
+#  pragma comment(lib, "User32.lib")
+#endif
 #endif
 
 namespace
@@ -89,9 +93,91 @@ namespace
         return lowerText.find(lowerNeedle) != std::string::npos;
     }
 
+    static bool EqualsAnyAsciiNoCase(const std::string& text, const char* const* candidates, const size_t candidateCount)
+    {
+        for (size_t index = 0; index < candidateCount; index++)
+        {
+            if (EqualsAsciiNoCase(text, candidates[index]))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    static bool StartsWithAnyAsciiNoCase(const std::string& text, const char* const* prefixes, const size_t prefixCount)
+    {
+        for (size_t index = 0; index < prefixCount; index++)
+        {
+            if (StartsWithAsciiNoCase(text, prefixes[index]))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    static bool ContainsAnyAsciiNoCase(const std::string& text, const char* const* needles, const size_t needleCount)
+    {
+        for (size_t index = 0; index < needleCount; index++)
+        {
+            if (ContainsAsciiNoCase(text, needles[index]))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    static bool ContainsNullCharacter(const std::string& text)
+    {
+        return text.find('\0') != std::string::npos;
+    }
+
+    static bool StringListContainsAnyAsciiNoCase(const std::vector<std::string>& values, const char* const* needles, const size_t needleCount)
+    {
+        for (size_t valueIndex = 0; valueIndex < values.size(); valueIndex++)
+        {
+            if (ContainsAnyAsciiNoCase(values[valueIndex], needles, needleCount))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
     static std::string NormalizeGuidString(const std::string& guid)
     {
         return ToLowerAscii(guid);
+    }
+
+    static bool IsValidSystemDeviceKind(const GB_SystemDeviceKind deviceKind)
+    {
+        switch (deviceKind)
+        {
+        case GB_SystemDeviceKind::Unknown:
+        case GB_SystemDeviceKind::Usb:
+        case GB_SystemDeviceKind::Display:
+        case GB_SystemDeviceKind::Battery:
+        case GB_SystemDeviceKind::Storage:
+        case GB_SystemDeviceKind::Network:
+        case GB_SystemDeviceKind::HumanInterface:
+        case GB_SystemDeviceKind::Audio:
+        case GB_SystemDeviceKind::Bluetooth:
+        case GB_SystemDeviceKind::Camera:
+        case GB_SystemDeviceKind::Keyboard:
+        case GB_SystemDeviceKind::Mouse:
+        case GB_SystemDeviceKind::Printer:
+            return true;
+        default:
+            break;
+        }
+
+        return false;
     }
 
 #if defined(_WIN32)
@@ -204,7 +290,7 @@ namespace
     static std::string GuidToString(const GUID& guid)
     {
         char buffer[64] = {};
-        std::snprintf(buffer, sizeof(buffer), "{%08lX-%04X-%04X-%02X%02X-%02X%02X%02X%02X%02X%02X}", static_cast<unsigned long>(guid.Data1), guid.Data2, guid.Data3, guid.Data4[0], guid.Data4[1], guid.Data4[2], guid.Data4[3], guid.Data4[4], guid.Data4[5], guid.Data4[6], guid.Data4[7]);
+        std::snprintf(buffer, sizeof(buffer), "{%08lX-%04X-%04X-%02X%02X-%02X%02X%02X%02X%02X%02X}", static_cast<unsigned long>(guid.Data1), static_cast<unsigned int>(guid.Data2), static_cast<unsigned int>(guid.Data3), static_cast<unsigned int>(guid.Data4[0]), static_cast<unsigned int>(guid.Data4[1]), static_cast<unsigned int>(guid.Data4[2]), static_cast<unsigned int>(guid.Data4[3]), static_cast<unsigned int>(guid.Data4[4]), static_cast<unsigned int>(guid.Data4[5]), static_cast<unsigned int>(guid.Data4[6]), static_cast<unsigned int>(guid.Data4[7]));
         return std::string(buffer);
     }
 
@@ -307,25 +393,174 @@ namespace
         return true;
     }
 
+    static std::string CanonicalizeGuidString(const std::string& guidText)
+    {
+        GUID guid = {};
+        if (TryParseGuidString(guidText, guid))
+        {
+            return NormalizeGuidString(GuidToString(guid));
+        }
+
+        return NormalizeGuidString(guidText);
+    }
+
+    static bool EqualsGuidString(const std::string& leftGuidText, const std::string& rightGuidText)
+    {
+        const std::string leftGuid = CanonicalizeGuidString(leftGuidText);
+        const std::string rightGuid = CanonicalizeGuidString(rightGuidText);
+        return !leftGuid.empty() && !rightGuid.empty() && leftGuid == rightGuid;
+    }
+
+    static bool IsOneOfClassGuid(const std::string& classGuid, const char* const* classGuids, const size_t classGuidCount)
+    {
+        if (classGuid.empty() || classGuids == nullptr)
+        {
+            return false;
+        }
+
+        const std::string normalizedClassGuid = CanonicalizeGuidString(classGuid);
+        for (size_t index = 0; index < classGuidCount; index++)
+        {
+            if (normalizedClassGuid == NormalizeGuidString(classGuids[index]))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
     static GB_SystemResult ConfigRetToResult(const CONFIGRET configResult, const std::string& operationName, const std::string& message)
     {
         const DWORD win32Error = ::CM_MapCrToWin32Err(configResult, ERROR_GEN_FAILURE);
         return GB_SystemResult::FromWin32Error(win32Error, operationName, message);
     }
 
-    static bool TryReadDevicePropertyBuffer(HDEVINFO deviceInfoSet, SP_DEVINFO_DATA& deviceInfoData, const DEVPROPKEY& propertyKey, DEVPROPTYPE& propertyType, std::vector<BYTE>& propertyBuffer)
+    static bool IsConfigRetDeviceNotFound(const CONFIGRET configResult)
     {
-        propertyType = 0;
-        propertyBuffer.clear();
-
-        DWORD requiredSize = 0;
-        if (!::SetupDiGetDevicePropertyW(deviceInfoSet, &deviceInfoData, &propertyKey, &propertyType, nullptr, 0, &requiredSize, 0))
+        if (configResult == CR_NO_SUCH_DEVNODE)
         {
-            const DWORD lastError = ::GetLastError();
-            if (lastError != ERROR_INSUFFICIENT_BUFFER || requiredSize == 0)
-            {
-                return false;
-            }
+            return true;
+        }
+#if defined(CR_NO_SUCH_DEVINST)
+        if (configResult == CR_NO_SUCH_DEVINST)
+        {
+            return true;
+        }
+#endif
+#if defined(CR_INVALID_DEVNODE)
+        if (configResult == CR_INVALID_DEVNODE)
+        {
+            return true;
+        }
+#endif
+#if defined(CR_INVALID_DEVINST)
+        if (configResult == CR_INVALID_DEVINST)
+        {
+            return true;
+        }
+#endif
+#if defined(CR_INVALID_DEVICE_ID)
+        if (configResult == CR_INVALID_DEVICE_ID)
+        {
+            return true;
+        }
+#endif
+
+        return false;
+    }
+
+    static bool TryCheckDevicePresentByConfigManager(const std::string& instanceId, bool& isPresent)
+    {
+        isPresent = false;
+        if (instanceId.empty() || ContainsNullCharacter(instanceId))
+        {
+            return false;
+        }
+
+        const std::wstring instanceIdWide = Utf8ToWideSafe(instanceId);
+        if (instanceIdWide.empty())
+        {
+            return false;
+        }
+
+        DEVINST deviceInstance = 0;
+        const CONFIGRET configResult = ::CM_Locate_DevNodeW(&deviceInstance, const_cast<DEVINSTID_W>(instanceIdWide.c_str()), CM_LOCATE_DEVNODE_NORMAL);
+        if (configResult == CR_SUCCESS)
+        {
+            isPresent = true;
+            return true;
+        }
+        if (IsConfigRetDeviceNotFound(configResult))
+        {
+            isPresent = false;
+            return true;
+        }
+
+        return false;
+    }
+
+    static bool IsReasonableDevicePropertyBufferSize(const DWORD requiredSize)
+    {
+        static const DWORD maxPropertyBufferSize = 16u * 1024u * 1024u;
+        return requiredSize > 0 && requiredSize <= maxPropertyBufferSize;
+    }
+
+    static bool IsReasonableDeviceInterfaceDetailBufferSize(const DWORD requiredSize)
+    {
+        static const DWORD maxInterfaceDetailBufferSize = 16u * 1024u * 1024u;
+        const DWORD minInterfaceDetailBufferSize = static_cast<DWORD>(offsetof(SP_DEVICE_INTERFACE_DETAIL_DATA_W, DevicePath) + sizeof(wchar_t));
+        return requiredSize >= minInterfaceDetailBufferSize && requiredSize <= maxInterfaceDetailBufferSize;
+    }
+
+    template<typename TContainer>
+    static bool TryReserve(TContainer& container, const size_t capacity)
+    {
+        try
+        {
+            container.reserve(capacity);
+        }
+        catch (...)
+        {
+            return false;
+        }
+
+        return true;
+    }
+
+    static bool TryAssignDeviceInterfaceDetailBuffer(const DWORD requiredSize, std::vector<BYTE>& detailBuffer)
+    {
+        if (!IsReasonableDeviceInterfaceDetailBufferSize(requiredSize))
+        {
+            detailBuffer.clear();
+            return false;
+        }
+
+        try
+        {
+            detailBuffer.assign(static_cast<size_t>(requiredSize), 0);
+        }
+        catch (...)
+        {
+            detailBuffer.clear();
+            return false;
+        }
+
+        return true;
+    }
+
+    static bool TryAssignByteBuffer(const DWORD requiredSize, std::vector<BYTE>& propertyBuffer)
+    {
+        if (!IsReasonableDevicePropertyBufferSize(requiredSize))
+        {
+            propertyBuffer.clear();
+            return false;
+        }
+
+        if (static_cast<size_t>(requiredSize) > (std::numeric_limits<size_t>::max)() - sizeof(wchar_t) * 2)
+        {
+            propertyBuffer.clear();
+            return false;
         }
 
         try
@@ -338,7 +573,152 @@ namespace
             return false;
         }
 
-        return ::SetupDiGetDevicePropertyW(deviceInfoSet, &deviceInfoData, &propertyKey, &propertyType, propertyBuffer.data(), requiredSize, &requiredSize, 0) != FALSE;
+        return true;
+    }
+
+
+    static bool TryCopyByteBufferToWideBuffer(const std::vector<BYTE>& byteBuffer, std::vector<wchar_t>& wideBuffer)
+    {
+        wideBuffer.clear();
+        if (byteBuffer.empty())
+        {
+            return false;
+        }
+
+        const size_t byteCount = byteBuffer.size();
+        const size_t charCount = (byteCount + sizeof(wchar_t) - 1) / sizeof(wchar_t);
+        if (charCount > (std::numeric_limits<size_t>::max)() - 2)
+        {
+            return false;
+        }
+
+        try
+        {
+            wideBuffer.assign(charCount + 2, L'\0');
+            std::memcpy(wideBuffer.data(), byteBuffer.data(), byteCount);
+        }
+        catch (...)
+        {
+            wideBuffer.clear();
+            return false;
+        }
+
+        return true;
+    }
+
+    static bool TryConvertWideStringBufferToUtf8(const std::vector<BYTE>& byteBuffer, std::string& value)
+    {
+        value.clear();
+
+        std::vector<wchar_t> wideBuffer;
+        if (!TryCopyByteBufferToWideBuffer(byteBuffer, wideBuffer))
+        {
+            return false;
+        }
+
+        size_t length = 0;
+        while (length < wideBuffer.size() && wideBuffer[length] != L'\0')
+        {
+            length++;
+        }
+
+        try
+        {
+            value = WideStringToUtf8Safe(std::wstring(wideBuffer.data(), length));
+        }
+        catch (...)
+        {
+            value.clear();
+            return false;
+        }
+
+        return true;
+    }
+
+    static bool TryConvertWideStringListBufferToUtf8(const std::vector<BYTE>& byteBuffer, std::vector<std::string>& values)
+    {
+        values.clear();
+
+        std::vector<wchar_t> wideBuffer;
+        if (!TryCopyByteBufferToWideBuffer(byteBuffer, wideBuffer))
+        {
+            return false;
+        }
+
+        size_t offset = 0;
+        try
+        {
+            while (offset < wideBuffer.size() && wideBuffer[offset] != L'\0')
+            {
+                size_t length = 0;
+                while (offset + length < wideBuffer.size() && wideBuffer[offset + length] != L'\0')
+                {
+                    length++;
+                }
+                if (offset + length >= wideBuffer.size())
+                {
+                    values.clear();
+                    return false;
+                }
+
+                values.push_back(WideStringToUtf8Safe(std::wstring(wideBuffer.data() + offset, length)));
+                offset += length + 1;
+            }
+        }
+        catch (...)
+        {
+            values.clear();
+            return false;
+        }
+
+        return true;
+    }
+
+    static bool TryReadDevicePropertyBuffer(HDEVINFO deviceInfoSet, SP_DEVINFO_DATA& deviceInfoData, const DEVPROPKEY& propertyKey, DEVPROPTYPE& propertyType, std::vector<BYTE>& propertyBuffer)
+    {
+        propertyType = 0;
+        propertyBuffer.clear();
+
+        DWORD requiredSize = 0;
+        if (!::SetupDiGetDevicePropertyW(deviceInfoSet, &deviceInfoData, &propertyKey, &propertyType, nullptr, 0, &requiredSize, 0))
+        {
+            const DWORD lastError = ::GetLastError();
+            if (lastError != ERROR_INSUFFICIENT_BUFFER || !IsReasonableDevicePropertyBufferSize(requiredSize))
+            {
+                return false;
+            }
+        }
+
+        for (int retryIndex = 0; retryIndex < 3; retryIndex++)
+        {
+            if (!TryAssignByteBuffer(requiredSize, propertyBuffer))
+            {
+                return false;
+            }
+
+            DWORD actualSize = requiredSize;
+            if (::SetupDiGetDevicePropertyW(deviceInfoSet, &deviceInfoData, &propertyKey, &propertyType, propertyBuffer.data(), static_cast<DWORD>(propertyBuffer.size()), &actualSize, 0))
+            {
+                const size_t preservedSize = static_cast<size_t>(actualSize) + sizeof(wchar_t) * 2;
+                if (preservedSize < propertyBuffer.size())
+                {
+                    propertyBuffer.resize(preservedSize);
+                }
+                return true;
+            }
+
+            const DWORD lastError = ::GetLastError();
+            if (lastError != ERROR_INSUFFICIENT_BUFFER || !IsReasonableDevicePropertyBufferSize(actualSize))
+            {
+                propertyBuffer.clear();
+                return false;
+            }
+
+            requiredSize = actualSize;
+        }
+
+        propertyBuffer.clear();
+        return false;
     }
 
     static bool TryReadDeviceStringProperty(HDEVINFO deviceInfoSet, SP_DEVINFO_DATA& deviceInfoData, const DEVPROPKEY& propertyKey, std::string& value)
@@ -357,8 +737,7 @@ namespace
             return false;
         }
 
-        value = WideNullTerminatedStringToUtf8(reinterpret_cast<const wchar_t*>(propertyBuffer.data()));
-        return true;
+        return TryConvertWideStringBufferToUtf8(propertyBuffer, value);
     }
 
     static bool TryReadDeviceGuidProperty(HDEVINFO deviceInfoSet, SP_DEVINFO_DATA& deviceInfoData, const DEVPROPKEY& propertyKey, std::string& value)
@@ -471,14 +850,7 @@ namespace
             return false;
         }
 
-        const wchar_t* currentText = reinterpret_cast<const wchar_t*>(propertyBuffer.data());
-        while (currentText != nullptr && currentText[0] != L'\0')
-        {
-            values.push_back(WideNullTerminatedStringToUtf8(currentText));
-            currentText += std::wcslen(currentText) + 1;
-        }
-
-        return true;
+        return TryConvertWideStringListBufferToUtf8(propertyBuffer, values);
     }
 
     static bool TryReadDeviceRegistryPropertyBuffer(HDEVINFO deviceInfoSet, SP_DEVINFO_DATA& deviceInfoData, DWORD registryProperty, DWORD& registryType, std::vector<BYTE>& propertyBuffer)
@@ -490,23 +862,42 @@ namespace
         if (!::SetupDiGetDeviceRegistryPropertyW(deviceInfoSet, &deviceInfoData, registryProperty, &registryType, nullptr, 0, &requiredSize))
         {
             const DWORD lastError = ::GetLastError();
-            if (lastError != ERROR_INSUFFICIENT_BUFFER || requiredSize == 0)
+            if (lastError != ERROR_INSUFFICIENT_BUFFER || !IsReasonableDevicePropertyBufferSize(requiredSize))
             {
                 return false;
             }
         }
 
-        try
+        for (int retryIndex = 0; retryIndex < 3; retryIndex++)
         {
-            propertyBuffer.assign(static_cast<size_t>(requiredSize) + sizeof(wchar_t) * 2, 0);
-        }
-        catch (...)
-        {
-            propertyBuffer.clear();
-            return false;
+            if (!TryAssignByteBuffer(requiredSize, propertyBuffer))
+            {
+                return false;
+            }
+
+            DWORD actualSize = requiredSize;
+            if (::SetupDiGetDeviceRegistryPropertyW(deviceInfoSet, &deviceInfoData, registryProperty, &registryType, propertyBuffer.data(), static_cast<DWORD>(propertyBuffer.size()), &actualSize))
+            {
+                const size_t preservedSize = static_cast<size_t>(actualSize) + sizeof(wchar_t) * 2;
+                if (preservedSize < propertyBuffer.size())
+                {
+                    propertyBuffer.resize(preservedSize);
+                }
+                return true;
+            }
+
+            const DWORD lastError = ::GetLastError();
+            if (lastError != ERROR_INSUFFICIENT_BUFFER || !IsReasonableDevicePropertyBufferSize(actualSize))
+            {
+                propertyBuffer.clear();
+                return false;
+            }
+
+            requiredSize = actualSize;
         }
 
-        return ::SetupDiGetDeviceRegistryPropertyW(deviceInfoSet, &deviceInfoData, registryProperty, &registryType, propertyBuffer.data(), requiredSize, &requiredSize) != FALSE;
+        propertyBuffer.clear();
+        return false;
     }
 
     static bool TryReadDeviceRegistryString(HDEVINFO deviceInfoSet, SP_DEVINFO_DATA& deviceInfoData, DWORD registryProperty, std::string& value)
@@ -525,8 +916,7 @@ namespace
             return false;
         }
 
-        value = WideNullTerminatedStringToUtf8(reinterpret_cast<const wchar_t*>(propertyBuffer.data()));
-        return true;
+        return TryConvertWideStringBufferToUtf8(propertyBuffer, value);
     }
 
     static bool TryReadDeviceRegistryUInt32(HDEVINFO deviceInfoSet, SP_DEVINFO_DATA& deviceInfoData, DWORD registryProperty, uint32_t& value)
@@ -567,14 +957,7 @@ namespace
             return false;
         }
 
-        const wchar_t* currentText = reinterpret_cast<const wchar_t*>(propertyBuffer.data());
-        while (currentText != nullptr && currentText[0] != L'\0')
-        {
-            values.push_back(WideNullTerminatedStringToUtf8(currentText));
-            currentText += std::wcslen(currentText) + 1;
-        }
-
-        return true;
+        return TryConvertWideStringListBufferToUtf8(propertyBuffer, values);
     }
 
     static bool TryGetDeviceInstanceId(HDEVINFO deviceInfoSet, SP_DEVINFO_DATA& deviceInfoData, std::string& instanceId)
@@ -591,7 +974,16 @@ namespace
             }
         }
 
-        std::vector<wchar_t> buffer(static_cast<size_t>(requiredLength) + 1, L'\0');
+        std::vector<wchar_t> buffer;
+        try
+        {
+            buffer.assign(static_cast<size_t>(requiredLength) + 1, L'\0');
+        }
+        catch (...)
+        {
+            return false;
+        }
+
         if (!::SetupDiGetDeviceInstanceIdW(deviceInfoSet, &deviceInfoData, buffer.data(), requiredLength, nullptr))
         {
             return false;
@@ -632,72 +1024,112 @@ namespace
         return instanceId.substr(0, backslashIndex);
     }
 
-    static bool IsUsbDevice(const GB_SystemDeviceInfo& deviceInfo)
+    static bool IsUsbConnectedDevice(const GB_SystemDeviceInfo& deviceInfo)
     {
-        if (EqualsAsciiNoCase(deviceInfo.enumeratorName, "USB") || EqualsAsciiNoCase(deviceInfo.enumeratorName, "USBSTOR"))
+        static const char* const usbEnumerators[] = { "USB", "USBSTOR", "USBPRINT", "USBCCGP", "USB4" };
+        static const char* const usbInstancePrefixes[] = { "USB\\", "USBSTOR\\", "USBPRINT\\", "USBCCGP\\", "USB4\\" };
+        static const char* const usbIdNeedles[] = { "USB\\VID_", "USBSTOR\\", "USBPRINT\\", "USBCCGP\\", "USB4\\" };
+
+        if (EqualsAnyAsciiNoCase(deviceInfo.enumeratorName, usbEnumerators, sizeof(usbEnumerators) / sizeof(usbEnumerators[0])))
         {
             return true;
         }
 
-        return StartsWithAsciiNoCase(deviceInfo.instanceId, "USB\\") || StartsWithAsciiNoCase(deviceInfo.instanceId, "USBSTOR\\");
+        if (StartsWithAnyAsciiNoCase(deviceInfo.instanceId, usbInstancePrefixes, sizeof(usbInstancePrefixes) / sizeof(usbInstancePrefixes[0])))
+        {
+            return true;
+        }
+
+        return StringListContainsAnyAsciiNoCase(deviceInfo.hardwareIds, usbIdNeedles, sizeof(usbIdNeedles) / sizeof(usbIdNeedles[0])) || StringListContainsAnyAsciiNoCase(deviceInfo.compatibleIds, usbIdNeedles, sizeof(usbIdNeedles) / sizeof(usbIdNeedles[0]));
+    }
+
+    static bool IsBluetoothConnectedDevice(const GB_SystemDeviceInfo& deviceInfo)
+    {
+        static const char* const bluetoothEnumerators[] = { "BTH", "BTHLE", "BTHENUM", "BTHLEENUM", "BTHHFENUM", "BTHMODEM", "Bluetooth" };
+        static const char* const bluetoothInstancePrefixes[] = { "BTH\\", "BTHLE\\", "BTHENUM\\", "BTHLEENUM\\", "BTHHFENUM\\", "BTHMODEM\\", "Bluetooth\\", "SWD\\RADIO\\Bluetooth" };
+        static const char* const bluetoothIdNeedles[] = { "BTHENUM\\", "BTHLE\\", "BTH\\MS_BTH", "BTH\\MS_RFCOMM", "SWD\\RADIO\\Bluetooth" };
+
+        if (EqualsAnyAsciiNoCase(deviceInfo.enumeratorName, bluetoothEnumerators, sizeof(bluetoothEnumerators) / sizeof(bluetoothEnumerators[0])))
+        {
+            return true;
+        }
+
+        if (StartsWithAnyAsciiNoCase(deviceInfo.instanceId, bluetoothInstancePrefixes, sizeof(bluetoothInstancePrefixes) / sizeof(bluetoothInstancePrefixes[0])))
+        {
+            return true;
+        }
+
+        return StringListContainsAnyAsciiNoCase(deviceInfo.hardwareIds, bluetoothIdNeedles, sizeof(bluetoothIdNeedles) / sizeof(bluetoothIdNeedles[0])) || StringListContainsAnyAsciiNoCase(deviceInfo.compatibleIds, bluetoothIdNeedles, sizeof(bluetoothIdNeedles) / sizeof(bluetoothIdNeedles[0]));
     }
 
     static GB_SystemDeviceKind DeduceDeviceKind(const GB_SystemDeviceInfo& deviceInfo)
     {
-        if (IsUsbDevice(deviceInfo))
-        {
-            return GB_SystemDeviceKind::Usb;
-        }
-
         const std::string className = ToLowerAscii(deviceInfo.className);
         const std::string enumeratorName = ToLowerAscii(deviceInfo.enumeratorName);
         const std::string instanceId = ToLowerAscii(deviceInfo.instanceId);
         const std::string friendlyName = ToLowerAscii(deviceInfo.friendlyName);
         const std::string description = ToLowerAscii(deviceInfo.description);
 
-        if (className == "monitor" || className == "display" || StartsWithAsciiNoCase(instanceId, "DISPLAY\\"))
-        {
-            return GB_SystemDeviceKind::Display;
-        }
-        if (className == "battery")
-        {
-            return GB_SystemDeviceKind::Battery;
-        }
-        if (className == "diskdrive" || className == "volume" || className == "scsiadapter" || className == "storage" || className == "wdc")
-        {
-            return GB_SystemDeviceKind::Storage;
-        }
-        if (className == "net")
-        {
-            return GB_SystemDeviceKind::Network;
-        }
-        if (className == "keyboard")
+        static const char* const displayClassGuids[] = { "{4D36E968-E325-11CE-BFC1-08002BE10318}", "{4D36E96E-E325-11CE-BFC1-08002BE10318}" };
+        static const char* const batteryClassGuids[] = { "{72631E54-78A4-11D0-BCF7-00AA00B7B32A}" };
+        static const char* const storageClassGuids[] = { "{4D36E967-E325-11CE-BFC1-08002BE10318}", "{71A27CDD-812A-11D0-BEC7-08002BE2092F}", "{4D36E96A-E325-11CE-BFC1-08002BE10318}", "{4D36E97B-E325-11CE-BFC1-08002BE10318}" };
+        static const char* const networkClassGuids[] = { "{4D36E972-E325-11CE-BFC1-08002BE10318}" };
+        static const char* const keyboardClassGuids[] = { "{4D36E96B-E325-11CE-BFC1-08002BE10318}" };
+        static const char* const mouseClassGuids[] = { "{4D36E96F-E325-11CE-BFC1-08002BE10318}" };
+        static const char* const hidClassGuids[] = { "{745A17A0-74D3-11D0-B6FE-00A0C90F57DA}" };
+        static const char* const audioClassGuids[] = { "{4D36E96C-E325-11CE-BFC1-08002BE10318}", "{C166523C-FE0C-4A94-A586-F1A80CFBBF3E}" };
+        static const char* const bluetoothClassGuids[] = { "{E0CBF06C-CD8B-4647-BB8A-263B43F0F974}" };
+        static const char* const cameraClassGuids[] = { "{CA3E7AB9-B4C3-4AE6-8251-579EF933890F}", "{6BDD1FC6-810F-11D0-BEC7-08002BE2092F}" };
+        static const char* const printerClassGuids[] = { "{4D36E979-E325-11CE-BFC1-08002BE10318}", "{1ED2BBF9-11F0-4084-B21F-AD83A8E6DCDC}" };
+        static const char* const usbClassGuids[] = { "{36FC9E60-C465-11CF-8056-444553540000}" };
+
+        if (className == "keyboard" || IsOneOfClassGuid(deviceInfo.classGuid, keyboardClassGuids, sizeof(keyboardClassGuids) / sizeof(keyboardClassGuids[0])))
         {
             return GB_SystemDeviceKind::Keyboard;
         }
-        if (className == "mouse")
+        if (className == "mouse" || IsOneOfClassGuid(deviceInfo.classGuid, mouseClassGuids, sizeof(mouseClassGuids) / sizeof(mouseClassGuids[0])))
         {
             return GB_SystemDeviceKind::Mouse;
         }
-        if (className == "hidclass")
+        if (className == "monitor" || className == "display" || StartsWithAsciiNoCase(instanceId, "DISPLAY\\") || IsOneOfClassGuid(deviceInfo.classGuid, displayClassGuids, sizeof(displayClassGuids) / sizeof(displayClassGuids[0])))
         {
-            return GB_SystemDeviceKind::HumanInterface;
+            return GB_SystemDeviceKind::Display;
         }
-        if (className == "media" || className == "audioendpoint" || ContainsAsciiNoCase(friendlyName, "audio") || ContainsAsciiNoCase(description, "audio"))
+        if (className == "battery" || IsOneOfClassGuid(deviceInfo.classGuid, batteryClassGuids, sizeof(batteryClassGuids) / sizeof(batteryClassGuids[0])))
+        {
+            return GB_SystemDeviceKind::Battery;
+        }
+        if (className == "diskdrive" || className == "volume" || className == "scsiadapter" || className == "storage" || className == "wdc" || IsOneOfClassGuid(deviceInfo.classGuid, storageClassGuids, sizeof(storageClassGuids) / sizeof(storageClassGuids[0])))
+        {
+            return GB_SystemDeviceKind::Storage;
+        }
+        if (className == "net" || IsOneOfClassGuid(deviceInfo.classGuid, networkClassGuids, sizeof(networkClassGuids) / sizeof(networkClassGuids[0])))
+        {
+            return GB_SystemDeviceKind::Network;
+        }
+        if (className == "media" || className == "audioendpoint" || friendlyName.find("audio") != std::string::npos || description.find("audio") != std::string::npos || IsOneOfClassGuid(deviceInfo.classGuid, audioClassGuids, sizeof(audioClassGuids) / sizeof(audioClassGuids[0])))
         {
             return GB_SystemDeviceKind::Audio;
         }
-        if (className == "bluetooth" || enumeratorName == "bth" || StartsWithAsciiNoCase(instanceId, "BTH\\") || StartsWithAsciiNoCase(instanceId, "BTHLE\\"))
-        {
-            return GB_SystemDeviceKind::Bluetooth;
-        }
-        if (className == "camera" || className == "image" || ContainsAsciiNoCase(friendlyName, "camera") || ContainsAsciiNoCase(description, "camera"))
+        if (className == "camera" || className == "image" || friendlyName.find("camera") != std::string::npos || description.find("camera") != std::string::npos || IsOneOfClassGuid(deviceInfo.classGuid, cameraClassGuids, sizeof(cameraClassGuids) / sizeof(cameraClassGuids[0])))
         {
             return GB_SystemDeviceKind::Camera;
         }
-        if (className == "printer" || className == "printqueue")
+        if (className == "printer" || className == "printqueue" || IsOneOfClassGuid(deviceInfo.classGuid, printerClassGuids, sizeof(printerClassGuids) / sizeof(printerClassGuids[0])))
         {
             return GB_SystemDeviceKind::Printer;
+        }
+        if (className == "hidclass" || IsOneOfClassGuid(deviceInfo.classGuid, hidClassGuids, sizeof(hidClassGuids) / sizeof(hidClassGuids[0])))
+        {
+            return GB_SystemDeviceKind::HumanInterface;
+        }
+        if (className == "bluetooth" || enumeratorName == "bth" || enumeratorName == "bthle" || IsBluetoothConnectedDevice(deviceInfo) || IsOneOfClassGuid(deviceInfo.classGuid, bluetoothClassGuids, sizeof(bluetoothClassGuids) / sizeof(bluetoothClassGuids[0])))
+        {
+            return GB_SystemDeviceKind::Bluetooth;
+        }
+        if (IsUsbConnectedDevice(deviceInfo) || IsOneOfClassGuid(deviceInfo.classGuid, usbClassGuids, sizeof(usbClassGuids) / sizeof(usbClassGuids[0])))
+        {
+            return GB_SystemDeviceKind::Usb;
         }
 
         return GB_SystemDeviceKind::Unknown;
@@ -763,24 +1195,34 @@ namespace
         }
 
         bool isPresentProperty = false;
-        bool hasPresentProperty = TryReadDeviceBooleanProperty(deviceInfoSet, deviceInfoData, DEVPKEY_Device_IsPresent, isPresentProperty);
-        const bool hasDevNodeStatus = FillDevNodeStatus(deviceInfoData, deviceInfo);
+        const bool hasPresentProperty = TryReadDeviceBooleanProperty(deviceInfoSet, deviceInfoData, DEVPKEY_Device_IsPresent, isPresentProperty);
+        (void)FillDevNodeStatus(deviceInfoData, deviceInfo);
         if (hasPresentProperty)
         {
             deviceInfo.isPresent = isPresentProperty;
         }
         else
         {
-            deviceInfo.isPresent = hasDevNodeStatus ? true : presentOnly;
+            bool configManagerPresent = false;
+            if (TryCheckDevicePresentByConfigManager(deviceInfo.instanceId, configManagerPresent))
+            {
+                deviceInfo.isPresent = configManagerPresent;
+            }
+            else
+            {
+                deviceInfo.isPresent = presentOnly;
+            }
         }
 
+        deviceInfo.isUsbConnected = IsUsbConnectedDevice(deviceInfo);
+        deviceInfo.isBluetoothConnected = IsBluetoothConnectedDevice(deviceInfo);
         deviceInfo.isRemovable = (deviceInfo.capabilities & CM_DEVCAP_REMOVABLE) != 0 || deviceInfo.removalPolicy == CM_REMOVAL_POLICY_EXPECT_ORDERLY_REMOVAL || deviceInfo.removalPolicy == CM_REMOVAL_POLICY_EXPECT_SURPRISE_REMOVAL;
         deviceInfo.deviceKind = DeduceDeviceKind(deviceInfo);
     }
 
     static bool DeviceMatchesOptions(const GB_SystemDeviceInfo& deviceInfo, const GB_SystemDeviceQueryOptions& options)
     {
-        if (!options.classGuid.empty() && !EqualsAsciiNoCase(deviceInfo.classGuid, options.classGuid))
+        if (!options.classGuid.empty() && !EqualsGuidString(deviceInfo.classGuid, options.classGuid))
         {
             return false;
         }
@@ -789,6 +1231,14 @@ namespace
             return false;
         }
         if (options.deviceKind != GB_SystemDeviceKind::Unknown && deviceInfo.deviceKind != options.deviceKind)
+        {
+            return false;
+        }
+        if (options.usbConnectedOnly && !deviceInfo.isUsbConnected)
+        {
+            return false;
+        }
+        if (options.bluetoothConnectedOnly && !deviceInfo.isBluetoothConnected)
         {
             return false;
         }
@@ -810,7 +1260,65 @@ namespace
         return deviceInfo.instanceId;
     }
 
-    static GB_SystemResult BuildInstalledInterfaceClassGuids(std::vector<GUID>& classGuids)
+    static GB_SystemResult AppendUniqueGuid(const GUID& classGuid, std::unordered_set<std::string>& seenGuids, std::vector<GUID>& classGuids, const std::string& operationName, const std::string& message)
+    {
+        const std::string normalizedGuid = NormalizeGuidString(GuidToString(classGuid));
+        try
+        {
+            if (!seenGuids.insert(normalizedGuid).second)
+            {
+                return GB_SystemResult::Succeeded(operationName);
+            }
+            classGuids.push_back(classGuid);
+        }
+        catch (...)
+        {
+            return GB_SystemResult::Failed(GB_SystemErrorCode::ResourceAllocationFailed, operationName, message);
+        }
+
+        return GB_SystemResult::Succeeded(operationName);
+    }
+
+#if defined(CM_ENUMERATE_CLASSES_INTERFACE)
+    static GB_SystemResult BuildInstalledInterfaceClassGuidsByConfigManager(std::vector<GUID>& classGuids)
+    {
+        classGuids.clear();
+
+        std::unordered_set<std::string> seenGuids;
+        if (!TryReserve(seenGuids, 128) || !TryReserve(classGuids, 128))
+        {
+            return GB_SystemResult::Failed(GB_SystemErrorCode::ResourceAllocationFailed, u8"GB_SystemDevice::GetDeviceInterfaces", u8"初始化设备接口类 GUID 缓存时内存不足。");
+        }
+
+        for (ULONG classIndex = 0;; classIndex++)
+        {
+            GUID classGuid = {};
+            const CONFIGRET configResult = ::CM_Enumerate_Classes(classIndex, &classGuid, CM_ENUMERATE_CLASSES_INTERFACE);
+            if (configResult == CR_NO_SUCH_VALUE)
+            {
+                break;
+            }
+            if (configResult == CR_INVALID_DATA)
+            {
+                continue;
+            }
+            if (configResult != CR_SUCCESS)
+            {
+                return ConfigRetToResult(configResult, u8"GB_SystemDevice::GetDeviceInterfaces", u8"CM_Enumerate_Classes 枚举设备接口类失败。");
+            }
+
+            const GB_SystemResult appendResult = AppendUniqueGuid(classGuid, seenGuids, classGuids, u8"GB_SystemDevice::GetDeviceInterfaces", u8"保存设备接口类 GUID 时内存不足。");
+            if (appendResult.IsFailed())
+            {
+                return appendResult;
+            }
+        }
+
+        return GB_SystemResult::Succeeded(u8"GB_SystemDevice::GetDeviceInterfaces", u8"已通过 ConfigMgr 读取系统已安装设备接口类。");
+    }
+#endif
+
+    static GB_SystemResult BuildInstalledInterfaceClassGuidsByRegistry(std::vector<GUID>& classGuids)
     {
         classGuids.clear();
 
@@ -820,7 +1328,12 @@ namespace
             return GB_SystemResult::FromLastWin32Error(u8"GB_SystemDevice::GetDeviceInterfaces", u8"SetupDiOpenClassRegKeyExW 打开设备接口类注册表根失败。");
         }
 
-        std::set<std::string> seenGuids;
+        std::unordered_set<std::string> seenGuids;
+        if (!TryReserve(seenGuids, 128) || !TryReserve(classGuids, 128))
+        {
+            return GB_SystemResult::Failed(GB_SystemErrorCode::ResourceAllocationFailed, u8"GB_SystemDevice::GetDeviceInterfaces", u8"初始化设备接口类 GUID 缓存时内存不足。");
+        }
+
         for (DWORD keyIndex = 0;; keyIndex++)
         {
             wchar_t keyName[128] = {};
@@ -842,17 +1355,34 @@ namespace
                 continue;
             }
 
-            const std::string normalizedGuid = NormalizeGuidString(GuidToString(classGuid));
-            if (seenGuids.insert(normalizedGuid).second)
+            const GB_SystemResult appendResult = AppendUniqueGuid(classGuid, seenGuids, classGuids, u8"GB_SystemDevice::GetDeviceInterfaces", u8"保存设备接口类 GUID 时内存不足。");
+            if (appendResult.IsFailed())
             {
-                classGuids.push_back(classGuid);
+                return appendResult;
             }
         }
 
-        return GB_SystemResult::Succeeded(u8"GB_SystemDevice::GetDeviceInterfaces", u8"已读取系统已安装设备接口类。");
+        return GB_SystemResult::Succeeded(u8"GB_SystemDevice::GetDeviceInterfaces", u8"已通过注册表读取系统已安装设备接口类。");
     }
 
-    static GB_SystemResult EnumerateInterfacesForClassGuid(const GUID& interfaceClassGuid, const GB_SystemDeviceInterfaceQueryOptions& options, std::set<std::string>& seenInterfacePaths, std::vector<GB_SystemDeviceInterfaceInfo>& outputInterfaces)
+    static GB_SystemResult BuildInstalledInterfaceClassGuids(std::vector<GUID>& classGuids)
+    {
+        classGuids.clear();
+
+#if defined(CM_ENUMERATE_CLASSES_INTERFACE)
+        std::vector<GUID> configManagerClassGuids;
+        const GB_SystemResult configManagerResult = BuildInstalledInterfaceClassGuidsByConfigManager(configManagerClassGuids);
+        if (configManagerResult.IsSucceeded())
+        {
+            classGuids = std::move(configManagerClassGuids);
+            return configManagerResult;
+        }
+#endif
+
+        return BuildInstalledInterfaceClassGuidsByRegistry(classGuids);
+    }
+
+    static GB_SystemResult EnumerateInterfacesForClassGuid(const GUID& interfaceClassGuid, const GB_SystemDeviceInterfaceQueryOptions& options, std::unordered_set<std::string>& seenInterfacePaths, std::vector<GB_SystemDeviceInterfaceInfo>& outputInterfaces)
     {
         std::wstring deviceInstanceIdWide;
         const wchar_t* enumeratorText = nullptr;
@@ -909,7 +1439,12 @@ namespace
                 return GB_SystemResult::FromWin32Error(sizeError, u8"GB_SystemDevice::GetDeviceInterfaces", u8"SetupDiGetDeviceInterfaceDetailW 获取接口详情长度失败。");
             }
 
-            std::vector<BYTE> detailBuffer(static_cast<size_t>(requiredSize), 0);
+            std::vector<BYTE> detailBuffer;
+            if (!TryAssignDeviceInterfaceDetailBuffer(requiredSize, detailBuffer))
+            {
+                return GB_SystemResult::Failed(GB_SystemErrorCode::ResourceAllocationFailed, u8"GB_SystemDevice::GetDeviceInterfaces", u8"分配设备接口详情缓冲区失败，可能是系统返回的详情长度异常或内存不足。");
+            }
+
             SP_DEVICE_INTERFACE_DETAIL_DATA_W* detailData = reinterpret_cast<SP_DEVICE_INTERFACE_DETAIL_DATA_W*>(detailBuffer.data());
             detailData->cbSize = sizeof(SP_DEVICE_INTERFACE_DETAIL_DATA_W);
             deviceInfoData = SP_DEVINFO_DATA();
@@ -932,12 +1467,6 @@ namespace
                 continue;
             }
 
-            const std::string normalizedPath = ToLowerAscii(interfaceInfo.interfacePath);
-            if (!seenInterfacePaths.insert(normalizedPath).second)
-            {
-                continue;
-            }
-
             interfaceInfo.interfaceClassGuid = GuidToString(interfaceClassGuid);
             interfaceInfo.isEnabled = (interfaceData.Flags & SPINT_ACTIVE) != 0;
             if (options.presentOnly && !interfaceInfo.isEnabled)
@@ -947,11 +1476,43 @@ namespace
 
             GB_SystemDeviceInfo associatedDevice;
             FillDeviceInfo(deviceInfoSet.Get(), deviceInfoData, options.presentOnly, false, associatedDevice);
+            if (!options.deviceInstanceId.empty() && !EqualsAsciiNoCase(associatedDevice.instanceId, options.deviceInstanceId))
+            {
+                continue;
+            }
+            if (options.presentOnly && !associatedDevice.isPresent)
+            {
+                continue;
+            }
+
+            bool shouldAppendInterface = false;
+            try
+            {
+                const std::string normalizedPath = ToLowerAscii(interfaceInfo.interfacePath);
+                shouldAppendInterface = seenInterfacePaths.insert(normalizedPath).second;
+            }
+            catch (...)
+            {
+                return GB_SystemResult::Failed(GB_SystemErrorCode::ResourceAllocationFailed, u8"GB_SystemDevice::GetDeviceInterfaces", u8"保存设备接口路径去重信息时内存不足。");
+            }
+
+            if (!shouldAppendInterface)
+            {
+                continue;
+            }
+
             interfaceInfo.deviceInstanceId = associatedDevice.instanceId;
             interfaceInfo.associatedDeviceName = GetBestDeviceName(associatedDevice);
             interfaceInfo.isPresent = associatedDevice.isPresent;
 
-            outputInterfaces.push_back(interfaceInfo);
+            try
+            {
+                outputInterfaces.push_back(interfaceInfo);
+            }
+            catch (...)
+            {
+                return GB_SystemResult::Failed(GB_SystemErrorCode::ResourceAllocationFailed, u8"GB_SystemDevice::GetDeviceInterfaces", u8"保存设备接口信息时内存不足。");
+            }
         }
 
         return GB_SystemResult::Succeeded(u8"GB_SystemDevice::GetDeviceInterfaces", u8"设备接口枚举完成。");
@@ -1141,16 +1702,30 @@ GB_SystemResult GB_SystemDevice::GetDevices(std::vector<GB_SystemDeviceInfo>& de
 #else
     GUID classGuid = {};
     const bool hasClassGuid = !options.classGuid.empty();
-    if (hasClassGuid && !TryParseGuidString(options.classGuid, classGuid))
+    GB_SystemDeviceQueryOptions normalizedOptions = options;
+    if (ContainsNullCharacter(normalizedOptions.classGuid) || ContainsNullCharacter(normalizedOptions.enumeratorName))
     {
-        return GB_SystemResult::Failed(GB_SystemErrorCode::InvalidArgument, u8"GB_SystemDevice::GetDevices", u8"classGuid 不是有效的 GUID 字符串。");
+        return GB_SystemResult::Failed(GB_SystemErrorCode::InvalidArgument, u8"GB_SystemDevice::GetDevices", u8"classGuid 或 enumeratorName 不能包含内嵌空字符。");
+    }
+    if (!IsValidSystemDeviceKind(normalizedOptions.deviceKind))
+    {
+        return GB_SystemResult::Failed(GB_SystemErrorCode::InvalidArgument, u8"GB_SystemDevice::GetDevices", u8"deviceKind 不是有效的 GB_SystemDeviceKind 枚举值。");
+    }
+
+    if (hasClassGuid)
+    {
+        if (!TryParseGuidString(options.classGuid, classGuid))
+        {
+            return GB_SystemResult::Failed(GB_SystemErrorCode::InvalidArgument, u8"GB_SystemDevice::GetDevices", u8"classGuid 不是有效的 GUID 字符串。");
+        }
+        normalizedOptions.classGuid = GuidToString(classGuid);
     }
 
     std::wstring enumeratorNameWide;
     const wchar_t* enumeratorName = nullptr;
-    if (!options.enumeratorName.empty())
+    if (!normalizedOptions.enumeratorName.empty())
     {
-        enumeratorNameWide = Utf8ToWideSafe(options.enumeratorName);
+        enumeratorNameWide = Utf8ToWideSafe(normalizedOptions.enumeratorName);
         if (enumeratorNameWide.empty())
         {
             return GB_SystemResult::Failed(GB_SystemErrorCode::EncodingConversionFailed, u8"GB_SystemDevice::GetDevices", u8"enumeratorName 从 UTF-8 转 UTF-16 失败。");
@@ -1158,7 +1733,7 @@ GB_SystemResult GB_SystemDevice::GetDevices(std::vector<GB_SystemDeviceInfo>& de
         enumeratorName = enumeratorNameWide.c_str();
     }
 
-    const DWORD flags = (hasClassGuid ? 0 : DIGCF_ALLCLASSES) | (options.presentOnly ? DIGCF_PRESENT : 0);
+    const DWORD flags = (hasClassGuid ? 0 : DIGCF_ALLCLASSES) | (normalizedOptions.presentOnly ? DIGCF_PRESENT : 0);
     DeviceInfoSetScope deviceInfoSet(::SetupDiGetClassDevsW(hasClassGuid ? &classGuid : nullptr, enumeratorName, nullptr, flags));
     if (!deviceInfoSet.IsValid())
     {
@@ -1166,6 +1741,10 @@ GB_SystemResult GB_SystemDevice::GetDevices(std::vector<GB_SystemDeviceInfo>& de
     }
 
     std::vector<GB_SystemDeviceInfo> collectedDevices;
+    if (!TryReserve(collectedDevices, 256))
+    {
+        return GB_SystemResult::Failed(GB_SystemErrorCode::ResourceAllocationFailed, u8"GB_SystemDevice::GetDevices", u8"初始化系统设备缓存时内存不足。");
+    }
     for (DWORD deviceIndex = 0;; deviceIndex++)
     {
         SP_DEVINFO_DATA deviceInfoData = {};
@@ -1182,10 +1761,17 @@ GB_SystemResult GB_SystemDevice::GetDevices(std::vector<GB_SystemDeviceInfo>& de
         }
 
         GB_SystemDeviceInfo deviceInfo;
-        FillDeviceInfo(deviceInfoSet.Get(), deviceInfoData, options.presentOnly, options.readDriverInfo, deviceInfo);
-        if (DeviceMatchesOptions(deviceInfo, options))
+        FillDeviceInfo(deviceInfoSet.Get(), deviceInfoData, normalizedOptions.presentOnly, normalizedOptions.readDriverInfo, deviceInfo);
+        if (DeviceMatchesOptions(deviceInfo, normalizedOptions))
         {
-            collectedDevices.push_back(deviceInfo);
+            try
+            {
+                collectedDevices.push_back(deviceInfo);
+            }
+            catch (...)
+            {
+                return GB_SystemResult::Failed(GB_SystemErrorCode::ResourceAllocationFailed, u8"GB_SystemDevice::GetDevices", u8"保存系统设备信息时内存不足。");
+            }
         }
     }
 
@@ -1196,6 +1782,12 @@ GB_SystemResult GB_SystemDevice::GetDevices(std::vector<GB_SystemDeviceInfo>& de
 
 GB_SystemResult GB_SystemDevice::GetDevicesByKind(const GB_SystemDeviceKind deviceKind, std::vector<GB_SystemDeviceInfo>& devices, const bool presentOnly)
 {
+    if (!IsValidSystemDeviceKind(deviceKind))
+    {
+        devices.clear();
+        return GB_SystemResult::Failed(GB_SystemErrorCode::InvalidArgument, u8"GB_SystemDevice::GetDevicesByKind", u8"deviceKind 不是有效的 GB_SystemDeviceKind 枚举值。");
+    }
+
     GB_SystemDeviceQueryOptions options;
     options.presentOnly = presentOnly;
     options.deviceKind = deviceKind;
@@ -1213,6 +1805,10 @@ GB_SystemResult GB_SystemDevice::GetDeviceByInstanceId(const std::string& instan
     if (instanceId.empty())
     {
         return GB_SystemResult::Failed(GB_SystemErrorCode::InvalidArgument, u8"GB_SystemDevice::GetDeviceByInstanceId", u8"设备实例 ID 不能为空。");
+    }
+    if (ContainsNullCharacter(instanceId))
+    {
+        return GB_SystemResult::Failed(GB_SystemErrorCode::InvalidArgument, u8"GB_SystemDevice::GetDeviceByInstanceId", u8"设备实例 ID 不能包含内嵌空字符。");
     }
 
     const std::wstring instanceIdWide = Utf8ToWideSafe(instanceId);
@@ -1249,16 +1845,40 @@ GB_SystemResult GB_SystemDevice::GetDeviceByInstanceId(const std::string& instan
 GB_SystemResult GB_SystemDevice::DeviceExists(const std::string& instanceId, bool& exists)
 {
     exists = false;
-    GB_SystemDeviceInfo deviceInfo;
-    bool found = false;
-    GB_SystemResult result = GetDeviceByInstanceId(instanceId, deviceInfo, found);
-    if (result.IsFailed())
+#if !defined(_WIN32)
+    (void)instanceId;
+    return GB_SystemResult::Failed(GB_SystemErrorCode::UnsupportedPlatform, u8"GB_SystemDevice::DeviceExists", u8"当前平台不支持 Windows 设备查询。");
+#else
+    if (instanceId.empty())
     {
-        return result.WithOperationName(u8"GB_SystemDevice::DeviceExists");
+        return GB_SystemResult::Failed(GB_SystemErrorCode::InvalidArgument, u8"GB_SystemDevice::DeviceExists", u8"设备实例 ID 不能为空。");
+    }
+    if (ContainsNullCharacter(instanceId))
+    {
+        return GB_SystemResult::Failed(GB_SystemErrorCode::InvalidArgument, u8"GB_SystemDevice::DeviceExists", u8"设备实例 ID 不能包含内嵌空字符。");
     }
 
-    exists = found && deviceInfo.isPresent;
-    return GB_SystemResult::Succeeded(u8"GB_SystemDevice::DeviceExists", u8"已检查指定设备实例是否当前存在。");
+    const std::wstring instanceIdWide = Utf8ToWideSafe(instanceId);
+    if (instanceIdWide.empty())
+    {
+        return GB_SystemResult::Failed(GB_SystemErrorCode::EncodingConversionFailed, u8"GB_SystemDevice::DeviceExists", u8"设备实例 ID 从 UTF-8 转 UTF-16 失败。");
+    }
+
+    DEVINST deviceInstance = 0;
+    const CONFIGRET configResult = ::CM_Locate_DevNodeW(&deviceInstance, const_cast<DEVINSTID_W>(instanceIdWide.c_str()), CM_LOCATE_DEVNODE_NORMAL);
+    if (configResult == CR_SUCCESS)
+    {
+        exists = true;
+        return GB_SystemResult::Succeeded(u8"GB_SystemDevice::DeviceExists", u8"指定设备实例当前存在。");
+    }
+    if (IsConfigRetDeviceNotFound(configResult))
+    {
+        exists = false;
+        return GB_SystemResult::Succeeded(u8"GB_SystemDevice::DeviceExists", u8"指定设备实例当前不存在。");
+    }
+
+    return ConfigRetToResult(configResult, u8"GB_SystemDevice::DeviceExists", u8"CM_Locate_DevNodeW 检查设备实例失败。");
+#endif
 }
 
 GB_SystemResult GB_SystemDevice::GetDeviceInterfaces(std::vector<GB_SystemDeviceInterfaceInfo>& deviceInterfaces, const GB_SystemDeviceInterfaceQueryOptions& options)
@@ -1268,6 +1888,11 @@ GB_SystemResult GB_SystemDevice::GetDeviceInterfaces(std::vector<GB_SystemDevice
     (void)options;
     return GB_SystemResult::Failed(GB_SystemErrorCode::UnsupportedPlatform, u8"GB_SystemDevice::GetDeviceInterfaces", u8"当前平台不支持 Windows 设备接口枚举。");
 #else
+    if (ContainsNullCharacter(options.interfaceClassGuid) || ContainsNullCharacter(options.deviceInstanceId))
+    {
+        return GB_SystemResult::Failed(GB_SystemErrorCode::InvalidArgument, u8"GB_SystemDevice::GetDeviceInterfaces", u8"interfaceClassGuid 或 deviceInstanceId 不能包含内嵌空字符。");
+    }
+
     std::vector<GUID> interfaceClassGuids;
     if (!options.interfaceClassGuid.empty())
     {
@@ -1277,7 +1902,14 @@ GB_SystemResult GB_SystemDevice::GetDeviceInterfaces(std::vector<GB_SystemDevice
             return GB_SystemResult::Failed(GB_SystemErrorCode::InvalidArgument, u8"GB_SystemDevice::GetDeviceInterfaces", u8"interfaceClassGuid 不是有效的 GUID 字符串。");
         }
 
-        interfaceClassGuids.push_back(interfaceClassGuid);
+        try
+        {
+            interfaceClassGuids.push_back(interfaceClassGuid);
+        }
+        catch (...)
+        {
+            return GB_SystemResult::Failed(GB_SystemErrorCode::ResourceAllocationFailed, u8"GB_SystemDevice::GetDeviceInterfaces", u8"保存设备接口类 GUID 时内存不足。");
+        }
     }
     else if (options.enumerateAllInstalledInterfaceClasses)
     {
@@ -1292,8 +1924,12 @@ GB_SystemResult GB_SystemDevice::GetDeviceInterfaces(std::vector<GB_SystemDevice
         return GB_SystemResult::Failed(GB_SystemErrorCode::InvalidArgument, u8"GB_SystemDevice::GetDeviceInterfaces", u8"interfaceClassGuid 为空时必须启用 enumerateAllInstalledInterfaceClasses。");
     }
 
-    std::set<std::string> seenInterfacePaths;
+    std::unordered_set<std::string> seenInterfacePaths;
     std::vector<GB_SystemDeviceInterfaceInfo> collectedInterfaces;
+    if (!TryReserve(seenInterfacePaths, 1024) || !TryReserve(collectedInterfaces, 256))
+    {
+        return GB_SystemResult::Failed(GB_SystemErrorCode::ResourceAllocationFailed, u8"GB_SystemDevice::GetDeviceInterfaces", u8"初始化设备接口缓存时内存不足。");
+    }
     for (size_t index = 0; index < interfaceClassGuids.size(); index++)
     {
         GB_SystemResult result = EnumerateInterfacesForClassGuid(interfaceClassGuids[index], options, seenInterfacePaths, collectedInterfaces);
@@ -1320,7 +1956,7 @@ GB_SystemResult GB_SystemDevice::GetDeviceInterfacesByClassGuid(const std::strin
 class GB_SystemDeviceWatcher::Impl
 {
 public:
-    Impl() : typedDispatcher(GB_EventDispatcher::MakeQueuedOptions(1024, GB_EventQueueOverflowPolicy::DropOldest, u8"GB_SystemDeviceWatcher.Typed")), publicDispatcher(GB_EventDispatcher::MakeQueuedOptions(1024, GB_EventQueueOverflowPolicy::DropOldest, u8"GB_SystemDeviceWatcher.Public"))
+    Impl() : typedDispatcher(GB_EventDispatcher::MakeQueuedOptions(1024, GB_EventQueueOverflowPolicy::DropOldest, u8"GB_SystemDeviceWatcher.Typed")), publicDispatcher(GB_EventDispatcher::MakeQueuedOptions(1024, GB_EventQueueOverflowPolicy::DropOldest, u8"GB_SystemDeviceWatcher.Public")), acceptingNativeNotifications(false), activeNativeNotificationCount(0)
     {
         (void)typedDispatcher.SubscribeAll([this](const GB_Event& event)
             {
@@ -1359,6 +1995,8 @@ public:
             return result.WithOperationName(u8"GB_SystemDeviceWatcher::Start");
         }
 
+        EnableNativeNotifications();
+
 #if GB_SYSTEMDEVICE_HAS_CM_NOTIFICATION
         result = TryStartCmNotifications();
         if (result.IsSucceeded())
@@ -1373,6 +2011,8 @@ public:
         result = StartFallbackWindow();
         if (result.IsFailed())
         {
+            DisableNativeNotifications();
+            WaitNativeNotificationsFinished();
             (void)publicDispatcher.Stop(GB_EventDispatcherStopMode::Discard);
             (void)typedDispatcher.Stop(GB_EventDispatcherStopMode::Discard);
             return result.WithOperationName(u8"GB_SystemDeviceWatcher::Start");
@@ -1412,6 +2052,7 @@ public:
                 return GB_SystemResult::Succeeded(u8"GB_SystemDeviceWatcher::Stop", u8"系统设备监听器未启动。");
             }
 
+            DisableNativeNotifications();
             running = false;
             localWindowHandle = windowHandle;
             localThreadId = windowThreadId;
@@ -1428,12 +2069,14 @@ public:
 #if GB_SYSTEMDEVICE_HAS_CM_NOTIFICATION
         UnregisterCmNotifications(localCmNotificationHandles);
 #endif
+        WaitNativeNotificationsFinished();
 
-        if (localWindowHandle != nullptr)
+        bool stopMessagePosted = false;
+        if (localWindowHandle != nullptr && ::IsWindow(localWindowHandle))
         {
-            (void)::PostMessageW(localWindowHandle, WM_CLOSE, 0, 0);
+            stopMessagePosted = ::PostMessageW(localWindowHandle, WM_CLOSE, 0, 0) != FALSE;
         }
-        else if (localThreadId != 0)
+        if (!stopMessagePosted && localThreadId != 0)
         {
             (void)::PostThreadMessageW(localThreadId, WM_QUIT, 0, 0);
         }
@@ -1474,6 +2117,51 @@ public:
     }
 
 private:
+    void EnableNativeNotifications() noexcept
+    {
+        acceptingNativeNotifications.store(true, std::memory_order_release);
+    }
+
+    void DisableNativeNotifications() noexcept
+    {
+        acceptingNativeNotifications.store(false, std::memory_order_release);
+    }
+
+    bool TryEnterNativeNotification() noexcept
+    {
+        if (!acceptingNativeNotifications.load(std::memory_order_acquire))
+        {
+            return false;
+        }
+
+        activeNativeNotificationCount.fetch_add(1, std::memory_order_acq_rel);
+        if (!acceptingNativeNotifications.load(std::memory_order_acquire))
+        {
+            LeaveNativeNotification();
+            return false;
+        }
+
+        return true;
+    }
+
+    void LeaveNativeNotification() noexcept
+    {
+        if (activeNativeNotificationCount.fetch_sub(1, std::memory_order_acq_rel) == 1)
+        {
+            std::lock_guard<std::mutex> lock(notificationMutex);
+            notificationCondition.notify_all();
+        }
+    }
+
+    void WaitNativeNotificationsFinished()
+    {
+        std::unique_lock<std::mutex> lock(notificationMutex);
+        notificationCondition.wait(lock, [this]()
+            {
+                return activeNativeNotificationCount.load(std::memory_order_acquire) == 0;
+            });
+    }
+
     void DispatchTypedCallback(const GB_Event& event)
     {
         const GB_SystemDeviceEvent* deviceEvent = event.payload.AnyCast<GB_SystemDeviceEvent>();
@@ -1513,6 +2201,14 @@ private:
         }
 
         std::vector<HCMNOTIFICATION> registeredHandles;
+        try
+        {
+            registeredHandles.reserve(2);
+        }
+        catch (...)
+        {
+            return GB_SystemResult::Failed(GB_SystemErrorCode::ResourceAllocationFailed, u8"GB_SystemDeviceWatcher::Start", u8"分配设备通知句柄缓存失败。");
+        }
 
         CM_NOTIFY_FILTER deviceInstanceFilter = {};
         deviceInstanceFilter.cbSize = sizeof(deviceInstanceFilter);
@@ -1526,7 +2222,19 @@ private:
         {
             return ConfigRetToResult(configResult, u8"GB_SystemDeviceWatcher::Start", u8"CM_Register_Notification 注册全部设备实例事件失败。");
         }
-        registeredHandles.push_back(deviceInstanceNotification);
+        try
+        {
+            registeredHandles.push_back(deviceInstanceNotification);
+        }
+        catch (...)
+        {
+            CmUnregisterNotificationFunc unregisterNotificationFunc = GetCmUnregisterNotificationFunc();
+            if (unregisterNotificationFunc != nullptr)
+            {
+                (void)unregisterNotificationFunc(deviceInstanceNotification);
+            }
+            return GB_SystemResult::Failed(GB_SystemErrorCode::ResourceAllocationFailed, u8"GB_SystemDeviceWatcher::Start", u8"保存设备实例通知句柄时内存不足。");
+        }
 
         CM_NOTIFY_FILTER deviceInterfaceFilter = {};
         deviceInterfaceFilter.cbSize = sizeof(deviceInterfaceFilter);
@@ -1540,7 +2248,20 @@ private:
             UnregisterCmNotifications(registeredHandles);
             return ConfigRetToResult(configResult, u8"GB_SystemDeviceWatcher::Start", u8"CM_Register_Notification 注册全部设备接口事件失败。");
         }
-        registeredHandles.push_back(deviceInterfaceNotification);
+        try
+        {
+            registeredHandles.push_back(deviceInterfaceNotification);
+        }
+        catch (...)
+        {
+            CmUnregisterNotificationFunc unregisterNotificationFunc = GetCmUnregisterNotificationFunc();
+            if (unregisterNotificationFunc != nullptr)
+            {
+                (void)unregisterNotificationFunc(deviceInterfaceNotification);
+            }
+            UnregisterCmNotifications(registeredHandles);
+            return GB_SystemResult::Failed(GB_SystemErrorCode::ResourceAllocationFailed, u8"GB_SystemDeviceWatcher::Start", u8"保存设备接口通知句柄时内存不足。");
+        }
 
         {
             std::lock_guard<std::mutex> lock(stateMutex);
@@ -1580,7 +2301,19 @@ private:
             return ERROR_SUCCESS;
         }
 
-        impl->HandleCmNotification(action, eventData);
+        if (!impl->TryEnterNativeNotification())
+        {
+            return ERROR_SUCCESS;
+        }
+
+        try
+        {
+            impl->HandleCmNotification(action, eventData);
+        }
+        catch (...)
+        {
+        }
+        impl->LeaveNativeNotification();
         return ERROR_SUCCESS;
     }
 
@@ -1721,7 +2454,16 @@ private:
             return GB_SystemResult::FromLastWin32Error(u8"GB_SystemDeviceWatcher::Start", u8"RegisterDeviceNotificationW 注册全部设备接口通知失败。");
         }
 
-        deviceNotifyHandles.push_back(notifyHandle);
+        try
+        {
+            deviceNotifyHandles.push_back(notifyHandle);
+        }
+        catch (...)
+        {
+            (void)::UnregisterDeviceNotification(notifyHandle);
+            return GB_SystemResult::Failed(GB_SystemErrorCode::ResourceAllocationFailed, u8"GB_SystemDeviceWatcher::Start", u8"保存设备通知句柄时内存不足。");
+        }
+
         return GB_SystemResult::Succeeded(u8"GB_SystemDeviceWatcher::Start", u8"RegisterDeviceNotificationW 注册完成。");
     }
 
@@ -1847,7 +2589,18 @@ private:
         switch (message)
         {
         case WM_DEVICECHANGE:
-            HandleDeviceChange(message, wParam, lParam);
+            if (!TryEnterNativeNotification())
+            {
+                return TRUE;
+            }
+            try
+            {
+                HandleDeviceChange(message, wParam, lParam);
+            }
+            catch (...)
+            {
+            }
+            LeaveNativeNotification();
             return TRUE;
         case WM_CLOSE:
             UnregisterFallbackNotifications();
@@ -1919,12 +2672,18 @@ private:
         return event;
     }
 
-    void PublishEvent(const GB_SystemDeviceEvent& deviceEvent)
+    void PublishEvent(const GB_SystemDeviceEvent& deviceEvent) noexcept
     {
-        GB_Event typedEvent(deviceEvent.eventName, GB_Variant(deviceEvent), deviceEvent.sourceName.empty() ? u8"GB_SystemDeviceWatcher" : deviceEvent.sourceName);
-        typedEvent.timestampMilliseconds = deviceEvent.timestampMilliseconds;
-        (void)typedDispatcher.Post(typedEvent);
-        (void)publicDispatcher.Post(BuildPublicEvent(deviceEvent));
+        try
+        {
+            GB_Event typedEvent(deviceEvent.eventName, GB_Variant(deviceEvent), deviceEvent.sourceName.empty() ? u8"GB_SystemDeviceWatcher" : deviceEvent.sourceName);
+            typedEvent.timestampMilliseconds = deviceEvent.timestampMilliseconds;
+            (void)typedDispatcher.Post(typedEvent);
+            (void)publicDispatcher.Post(BuildPublicEvent(deviceEvent));
+        }
+        catch (...)
+        {
+        }
     }
 #endif
 
@@ -1932,7 +2691,11 @@ private:
     mutable std::mutex operationMutex;
     mutable std::mutex stateMutex;
     mutable std::mutex callbackMutex;
+    mutable std::mutex notificationMutex;
     std::condition_variable startCondition;
+    std::condition_variable notificationCondition;
+    std::atomic<bool> acceptingNativeNotifications;
+    std::atomic<size_t> activeNativeNotificationCount;
     std::thread windowThread;
     bool running = false;
     bool startCompleted = false;
@@ -1959,6 +2722,10 @@ GB_SystemDeviceWatcher::GB_SystemDeviceWatcher() : impl(new Impl())
 
 GB_SystemDeviceWatcher::~GB_SystemDeviceWatcher() noexcept
 {
+    if (impl)
+    {
+        (void)impl->Stop();
+    }
 }
 
 GB_SystemResult GB_SystemDeviceWatcher::Start()

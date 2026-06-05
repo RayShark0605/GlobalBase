@@ -48,6 +48,8 @@ enum class GB_SystemDeviceKind : uint16_t
  * - classGuid 使用 Windows GUID 字符串形式，例如 "{4D36E972-E325-11CE-BFC1-08002BE10318}"，比较时不区分大小写；
  * - enumeratorName 是 PnP 枚举器名，例如 "USB"、"PCI"、"BTH"；
  * - deviceKind 为 Unknown 时不按粗分类过滤；
+ * - usbConnectedOnly=true 时只返回通过 USB/USBSTOR 枚举器暴露的设备；
+ * - bluetoothConnectedOnly=true 时只返回通过 BTH/BTHLE/Bluetooth 枚举器暴露的设备；
  * - readDriverInfo=true 会额外读取驱动提供商、版本和日期，成本略高，默认关闭。
  */
 struct GB_SystemDeviceQueryOptions
@@ -56,6 +58,8 @@ struct GB_SystemDeviceQueryOptions
     std::string classGuid = "";
     std::string enumeratorName = "";
     GB_SystemDeviceKind deviceKind = GB_SystemDeviceKind::Unknown;
+    bool usbConnectedOnly = false;
+    bool bluetoothConnectedOnly = false;
     bool readDriverInfo = false;
 };
 
@@ -87,7 +91,8 @@ struct GB_SystemDeviceInterfaceQueryOptions
  * - hardwareIds / compatibleIds 可能为空，取决于设备和驱动提供的信息；
  * - devNodeStatus / problemCode 保存 Windows 原生状态位和问题码，便于上层做更精细诊断；
  * - removalPolicy 保存 CM_REMOVAL_POLICY_xxx 原始值，0 表示未能读取；
- * - capabilities 保存 CM_DEVCAP_xxx 位集合，0 表示未能读取或设备未报告能力。
+ * - capabilities 保存 CM_DEVCAP_xxx 位集合，0 表示未能读取或设备未报告能力；
+ * - isUsbConnected / isBluetoothConnected 表达连接通道，deviceKind 表达主要功能类别，二者不互相替代。
  */
 struct GB_SystemDeviceInfo
 {
@@ -115,6 +120,8 @@ struct GB_SystemDeviceInfo
     bool isStarted = false;
     bool hasProblem = false;
     bool isDisabled = false;
+    bool isUsbConnected = false;
+    bool isBluetoothConnected = false;
     bool isRemovable = false;
     GB_SystemDeviceKind deviceKind = GB_SystemDeviceKind::Unknown;
 };
