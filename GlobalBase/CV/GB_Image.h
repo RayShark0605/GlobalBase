@@ -1006,6 +1006,17 @@ public:
     bool ConvertColorInPlace(GB_ImageColorConversion conversion);
 
     /**
+     * @brief 转换为 8 位直 Alpha BGRA 图像。
+     *
+     * 说明：
+     * - 支持当前模块可识别的 Gray、Gray+Alpha、BGR、BGRA、RGB、RGBA 图像；
+     * - 非 8 位输入会沿用 ConvertTo(UInt8) 的数值转换语义；
+     * - 已经是 8 位 BGRA 的连续或非连续图像仍返回独立的 GB_Image 值对象，底层像素可按引用计数共享；
+     * - 转换失败或源图像为空时返回空图像。
+     */
+    GB_Image ConvertToBgra8() const;
+
+    /**
      * @brief 在当前图像中查找模板图像。
      *
      * @param templateImage 要查找的小图像。

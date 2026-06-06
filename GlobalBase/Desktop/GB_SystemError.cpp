@@ -596,6 +596,7 @@ bool GB_SystemError::IsValidErrorCodeValue(const uint64_t errorCodeValue)
     case static_cast<uint64_t>(GB_SystemErrorCode::ParseFailed):
     case static_cast<uint64_t>(GB_SystemErrorCode::InternalError):
     case static_cast<uint64_t>(GB_SystemErrorCode::UnknownError):
+    case static_cast<uint64_t>(GB_SystemErrorCode::ResourceBusy):
         return true;
 
     default:
@@ -670,6 +671,8 @@ std::string GB_SystemError::GetErrorCodeName(const GB_SystemErrorCode errorCode)
         return u8"InternalError";
     case GB_SystemErrorCode::UnknownError:
         return u8"UnknownError";
+    case GB_SystemErrorCode::ResourceBusy:
+        return u8"ResourceBusy";
     }
 
     return u8"UnknownError";
@@ -719,6 +722,8 @@ std::string GB_SystemError::GetErrorCodeDescription(const GB_SystemErrorCode err
         return u8"内部逻辑错误。";
     case GB_SystemErrorCode::UnknownError:
         return u8"未知错误。";
+    case GB_SystemErrorCode::ResourceBusy:
+        return u8"目标资源当前正被其他操作占用。";
     }
 
     return u8"未知错误。";
@@ -1145,12 +1150,14 @@ GB_SystemErrorCode GB_SystemError::GuessErrorCodeFromWin32ErrorCode(const uint32
     case 1113:  // ERROR_NO_UNICODE_TRANSLATION
         return GB_SystemErrorCode::EncodingConversionFailed;
 
-    case 21:    // ERROR_NOT_READY
-    case 31:    // ERROR_GEN_FAILURE
     case 170:   // ERROR_BUSY
     case 231:   // ERROR_PIPE_BUSY
     case 32:    // ERROR_SHARING_VIOLATION
     case 33:    // ERROR_LOCK_VIOLATION
+        return GB_SystemErrorCode::ResourceBusy;
+
+    case 21:    // ERROR_NOT_READY
+    case 31:    // ERROR_GEN_FAILURE
     case 1051:  // ERROR_DEPENDENT_SERVICES_RUNNING
     case 1056:  // ERROR_SERVICE_ALREADY_RUNNING
     case 1058:  // ERROR_SERVICE_DISABLED

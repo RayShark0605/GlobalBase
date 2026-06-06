@@ -5131,6 +5131,29 @@ bool GB_Image::ConvertColorInPlace(GB_ImageColorConversion conversion)
     return true;
 }
 
+/**
+ * @brief 转换为 8 位直 Alpha BGRA 图像。
+ */
+GB_Image GB_Image::ConvertToBgra8() const
+{
+    GBImage_Internal::EnsureOpenCvErrorLogOnly();
+    GB_Image resultImage;
+    if (IsEmpty())
+    {
+        return resultImage;
+    }
+
+    cv::Mat straightBgraImage;
+    if (!GBImage_Internal::TryConvertImageMatToStraightBgra(imageImpl->imageMat, imageImpl->channelLayout, straightBgraImage))
+    {
+        return resultImage;
+    }
+
+    resultImage.imageImpl->imageMat = std::move(straightBgraImage);
+    resultImage.imageImpl->channelLayout = GBImage_Internal::ImageChannelLayout::Bgra;
+    return resultImage;
+}
+
 
 /**
  * @brief 在当前图像中查找模板图像。

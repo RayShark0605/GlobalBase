@@ -511,6 +511,9 @@ int32_t GB_SystemResult::ErrorCodeToHResult(const GB_SystemErrorCode errorCode)
     case GB_SystemErrorCode::ParseFailed:
         return GB_SystemError::Win32ErrorCodeToHResult(13u); // ERROR_INVALID_DATA
 
+    case GB_SystemErrorCode::ResourceBusy:
+        return GB_SystemError::Win32ErrorCodeToHResult(170u); // ERROR_BUSY
+
     case GB_SystemErrorCode::InternalError:
         return MakeHResult(0x8000FFFFu); // E_UNEXPECTED
 

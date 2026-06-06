@@ -80,7 +80,10 @@ enum class GB_SystemErrorCode : uint16_t
     InternalError = 18,
 
     /** @brief 未知错误。 */
-    UnknownError = 19
+    UnknownError = 19,
+
+    /** @brief 目标资源当前正被其他操作占用，调用方可在有限等待后重试。 */
+    ResourceBusy = 20
 };
 
 /**

@@ -165,6 +165,9 @@
     <ClInclude Include="Desktop\GB_Screen.h">
       <Filter>头文件\Desktop\Automation</Filter>
     </ClInclude>
+    <ClInclude Include="Desktop\GB_SystemClipboard.h">
+      <Filter>头文件\Desktop\System</Filter>
+    </ClInclude>
     <ClInclude Include="Desktop\GB_SystemError.h">
       <Filter>头文件\Desktop</Filter>
     </ClInclude>
@@ -304,6 +307,9 @@
     </ClCompile>
     <ClCompile Include="Desktop\GB_Screen.cpp">
       <Filter>源文件\Desktop\Automation</Filter>
+    </ClCompile>
+    <ClCompile Include="Desktop\GB_SystemClipboard.cpp">
+      <Filter>源文件\Desktop\System</Filter>
     </ClCompile>
     <ClCompile Include="Desktop\GB_SystemError.cpp">
       <Filter>源文件\Desktop</Filter>

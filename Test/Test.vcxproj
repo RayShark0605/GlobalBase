@@ -19,6 +19,7 @@
     </ProjectConfiguration>
   </ItemGroup>
   <ItemGroup>
+    <ClCompile Include="GB_SystemClipboard_Test.cpp" />
     <ClCompile Include="GB_SystemDevice_Test.cpp" />
     <ClCompile Include="GB_Utf8String_Test.cpp" />
     <ClCompile Include="main.cpp" />
