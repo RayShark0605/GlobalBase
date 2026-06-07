@@ -6460,3 +6460,87 @@ std::string GB_UrlOperator::ReplaceUrlPathParams(const std::string& urlUtf8, con
 
     return prefix + newPath + suffix;
 }
+
+static bool IsTokenLikeUrlQueryKeyInternal(const std::string& keyUtf8, const std::vector<std::string>& extraKeys, bool keyCaseSensitive)
+{
+    const static std::vector<std::string> kDefaultTokenLikeUrlQueryKeysVec =
+    {
+        "tk",
+        "token",
+        "access_token",
+        "accessToken",
+        "key",
+        "ak",
+        "api_key",
+        "apiKey",
+        "apikey",
+        "api-key",
+        "x-api-key",
+        "app_key",
+        "appKey",
+        "appkey",
+        "app-key",
+        "auth_key",
+        "authKey",
+        "authkey",
+        "auth-key",
+        "auth_token",
+        "authToken",
+        "authtoken",
+        "auth-token",
+        "access_key",
+        "accessKey",
+        "accesskey",
+        "access-key",
+        "client_key",
+        "clientKey",
+        "clientkey",
+        "client-key",
+        "service_key",
+        "serviceKey",
+        "servicekey",
+        "service-key",
+        "authorization",
+        "auth"
+    };
+
+    for (size_t i = 0; i < kDefaultTokenLikeUrlQueryKeysVec.size(); i++)
+    {
+        if (AreUrlKeysEqual(keyUtf8, kDefaultTokenLikeUrlQueryKeysVec[i], keyCaseSensitive))
+        {
+            return true;
+        }
+	}
+
+    for (size_t i = 0; i < extraKeys.size(); i++)
+    {
+        if (AreUrlKeysEqual(keyUtf8, extraKeys[i], keyCaseSensitive))
+        {
+            return true;
+        }
+	}
+
+    return false;
+}
+
+std::vector<GB_UrlOperator::UrlKeyValue> GB_UrlOperator::ExtractTokenLikeUrlQueryKvp(const std::string& urlUtf8, const std::vector<std::string>& extraKeys, bool keyCaseSensitive)
+{
+    const std::vector<GB_UrlOperator::UrlKeyValue> kvps = GB_UrlOperator::ParseUrlQueryKvp(urlUtf8);
+
+    std::vector<GB_UrlOperator::UrlKeyValue> result;
+    result.reserve(kvps.size());
+    for (size_t i = 0; i < kvps.size(); i++)
+    {
+        const GB_UrlOperator::UrlKeyValue& kvp = kvps[i];
+        if (kvp.keyUtf8.empty() || kvp.valueUtf8.empty())
+        {
+            continue;
+        }
+
+        if (IsTokenLikeUrlQueryKeyInternal(kvp.keyUtf8, extraKeys, keyCaseSensitive))
+        {
+            result.push_back(kvp);
+        }
+    }
+    return result;
+}

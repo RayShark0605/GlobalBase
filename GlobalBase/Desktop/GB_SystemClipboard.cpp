@@ -27,6 +27,9 @@
 
 namespace
 {
+    const size_t GB_ClipboardMaximumInternalTextStorageBytes = static_cast<size_t>(512) * 1024 * 1024;
+    const uint32_t GB_ClipboardMaximumRetryCount = 1000;
+
     static const char* const GB_ClipboardOperationClear = "GB_SystemClipboard::Clear";
     static const char* const GB_ClipboardOperationIsFormatAvailable = "GB_SystemClipboard::IsFormatAvailable";
     static const char* const GB_ClipboardOperationHasText = "GB_SystemClipboard::HasText";
@@ -51,6 +54,15 @@ namespace
     static bool HasEmbeddedNull(const std::string& text)
     {
         return text.find('\0') != std::string::npos;
+    }
+
+    static GB_SystemResult ValidateClipboardAccessOptions(const GB_SystemClipboardAccessOptions& options, const std::string& operationName)
+    {
+        if (options.retryCount > GB_ClipboardMaximumRetryCount)
+        {
+            return GB_SystemResult::Failed(GB_SystemErrorCode::InvalidArgument, operationName, "剪贴板重试次数超过允许上限。");
+        }
+        return GB_SystemResult::Succeeded(operationName);
     }
 
     static bool CheckedAddSize(size_t leftValue, size_t rightValue, size_t& result)
@@ -291,6 +303,12 @@ namespace
             if (isOpened)
             {
                 return GB_SystemResult::Succeeded(operationName);
+            }
+
+            const GB_SystemResult validationResult = ValidateClipboardAccessOptions(options, operationName);
+            if (validationResult.IsFailed())
+            {
+                return validationResult;
             }
 
             DWORD lastErrorCode = ERROR_SUCCESS;
@@ -1653,9 +1671,9 @@ GB_SystemResult GB_SystemClipboard::GetText(std::string& text, const GB_SystemCl
     {
         return GB_SystemResult::Failed(GB_SystemErrorCode::ParseFailed, GB_ClipboardOperationGetText, "剪贴板 Unicode 文本内存块大小不是合法 UTF-16 字节数。");
     }
-    if (globalSize > options.maxTextBytes)
+    if (globalSize > GB_ClipboardMaximumInternalTextStorageBytes)
     {
-        return GB_SystemResult::Failed(GB_SystemErrorCode::InvalidArgument, GB_ClipboardOperationGetText, "剪贴板文本超过读取上限。");
+        return GB_SystemResult::Failed(GB_SystemErrorCode::ResourceAllocationFailed, GB_ClipboardOperationGetText, "剪贴板 Unicode 文本内部存储超过模块安全上限。");
     }
 
     GB_GlobalLockScope lockScope(textHandle);
@@ -1749,7 +1767,7 @@ GB_SystemResult GB_SystemClipboard::SetText(const std::string& text, const GB_Sy
     std::wstring textWide;
     if (!Utf8ToWide(*textForConversion, textWide))
     {
-        return GB_SystemResult::Failed(GB_SystemErrorCode::EncodingConversionFailed, GB_ClipboardOperationSetText, "输入文本不是有效 UTF-8 字符串。");
+        return GB_SystemResult::Failed(GB_SystemErrorCode::InvalidArgument, GB_ClipboardOperationSetText, "输入文本不是有效 UTF-8 字符串。");
     }
 
     size_t wideCharacterCountWithNull = 0;
@@ -1758,9 +1776,9 @@ GB_SystemResult GB_SystemClipboard::SetText(const std::string& text, const GB_Sy
         return GB_SystemResult::Failed(GB_SystemErrorCode::InvalidArgument, GB_ClipboardOperationSetText, "文本过长。");
     }
     size_t byteSize = 0;
-    if (!CheckedMultiplySize(wideCharacterCountWithNull, sizeof(wchar_t), byteSize) || byteSize > options.maxTextBytes)
+    if (!CheckedMultiplySize(wideCharacterCountWithNull, sizeof(wchar_t), byteSize) || byteSize > GB_ClipboardMaximumInternalTextStorageBytes)
     {
-        return GB_SystemResult::Failed(GB_SystemErrorCode::InvalidArgument, GB_ClipboardOperationSetText, "文本转换为 UTF-16 后超过写入上限。");
+        return GB_SystemResult::Failed(GB_SystemErrorCode::ResourceAllocationFailed, GB_ClipboardOperationSetText, "文本转换后的 UTF-16 内部存储超过模块安全上限。");
     }
 
     GB_GlobalMemoryHandle memoryHandle(::GlobalAlloc(GMEM_MOVEABLE | GMEM_ZEROINIT, byteSize));
@@ -2308,6 +2326,15 @@ public:
     GB_SystemResult Start()
     {
 #ifdef _WIN32
+        if (options.includeFormats)
+        {
+            const GB_SystemResult validationResult = ValidateClipboardAccessOptions(options.formatAccessOptions, GB_ClipboardOperationWatcherStart);
+            if (validationResult.IsFailed())
+            {
+                return validationResult;
+            }
+        }
+
         std::unique_lock<std::mutex> lock(stateMutex);
         if (running)
         {

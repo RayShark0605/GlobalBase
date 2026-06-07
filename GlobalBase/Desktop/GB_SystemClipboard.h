@@ -69,7 +69,7 @@ struct GB_SystemClipboardAccessOptions
  * @remarks
  * - 读取接口优先读取 CF_UNICODETEXT，并将 UTF-16 转换为 UTF-8 输出。
  * - 读取成功前不会修改调用方传入的输出字符串。
- * - maxTextBytes 会同时约束剪贴板原始 UTF-16 内存块规模和转换后的 UTF-8 文本规模。
+ * - maxTextBytes 约束最终 UTF-8 文本规模，不把内部 UTF-16 存储和终止 NUL 计入调用方配额。
  */
 struct GB_SystemClipboardTextReadOptions
 {
@@ -102,7 +102,7 @@ struct GB_SystemClipboardTextWriteOptions
     /** @brief 是否允许写入空字符串；false 时空字符串会返回 InvalidArgument。 */
     bool allowEmptyText = true;
 
-    /** @brief 允许写入的最大文本字节数；会检查输入 UTF-8、规范化后文本以及转换后的 UTF-16 数据规模。 */
+    /** @brief 允许写入的最大 UTF-8 文本字节数；不包含内部 UTF-16 存储和终止 NUL。 */
     size_t maxTextBytes = static_cast<size_t>(256) * 1024 * 1024;
 };
 

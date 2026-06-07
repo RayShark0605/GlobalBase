@@ -352,6 +352,13 @@ namespace
             return closeResult != FALSE ? MakeCloseSucceededResult(closeMethod, resourceName, std::string()) : MakeCloseFailedResultFromLastError(closeMethod, resourceName, u8"UnhookWindowsHookEx 调用失败。");
         }
 
+        case GB_WinHandleCloseMethod::UnhookWinEvent:
+        {
+            ::SetLastError(ERROR_SUCCESS);
+            const BOOL closeResult = ::UnhookWinEvent(static_cast<HWINEVENTHOOK>(handle));
+            return closeResult != FALSE ? MakeCloseSucceededResult(closeMethod, resourceName, std::string()) : MakeCloseFailedResultFromLastError(closeMethod, resourceName, u8"UnhookWinEvent 调用失败。");
+        }
+
         case GB_WinHandleCloseMethod::UnmapViewOfFile:
         {
             ::SetLastError(ERROR_SUCCESS);
@@ -443,6 +450,10 @@ namespace
 
         case GB_WinHandleCloseMethod::UnhookWindowsHookEx:
             (void)::UnhookWindowsHookEx(static_cast<HHOOK>(handle));
+            return;
+
+        case GB_WinHandleCloseMethod::UnhookWinEvent:
+            (void)::UnhookWinEvent(static_cast<HWINEVENTHOOK>(handle));
             return;
 
         case GB_WinHandleCloseMethod::UnmapViewOfFile:
@@ -601,6 +612,11 @@ GB_WinHandleScope GB_WinHandleScope::FromCursor(NativeHandle handle, const std::
 GB_WinHandleScope GB_WinHandleScope::FromHook(NativeHandle handle, const std::string& resourceName)
 {
     return GB_WinHandleScope(handle, GB_WinHandleCloseMethod::UnhookWindowsHookEx, nullptr, resourceName);
+}
+
+GB_WinHandleScope GB_WinHandleScope::FromWinEventHook(NativeHandle handle, const std::string& resourceName)
+{
+    return GB_WinHandleScope(handle, GB_WinHandleCloseMethod::UnhookWinEvent, nullptr, resourceName);
 }
 
 GB_WinHandleScope GB_WinHandleScope::FromMappedView(NativeHandle handle, const std::string& resourceName)
@@ -776,6 +792,7 @@ bool GB_WinHandleScope::IsValidCloseMethodValue(const uint64_t closeMethodValue)
     case static_cast<uint64_t>(GB_WinHandleCloseMethod::DestroyIcon):
     case static_cast<uint64_t>(GB_WinHandleCloseMethod::DestroyCursor):
     case static_cast<uint64_t>(GB_WinHandleCloseMethod::UnhookWindowsHookEx):
+    case static_cast<uint64_t>(GB_WinHandleCloseMethod::UnhookWinEvent):
     case static_cast<uint64_t>(GB_WinHandleCloseMethod::UnmapViewOfFile):
     case static_cast<uint64_t>(GB_WinHandleCloseMethod::CoTaskMemFree):
         return true;
@@ -912,6 +929,9 @@ std::string GB_WinHandleScope::GetCloseMethodName(const GB_WinHandleCloseMethod 
     case GB_WinHandleCloseMethod::UnhookWindowsHookEx:
         return u8"UnhookWindowsHookEx";
 
+    case GB_WinHandleCloseMethod::UnhookWinEvent:
+        return u8"UnhookWinEvent";
+
     case GB_WinHandleCloseMethod::UnmapViewOfFile:
         return u8"UnmapViewOfFile";
 
@@ -984,6 +1004,9 @@ std::string GB_WinHandleScope::GetCloseMethodDescription(const GB_WinHandleClose
 
     case GB_WinHandleCloseMethod::UnhookWindowsHookEx:
         return u8"使用 UnhookWindowsHookEx 卸载 Windows Hook。";
+
+    case GB_WinHandleCloseMethod::UnhookWinEvent:
+        return u8"使用 UnhookWinEvent 卸载辅助功能 WinEvent Hook。";
 
     case GB_WinHandleCloseMethod::UnmapViewOfFile:
         return u8"使用 UnmapViewOfFile 解除文件映射视图。";

@@ -468,6 +468,18 @@ public:
      * @param keyCaseSensitive key 是否大小写敏感（仅对 ASCII 字母进行不敏感比较）。默认 false。
      */
     static std::string ReplaceUrlPathParams(const std::string& urlUtf8, const std::vector<UrlKeyValue>& params, bool encodeValue = true, bool keyCaseSensitive = false);
+
+    /**
+     * @brief 从 URL query 中提取“类似 token / API key / 鉴权凭证”的 key-value 列表。
+     *
+     * @remarks
+     * - 返回项会保留 URL 中的原始 key 写法（例如 tk、apiKey、access_token），便于后续原样透传。
+     * - 默认忽略 value 为空的项。
+     * - 如果服务使用签名参数（如 sig/signature/timestamp/nonce），建议调用方通过 extraKeys 显式指定需要透传的参数。
+     */
+    static std::vector<UrlKeyValue> ExtractTokenLikeUrlQueryKvp(const std::string& urlUtf8, const std::vector<std::string>& extraKeys = std::vector<std::string>(), bool keyCaseSensitive = false);
+
+
 };
 
 #endif

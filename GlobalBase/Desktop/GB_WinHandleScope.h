@@ -78,7 +78,10 @@ enum class GB_WinHandleCloseMethod : uint16_t
     UnmapViewOfFile = 17,
 
     /** @brief 使用 CoTaskMemFree 释放 COM 任务内存。 */
-    CoTaskMemFree = 18
+    CoTaskMemFree = 18,
+
+    /** @brief 使用 UnhookWinEvent 卸载辅助功能 WinEvent Hook。 */
+    UnhookWinEvent = 19
 };
 
 /**
@@ -190,6 +193,9 @@ public:
 
     /** @brief 创建使用 UnhookWindowsHookEx 卸载的 Hook 句柄对象。 */
     static GB_WinHandleScope FromHook(NativeHandle handle, const std::string& resourceName = std::string());
+
+    /** @brief 创建使用 UnhookWinEvent 卸载的辅助功能 WinEvent Hook 句柄对象。 */
+    static GB_WinHandleScope FromWinEventHook(NativeHandle handle, const std::string& resourceName = std::string());
 
     /** @brief 创建使用 UnmapViewOfFile 解除映射的文件映射视图对象。 */
     static GB_WinHandleScope FromMappedView(NativeHandle handle, const std::string& resourceName = std::string());

@@ -1,15 +1,20 @@
 #include "GB_RunTests.h"
 
 #include <iostream>
+#include <string>
 
 int main(int argc, char* argv[])
 {
-    (void)argc;
-    (void)argv;
+    if (argc == 2 && argv != nullptr && argv[1] != nullptr && std::string(argv[1]) == "--gb-system-clipboard-isolated-child")
+    {
+        return RunGB_SystemClipboardIsolatedTests();
+    }
 
     int failedCount = 0;
     failedCount += RunGB_Utf8StringTests();
     failedCount += RunGB_SystemDeviceTests();
+    failedCount += RunGB_SystemClipboardTests();
+    failedCount += RunGB_SystemWindowTests();
 
     if (failedCount != 0)
     {
