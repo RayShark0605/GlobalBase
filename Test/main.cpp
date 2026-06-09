@@ -5,6 +5,13 @@
 
 int main(int argc, char* argv[])
 {
+    bool systemProcessChildHandled = false;
+    const int systemProcessChildExitCode = RunGB_SystemProcessChildMode(argc, argv, systemProcessChildHandled);
+    if (systemProcessChildHandled)
+    {
+        return systemProcessChildExitCode;
+    }
+
     if (argc == 2 && argv != nullptr && argv[1] != nullptr && std::string(argv[1]) == "--gb-system-clipboard-isolated-child")
     {
         return RunGB_SystemClipboardIsolatedTests();
@@ -15,6 +22,7 @@ int main(int argc, char* argv[])
     failedCount += RunGB_SystemDeviceTests();
     failedCount += RunGB_SystemClipboardTests();
     failedCount += RunGB_SystemWindowTests();
+    failedCount += RunGB_SystemProcessTests();
 
     if (failedCount != 0)
     {

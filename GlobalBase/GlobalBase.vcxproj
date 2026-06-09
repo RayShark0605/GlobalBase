@@ -31,6 +31,7 @@
     <ClInclude Include="Desktop\GB_SystemClipboard.h" />
     <ClInclude Include="Desktop\GB_SystemDevice.h" />
     <ClInclude Include="Desktop\GB_SystemError.h" />
+    <ClInclude Include="Desktop\GB_SystemProcess.h" />
     <ClInclude Include="Desktop\GB_SystemResult.h" />
     <ClInclude Include="Desktop\GB_SystemShell.h" />
     <ClInclude Include="Desktop\GB_SystemWindow.h" />
@@ -84,6 +85,7 @@
     <ClCompile Include="Desktop\GB_SystemClipboard.cpp" />
     <ClCompile Include="Desktop\GB_SystemDevice.cpp" />
     <ClCompile Include="Desktop\GB_SystemError.cpp" />
+    <ClCompile Include="Desktop\GB_SystemProcess.cpp" />
     <ClCompile Include="Desktop\GB_SystemResult.cpp" />
     <ClCompile Include="Desktop\GB_SystemShell.cpp" />
     <ClCompile Include="Desktop\GB_SystemWindow.cpp" />

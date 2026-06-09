@@ -2,6 +2,7 @@
 #define GLOBALBASE_PROCESS_H_H
 
 #include "GlobalBasePort.h"
+#include "Desktop/GB_SystemProcess.h"
 #include <string>
 #include <vector>
 
@@ -41,63 +42,6 @@ GLOBALBASE_PORT bool GB_EnsureRunningAsAdmin();
  * - 退出码在不同平台上的可观察范围可能存在差异：例如 POSIX 父进程通常只能观察到低 8 位。
  */
 GLOBALBASE_PORT void GB_ExitCurrentProcess(int exitCode = 0);
-
-/**
- * @brief 进程信息。
- *
- * @remarks
- * - 所有字符串均为 UTF-8 编码。
- * - 由于权限、系统限制或进程瞬时退出等原因，部分字段可能无法获取；
- *   此时对应 hasXXX 标记为 false（或保持默认值）。
- * - Linux 下多数信息来自 /proc，受 ptrace 访问控制影响，某些字段可能读取不到或显示为 0。
- */
-struct GB_ProcessInfo
-{
-    // --- 基本标识 ---
-    int processId = 0;                 // PID
-    int parentProcessId = 0;           // PPID
-
-    // --- 名称/路径/命令行/用户 ---
-    std::string processNameUtf8 = "";       // 进程名（Windows: EXE 文件名；Linux: /proc/[pid]/comm）
-    std::string executablePathUtf8 = "";    // 可执行文件完整路径
-    bool hasExecutablePath = false;
-
-    std::string commandLineUtf8 = "";       // 命令行（Windows 仅保证当前进程可靠获取）
-    bool hasCommandLine = false;
-
-    std::string userNameUtf8 = "";          // 用户名（Windows: Domain\User；Linux: pw_name）
-    bool hasUserName = false;
-
-    std::string workingDirectoryUtf8 = "";  // 当前工作目录（Windows 仅保证当前进程可靠获取）
-    bool hasWorkingDirectory = false;
-
-    // --- 运行态属性 ---
-    bool is64Bit = false;
-    bool isElevated = false;
-
-    std::string stateUtf8;             // Linux: R/S/D/Z/T/I 等
-
-    unsigned int threadCount = 0;
-    unsigned int handleCount = 0;      // Windows: GetProcessHandleCount
-
-    unsigned int priorityClass = 0;    // Windows: priority class（GetPriorityClass）
-    int niceValue = 0;                 // Linux: nice
-
-    // --- 时间 ---
-    double cpuUserSeconds = 0;
-    double cpuKernelSeconds = 0;
-    bool hasCpuTimes = false;
-
-    long long startTimeUnixMs = 0;     // UNIX epoch（毫秒）
-    bool hasStartTime = false;
-
-    // --- 内存 ---
-    unsigned long long virtualMemoryBytes = 0;
-    unsigned long long residentSetBytes = 0;
-    unsigned long long peakResidentSetBytes = 0;
-    unsigned long long privateMemoryBytes = 0;
-    bool hasMemoryInfo = false;
-};
 
 /**
  * @brief 获取当前系统的所有进程信息。

@@ -1346,79 +1346,7 @@ std::vector<GB_ProcessInfo> GB_GetAllProcessesInfo()
     std::vector<GB_ProcessInfo> processesInfo;
 
 #ifdef _WIN32
-    HandleGuard snapshot(::CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0));
-    if (snapshot.handle == INVALID_HANDLE_VALUE)
-    {
-        return processesInfo;
-    }
-
-    PROCESSENTRY32W pe;
-    ::ZeroMemory(&pe, sizeof(pe));
-    pe.dwSize = sizeof(pe);
-
-    if (!::Process32FirstW(snapshot.handle, &pe))
-    {
-        return processesInfo;
-    }
-
-    processesInfo.reserve(256);
-
-    do
-    {
-        GB_ProcessInfo info;
-        info.processId = static_cast<int>(pe.th32ProcessID);
-        info.parentProcessId = static_cast<int>(pe.th32ParentProcessID);
-        info.threadCount = static_cast<unsigned int>(pe.cntThreads);
-        info.processNameUtf8 = GB_WStringToUtf8(std::wstring(pe.szExeFile));
-
-        const DWORD desiredAccess = PROCESS_QUERY_LIMITED_INFORMATION;
-        HandleGuard processHandle(::OpenProcess(desiredAccess, FALSE, pe.th32ProcessID));
-        if (processHandle.handle != nullptr)
-        {
-            FillProcessBitness(processHandle.handle, info);
-
-            std::string exePath;
-            if (FillProcessExePath(processHandle.handle, exePath))
-            {
-                info.executablePathUtf8 = exePath;
-                info.hasExecutablePath = true;
-            }
-
-            std::string userName;
-            if (FillProcessUserName(processHandle.handle, userName))
-            {
-                info.userNameUtf8 = userName;
-                info.hasUserName = true;
-            }
-
-            bool elevated = false;
-            if (IsProcessElevated(processHandle.handle, elevated))
-            {
-                info.isElevated = elevated;
-            }
-
-            DWORD handleCount = 0;
-            if (::GetProcessHandleCount(processHandle.handle, &handleCount))
-            {
-                info.handleCount = static_cast<unsigned int>(handleCount);
-            }
-
-            const DWORD priority = ::GetPriorityClass(processHandle.handle);
-            if (priority != 0)
-            {
-                info.priorityClass = static_cast<unsigned int>(priority);
-            }
-
-            FillProcessTimes(processHandle.handle, info);
-            FillProcessMemory(processHandle.handle, info);
-        }
-
-        // Windows 下没有公开的“读取任意进程命令行”API；仅对当前进程填充。
-        FillCurrentProcessCommandLineIfMatch(info);
-        FillCurrentProcessWorkingDirectoryIfMatch(info);
-
-        processesInfo.push_back(std::move(info));
-    } while (::Process32NextW(snapshot.handle, &pe));
+    (void)GB_SystemProcess::GetAllProcesses(processesInfo);
 
 #else
     const long long bootTimeSeconds = ReadBootTimeUnixSeconds();
@@ -1570,28 +1498,28 @@ std::vector<int> GB_FindProcessIdsByName(const std::string& processNameUtf8, boo
     }
 
 #ifdef _WIN32
-    HandleGuard snapshot(::CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0));
-    if (snapshot.handle == INVALID_HANDLE_VALUE)
+    GB_ProcessFindOptions findOptions;
+    findOptions.processName = processNameUtf8;
+    findOptions.exactNameMatch = !allowSubstringMatch;
+    findOptions.caseSensitive = caseSensitive;
+    findOptions.queryOptions.queryExecutablePath = false;
+    findOptions.queryOptions.queryUserName = false;
+    findOptions.queryOptions.queryElevation = false;
+    findOptions.queryOptions.queryArchitecture = false;
+    findOptions.queryOptions.queryTimes = false;
+    findOptions.queryOptions.queryMemory = false;
+    findOptions.queryOptions.queryHandleCount = false;
+    findOptions.queryOptions.queryPriority = false;
+    findOptions.queryOptions.queryProtection = false;
+    findOptions.queryOptions.queryMainWindow = false;
+    std::vector<GB_ProcessInfo> matchedProcesses;
+    if (GB_SystemProcess::FindProcesses(findOptions, matchedProcesses).IsSucceeded())
     {
-        return processIds;
-    }
-
-    PROCESSENTRY32W pe;
-    ::ZeroMemory(&pe, sizeof(pe));
-    pe.dwSize = sizeof(pe);
-    if (!::Process32FirstW(snapshot.handle, &pe))
-    {
-        return processIds;
-    }
-
-    do
-    {
-        const std::string candidateNameUtf8 = GB_WStringToUtf8(std::wstring(pe.szExeFile));
-        if (IsProcessNameMatched(candidateNameUtf8, processNameUtf8, allowSubstringMatch, caseSensitive))
+        for (size_t processIndex = 0; processIndex < matchedProcesses.size(); processIndex++)
         {
-            processIds.push_back(static_cast<int>(pe.th32ProcessID));
+            processIds.push_back(matchedProcesses[processIndex].processId);
         }
-    } while (::Process32NextW(snapshot.handle, &pe));
+    }
 
 #else
     DIR* procDir = ::opendir("/proc");
@@ -1655,86 +1583,7 @@ bool GB_GetProcessInfo(int processId, GB_ProcessInfo& info)
     }
 
 #ifdef _WIN32
-    HandleGuard snapshot(::CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0));
-    if (snapshot.handle == INVALID_HANDLE_VALUE)
-    {
-        return false;
-    }
-
-    PROCESSENTRY32W pe;
-    ::ZeroMemory(&pe, sizeof(pe));
-    pe.dwSize = sizeof(pe);
-    if (!::Process32FirstW(snapshot.handle, &pe))
-    {
-        return false;
-    }
-
-    bool found = false;
-    do
-    {
-        if (static_cast<int>(pe.th32ProcessID) == processId)
-        {
-            found = true;
-            info.processId = processId;
-            info.parentProcessId = static_cast<int>(pe.th32ParentProcessID);
-            info.threadCount = static_cast<unsigned int>(pe.cntThreads);
-            info.processNameUtf8 = GB_WStringToUtf8(std::wstring(pe.szExeFile));
-            break;
-        }
-    } while (::Process32NextW(snapshot.handle, &pe));
-
-    if (!found)
-    {
-        return false;
-    }
-
-    const DWORD desiredAccess = PROCESS_QUERY_LIMITED_INFORMATION;
-    HandleGuard processHandle(::OpenProcess(desiredAccess, FALSE, static_cast<DWORD>(processId)));
-    if (processHandle.handle != nullptr)
-    {
-        FillProcessBitness(processHandle.handle, info);
-
-        std::string exePath;
-        if (FillProcessExePath(processHandle.handle, exePath))
-        {
-            info.executablePathUtf8 = exePath;
-            info.hasExecutablePath = true;
-        }
-
-        std::string userName;
-        if (FillProcessUserName(processHandle.handle, userName))
-        {
-            info.userNameUtf8 = userName;
-            info.hasUserName = true;
-        }
-
-        bool elevated = false;
-        if (IsProcessElevated(processHandle.handle, elevated))
-        {
-            info.isElevated = elevated;
-        }
-
-        DWORD handleCount = 0;
-        if (::GetProcessHandleCount(processHandle.handle, &handleCount))
-        {
-            info.handleCount = static_cast<unsigned int>(handleCount);
-        }
-
-        const DWORD priority = ::GetPriorityClass(processHandle.handle);
-        if (priority != 0)
-        {
-            info.priorityClass = static_cast<unsigned int>(priority);
-        }
-
-        FillProcessTimes(processHandle.handle, info);
-        FillProcessMemory(processHandle.handle, info);
-    }
-
-    // Windows 下没有公开的“读取任意进程命令行/工作目录”API；仅对当前进程填充。
-    FillCurrentProcessCommandLineIfMatch(info);
-    FillCurrentProcessWorkingDirectoryIfMatch(info);
-
-    return true;
+    return GB_SystemProcess::GetProcessInfo(static_cast<uint32_t>(processId), info).IsSucceeded();
 
 #else
     struct stat st;
@@ -1858,56 +1707,19 @@ bool GB_StartProcess(const std::string& executablePathUtf8, const std::vector<st
     }
 
 #ifdef _WIN32
-    const std::wstring exePathW = GB_Utf8ToWString(executablePathUtf8);
-    if (exePathW.empty())
+    GB_ProcessStartOptions options;
+    options.executablePath = executablePathUtf8;
+    options.arguments = argsUtf8;
+    options.workingDirectory = workingDirectoryUtf8;
+    GB_ProcessInstance processInstance;
+    if (GB_SystemProcess::Start(options, processInstance).IsFailed())
     {
         return false;
     }
-
-    std::wstring cmdLine = GB_WindowsCommandLineInternal::QuoteArgument(exePathW);
-    for (const std::string& argUtf8 : argsUtf8)
-    {
-        const std::wstring argW = GB_Utf8ToWString(argUtf8);
-        cmdLine.push_back(L' ');
-        cmdLine += GB_WindowsCommandLineInternal::QuoteArgument(argW);
-    }
-
-    STARTUPINFOW si;
-    ::ZeroMemory(&si, sizeof(si));
-    si.cb = sizeof(si);
-
-    PROCESS_INFORMATION pi;
-    ::ZeroMemory(&pi, sizeof(pi));
-
-    std::wstring workingDirW;
-    const wchar_t* workingDirPtr = nullptr;
-    if (!workingDirectoryUtf8.empty())
-    {
-        workingDirW = GB_Utf8ToWString(workingDirectoryUtf8);
-        if (!workingDirW.empty())
-        {
-            workingDirPtr = workingDirW.c_str();
-        }
-    }
-
-    // CreateProcessW 需要可写的 commandLine 缓冲区。
-    std::vector<wchar_t> cmdLineBuffer(cmdLine.begin(), cmdLine.end());
-    cmdLineBuffer.push_back(L'\0');
-
-    const BOOL ok = ::CreateProcessW(exePathW.c_str(), cmdLineBuffer.data(), nullptr, nullptr, FALSE, 0, nullptr, workingDirPtr, &si, &pi);
-
-    if (!ok)
-    {
-        return false;
-    }
-
     if (outProcessId != nullptr)
     {
-        *outProcessId = static_cast<int>(pi.dwProcessId);
+        *outProcessId = static_cast<int>(processInstance.GetProcessId());
     }
-
-    ::CloseHandle(pi.hThread);
-    ::CloseHandle(pi.hProcess);
     return true;
 
 #else
@@ -1969,45 +1781,27 @@ bool GB_TerminateProcessById(int processId, unsigned int waitMs, bool allowForce
     }
 
 #ifdef _WIN32
-    const DWORD pid = static_cast<DWORD>(processId);
-    const bool closeRequested = TryRequestCloseWindows(pid);
-
-    HandleGuard processHandle(::OpenProcess(SYNCHRONIZE | PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid));
-    if (processHandle.handle == nullptr)
+    GB_ProcessQueryOptions queryOptions;
+    queryOptions.queryExecutablePath = false;
+    queryOptions.queryMemory = false;
+    queryOptions.queryMainWindow = false;
+    queryOptions.queryUserName = false;
+    queryOptions.queryElevation = false;
+    queryOptions.queryArchitecture = false;
+    queryOptions.queryTimes = false;
+    queryOptions.queryHandleCount = false;
+    queryOptions.queryPriority = false;
+    queryOptions.queryProtection = false;
+    GB_ProcessInfo processInfo;
+    if (GB_SystemProcess::GetProcessInfo(static_cast<uint32_t>(processId), processInfo, queryOptions).IsFailed() || !processInfo.identity.IsStrong())
     {
-        // 至少能发出 WM_CLOSE 请求时认为“关闭请求已发出”。
-        return closeRequested;
+        return false;
     }
-
-    // 已退出
-    if (!IsProcessRunningWindows(processHandle.handle))
-    {
-        return true;
-    }
-
-    if (waitMs > 0)
-    {
-        const DWORD waitResult = ::WaitForSingleObject(processHandle.handle, waitMs);
-        if (waitResult == WAIT_OBJECT_0)
-        {
-            return true;
-        }
-    }
-
-    if (allowForceKill)
-    {
-        if (IsProcessRunningWindows(processHandle.handle))
-        {
-            ::TerminateProcess(processHandle.handle, 1);
-            if (waitMs > 0)
-            {
-                ::WaitForSingleObject(processHandle.handle, waitMs);
-            }
-        }
-    }
-
-    // 最终以“是否仍在运行”作为判断。
-    return !IsProcessRunningWindows(processHandle.handle) || closeRequested;
+    GB_ProcessCloseOptions closeOptions;
+    closeOptions.waitForExitMilliseconds = waitMs;
+    closeOptions.forceTerminateAfterTimeout = allowForceKill;
+    const GB_SystemResult closeResult = GB_SystemProcess::CloseProcess(processInfo.identity, closeOptions);
+    return closeResult.IsSucceeded() || (!allowForceKill && closeResult.errorCode == GB_SystemErrorCode::Timeout);
 
 #else
     const int pid = processId;
