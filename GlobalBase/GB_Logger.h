@@ -433,53 +433,53 @@ private:
  */
 #define GBLOG_TRACE(msg)   do { GB_Logger& gbLogger = GB_Logger::GetInstance(); if (gbLogger.IsLogEnabled()) { gbLogger.LogChecked(GB_LogLevel::GBLOGLEVEL_TRACE,   (msg), __FILE__, __LINE__); } } while (0)
 
- /**
-  * @brief 写入一条 DEBUG 级别日志。
-  *
-  * @details
-  *  宏自动携带 __FILE__ 与 __LINE__。日志总开关关闭时，@p msg 不会被求值；日志总开关开启时，
-  *  该日志会写入全量日志文件，并在满足 filterLevel 时写入普通日志文件和 Console。
-  */
+/**
+ * @brief 写入一条 DEBUG 级别日志。
+ *
+ * @details
+ *  宏自动携带 __FILE__ 与 __LINE__。日志总开关关闭时，@p msg 不会被求值；日志总开关开启时，
+ *  该日志会写入全量日志文件，并在满足 filterLevel 时写入普通日志文件和 Console。
+ */
 #define GBLOG_DEBUG(msg)   do { GB_Logger& gbLogger = GB_Logger::GetInstance(); if (gbLogger.IsLogEnabled()) { gbLogger.LogChecked(GB_LogLevel::GBLOGLEVEL_DEBUG,   (msg), __FILE__, __LINE__); } } while (0)
 
-  /**
-   * @brief 写入一条 INFO 级别日志。
-   *
-   * @details
-   *  适合记录业务里程碑、模块启动/停止、配置加载结果、批处理完成等正常运转事实。
-   *  日志总开关关闭时，@p msg 不会被求值；日志总开关开启时，日志会进入异步队列。
-   */
+/**
+ * @brief 写入一条 INFO 级别日志。
+ *
+ * @details
+ *  适合记录业务里程碑、模块启动/停止、配置加载结果、批处理完成等正常运转事实。
+ *  日志总开关关闭时，@p msg 不会被求值；日志总开关开启时，日志会进入异步队列。
+ */
 #define GBLOG_INFO(msg)    do { GB_Logger& gbLogger = GB_Logger::GetInstance(); if (gbLogger.IsLogEnabled()) { gbLogger.LogChecked(GB_LogLevel::GBLOGLEVEL_INFO,    (msg), __FILE__, __LINE__); } } while (0)
 
-   /**
-    * @brief 写入一条 WARNING 级别日志。
-    *
-    * @details
-    *  适合记录可自愈异常、降级、重试成功、使用默认配置、资源接近阈值等需要关注但通常不打断流程的问题。
-    */
+/**
+ * @brief 写入一条 WARNING 级别日志。
+ *
+ * @details
+ *  适合记录可自愈异常、降级、重试成功、使用默认配置、资源接近阈值等需要关注但通常不打断流程的问题。
+ */
 #define GBLOG_WARNING(msg) do { GB_Logger& gbLogger = GB_Logger::GetInstance(); if (gbLogger.IsLogEnabled()) { gbLogger.LogChecked(GB_LogLevel::GBLOGLEVEL_WARNING, (msg), __FILE__, __LINE__); } } while (0)
 
-    /**
-     * @brief 写入一条 ERROR 级别日志。
-     *
-     * @details
-     *  适合记录当前操作已经失败、需要补偿或人工排查的问题。Console 输出开启时，ERROR 会输出到 stderr。
-     */
+/**
+ * @brief 写入一条 ERROR 级别日志。
+ *
+ * @details
+ *  适合记录当前操作已经失败、需要补偿或人工排查的问题。Console 输出开启时，ERROR 会输出到 stderr。
+ */
 #define GBLOG_ERROR(msg)   do { GB_Logger& gbLogger = GB_Logger::GetInstance(); if (gbLogger.IsLogEnabled()) { gbLogger.LogChecked(GB_LogLevel::GBLOGLEVEL_ERROR,   (msg), __FILE__, __LINE__); } } while (0)
 
-     /**
-      * @brief 写入一条 FATAL 级别日志。
-      *
-      * @details
-      *  适合记录不可恢复错误。该宏只负责记录日志，不会主动 abort、exit 或抛异常；调用方应自行决定进程退出策略。
-      *  Console 输出开启时，FATAL 会输出到 stderr。
-      */
+/**
+ * @brief 写入一条 FATAL 级别日志。
+ *
+ * @details
+ *  适合记录不可恢复错误。该宏只负责记录日志，不会主动 abort、exit 或抛异常；调用方应自行决定进程退出策略。
+ *  Console 输出开启时，FATAL 会输出到 stderr。
+ */
 #define GBLOG_FATAL(msg)   do { GB_Logger& gbLogger = GB_Logger::GetInstance(); if (gbLogger.IsLogEnabled()) { gbLogger.LogChecked(GB_LogLevel::GBLOGLEVEL_FATAL,   (msg), __FILE__, __LINE__); } } while (0)
 
-      /**
-       * @brief 查询全局日志总开关是否启用。
-       * @return true 已启用；false 未启用。
-       */
+/**
+ * @brief 查询全局日志总开关是否启用。
+ * @return true 已启用；false 未启用。
+ */
 GLOBALBASE_PORT bool GB_IsLogEnabled();
 
 /**
