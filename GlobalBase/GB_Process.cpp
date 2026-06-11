@@ -32,12 +32,14 @@
 #  include <dirent.h>
 #  include <unistd.h>
 #  include <errno.h>
+#  include <fcntl.h>
 #  include <signal.h>
 #  include <fstream>
 #  include <iterator>
 #  include <pwd.h>
 #  include <sys/stat.h>
 #  include <sys/types.h>
+#  include <sys/wait.h>
 #endif
 
 namespace
@@ -804,6 +806,7 @@ namespace
         if (stateChar != '\0')
         {
             info.stateUtf8 = std::string(1, stateChar);
+            info.processState = (stateChar == 'Z' || stateChar == 'X') ? GB_ProcessState::Exited : GB_ProcessState::Running;
         }
 
         info.parentProcessId = std::atoi(fields[1].c_str());
@@ -1042,6 +1045,11 @@ namespace
         return GB_Utf8ToLower(textUtf8);
     }
 
+    static bool ContainsEmbeddedNull(const std::string& textUtf8)
+    {
+        return textUtf8.find('\0') != std::string::npos;
+    }
+
 #ifdef _WIN32
     static bool HasExeSuffix(const std::string& nameLower)
     {
@@ -1205,6 +1213,64 @@ namespace
 
         return false;
     }
+
+    static bool SetCloseOnExecLinux(int fileDescriptor)
+    {
+        const int flags = ::fcntl(fileDescriptor, F_GETFD);
+        if (flags < 0)
+        {
+            return false;
+        }
+        return ::fcntl(fileDescriptor, F_SETFD, flags | FD_CLOEXEC) == 0;
+    }
+
+    static void WriteExecErrorLinux(int fileDescriptor, int errorNumber)
+    {
+        const int savedErrorNumber = errorNumber;
+        const char* bytes = reinterpret_cast<const char*>(&savedErrorNumber);
+        size_t writtenBytes = 0;
+        while (writtenBytes < sizeof(savedErrorNumber))
+        {
+            const ssize_t writeResult = ::write(fileDescriptor, bytes + writtenBytes, sizeof(savedErrorNumber) - writtenBytes);
+            if (writeResult > 0)
+            {
+                writtenBytes += static_cast<size_t>(writeResult);
+                continue;
+            }
+            if (writeResult < 0 && errno == EINTR)
+            {
+                continue;
+            }
+            break;
+        }
+    }
+
+    static bool ReadExecErrorLinux(int fileDescriptor, int& errorNumber)
+    {
+        errorNumber = 0;
+        char* bytes = reinterpret_cast<char*>(&errorNumber);
+        size_t readBytes = 0;
+        while (readBytes < sizeof(errorNumber))
+        {
+            const ssize_t readResult = ::read(fileDescriptor, bytes + readBytes, sizeof(errorNumber) - readBytes);
+            if (readResult > 0)
+            {
+                readBytes += static_cast<size_t>(readResult);
+                continue;
+            }
+            if (readResult == 0)
+            {
+                return false;
+            }
+            if (errno == EINTR)
+            {
+                continue;
+            }
+            errorNumber = errno;
+            return true;
+        }
+        return true;
+    }
 #endif
 }
 
@@ -1346,7 +1412,9 @@ std::vector<GB_ProcessInfo> GB_GetAllProcessesInfo()
     std::vector<GB_ProcessInfo> processesInfo;
 
 #ifdef _WIN32
-    (void)GB_SystemProcess::GetAllProcesses(processesInfo);
+    GB_ProcessQueryOptions queryOptions;
+    queryOptions.recordFieldErrors = false;
+    (void)GB_SystemProcess::GetAllProcesses(processesInfo, queryOptions);
 
 #else
     const long long bootTimeSeconds = ReadBootTimeUnixSeconds();
@@ -1417,6 +1485,8 @@ std::vector<GB_ProcessInfo> GB_GetAllProcessesInfo()
             if (IsElf64Bit(exePath, is64Bit))
             {
                 info.is64Bit = is64Bit;
+                info.architecture = is64Bit ? GB_ProcessArchitecture::X64 : GB_ProcessArchitecture::X86;
+                info.hasArchitecture = true;
             }
         }
 
@@ -1445,6 +1515,7 @@ std::vector<GB_ProcessInfo> GB_GetAllProcessesInfo()
                 }
 
                 info.isElevated = (parsed.effectiveUid == 0);
+                info.hasElevationState = true;
             }
 
             // 内存：若 stat 里没读到（或想补齐 peak/private），尝试从 status 解析。
@@ -1479,6 +1550,7 @@ std::vector<GB_ProcessInfo> GB_GetAllProcessesInfo()
         if (GetOpenFileDescriptorCountLinux(pid, fdCount))
         {
             info.handleCount = fdCount;
+            info.hasHandleCount = true;
         }
 
         processesInfo.push_back(std::move(info));
@@ -1512,6 +1584,7 @@ std::vector<int> GB_FindProcessIdsByName(const std::string& processNameUtf8, boo
     findOptions.queryOptions.queryPriority = false;
     findOptions.queryOptions.queryProtection = false;
     findOptions.queryOptions.queryMainWindow = false;
+    findOptions.queryOptions.recordFieldErrors = false;
     std::vector<GB_ProcessInfo> matchedProcesses;
     if (GB_SystemProcess::FindProcesses(findOptions, matchedProcesses).IsSucceeded())
     {
@@ -1583,7 +1656,9 @@ bool GB_GetProcessInfo(int processId, GB_ProcessInfo& info)
     }
 
 #ifdef _WIN32
-    return GB_SystemProcess::GetProcessInfo(static_cast<uint32_t>(processId), info).IsSucceeded();
+    GB_ProcessQueryOptions queryOptions;
+    queryOptions.recordFieldErrors = false;
+    return GB_SystemProcess::GetProcessInfo(static_cast<uint32_t>(processId), info, queryOptions).IsSucceeded();
 
 #else
     struct stat st;
@@ -1626,6 +1701,8 @@ bool GB_GetProcessInfo(int processId, GB_ProcessInfo& info)
         if (IsElf64Bit(exePath, is64Bit))
         {
             info.is64Bit = is64Bit;
+            info.architecture = is64Bit ? GB_ProcessArchitecture::X64 : GB_ProcessArchitecture::X86;
+            info.hasArchitecture = true;
         }
     }
 
@@ -1651,6 +1728,7 @@ bool GB_GetProcessInfo(int processId, GB_ProcessInfo& info)
                 info.hasUserName = true;
             }
             info.isElevated = (parsed.effectiveUid == 0);
+            info.hasElevationState = true;
         }
 
         if (parsed.hasVmHwm)
@@ -1683,6 +1761,7 @@ bool GB_GetProcessInfo(int processId, GB_ProcessInfo& info)
     if (GetOpenFileDescriptorCountLinux(processId, fdCount))
     {
         info.handleCount = fdCount;
+        info.hasHandleCount = true;
     }
 
     return true;
@@ -1701,9 +1780,17 @@ bool GB_StartProcess(const std::string& executablePathUtf8, const std::vector<st
         *outProcessId = 0;
     }
 
-    if (executablePathUtf8.empty())
+    if (executablePathUtf8.empty() || ContainsEmbeddedNull(executablePathUtf8) || ContainsEmbeddedNull(workingDirectoryUtf8))
     {
         return false;
+    }
+
+    for (const std::string& argumentUtf8 : argsUtf8)
+    {
+        if (ContainsEmbeddedNull(argumentUtf8))
+        {
+            return false;
+        }
     }
 
 #ifdef _WIN32
@@ -1723,46 +1810,86 @@ bool GB_StartProcess(const std::string& executablePathUtf8, const std::vector<st
     return true;
 
 #else
+    if (!workingDirectoryUtf8.empty())
+    {
+        struct stat workingDirectoryStat;
+        if (::stat(workingDirectoryUtf8.c_str(), &workingDirectoryStat) != 0 || !S_ISDIR(workingDirectoryStat.st_mode))
+        {
+            return false;
+        }
+    }
+
+    std::vector<std::string> argvStrings;
+    argvStrings.reserve(argsUtf8.size() + 1);
+    argvStrings.push_back(executablePathUtf8);
+    for (const std::string& argumentUtf8 : argsUtf8)
+    {
+        argvStrings.push_back(argumentUtf8);
+    }
+
+    std::vector<char*> argvPointers;
+    argvPointers.reserve(argvStrings.size() + 1);
+    for (std::string& argumentUtf8 : argvStrings)
+    {
+        argvPointers.push_back(const_cast<char*>(argumentUtf8.c_str()));
+    }
+    argvPointers.push_back(nullptr);
+
+    int execErrorPipe[2] = { -1, -1 };
+    if (::pipe(execErrorPipe) != 0)
+    {
+        return false;
+    }
+
+    if (!SetCloseOnExecLinux(execErrorPipe[1]))
+    {
+        ::close(execErrorPipe[0]);
+        ::close(execErrorPipe[1]);
+        return false;
+    }
+
     pid_t child = ::fork();
     if (child < 0)
     {
+        ::close(execErrorPipe[0]);
+        ::close(execErrorPipe[1]);
         return false;
     }
 
     if (child == 0)
     {
-        if (!workingDirectoryUtf8.empty())
-        {
-            ::chdir(workingDirectoryUtf8.c_str());
-        }
+        ::close(execErrorPipe[0]);
 
-        std::vector<std::string> argvStrings;
-        argvStrings.reserve(argsUtf8.size() + 1);
-        argvStrings.push_back(executablePathUtf8);
-        for (const std::string& a : argsUtf8)
+        if (!workingDirectoryUtf8.empty() && ::chdir(workingDirectoryUtf8.c_str()) != 0)
         {
-            argvStrings.push_back(a);
+            WriteExecErrorLinux(execErrorPipe[1], errno);
+            ::_exit(126);
         }
-
-        std::vector<char*> argv;
-        argv.reserve(argvStrings.size() + 1);
-        for (std::string& s : argvStrings)
-        {
-            argv.push_back(const_cast<char*>(s.c_str()));
-        }
-        argv.push_back(nullptr);
 
         // 如果路径中包含 '/', 则按指定路径执行；否则允许通过 PATH 查找。
         if (executablePathUtf8.find('/') != std::string::npos)
         {
-            ::execv(executablePathUtf8.c_str(), argv.data());
+            ::execv(executablePathUtf8.c_str(), argvPointers.data());
         }
         else
         {
-            ::execvp(executablePathUtf8.c_str(), argv.data());
+            ::execvp(executablePathUtf8.c_str(), argvPointers.data());
         }
 
+        WriteExecErrorLinux(execErrorPipe[1], errno);
         ::_exit(127);
+    }
+
+    ::close(execErrorPipe[1]);
+
+    int childErrorNumber = 0;
+    const bool hasChildError = ReadExecErrorLinux(execErrorPipe[0], childErrorNumber);
+    ::close(execErrorPipe[0]);
+    if (hasChildError)
+    {
+        int childStatus = 0;
+        (void)::waitpid(child, &childStatus, 0);
+        return false;
     }
 
     if (outProcessId != nullptr)
@@ -1781,6 +1908,12 @@ bool GB_TerminateProcessById(int processId, unsigned int waitMs, bool allowForce
     }
 
 #ifdef _WIN32
+    const uint32_t targetProcessId = static_cast<uint32_t>(processId);
+    if (targetProcessId == ::GetCurrentProcessId() || targetProcessId == 4)
+    {
+        return false;
+    }
+
     GB_ProcessQueryOptions queryOptions;
     queryOptions.queryExecutablePath = false;
     queryOptions.queryMemory = false;
@@ -1788,23 +1921,46 @@ bool GB_TerminateProcessById(int processId, unsigned int waitMs, bool allowForce
     queryOptions.queryUserName = false;
     queryOptions.queryElevation = false;
     queryOptions.queryArchitecture = false;
-    queryOptions.queryTimes = false;
+    queryOptions.queryTimes = true;
     queryOptions.queryHandleCount = false;
     queryOptions.queryPriority = false;
-    queryOptions.queryProtection = false;
+    queryOptions.queryProtection = true;
+    queryOptions.recordFieldErrors = false;
+
     GB_ProcessInfo processInfo;
-    if (GB_SystemProcess::GetProcessInfo(static_cast<uint32_t>(processId), processInfo, queryOptions).IsFailed() || !processInfo.identity.IsStrong())
+    if (GB_SystemProcess::GetProcessInfo(targetProcessId, processInfo, queryOptions).IsFailed() || !processInfo.identity.IsStrong())
     {
         return false;
     }
+
+    if (processInfo.isCurrentProcess || processInfo.isSystemProcess)
+    {
+        return false;
+    }
+
+    // 旧接口没有显式的危险开关；已知为关键/受保护进程时直接拒绝。
+    // 若系统不支持读取这些状态，后续强制终止路径仍会由 GB_SystemProcess::TerminateProcess 再做安全校验。
+    if ((processInfo.hasCriticalProcessState && processInfo.isCriticalProcess) || (processInfo.hasProtectedProcessState && processInfo.isProtectedProcess))
+    {
+        return false;
+    }
+
     GB_ProcessCloseOptions closeOptions;
     closeOptions.waitForExitMilliseconds = waitMs;
-    closeOptions.forceTerminateAfterTimeout = allowForceKill;
+    closeOptions.forceTerminateAfterTimeout = allowForceKill && waitMs != 0;
     const GB_SystemResult closeResult = GB_SystemProcess::CloseProcess(processInfo.identity, closeOptions);
-    return closeResult.IsSucceeded() || (!allowForceKill && closeResult.errorCode == GB_SystemErrorCode::Timeout);
+    if (closeResult.IsSucceeded())
+    {
+        return true;
+    }
+    return closeResult.errorCode == GB_SystemErrorCode::Timeout && waitMs == 0;
 
 #else
     const int pid = processId;
+    if (pid == static_cast<int>(::getpid()) || pid <= 1)
+    {
+        return false;
+    }
 
     if (!IsProcessAliveLinux(pid))
     {
@@ -1971,9 +2127,14 @@ namespace
 
         file.seekg(0, std::ios::end);
         const std::streamoff fileSize = file.tellg();
-        if (fileSize <= 0)
+        if (fileSize < 0)
         {
             return false;
+        }
+        if (fileSize == 0)
+        {
+            outBytes->clear();
+            return true;
         }
 
         file.seekg(0, std::ios::beg);
@@ -2083,7 +2244,8 @@ namespace
             return std::string();
         }
 
-        const size_t limit = std::min(bytes.size(), offset + maxLen);
+        const size_t remainingBytes = bytes.size() - offset;
+        const size_t limit = offset + std::min(remainingBytes, maxLen);
         size_t end = offset;
         while (end < limit && bytes[end] != 0)
         {
@@ -2249,17 +2411,19 @@ namespace
         // PE32:  offset 92 (0x5C)
         // PE32+: offset 108 (0x6C)
         bool ok = false;
-        const size_t optionalEnd = optionalOffset + static_cast<size_t>(sizeOfOptionalHeader);
-        if (optionalEnd > bytes.size())
+        const size_t optionalHeaderSize = static_cast<size_t>(sizeOfOptionalHeader);
+        if (optionalOffset > bytes.size() || optionalHeaderSize > bytes.size() - optionalOffset)
         {
             return false;
         }
+        const size_t optionalEnd = optionalOffset + optionalHeaderSize;
 
-        const size_t numberOfRvaAndSizesOffset = isPe32Plus ? (optionalOffset + 108) : (optionalOffset + 92);
-        if (numberOfRvaAndSizesOffset + 4 > optionalEnd)
+        const size_t numberOfRvaAndSizesRelativeOffset = isPe32Plus ? 108u : 92u;
+        if (numberOfRvaAndSizesRelativeOffset > optionalHeaderSize || optionalHeaderSize - numberOfRvaAndSizesRelativeOffset < 4u)
         {
             return false;
         }
+        const size_t numberOfRvaAndSizesOffset = optionalOffset + numberOfRvaAndSizesRelativeOffset;
 
         const uint32_t numberOfRvaAndSizes = ReadU32Le(bytes, numberOfRvaAndSizesOffset, &ok);
         if (!ok || numberOfRvaAndSizes == 0 || directoryIndex >= numberOfRvaAndSizes)
@@ -2267,9 +2431,15 @@ namespace
             return false;
         }
 
-        const size_t dataDirOffset = isPe32Plus ? (optionalOffset + 112) : (optionalOffset + 96);
+        const size_t dataDirRelativeOffset = isPe32Plus ? 112u : 96u;
+        if (dataDirRelativeOffset > optionalHeaderSize)
+        {
+            return false;
+        }
+
+        const size_t dataDirOffset = optionalOffset + dataDirRelativeOffset;
         const size_t needBytes = (static_cast<size_t>(directoryIndex) + 1u) * sizeof(PeDataDirectory);
-        if (dataDirOffset + needBytes > optionalEnd)
+        if (needBytes > optionalEnd - dataDirOffset)
         {
             return false;
         }
@@ -2316,6 +2486,11 @@ namespace
                 *outOffset = section.pointerToRawData + delta;
                 return true;
             }
+        }
+
+        if (sections.empty())
+        {
+            return false;
         }
 
         // 只有当 RVA 落在“头部”范围内时，才允许直接当作文件偏移。
@@ -2558,7 +2733,10 @@ namespace
             oss << " NAME=" << name;
 
             // Forwarder: func RVA points back into export directory range.
-            if (funcRva >= exportDir.virtualAddress && funcRva < exportDir.virtualAddress + exportDir.size)
+            const uint64_t exportStartRva = static_cast<uint64_t>(exportDir.virtualAddress);
+            const uint64_t exportEndRva = exportStartRva + static_cast<uint64_t>(exportDir.size);
+            const uint64_t functionRva = static_cast<uint64_t>(funcRva);
+            if (functionRva >= exportStartRva && functionRva < exportEndRva)
             {
                 uint32_t forwarderOffset = 0;
                 if (RvaToFileOffsetPe(sections, funcRva, &forwarderOffset))

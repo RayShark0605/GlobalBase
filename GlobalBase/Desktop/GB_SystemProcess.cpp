@@ -17,6 +17,7 @@
 #include <stdexcept>
 #include <system_error>
 #include <thread>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -1521,8 +1522,15 @@ public:
             bytes = standardError ? standardErrorBytes : standardOutputBytes;
             truncated = standardError ? standardErrorTruncated : standardOutputTruncated;
         }
+
+        // IO 线程尚未结束时，当前快照并不代表完整输出。这里把 truncated 一并置为 true，
+        // 避免调用方把运行中读取到的半截 UTF-8 文本误认为完整输出。
         const bool temporarilyIncomplete = ioStarted.load(std::memory_order_acquire) && !ioCompleted.load(std::memory_order_acquire);
-        return ConvertCapturedBytes(std::move(bytes), truncated || temporarilyIncomplete, outputEncoding, output);
+        if (temporarilyIncomplete)
+        {
+            truncated = true;
+        }
+        return ConvertCapturedBytes(std::move(bytes), truncated, outputEncoding, output);
     }
 
     void MarkOutputTruncated(const GB_ProcessOutputStream outputStream)
@@ -1855,6 +1863,12 @@ public:
     std::atomic<uint64_t> droppedOutputCallbackCount{ 0 };
     std::atomic<bool> shutdownStarted{ false };
 };
+#else
+class GB_ProcessInstance::Impl final
+{
+public:
+    Impl() = default;
+};
 #endif
 
 GB_ProcessInstance::GB_ProcessInstance() = default;
@@ -2155,27 +2169,39 @@ GB_SystemResult GB_ProcessInstance::WriteStandardInput(const std::string& bytes)
     {
         return GB_SystemResult::Failed(GB_SystemErrorCode::InvalidState, "GB_ProcessInstance::WriteStandardInput", "当前实例没有可写的标准输入管道。");
     }
+    if (bytes.empty())
+    {
+        return GB_SystemResult::Succeeded("GB_ProcessInstance::WriteStandardInput");
+    }
+
     std::lock_guard<std::mutex> lock(implementation->inputMutex);
+    GB_WinHandleScope eventHandle = GB_WinHandleScope::FromKernelHandle(::CreateEventW(nullptr, TRUE, FALSE, nullptr), "StandardInputWriteEvent");
+    if (!eventHandle.IsValid())
+    {
+        return GB_SystemResult::FromLastWin32Error("GB_ProcessInstance::WriteStandardInput", "创建标准输入写事件失败。");
+    }
+
     size_t writtenTotal = 0;
     while (writtenTotal < bytes.size())
     {
         const DWORD chunkSize = static_cast<DWORD>((std::min)(bytes.size() - writtenTotal, static_cast<size_t>(65536)));
-        GB_WinHandleScope eventHandle = GB_WinHandleScope::FromKernelHandle(::CreateEventW(nullptr, TRUE, FALSE, nullptr), "StandardInputWriteEvent");
-        if (!eventHandle.IsValid())
+        if (::ResetEvent(eventHandle.GetHandleAs<HANDLE>()) == FALSE)
         {
-            return GB_SystemResult::FromLastWin32Error("GB_ProcessInstance::WriteStandardInput", "创建标准输入写事件失败。");
+            return GB_SystemResult::FromLastWin32Error("GB_ProcessInstance::WriteStandardInput", "重置标准输入写事件失败。");
         }
+
         OVERLAPPED overlapped = {};
         overlapped.hEvent = eventHandle.GetHandleAs<HANDLE>();
         DWORD bytesWritten = 0;
         const HANDLE inputHandle = implementation->standardInputWriteHandle.GetHandleAs<HANDLE>();
-        if (::WriteFile(inputHandle, bytes.data() + writtenTotal, chunkSize, &bytesWritten, &overlapped) == FALSE)
+        if (::WriteFile(inputHandle, bytes.data() + writtenTotal, chunkSize, nullptr, &overlapped) == FALSE)
         {
             const DWORD writeError = ::GetLastError();
             if (writeError != ERROR_IO_PENDING)
             {
                 return GB_SystemResult::FromWin32Error(writeError, "GB_ProcessInstance::WriteStandardInput", "写入子进程标准输入失败。");
             }
+
             HANDLE waitHandles[2] = { eventHandle.GetHandleAs<HANDLE>(), implementation->processHandle.GetHandleAs<HANDLE>() };
             const DWORD waitResult = ::WaitForMultipleObjects(2, waitHandles, FALSE, 30000);
             if (waitResult == WAIT_TIMEOUT)
@@ -2200,10 +2226,11 @@ GB_SystemResult GB_ProcessInstance::WriteStandardInput(const std::string& bytes)
                 (void)::GetOverlappedResult(inputHandle, &overlapped, &ignoredByteCount, TRUE);
                 return GB_SystemResult::FromWin32Error(waitError, "GB_ProcessInstance::WriteStandardInput", "等待标准输入写入完成失败。");
             }
-            if (::GetOverlappedResult(inputHandle, &overlapped, &bytesWritten, FALSE) == FALSE)
-            {
-                return GB_SystemResult::FromLastWin32Error("GB_ProcessInstance::WriteStandardInput", "等待标准输入写入完成失败。");
-            }
+        }
+
+        if (::GetOverlappedResult(inputHandle, &overlapped, &bytesWritten, FALSE) == FALSE)
+        {
+            return GB_SystemResult::FromLastWin32Error("GB_ProcessInstance::WriteStandardInput", "等待标准输入写入完成失败。");
         }
         if (bytesWritten == 0)
         {
@@ -2633,6 +2660,16 @@ GB_SystemResult GB_SystemProcess::Start(const GB_ProcessStartOptions& options, G
 
     GB_WinHandleScope processHandle = GB_WinHandleScope::FromKernelHandle(processInformation.hProcess, "CreatedProcess");
     GB_WinHandleScope mainThreadHandle = GB_WinHandleScope::FromKernelHandle(processInformation.hThread, "CreatedProcessMainThread");
+
+    // CreateProcessW 返回后，子进程已经拥有需要继承的标准句柄副本；父进程应尽早关闭
+    // 自己持有的 child 端副本，避免管道 EOF 被父进程额外句柄延后。
+    (void)standardInputPipe.childHandle.Close();
+    (void)standardOutputPipe.childHandle.Close();
+    (void)standardErrorPipe.childHandle.Close();
+    (void)inheritedStandardInput.Close();
+    (void)inheritedStandardOutput.Close();
+    (void)inheritedStandardError.Close();
+
     if (jobHandle.IsValid() && ::AssignProcessToJobObject(jobHandle.GetHandleAs<HANDLE>(), processInformation.hProcess) == FALSE)
     {
         const DWORD assignError = ::GetLastError();
@@ -2857,14 +2894,15 @@ GB_SystemResult GB_SystemProcess::GetAllProcesses(std::vector<GB_ProcessInfo>& p
             const GB_SystemResult windowResult = GB_SystemWindow::GetTopLevelWindows(windows);
             if (windowResult.IsSucceeded())
             {
-                std::map<uint32_t, size_t> processIndexes;
+                std::unordered_map<uint32_t, size_t> processIndexes;
+                processIndexes.reserve(processes.size());
                 for (size_t processIndex = 0; processIndex < processes.size(); processIndex++)
                 {
                     processIndexes[static_cast<uint32_t>(processes[processIndex].processId)] = processIndex;
                 }
                 for (size_t windowIndex = 0; windowIndex < windows.size(); windowIndex++)
                 {
-                    const std::map<uint32_t, size_t>::const_iterator processIterator = processIndexes.find(windows[windowIndex].windowId.processId);
+                    const std::unordered_map<uint32_t, size_t>::const_iterator processIterator = processIndexes.find(windows[windowIndex].windowId.processId);
                     if (processIterator == processIndexes.end() || processes[processIterator->second].hasMainWindow || !IsMainWindowCandidate(windows[windowIndex]))
                     {
                         continue;
@@ -2905,10 +2943,6 @@ GB_SystemResult GB_SystemProcess::GetProcessInfo(const uint32_t processId, GB_Pr
 {
     processInfo = GB_ProcessInfo();
 #if defined(_WIN32)
-    if (processId == 0)
-    {
-        return GB_SystemResult::Failed(GB_SystemErrorCode::InvalidArgument, GB_ProcessOperationGetInfo, "进程 ID 不能为 0。");
-    }
     PROCESSENTRY32W processEntry = {};
     GB_SystemResult result = FindProcessEntry(processId, processEntry);
     if (result.IsFailed())
@@ -2987,60 +3021,82 @@ GB_SystemResult GB_SystemProcess::FindProcesses(const GB_ProcessFindOptions& fin
     {
         return result;
     }
+
     GB_ProcessQueryOptions queryOptions = findOptions.queryOptions;
     if (!findOptions.executablePath.empty())
     {
         queryOptions.queryExecutablePath = true;
     }
+
     DWORD currentSessionId = 0;
     if (findOptions.onlyCurrentSession && ::ProcessIdToSessionId(::GetCurrentProcessId(), &currentSessionId) == FALSE)
     {
         return GB_SystemResult::FromLastWin32Error(GB_ProcessOperationFind, "读取当前会话 ID 失败。");
     }
-    std::vector<GB_ProcessInfo> allProcesses;
-    result = GetAllProcesses(allProcesses, queryOptions);
-    if (result.IsFailed())
-    {
-        return result.WithOperationName(GB_ProcessOperationFind);
-    }
-    try
-    {
-        for (size_t processIndex = 0; processIndex < allProcesses.size(); processIndex++)
+
+    const auto appendIfMatched = [&](const GB_ProcessInfo& processInfo) -> void
         {
-            const GB_ProcessInfo& processInfo = allProcesses[processIndex];
             if (findOptions.processId != 0 && static_cast<uint32_t>(processInfo.processId) != findOptions.processId)
             {
-                continue;
+                return;
             }
             if (findOptions.parentProcessId != 0 && static_cast<uint32_t>(processInfo.parentProcessId) != findOptions.parentProcessId)
             {
-                continue;
+                return;
             }
             if (findOptions.hasSessionId && (!processInfo.hasSessionId || processInfo.sessionId != findOptions.sessionId))
             {
-                continue;
+                return;
             }
             if (findOptions.onlyCurrentSession && (!processInfo.hasSessionId || processInfo.sessionId != currentSessionId))
             {
-                continue;
+                return;
             }
             if (!findOptions.includeSystemProcesses && processInfo.isSystemProcess)
             {
-                continue;
+                return;
             }
             if (!TextMatches(processInfo.processNameUtf8, findOptions.processName, findOptions.exactNameMatch, findOptions.caseSensitive))
             {
-                continue;
+                return;
             }
             if (!TextMatches(processInfo.executablePathUtf8, findOptions.executablePath, true, findOptions.caseSensitive))
             {
-                continue;
+                return;
             }
             if (!TextMatches(processInfo.commandLineUtf8, findOptions.commandLineContains, false, findOptions.caseSensitive))
             {
-                continue;
+                return;
             }
             processes.push_back(processInfo);
+        };
+
+    try
+    {
+        if (findOptions.processId != 0)
+        {
+            GB_ProcessInfo processInfo;
+            result = GetProcessInfo(findOptions.processId, processInfo, queryOptions);
+            if (result.IsFailed())
+            {
+                return result.errorCode == GB_SystemErrorCode::NotFound ? GB_SystemResult::Succeeded(GB_ProcessOperationFind) : result.WithOperationName(GB_ProcessOperationFind);
+            }
+
+            appendIfMatched(processInfo);
+            return GB_SystemResult::Succeeded(GB_ProcessOperationFind);
+        }
+
+        std::vector<GB_ProcessInfo> allProcesses;
+        result = GetAllProcesses(allProcesses, queryOptions);
+        if (result.IsFailed())
+        {
+            return result.WithOperationName(GB_ProcessOperationFind);
+        }
+
+        processes.reserve(allProcesses.size());
+        for (size_t processIndex = 0; processIndex < allProcesses.size(); processIndex++)
+        {
+            appendIfMatched(allProcesses[processIndex]);
         }
         return GB_SystemResult::Succeeded(GB_ProcessOperationFind);
     }
