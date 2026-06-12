@@ -745,6 +745,30 @@ public:
     bool ToColorMatrix(std::vector<std::vector<GB_ColorRGBA>>& colorMatrix) const;
 
     /**
+     * @brief 导出为从左上角像素开始、按 (RGBA)(RGBA)... 紧凑排列的一维像素数组。
+     *
+     * 返回数组大小固定为 rows * cols * 4。
+     * - 1 通道：复制为 R/G/B，A 固定为 255；
+     * - 2 通道：按 Gray/Alpha 解释，复制 Gray 到 R/G/B，Alpha 写入 A；
+     * - 3 通道：根据当前实际通道顺序 BGR/RGB 转为 RGBA，A 固定为 255；
+     * - 4 通道：根据当前实际通道顺序 BGRA/RGBA 转为 RGBA；
+     * - 非 8 位图像会按颜色图像常用取值范围确定性转换到 8 位；
+     * - 非连续图像会逐行拷贝，不会把行间 padding 写入返回数组；
+     * - 仅支持二维图像矩阵，不支持 n 维 Mat 直接导出。
+     *
+     * 导出失败或当前为空图像时返回空数组。
+     */
+    std::vector<unsigned char> GetSequentialRgbaPixels() const;
+
+    /**
+     * @brief 导出为从左上角像素开始、按 (RGBA)(RGBA)... 紧凑排列的一维像素数组。
+     *
+     * 该重载可复用调用方传入 vector 的已分配容量，适合高频导出或大图导出场景。
+     * 导出失败或当前为空图像时，sequentialRgbaPixels 会被清空。
+     */
+    bool GetSequentialRgbaPixels(std::vector<unsigned char>& sequentialRgbaPixels) const;
+
+    /**
      * @brief 根据逻辑 RGBA 二维矩阵设置当前图像。
      *
      * 输入矩阵必须为规则矩阵，且行列数都大于 0。
@@ -907,7 +931,6 @@ public:
      * @brief 在当前图像上叠加绘制另一幅图像。
      */
     bool DrawImage(const GB_Image& image, const GB_Rectangle& imageRectangle);
-
 
     /**
      * @brief 返回深拷贝图像。

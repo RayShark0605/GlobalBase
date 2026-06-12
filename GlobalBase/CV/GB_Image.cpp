@@ -960,6 +960,54 @@ namespace GBImage_Internal
     }
 
     /**
+     * @brief 判断当前图像是否支持导出为紧凑 RGBA 字节序列。
+     */
+    static bool IsSequentialRgbaExportSupported(const cv::Mat& imageMat, ImageChannelLayout channelLayout)
+    {
+        if (imageMat.empty() || imageMat.dims != 2 || imageMat.rows <= 0 || imageMat.cols <= 0)
+        {
+            return false;
+        }
+
+        switch (imageMat.depth())
+        {
+        case CV_8U:
+        case CV_8S:
+        case CV_16U:
+        case CV_16S:
+        case CV_32S:
+        case CV_32F:
+        case CV_64F:
+            break;
+
+        default:
+            return false;
+        }
+
+        switch (channelLayout)
+        {
+        case ImageChannelLayout::Gray:
+            return imageMat.channels() == 1;
+
+        case ImageChannelLayout::Bgr:
+        case ImageChannelLayout::Rgb:
+            return imageMat.channels() == 3;
+
+        case ImageChannelLayout::Bgra:
+        case ImageChannelLayout::Rgba:
+            return imageMat.channels() == 4;
+
+        case ImageChannelLayout::Other:
+            return imageMat.channels() == 2;
+
+        default:
+            break;
+        }
+
+        return false;
+    }
+
+    /**
      * @brief 判断通道排列信息是否与通道数相容。
      */
     static bool IsChannelLayoutValidForChannels(int channels, ImageChannelLayout channelLayout, bool isEmptyImage)
@@ -1589,6 +1637,290 @@ namespace GBImage_Internal
         catch (...)
         {
             targetImage.release();
+            return false;
+        }
+    }
+
+    /**
+     * @brief 将图像位深转换为适合导出 RGBA 字节序列的 8 位图像。
+     *
+     * 该函数按颜色图像常用取值范围做确定性映射，不做按图像内容自适应的 min/max 归一化，
+     * 避免同一像素值在不同图像中得到不同的导出结果。
+     */
+    static bool ConvertImageDepthToSequentialExportUInt8(const cv::Mat& sourceImage, cv::Mat& targetImage)
+    {
+        targetImage.release();
+        if (sourceImage.empty())
+        {
+            return false;
+        }
+
+        try
+        {
+            switch (sourceImage.depth())
+            {
+            case CV_8U:
+                targetImage = sourceImage;
+                return true;
+
+            case CV_8S:
+                sourceImage.convertTo(targetImage, CV_8U, 1.0, 128.0);
+                return !targetImage.empty();
+
+            case CV_16U:
+                sourceImage.convertTo(targetImage, CV_8U, 1.0 / 257.0, 0.0);
+                return !targetImage.empty();
+
+            case CV_16S:
+                sourceImage.convertTo(targetImage, CV_8U, 1.0 / 257.0, 32768.0 / 257.0);
+                return !targetImage.empty();
+
+            case CV_32F:
+            case CV_64F:
+                sourceImage.convertTo(targetImage, CV_8U, 255.0, 0.0);
+                return !targetImage.empty();
+
+            case CV_32S:
+                sourceImage.convertTo(targetImage, CV_8U, 1.0, 0.0);
+                return !targetImage.empty();
+
+            default:
+                break;
+            }
+        }
+        catch (...)
+        {
+            targetImage.release();
+            return false;
+        }
+
+        return false;
+    }
+
+    /**
+     * @brief 将矩阵按逐行紧凑方式拷贝到新的字节数组中。
+     */
+    static bool CopyMatToNewCompactBytes(const cv::Mat& imageMat, std::vector<unsigned char>& compactBytes)
+    {
+        compactBytes.clear();
+        if (imageMat.empty() || imageMat.dims != 2 || imageMat.rows <= 0 || imageMat.cols <= 0)
+        {
+            return false;
+        }
+
+        size_t expectedByteSize = 0;
+        if (!GetCompactPixelByteSize(static_cast<size_t>(imageMat.rows), static_cast<size_t>(imageMat.cols), imageMat.elemSize(), expectedByteSize))
+        {
+            return false;
+        }
+
+        if (expectedByteSize == 0)
+        {
+            return true;
+        }
+
+        const size_t rowByteSize = static_cast<size_t>(imageMat.cols) * imageMat.elemSize();
+        try
+        {
+            compactBytes.resize(expectedByteSize);
+        }
+        catch (...)
+        {
+            compactBytes.clear();
+            return false;
+        }
+
+        unsigned char* targetData = compactBytes.data();
+        if (targetData == nullptr)
+        {
+            compactBytes.clear();
+            return false;
+        }
+
+        if (imageMat.isContinuous())
+        {
+            const unsigned char* imageData = imageMat.ptr<unsigned char>(0);
+            if (imageData == nullptr)
+            {
+                compactBytes.clear();
+                return false;
+            }
+
+            std::memcpy(targetData, imageData, expectedByteSize);
+            return true;
+        }
+
+        for (int rowIndex = 0; rowIndex < imageMat.rows; rowIndex++)
+        {
+            const unsigned char* rowData = imageMat.ptr<unsigned char>(rowIndex);
+            if (rowData == nullptr)
+            {
+                compactBytes.clear();
+                return false;
+            }
+
+            std::memcpy(targetData + static_cast<size_t>(rowIndex) * rowByteSize, rowData, rowByteSize);
+        }
+
+        return true;
+    }
+
+    /**
+     * @brief 获取导出 RGBA 字节序列所需的目标字节数。
+     */
+    static bool GetSequentialRgbaTargetByteSize(const cv::Mat& imageMat, size_t& targetByteSize)
+    {
+        targetByteSize = 0;
+        if (imageMat.empty() || imageMat.dims != 2 || imageMat.rows <= 0 || imageMat.cols <= 0)
+        {
+            return false;
+        }
+
+        return GetCompactPixelByteSize(static_cast<size_t>(imageMat.rows), static_cast<size_t>(imageMat.cols), 4, targetByteSize);
+    }
+
+    /**
+     * @brief 将 8 位 Gray + Alpha 双通道矩阵导出为紧凑 RGBA 字节序列。
+     */
+    static bool CopyGrayAlphaMatToSequentialRgbaPixels(const cv::Mat& imageMat, std::vector<unsigned char>& sequentialRgbaPixels)
+    {
+        sequentialRgbaPixels.clear();
+        if (imageMat.empty() || imageMat.dims != 2 || imageMat.rows <= 0 || imageMat.cols <= 0 || imageMat.type() != CV_8UC2)
+        {
+            return false;
+        }
+
+        size_t targetByteSize = 0;
+        if (!GetSequentialRgbaTargetByteSize(imageMat, targetByteSize))
+        {
+            return false;
+        }
+
+        try
+        {
+            sequentialRgbaPixels.resize(targetByteSize);
+        }
+        catch (...)
+        {
+            sequentialRgbaPixels.clear();
+            return false;
+        }
+
+        unsigned char* targetData = sequentialRgbaPixels.data();
+        if (targetData == nullptr)
+        {
+            sequentialRgbaPixels.clear();
+            return false;
+        }
+
+        const size_t cols = static_cast<size_t>(imageMat.cols);
+        for (int rowIndex = 0; rowIndex < imageMat.rows; rowIndex++)
+        {
+            const unsigned char* rowData = imageMat.ptr<unsigned char>(rowIndex);
+            if (rowData == nullptr)
+            {
+                sequentialRgbaPixels.clear();
+                return false;
+            }
+
+            unsigned char* targetRowData = targetData + static_cast<size_t>(rowIndex) * cols * 4;
+            for (size_t colIndex = 0; colIndex < cols; colIndex++)
+            {
+                const unsigned char grayValue = rowData[colIndex * 2];
+                const unsigned char alphaValue = rowData[colIndex * 2 + 1];
+                unsigned char* targetPixelData = targetRowData + colIndex * 4;
+                targetPixelData[0] = grayValue;
+                targetPixelData[1] = grayValue;
+                targetPixelData[2] = grayValue;
+                targetPixelData[3] = alphaValue;
+            }
+        }
+
+        return true;
+    }
+
+    /**
+     * @brief 将当前矩阵导出为从左上角开始的紧凑 RGBA 字节序列。
+     */
+    static bool ExportSequentialRgbaPixels(const cv::Mat& sourceImage, ImageChannelLayout channelLayout, std::vector<unsigned char>& sequentialRgbaPixels)
+    {
+        sequentialRgbaPixels.clear();
+        if (!IsSequentialRgbaExportSupported(sourceImage, channelLayout))
+        {
+            return false;
+        }
+
+        cv::Mat image8;
+        if (!ConvertImageDepthToSequentialExportUInt8(sourceImage, image8))
+        {
+            return false;
+        }
+
+        if (!IsSequentialRgbaExportSupported(image8, channelLayout) || image8.depth() != CV_8U)
+        {
+            return false;
+        }
+
+        try
+        {
+            if (channelLayout == ImageChannelLayout::Rgba)
+            {
+                return CopyMatToNewCompactBytes(image8, sequentialRgbaPixels);
+            }
+
+            if (channelLayout == ImageChannelLayout::Other)
+            {
+                return CopyGrayAlphaMatToSequentialRgbaPixels(image8, sequentialRgbaPixels);
+            }
+
+            size_t targetByteSize = 0;
+            if (!GetSequentialRgbaTargetByteSize(image8, targetByteSize))
+            {
+                return false;
+            }
+
+            sequentialRgbaPixels.resize(targetByteSize);
+            if (targetByteSize == 0)
+            {
+                return true;
+            }
+
+            cv::Mat targetRgbaImage(image8.rows, image8.cols, CV_8UC4, sequentialRgbaPixels.data());
+
+            switch (channelLayout)
+            {
+            case ImageChannelLayout::Gray:
+                cv::cvtColor(image8, targetRgbaImage, cv::COLOR_GRAY2RGBA);
+                break;
+
+            case ImageChannelLayout::Bgr:
+                cv::cvtColor(image8, targetRgbaImage, cv::COLOR_BGR2RGBA);
+                break;
+
+            case ImageChannelLayout::Bgra:
+                cv::cvtColor(image8, targetRgbaImage, cv::COLOR_BGRA2RGBA);
+                break;
+
+            case ImageChannelLayout::Rgb:
+                cv::cvtColor(image8, targetRgbaImage, cv::COLOR_RGB2RGBA);
+                break;
+
+            default:
+                sequentialRgbaPixels.clear();
+                return false;
+            }
+
+            if (targetRgbaImage.data != sequentialRgbaPixels.data() || !targetRgbaImage.isContinuous() || targetRgbaImage.type() != CV_8UC4)
+            {
+                sequentialRgbaPixels.clear();
+                return false;
+            }
+
+            return true;
+        }
+        catch (...)
+        {
+            sequentialRgbaPixels.clear();
             return false;
         }
     }
@@ -3683,6 +4015,37 @@ bool GB_Image::ToColorMatrix(std::vector<std::vector<GB_ColorRGBA>>& colorMatrix
         colorMatrix.clear();
         return false;
     }
+}
+
+/**
+ * @brief 导出为从左上角像素开始、按 (RGBA)(RGBA)... 紧凑排列的一维像素数组。
+ */
+std::vector<unsigned char> GB_Image::GetSequentialRgbaPixels() const
+{
+    std::vector<unsigned char> sequentialRgbaPixels;
+    GetSequentialRgbaPixels(sequentialRgbaPixels);
+    return sequentialRgbaPixels;
+}
+
+/**
+ * @brief 导出为从左上角像素开始、按 (RGBA)(RGBA)... 紧凑排列的一维像素数组。
+ */
+bool GB_Image::GetSequentialRgbaPixels(std::vector<unsigned char>& sequentialRgbaPixels) const
+{
+    GBImage_Internal::EnsureOpenCvErrorLogOnly();
+    sequentialRgbaPixels.clear();
+    if (IsEmpty())
+    {
+        return false;
+    }
+
+    if (!GBImage_Internal::ExportSequentialRgbaPixels(imageImpl->imageMat, imageImpl->channelLayout, sequentialRgbaPixels))
+    {
+        sequentialRgbaPixels.clear();
+        return false;
+    }
+
+    return true;
 }
 
 /**
