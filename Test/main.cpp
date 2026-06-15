@@ -16,10 +16,15 @@ int main(int argc, char* argv[])
     {
         return RunGB_SystemClipboardIsolatedTests();
     }
+    if (argc == 2 && argv != nullptr && argv[1] != nullptr && std::string(argv[1]) == "--gb-system-file-watcher-only")
+    {
+        return RunGB_SystemFileWatcherTests();
+    }
 
     int failedCount = 0;
     failedCount += RunGB_Utf8StringTests();
     failedCount += RunGB_SystemDeviceTests();
+    failedCount += RunGB_SystemFileWatcherTests();
     failedCount += RunGB_SystemClipboardTests();
     failedCount += RunGB_SystemWindowTests();
     failedCount += RunGB_SystemProcessTests();
