@@ -1,4 +1,4 @@
-#include "GB_SystemFileWatcher.h"
+﻿#include "GB_SystemFileWatcher.h"
 
 #include "../GB_FileSystem.h"
 #include "../GB_Utf8String.h"
@@ -267,9 +267,14 @@ namespace
     static std::wstring NormalizeRelativeWidePath(std::wstring path)
     {
         path = ReplaceSeparators(std::move(path));
-        while (!path.empty() && path[0] == L'\\')
+        const size_t firstNameIndex = path.find_first_not_of(L'\\');
+        if (firstNameIndex == std::wstring::npos)
         {
-            path.erase(path.begin());
+            return std::wstring();
+        }
+        if (firstNameIndex > 0)
+        {
+            path.erase(0, firstNameIndex);
         }
         return path;
     }
@@ -469,6 +474,12 @@ namespace
             return std::wstring();
         }
         return relativePath.substr(dotIndex);
+    }
+
+    static bool IsShellShortcutExtension(const std::wstring& extension)
+    {
+        const std::wstring foldedExtension = FoldCaseOrdinal(extension);
+        return foldedExtension == L".lnk" || foldedExtension == L".url";
     }
 
     static bool IsReadableFile(const std::wstring& path)
@@ -674,6 +685,7 @@ public:
 
         if (IsCoreRunning())
         {
+            EnqueueCleanupTargetOutputBuffers(targetId.targetId);
             GB_SystemResult rebuildResult = RebuildNativeEngine();
             if (rebuildResult.IsFailed())
             {
@@ -699,6 +711,7 @@ public:
         }
         if (IsCoreRunning())
         {
+            EnqueueCleanupAllOutputBuffers();
             GB_SystemResult rebuildResult = RebuildNativeEngine();
             if (rebuildResult.IsFailed())
             {
@@ -1124,7 +1137,9 @@ private:
         Overflow,
         SessionError,
         Synthetic,
-        PauseBarrier
+        PauseBarrier,
+        CleanupTargets,
+        CleanupAllTargets
     };
 
     struct NativePacket
@@ -1133,6 +1148,7 @@ private:
         std::wstring sessionPath;
         std::vector<NativeRecord> records;
         std::vector<GB_SystemFileEvent> syntheticEvents;
+        std::vector<uint64_t> cleanupTargetIds;
         DWORD errorCode = ERROR_SUCCESS;
         uint64_t barrierId = 0;
     };
@@ -1330,6 +1346,21 @@ private:
         return iter == targets.end() ? std::shared_ptr<TargetRecord>() : iter->second;
     }
 
+    TargetView MakeTargetView(const TargetRecord& targetRecord) const
+    {
+        TargetView targetView;
+        targetView.targetId = targetRecord.info.targetId;
+        targetView.path = targetRecord.info.path;
+        targetView.options = targetRecord.info.options;
+        targetView.normalizedPath = targetRecord.normalizedPath;
+        targetView.parentPath = targetRecord.parentPath;
+        targetView.fileName = targetRecord.fileName;
+        targetView.includeGlobsWide = targetRecord.includeGlobsWide;
+        targetView.excludeGlobsWide = targetRecord.excludeGlobsWide;
+        targetView.extensionsWide = targetRecord.extensionsWide;
+        return targetView;
+    }
+
     std::vector<TargetView> GetTargetViews() const
     {
         std::vector<TargetView> targetViews;
@@ -1337,17 +1368,23 @@ private:
         targetViews.reserve(targets.size());
         for (std::map<uint64_t, std::shared_ptr<TargetRecord>>::const_iterator iter = targets.begin(); iter != targets.end(); ++iter)
         {
-            TargetView targetView;
-            targetView.targetId = iter->second->info.targetId;
-            targetView.path = iter->second->info.path;
-            targetView.options = iter->second->info.options;
-            targetView.normalizedPath = iter->second->normalizedPath;
-            targetView.parentPath = iter->second->parentPath;
-            targetView.fileName = iter->second->fileName;
-            targetView.includeGlobsWide = iter->second->includeGlobsWide;
-            targetView.excludeGlobsWide = iter->second->excludeGlobsWide;
-            targetView.extensionsWide = iter->second->extensionsWide;
-            targetViews.push_back(std::move(targetView));
+            targetViews.push_back(MakeTargetView(*iter->second));
+        }
+        return targetViews;
+    }
+
+    std::vector<TargetView> GetTargetViewsForSession(const std::wstring& sessionPath) const
+    {
+        std::vector<TargetView> targetViews;
+        std::lock_guard<std::mutex> stateLock(stateMutex);
+        targetViews.reserve(targets.size());
+        for (std::map<uint64_t, std::shared_ptr<TargetRecord>>::const_iterator iter = targets.begin(); iter != targets.end(); iter++)
+        {
+            const TargetRecord& targetRecord = *iter->second;
+            if (EqualWidePath(targetRecord.normalizedPath, sessionPath, false) || EqualWidePath(targetRecord.parentPath, sessionPath, false))
+            {
+                targetViews.push_back(MakeTargetView(targetRecord));
+            }
         }
         return targetViews;
     }
@@ -1433,6 +1470,10 @@ private:
                 configuration.path = sessionPaths[pathIndex].first;
                 configuration.notifyFilter |= ToNativeNotifyFilter(targetView.options.notifyFilter);
                 configuration.notifyFilter |= FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_DIR_NAME;
+                if (targetView.options.includeShortcutFileEvents)
+                {
+                    configuration.notifyFilter |= FILE_NOTIFY_CHANGE_ATTRIBUTES | FILE_NOTIFY_CHANGE_SIZE | FILE_NOTIFY_CHANGE_LAST_WRITE;
+                }
                 configuration.recursive = configuration.recursive || sessionPaths[pathIndex].second;
                 configuration.bufferSizeBytes = (std::max)(configuration.bufferSizeBytes, targetView.options.bufferSizeBytes);
             }
@@ -1488,16 +1529,33 @@ private:
                 return GB_SystemResult::FromWin32Error(errorCode, GB_SystemFileOperationStart, u8"打开目录监听句柄失败。");
             }
 
-            std::shared_ptr<DirectorySession> session(new DirectorySession());
-            session->path = configuration.path;
-            session->key = iter->first;
-            session->notifyFilter = configuration.notifyFilter;
-            session->recursive = configuration.recursive;
-            session->bufferSizeBytes = configuration.bufferSizeBytes;
-            session->buffer.resize((configuration.bufferSizeBytes + sizeof(DWORD) - 1) / sizeof(DWORD));
-            session->directoryHandle = GB_WinHandleScope::FromKernelHandle(directoryHandle, "GB_SystemFileWatcher.Directory");
+            GB_WinHandleScope directoryHandleScope = GB_WinHandleScope::FromKernelHandle(directoryHandle, "GB_SystemFileWatcher.Directory");
+            std::shared_ptr<DirectorySession> session;
+            try
+            {
+                session.reset(new DirectorySession());
+                session->path = configuration.path;
+                session->key = iter->first;
+                session->notifyFilter = configuration.notifyFilter;
+                session->recursive = configuration.recursive;
+                session->bufferSizeBytes = configuration.bufferSizeBytes;
+                session->buffer.resize((configuration.bufferSizeBytes + sizeof(DWORD) - 1) / sizeof(DWORD));
+                session->directoryHandle = std::move(directoryHandleScope);
+            }
+            catch (const std::bad_alloc&)
+            {
+                engineLock.unlock();
+                StopNativeEngine();
+                return MakeAllocationFailedResult(GB_SystemFileOperationStart);
+            }
+            catch (...)
+            {
+                engineLock.unlock();
+                StopNativeEngine();
+                return GB_SystemResult::Failed(GB_SystemErrorCode::ResourceAllocationFailed, GB_SystemFileOperationStart, u8"创建目录监听 session 失败。");
+            }
 
-            if (::CreateIoCompletionPort(directoryHandle, completionPort, reinterpret_cast<ULONG_PTR>(session.get()), 0) == nullptr)
+            if (::CreateIoCompletionPort(session->directoryHandle.GetHandleAs<HANDLE>(), completionPort, reinterpret_cast<ULONG_PTR>(session.get()), 0) == nullptr)
             {
                 const DWORD errorCode = ::GetLastError();
                 engineLock.unlock();
@@ -1568,6 +1626,13 @@ private:
                             (void)errorCode;
                         }
                     }
+                }
+            }
+            for (size_t index = 0; index < sessions.size(); index++)
+            {
+                if (sessions[index]->directoryHandle.IsValid())
+                {
+                    (void)sessions[index]->directoryHandle.Close();
                 }
             }
             if (iocpThread.joinable())
@@ -1708,7 +1773,8 @@ private:
         }
         if (readResult.IsFailed())
         {
-            EnqueueSessionError(session->path, static_cast<DWORD>(readResult.nativeErrorCode));
+            const DWORD errorCode = readResult.nativeErrorCode == 0 ? ERROR_INVALID_FUNCTION : static_cast<DWORD>(readResult.nativeErrorCode);
+            EnqueueSessionError(session->path, errorCode);
         }
     }
 
@@ -1719,6 +1785,7 @@ private:
         {
             return false;
         }
+        records.reserve((std::max)(static_cast<DWORD>(1), transferredBytes / 32u));
 
         const unsigned char* bufferBytes = reinterpret_cast<const unsigned char*>(session.buffer.data());
         size_t offset = 0;
@@ -1753,18 +1820,7 @@ private:
             if (information->NextEntryOffset == 0)
             {
                 const size_t trailingBytes = transferredBytes - offset - recordBytes;
-                if (trailingBytes >= sizeof(DWORD))
-                {
-                    return false;
-                }
-                for (size_t trailingIndex = 0; trailingIndex < trailingBytes; trailingIndex++)
-                {
-                    if (bufferBytes[offset + recordBytes + trailingIndex] != 0)
-                    {
-                        return false;
-                    }
-                }
-                return true;
+                return trailingBytes < sizeof(DWORD);
             }
             if (information->NextEntryOffset % sizeof(DWORD) != 0 || information->NextEntryOffset < recordBytes || information->NextEntryOffset > transferredBytes - offset)
             {
@@ -1776,7 +1832,6 @@ private:
 
     void EnqueueOverflow(const std::wstring& sessionPath, const DWORD errorCode)
     {
-        overflowCount.fetch_add(1, std::memory_order_relaxed);
         NativePacket packet;
         packet.kind = NativePacketKind::Overflow;
         packet.sessionPath = sessionPath;
@@ -1810,6 +1865,21 @@ private:
         NativePacket packet;
         packet.kind = NativePacketKind::Synthetic;
         packet.syntheticEvents = std::move(events);
+        EnqueueNativePacket(std::move(packet));
+    }
+
+    void EnqueueCleanupTargetOutputBuffers(const uint64_t targetId)
+    {
+        NativePacket packet;
+        packet.kind = NativePacketKind::CleanupTargets;
+        packet.cleanupTargetIds.push_back(targetId);
+        EnqueueNativePacket(std::move(packet));
+    }
+
+    void EnqueueCleanupAllOutputBuffers()
+    {
+        NativePacket packet;
+        packet.kind = NativePacketKind::CleanupAllTargets;
         EnqueueNativePacket(std::move(packet));
     }
 
@@ -1924,7 +1994,10 @@ private:
                 state = GB_SystemFileWatcherState::Paused;
                 for (std::map<uint64_t, std::shared_ptr<TargetRecord>>::iterator iter = targets.begin(); iter != targets.end(); ++iter)
                 {
-                    iter->second->info.state = GB_SystemFileWatchTargetState::Paused;
+                    if (iter->second->info.state == GB_SystemFileWatchTargetState::Watching || iter->second->info.state == GB_SystemFileWatchTargetState::Recovering)
+                    {
+                        iter->second->info.state = GB_SystemFileWatchTargetState::Paused;
+                    }
                 }
             }
             {
@@ -1932,6 +2005,16 @@ private:
                 completedBarrierId = (std::max)(completedBarrierId, packet.barrierId);
             }
             barrierCondition.notify_all();
+            return;
+        }
+        if (packet.kind == NativePacketKind::CleanupTargets)
+        {
+            RemoveBufferedEventsForTargets(packet.cleanupTargetIds);
+            return;
+        }
+        if (packet.kind == NativePacketKind::CleanupAllTargets)
+        {
+            ClearBufferedEvents();
             return;
         }
         if (packet.kind == NativePacketKind::Synthetic)
@@ -2034,13 +2117,11 @@ private:
 
     void ProcessSessionOverflow(const std::wstring& sessionPath, const GB_SystemResult& result)
     {
-        const std::vector<TargetView> targetViews = GetTargetViews();
+        overflowCount.fetch_add(1, std::memory_order_relaxed);
+        const std::vector<TargetView> targetViews = GetTargetViewsForSession(sessionPath);
         for (size_t index = 0; index < targetViews.size(); index++)
         {
-            if (EqualWidePath(targetViews[index].normalizedPath, sessionPath, false) || EqualWidePath(targetViews[index].parentPath, sessionPath, false))
-            {
-                ProcessOverflowForTarget(targetViews[index], result);
-            }
+            ProcessOverflowForTarget(targetViews[index], result);
         }
     }
 
@@ -2072,13 +2153,9 @@ private:
     void ProcessSessionError(const std::wstring& sessionPath, const DWORD errorCode)
     {
         const GB_SystemResult result = GB_SystemResult::FromWin32Error(errorCode, "ReadDirectoryChangesW", u8"目录监听 session 发生错误，目标可能暂时不可用。");
-        const std::vector<TargetView> targetViews = GetTargetViews();
+        const std::vector<TargetView> targetViews = GetTargetViewsForSession(sessionPath);
         for (size_t index = 0; index < targetViews.size(); index++)
         {
-            if (!EqualWidePath(targetViews[index].normalizedPath, sessionPath, false) && !EqualWidePath(targetViews[index].parentPath, sessionPath, false))
-            {
-                continue;
-            }
             MarkTargetUnavailable(targetViews[index], result);
         }
     }
@@ -2132,7 +2209,7 @@ private:
 
     void ProcessNormalizedRename(const std::wstring& sessionPath, const std::wstring& oldRelativePath, const std::wstring& newRelativePath)
     {
-        const std::vector<TargetView> targetViews = GetTargetViews();
+        const std::vector<TargetView> targetViews = GetTargetViewsForSession(sessionPath);
         for (size_t index = 0; index < targetViews.size(); index++)
         {
             std::wstring oldTargetRelativePath;
@@ -2159,7 +2236,7 @@ private:
 
             const GB_SystemFileObjectType oldObjectType = oldMatchesScope ? GetSnapshotObjectType(targetViews[index], oldTargetRelativePath) : GB_SystemFileObjectType::Unknown;
             const bool oldPasses = oldMatchesScope && MatchesFilters(targetViews[index], oldTargetRelativePath, oldObjectType);
-            const GB_SystemFileObjectType newObjectType = newMatchesScope ? QueryObjectType(JoinWidePath(targetViews[index].normalizedPath, newTargetRelativePath), targetViews[index].options.targetType) : GB_SystemFileObjectType::Unknown;
+            const GB_SystemFileObjectType newObjectType = newMatchesScope ? QueryObjectType(GetTargetAbsolutePath(targetViews[index], newTargetRelativePath), targetViews[index].options.targetType) : GB_SystemFileObjectType::Unknown;
             const bool newPasses = newMatchesScope && MatchesFilters(targetViews[index], newTargetRelativePath, newObjectType);
             UpdateSnapshotForRename(targetViews[index], oldTargetRelativePath, newTargetRelativePath, oldMatchesScope, newMatchesScope);
 
@@ -2184,7 +2261,7 @@ private:
 
     void FanoutSingleEvent(const std::wstring& sessionPath, const std::wstring& sessionRelativePath, const GB_SystemFileEventType eventType, const DWORD nativeAction, const bool raw)
     {
-        const std::vector<TargetView> targetViews = GetTargetViews();
+        const std::vector<TargetView> targetViews = GetTargetViewsForSession(sessionPath);
         for (size_t index = 0; index < targetViews.size(); index++)
         {
             std::wstring targetRelativePath;
@@ -2307,9 +2384,9 @@ private:
                     return false;
                 }
                 const std::wstring extension = GetExtensionWide(relativePath);
-                bool extensionMatched = false;
+                bool extensionMatched = targetView.options.includeShortcutFileEvents && IsShellShortcutExtension(extension);
                 const std::wstring comparableExtension = targetView.options.caseSensitive ? extension : FoldCaseOrdinal(extension);
-                for (size_t index = 0; index < targetView.extensionsWide.size(); index++)
+                for (size_t index = 0; !extensionMatched && index < targetView.extensionsWide.size(); index++)
                 {
                     if (comparableExtension == targetView.extensionsWide[index])
                     {
@@ -2423,14 +2500,45 @@ private:
         {
             return;
         }
+
+        bool stateChanged = false;
+        const GB_SystemResult reconnectResult = GB_SystemResult::Succeeded("GB_SystemFileWatcher.Reconnect");
         {
             std::lock_guard<std::mutex> stateLock(stateMutex);
-            targetRecord->info.state = GB_SystemFileWatchTargetState::Watching;
+            const bool currentlyPaused = paused || state == GB_SystemFileWatcherState::Paused;
+            const GB_SystemFileWatchTargetState newState = currentlyPaused ? GB_SystemFileWatchTargetState::Paused : GB_SystemFileWatchTargetState::Watching;
+            stateChanged = targetRecord->info.state != newState;
+            targetRecord->info.state = newState;
+            targetRecord->info.lastResult = reconnectResult;
             targetRecord->reconnectDelayMilliseconds = options.reconnectInitialDelayMilliseconds;
         }
+        if (!stateChanged)
+        {
+            return;
+        }
+
         reconnectCount.fetch_add(1, std::memory_order_relaxed);
-        QueueOutputEvent(MakeTargetEvent(targetView, GB_SystemFileEventType::TargetRecovered, GB_SystemResult::Succeeded("GB_SystemFileWatcher.Reconnect")));
+        QueueOutputEvent(MakeTargetEvent(targetView, GB_SystemFileEventType::TargetRecovered, reconnectResult));
         RequestNativeRebuild();
+    }
+
+    void EnqueueTargetFailedEvents(const GB_SystemResult& result)
+    {
+        const std::vector<TargetView> targetViews = GetTargetViews();
+        std::vector<GB_SystemFileEvent> events;
+        try
+        {
+            events.reserve(targetViews.size());
+            for (size_t index = 0; index < targetViews.size(); index++)
+            {
+                events.push_back(MakeTargetEvent(targetViews[index], GB_SystemFileEventType::TargetFailed, result));
+            }
+        }
+        catch (...)
+        {
+            return;
+        }
+        EnqueueSyntheticEvents(std::move(events));
     }
 
     void RequestNativeRebuild()
@@ -2440,6 +2548,69 @@ private:
             nativeRebuildRequested = true;
         }
         recoveryCondition.notify_all();
+    }
+
+    static bool ContainsTargetId(const std::vector<uint64_t>& targetIds, const uint64_t targetId)
+    {
+        for (size_t index = 0; index < targetIds.size(); index++)
+        {
+            if (targetIds[index] == targetId)
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    void RemoveBufferedEventsForTargets(const std::vector<uint64_t>& targetIds)
+    {
+        if (targetIds.empty())
+        {
+            return;
+        }
+        for (std::map<std::string, PendingModifiedEvent>::iterator iter = pendingModifiedEvents.begin(); iter != pendingModifiedEvents.end();)
+        {
+            if (ContainsTargetId(targetIds, iter->second.event.targetId.targetId))
+            {
+                iter = pendingModifiedEvents.erase(iter);
+            }
+            else
+            {
+                iter++;
+            }
+        }
+        pendingBatch.events.erase(std::remove_if(pendingBatch.events.begin(), pendingBatch.events.end(), [&targetIds](const GB_SystemFileEvent& event)
+            {
+                return ContainsTargetId(targetIds, event.targetId.targetId);
+            }), pendingBatch.events.end());
+        RecalculatePendingBatchTimestamps();
+    }
+
+    void ClearBufferedEvents()
+    {
+        pendingModifiedEvents.clear();
+        pendingBatch.events.erase(std::remove_if(pendingBatch.events.begin(), pendingBatch.events.end(), [](const GB_SystemFileEvent& event)
+            {
+                return event.targetId.IsValid();
+            }), pendingBatch.events.end());
+        RecalculatePendingBatchTimestamps();
+    }
+
+    void RecalculatePendingBatchTimestamps()
+    {
+        if (pendingBatch.events.empty())
+        {
+            pendingBatch.firstTimestampMilliseconds = 0;
+            pendingBatch.lastTimestampMilliseconds = 0;
+            return;
+        }
+        pendingBatch.firstTimestampMilliseconds = pendingBatch.events.front().timestampMilliseconds;
+        pendingBatch.lastTimestampMilliseconds = pendingBatch.events.front().timestampMilliseconds;
+        for (size_t index = 1; index < pendingBatch.events.size(); index++)
+        {
+            pendingBatch.firstTimestampMilliseconds = (std::min)(pendingBatch.firstTimestampMilliseconds, pendingBatch.events[index].timestampMilliseconds);
+            pendingBatch.lastTimestampMilliseconds = (std::max)(pendingBatch.lastTimestampMilliseconds, pendingBatch.events[index].timestampMilliseconds);
+        }
     }
 
     void QueueOutputEvent(GB_SystemFileEvent event)
@@ -2730,6 +2901,11 @@ private:
                 {
                     ScheduleAllSnapshotRecoveries();
                 }
+                else
+                {
+                    SetWatcherFailed(rebuildResult);
+                    EnqueueTargetFailedEvents(rebuildResult);
+                }
             }
             CheckReconnectTargets();
             if (hasJob)
@@ -2778,7 +2954,8 @@ private:
             TargetRecord& targetRecord = *iter->second;
             if (available)
             {
-                targetRecord.info.state = GB_SystemFileWatchTargetState::Watching;
+                const bool currentlyPaused = paused || state == GB_SystemFileWatcherState::Paused;
+                targetRecord.info.state = currentlyPaused ? GB_SystemFileWatchTargetState::Paused : GB_SystemFileWatchTargetState::Watching;
                 targetRecord.info.lastResult = GB_SystemResult::Succeeded("GB_SystemFileWatcher.Reconnect");
                 targetRecord.reconnectDelayMilliseconds = options.reconnectInitialDelayMilliseconds;
                 recoveredTargets.push_back(dueTargets[index]);
@@ -2792,22 +2969,18 @@ private:
         if (!recoveredTargets.empty())
         {
             const GB_SystemResult rebuildResult = RebuildNativeEngine();
+            if (rebuildResult.IsFailed())
+            {
+                SetWatcherFailed(rebuildResult);
+                EnqueueTargetFailedEvents(rebuildResult);
+                return;
+            }
             for (size_t index = 0; index < recoveredTargets.size(); index++)
             {
-                if (rebuildResult.IsSucceeded())
-                {
-                    reconnectCount.fetch_add(1, std::memory_order_relaxed);
-                    EnqueueSyntheticEvent(MakeTargetEvent(recoveredTargets[index], GB_SystemFileEventType::TargetRecovered, rebuildResult));
-                }
-                else
-                {
-                    SetTargetState(recoveredTargets[index].targetId, GB_SystemFileWatchTargetState::Unavailable, rebuildResult);
-                }
+                reconnectCount.fetch_add(1, std::memory_order_relaxed);
+                EnqueueSyntheticEvent(MakeTargetEvent(recoveredTargets[index], GB_SystemFileEventType::TargetRecovered, rebuildResult));
             }
-            if (rebuildResult.IsSucceeded())
-            {
-                ScheduleAllSnapshotRecoveries();
-            }
+            ScheduleAllSnapshotRecoveries();
         }
     }
 
@@ -2923,7 +3096,7 @@ private:
             }
             else
             {
-                targetRecord->snapshot = newSnapshot;
+                targetRecord->snapshot = std::move(newSnapshot);
                 targetRecord->snapshotInitialized = true;
                 targetRecord->dirtyDuringRecovery = false;
                 targetRecord->info.state = GB_SystemFileWatchTargetState::Watching;
