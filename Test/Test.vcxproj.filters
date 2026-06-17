@@ -36,6 +36,9 @@
     <ClCompile Include="GB_SystemProcess_Test.cpp">
       <Filter>源文件</Filter>
     </ClCompile>
+    <ClCompile Include="GB_SystemSession_Test.cpp">
+      <Filter>源文件</Filter>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="GB_RunTests.h">

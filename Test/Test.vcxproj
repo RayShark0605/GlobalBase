@@ -25,6 +25,9 @@
       <AdditionalOptions>/utf-8 %(AdditionalOptions)</AdditionalOptions>
     </ClCompile>
     <ClCompile Include="GB_SystemProcess_Test.cpp" />
+    <ClCompile Include="GB_SystemSession_Test.cpp">
+      <AdditionalOptions>/utf-8 %(AdditionalOptions)</AdditionalOptions>
+    </ClCompile>
     <ClCompile Include="GB_SystemWindow_Test.cpp" />
     <ClCompile Include="GB_Utf8String_Test.cpp" />
     <ClCompile Include="main.cpp" />

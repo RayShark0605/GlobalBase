@@ -34,6 +34,7 @@
     <ClInclude Include="Desktop\GB_SystemFileWatcher.h" />
     <ClInclude Include="Desktop\GB_SystemProcess.h" />
     <ClInclude Include="Desktop\GB_SystemResult.h" />
+    <ClInclude Include="Desktop\GB_SystemSession.h" />
     <ClInclude Include="Desktop\GB_SystemShell.h" />
     <ClInclude Include="Desktop\GB_SystemWindow.h" />
     <ClInclude Include="Desktop\GB_WinHandleScope.h" />
@@ -91,6 +92,9 @@
     </ClCompile>
     <ClCompile Include="Desktop\GB_SystemProcess.cpp" />
     <ClCompile Include="Desktop\GB_SystemResult.cpp" />
+    <ClCompile Include="Desktop\GB_SystemSession.cpp">
+      <AdditionalOptions>/utf-8 %(AdditionalOptions)</AdditionalOptions>
+    </ClCompile>
     <ClCompile Include="Desktop\GB_SystemShell.cpp" />
     <ClCompile Include="Desktop\GB_SystemWindow.cpp" />
     <ClCompile Include="Desktop\GB_WinHandleScope.cpp" />

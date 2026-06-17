@@ -20,6 +20,10 @@ int main(int argc, char* argv[])
     {
         return RunGB_SystemFileWatcherTests();
     }
+    if (argc == 2 && argv != nullptr && argv[1] != nullptr && std::string(argv[1]) == "--gb-system-session-only")
+    {
+        return RunGB_SystemSessionTests();
+    }
 
     int failedCount = 0;
     failedCount += RunGB_Utf8StringTests();
@@ -28,6 +32,7 @@ int main(int argc, char* argv[])
     failedCount += RunGB_SystemClipboardTests();
     failedCount += RunGB_SystemWindowTests();
     failedCount += RunGB_SystemProcessTests();
+    failedCount += RunGB_SystemSessionTests();
 
     if (failedCount != 0)
     {

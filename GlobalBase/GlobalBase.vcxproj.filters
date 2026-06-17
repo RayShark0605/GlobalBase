@@ -198,6 +198,9 @@
     <ClInclude Include="Desktop\GB_SystemProcess.h">
       <Filter>头文件\Desktop\System</Filter>
     </ClInclude>
+    <ClInclude Include="Desktop\GB_SystemSession.h">
+      <Filter>头文件\Desktop\System</Filter>
+    </ClInclude>
     <ClInclude Include="Desktop\GB_SystemWindow.h">
       <Filter>头文件\Desktop\System</Filter>
     </ClInclude>
@@ -348,6 +351,9 @@
       <Filter>源文件\Desktop\System</Filter>
     </ClCompile>
     <ClCompile Include="Desktop\GB_SystemProcess.cpp">
+      <Filter>源文件\Desktop\System</Filter>
+    </ClCompile>
+    <ClCompile Include="Desktop\GB_SystemSession.cpp">
       <Filter>源文件\Desktop\System</Filter>
     </ClCompile>
     <ClCompile Include="Desktop\GB_SystemWindow.cpp">
