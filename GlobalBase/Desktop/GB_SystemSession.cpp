@@ -1,4 +1,4 @@
-#include "GB_SystemSession.h"
+﻿#include "GB_SystemSession.h"
 
 #include "../GB_Utf8String.h"
 
@@ -6,9 +6,11 @@
 #include <chrono>
 #include <condition_variable>
 #include <deque>
+#include <exception>
+#include <cstring>
 #include <limits>
-#include <map>
 #include <mutex>
+#include <unordered_map>
 #include <new>
 #include <system_error>
 #include <thread>
@@ -38,7 +40,7 @@ namespace
 
     std::mutex knownLockStateMutex;
     std::condition_variable knownLockStateCondition;
-    std::map<uint32_t, KnownLockStateEntry> knownLockStates;
+    std::unordered_map<uint32_t, KnownLockStateEntry> knownLockStates;
 
     GB_SystemResult MakeUnsupportedPlatformResult(const std::string& operationName)
     {
@@ -56,11 +58,6 @@ namespace
             diagnosticMessage += " ";
         }
         diagnosticMessage += message;
-    }
-
-    bool IsValidConnectState(const GB_SystemSessionConnectState connectState)
-    {
-        return connectState >= GB_SystemSessionConnectState::Unknown && connectState <= GB_SystemSessionConnectState::Init;
     }
 
     bool IsValidLockStateTarget(const GB_SystemSessionLockState lockState)
@@ -92,11 +89,22 @@ namespace
     GB_SystemSessionLockState ReadKnownLockState(const uint32_t sessionId)
     {
         std::lock_guard<std::mutex> lock(knownLockStateMutex);
-        const std::map<uint32_t, KnownLockStateEntry>::const_iterator iter = knownLockStates.find(sessionId);
+        const std::unordered_map<uint32_t, KnownLockStateEntry>::const_iterator iter = knownLockStates.find(sessionId);
         return iter == knownLockStates.end() ? GB_SystemSessionLockState::Unknown : iter->second.lockState;
     }
 
+    void ClearKnownLockState(const uint32_t sessionId)
+    {
+        {
+            std::lock_guard<std::mutex> lock(knownLockStateMutex);
+            knownLockStates.erase(sessionId);
+        }
+        knownLockStateCondition.notify_all();
+    }
+
 #if defined(_WIN32)
+    const UINT SessionWatcherStopMessage = WM_APP + 0x0512;
+
     class WtsMemoryScope final
     {
     public:
@@ -220,8 +228,25 @@ namespace
         {
             return true;
         }
+        if ((bytesReturned % sizeof(wchar_t)) != 0)
+        {
+            nativeErrorCode = ERROR_INVALID_DATA;
+            return false;
+        }
 
-        valueUtf8 = GB_WStringToUtf8(std::wstring(rawBuffer));
+        size_t wcharCount = static_cast<size_t>(bytesReturned / sizeof(wchar_t));
+        while (wcharCount > 0 && rawBuffer[wcharCount - 1] == L'\0')
+        {
+            wcharCount--;
+        }
+
+        if (wcharCount == 0)
+        {
+            return true;
+        }
+
+        const std::wstring valueWide(rawBuffer, rawBuffer + wcharCount);
+        valueUtf8 = GB_WStringToUtf8(valueWide);
         return true;
     }
 
@@ -245,7 +270,9 @@ namespace
             return false;
         }
 
-        connectState = MapWtsConnectState(*reinterpret_cast<WTS_CONNECTSTATE_CLASS*>(rawBuffer));
+        WTS_CONNECTSTATE_CLASS nativeConnectState = WTSDown;
+        std::memcpy(&nativeConnectState, rawBuffer, sizeof(nativeConnectState));
+        connectState = MapWtsConnectState(nativeConnectState);
         return true;
     }
 
@@ -269,7 +296,9 @@ namespace
             return false;
         }
 
-        clientProtocolType = *reinterpret_cast<USHORT*>(rawBuffer);
+        USHORT nativeClientProtocolType = 0;
+        std::memcpy(&nativeClientProtocolType, rawBuffer, sizeof(nativeClientProtocolType));
+        clientProtocolType = static_cast<uint16_t>(nativeClientProtocolType);
         return true;
     }
 
@@ -320,13 +349,16 @@ namespace
         return connectState == GB_SystemSessionConnectState::Active;
     }
 
-    void FillOptionalSessionFields(GB_SystemSessionInfo& sessionInfo)
+    void FillOptionalSessionFields(GB_SystemSessionInfo& sessionInfo, const bool queryWinStationName)
     {
         uint32_t nativeErrorCode = 0;
-        if (!QueryWtsString(sessionInfo.sessionId, WTSWinStationName, sessionInfo.winStationNameUtf8, nativeErrorCode))
+        if (queryWinStationName)
         {
-            sessionInfo.nativeErrorCode = nativeErrorCode;
-            AppendDiagnostic(sessionInfo.diagnosticMessage, "读取 WinStation 名称失败，Win32 错误码：" + std::to_string(nativeErrorCode) + "。");
+            if (!QueryWtsString(sessionInfo.sessionId, WTSWinStationName, sessionInfo.winStationNameUtf8, nativeErrorCode))
+            {
+                sessionInfo.nativeErrorCode = nativeErrorCode;
+                AppendDiagnostic(sessionInfo.diagnosticMessage, "读取 WinStation 名称失败，Win32 错误码：" + std::to_string(nativeErrorCode) + "。");
+            }
         }
         if (!QueryWtsString(sessionInfo.sessionId, WTSUserName, sessionInfo.userNameUtf8, nativeErrorCode))
         {
@@ -393,7 +425,7 @@ namespace
             return GB_SystemResult::FromWin32Error(nativeErrorCode, "GB_SystemSession::GetSessionInfo", "读取会话连接状态失败。");
         }
 
-        FillOptionalSessionFields(sessionInfo);
+        FillOptionalSessionFields(sessionInfo, true);
         return GB_SystemResult::Succeeded("GB_SystemSession::GetSessionInfo");
     }
 
@@ -407,7 +439,7 @@ namespace
         {
             sessionInfo.winStationNameUtf8 = GB_WStringToUtf8(std::wstring(nativeSession.pWinStationName));
         }
-        FillOptionalSessionFields(sessionInfo);
+        FillOptionalSessionFields(sessionInfo, false);
     }
 
     GB_SystemSessionEventType MapNativeSessionEvent(const uint32_t nativeEvent)
@@ -446,6 +478,17 @@ namespace
     std::string MakeSessionEventName(const GB_SystemSessionEventType eventType)
     {
         return "SystemSession." + GB_SystemSession::GetSessionEventTypeName(eventType);
+    }
+
+    GB_SystemResult MakeWtsRegisterSessionNotificationFailureResult(const uint32_t nativeErrorCode)
+    {
+        GB_SystemResult result = GB_SystemResult::FromWin32Error(nativeErrorCode, "GB_SystemSessionWatcher::Start", "注册 WTS 会话通知失败。");
+        if (nativeErrorCode == RPC_S_INVALID_BINDING)
+        {
+            result.errorCode = GB_SystemErrorCode::ResourceBusy;
+            result.message = "注册 WTS 会话通知失败：Remote Desktop Services 依赖服务可能尚未启动完成，可在 Global\\TermSrvReadyEvent 置位后重试。";
+        }
+        return result;
     }
 #endif
 }
@@ -509,7 +552,8 @@ GB_SystemResult GB_SystemSession::GetCurrentSessionInfo(GB_SystemSessionInfo& se
     {
         return result.WithOperationName("GB_SystemSession::GetCurrentSessionInfo");
     }
-    return GetSessionInfo(sessionId, sessionInfo).WithOperationName("GB_SystemSession::GetCurrentSessionInfo");
+    GB_SystemResult sessionResult = GetSessionInfo(sessionId, sessionInfo);
+    return sessionResult.WithOperationName("GB_SystemSession::GetCurrentSessionInfo");
 }
 
 GB_SystemResult GB_SystemSession::GetSessionInfo(const uint32_t sessionId, GB_SystemSessionInfo& sessionInfo)
@@ -648,7 +692,7 @@ GB_SystemResult GB_SystemSession::WaitForLockState(const GB_SystemSessionLockSta
 
     while (true)
     {
-        const std::map<uint32_t, KnownLockStateEntry>::const_iterator iter = knownLockStates.find(sessionId);
+        const std::unordered_map<uint32_t, KnownLockStateEntry>::const_iterator iter = knownLockStates.find(sessionId);
         if (iter != knownLockStates.end() && iter->second.lockState == targetLockState)
         {
             return GB_SystemResult::Succeeded("GB_SystemSession::WaitForLockState");
@@ -978,7 +1022,7 @@ public:
         try
         {
             eventWorkerThread = std::thread(&Impl::EventWorkerMain, this);
-            messageThread = std::thread(&Impl::MessageThreadMain, this);
+            messageThread = std::thread(&Impl::MessageThreadMainSafe, this);
         }
         catch (const std::system_error& exception)
         {
@@ -1022,6 +1066,7 @@ public:
     GB_SystemResult Stop()
     {
 #if !defined(_WIN32)
+        (void)eventDispatcher.Stop(GB_EventDispatcherStopMode::Discard);
         return GB_SystemResult::Succeeded("GB_SystemSessionWatcher::Stop");
 #else
         std::unique_lock<std::mutex> operationLock(operationMutex);
@@ -1157,21 +1202,54 @@ private:
 
     GB_SystemResult RequestMessageThreadStop()
     {
+        HWND localWindowHandle = nullptr;
         DWORD localThreadId = 0;
         {
             std::lock_guard<std::mutex> stateLock(stateMutex);
+            localWindowHandle = windowHandle;
             localThreadId = messageThreadId;
+        }
+
+        DWORD postWindowErrorCode = ERROR_SUCCESS;
+        if (localWindowHandle != nullptr)
+        {
+            if (::PostMessageW(localWindowHandle, SessionWatcherStopMessage, 0, 0) != FALSE)
+            {
+                return GB_SystemResult::Succeeded("GB_SystemSessionWatcher::Stop");
+            }
+            postWindowErrorCode = ::GetLastError();
         }
 
         if (localThreadId == 0)
         {
+            if (postWindowErrorCode == ERROR_SUCCESS || postWindowErrorCode == ERROR_INVALID_WINDOW_HANDLE)
+            {
+                return GB_SystemResult::Succeeded("GB_SystemSessionWatcher::Stop");
+            }
+            return GB_SystemResult::FromWin32Error(postWindowErrorCode, "GB_SystemSessionWatcher::Stop", "向会话监听隐藏窗口投递停止消息失败，且消息线程 ID 不可用。");
+        }
+
+        if (localThreadId == ::GetCurrentThreadId())
+        {
+            ::PostQuitMessage(0);
             return GB_SystemResult::Succeeded("GB_SystemSessionWatcher::Stop");
         }
-        if (::PostThreadMessageW(localThreadId, WM_QUIT, 0, 0) == FALSE)
+
+        if (::PostThreadMessageW(localThreadId, WM_QUIT, 0, 0) != FALSE)
         {
-            return GB_SystemResult::FromLastWin32Error("GB_SystemSessionWatcher::Stop", "向会话监听消息线程投递停止消息失败。");
+            return GB_SystemResult::Succeeded("GB_SystemSessionWatcher::Stop");
         }
-        return GB_SystemResult::Succeeded("GB_SystemSessionWatcher::Stop");
+
+        const DWORD postThreadErrorCode = ::GetLastError();
+        if (postThreadErrorCode == ERROR_INVALID_THREAD_ID)
+        {
+            return GB_SystemResult::Succeeded("GB_SystemSessionWatcher::Stop", "会话监听消息线程已经退出。");
+        }
+        if (postWindowErrorCode != ERROR_SUCCESS && postWindowErrorCode != ERROR_INVALID_WINDOW_HANDLE)
+        {
+            return GB_SystemResult::FromWin32Error(postWindowErrorCode, "GB_SystemSessionWatcher::Stop", "向会话监听隐藏窗口投递停止消息失败；线程级停止消息也失败，线程 Win32 错误码：" + std::to_string(postThreadErrorCode) + "。");
+        }
+        return GB_SystemResult::FromWin32Error(postThreadErrorCode, "GB_SystemSessionWatcher::Stop", "向会话监听消息线程投递停止消息失败。");
     }
 
     void RequestEventWorkerStop()
@@ -1185,18 +1263,50 @@ private:
 
     void SignalStartResult(const GB_SystemResult& result)
     {
+        bool shouldNotify = false;
         {
             std::lock_guard<std::mutex> stateLock(stateMutex);
-            startResult = result;
-            startCompleted = true;
+            if (!startCompleted)
+            {
+                startResult = result;
+                startCompleted = true;
+                shouldNotify = true;
+            }
         }
-        startCondition.notify_all();
+
+        if (shouldNotify)
+        {
+            startCondition.notify_all();
+        }
     }
 
     std::wstring MakeWindowClassName() const
     {
         const uintptr_t thisValue = reinterpret_cast<uintptr_t>(this);
         return L"GB_SystemSessionWatcher_" + std::to_wstring(::GetCurrentProcessId()) + L"_" + std::to_wstring(::GetTickCount64()) + L"_" + std::to_wstring(static_cast<unsigned long long>(thisValue));
+    }
+
+    void MessageThreadMainSafe()
+    {
+        try
+        {
+            MessageThreadMain();
+        }
+        catch (const std::bad_alloc&)
+        {
+            SignalStartResult(GB_SystemResult::Failed(GB_SystemErrorCode::ResourceAllocationFailed, "GB_SystemSessionWatcher::Start", "会话监听消息线程内存不足，线程已退出。"));
+            ClearMessageThreadState();
+        }
+        catch (const std::exception& exception)
+        {
+            SignalStartResult(GB_SystemResult::Failed(GB_SystemErrorCode::InternalError, "GB_SystemSessionWatcher::Start", std::string("会话监听消息线程异常退出：") + exception.what()));
+            ClearMessageThreadState();
+        }
+        catch (...)
+        {
+            SignalStartResult(GB_SystemResult::Failed(GB_SystemErrorCode::InternalError, "GB_SystemSessionWatcher::Start", "会话监听消息线程发生未知异常并退出。"));
+            ClearMessageThreadState();
+        }
     }
 
     void MessageThreadMain()
@@ -1235,7 +1345,8 @@ private:
         const DWORD notificationFlags = options.notificationScope == GB_SystemSessionNotificationScope::AllSessions ? NOTIFY_FOR_ALL_SESSIONS : NOTIFY_FOR_THIS_SESSION;
         if (::WTSRegisterSessionNotification(createdWindowHandle, notificationFlags) == FALSE)
         {
-            const GB_SystemResult result = GB_SystemResult::FromLastWin32Error("GB_SystemSessionWatcher::Start", "注册 WTS 会话通知失败。");
+            const DWORD nativeErrorCode = ::GetLastError();
+            const GB_SystemResult result = MakeWtsRegisterSessionNotificationFailureResult(static_cast<uint32_t>(nativeErrorCode));
             (void)::DestroyWindow(createdWindowHandle);
             (void)::UnregisterClassW(className.c_str(), windowClass.hInstance);
             SignalStartResult(result);
@@ -1286,10 +1397,21 @@ private:
             impl = reinterpret_cast<Impl*>(::GetWindowLongPtrW(hwnd, GWLP_USERDATA));
         }
 
+        if (impl != nullptr && message == SessionWatcherStopMessage)
+        {
+            ::PostQuitMessage(0);
+            return 0;
+        }
+
         if (impl != nullptr && message == WM_WTSSESSION_CHANGE)
         {
             impl->QueueNativeEvent(static_cast<uint32_t>(wParam), static_cast<uint32_t>(lParam));
             return 0;
+        }
+
+        if (message == WM_NCDESTROY)
+        {
+            ::SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
         }
 
         return ::DefWindowProcW(hwnd, message, wParam, lParam);
@@ -1349,7 +1471,11 @@ private:
                 typedEvent.SetAttribute("eventTypeName", GB_Variant(GB_SystemSession::GetSessionEventTypeName(sessionEvent.eventType)));
                 typedEvent.SetAttribute("sessionId", GB_Variant(static_cast<unsigned int>(sessionEvent.sessionId)));
                 typedEvent.SetAttribute("nativeEvent", GB_Variant(static_cast<unsigned int>(sessionEvent.nativeEvent)));
-                (void)eventDispatcher.Post(typedEvent);
+                const GB_SystemResult postResult = eventDispatcher.Post(typedEvent);
+                if (postResult.IsFailed())
+                {
+                    droppedNativeEventCount.fetch_add(1, std::memory_order_acq_rel);
+                }
             }
             catch (...)
             {
@@ -1368,6 +1494,10 @@ private:
         else if (eventType == GB_SystemSessionEventType::Unlock || eventType == GB_SystemSessionEventType::Logon || eventType == GB_SystemSessionEventType::DesktopReady)
         {
             UpdateKnownLockState(nativeEvent.sessionId, GB_SystemSessionLockState::Unlocked);
+        }
+        else if (eventType == GB_SystemSessionEventType::Logoff || eventType == GB_SystemSessionEventType::SessionCreated || eventType == GB_SystemSessionEventType::SessionTerminated)
+        {
+            ClearKnownLockState(nativeEvent.sessionId);
         }
 
         GB_SystemSessionEvent sessionEvent;

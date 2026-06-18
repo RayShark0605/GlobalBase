@@ -1,4 +1,4 @@
-#ifndef GLOBALBASE_SYSTEM_SESSION_H_H
+﻿#ifndef GLOBALBASE_SYSTEM_SESSION_H_H
 #define GLOBALBASE_SYSTEM_SESSION_H_H
 
 #include "../GlobalBasePort.h"
@@ -84,7 +84,7 @@ enum class GB_SystemSessionAutomationAvailability : uint16_t
  *
  * @remarks
  * - 所有 std::string 均约定为 UTF-8 编码。
- * - lockedState 是进程内事件缓存，不是 Windows 提供的即时绝对真值。
+ * - lockedState 是进程内事件缓存，不是 Windows 提供的即时绝对真值；只有本进程收到过相关 WTS 事件后才会变为 Locked/Unlocked。
  * - idleMilliseconds 仅对当前进程所在会话可靠。
  */
 struct GB_SystemSessionInfo
@@ -141,7 +141,13 @@ struct GB_SystemSessionAvailability
     std::string diagnosticMessage = "";
 };
 
-/** @brief 等待会话状态变化时使用的选项。 */
+/**
+ * @brief 等待会话状态变化时使用的选项。
+ *
+ * @remarks
+ * - WaitForLockState 依赖本进程已知的 WTS 锁屏/解锁事件缓存；如果没有运行 GB_SystemSessionWatcher 或目标事件发生在监听器启动前，状态可能一直为 Unknown。
+ * - cancellationFlag 不会主动唤醒条件变量，因此 pollIntervalMilliseconds 同时也是取消检查间隔。
+ */
 struct GB_SystemSessionWaitOptions
 {
     int64_t timeoutMilliseconds = 5000;
@@ -200,6 +206,7 @@ public:
  * - Windows 下使用隐藏消息窗口注册 WTSRegisterSessionNotification。
  * - 原生窗口线程只接收 WM_WTSSESSION_CHANGE 并入队，事件补充和用户回调通过内部工作线程与 GB_EventDispatcher 完成。
  * - Start()/Stop() 可重复调用；析构时自动停止；可以在强类型回调中调用 Stop()。
+ * - 本监听器适合普通桌面进程；Windows 服务接收会话变化应使用服务控制 HandlerEx。
  */
 class GLOBALBASE_PORT GB_SystemSessionWatcher final
 {
