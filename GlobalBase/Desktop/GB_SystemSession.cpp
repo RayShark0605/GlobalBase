@@ -24,6 +24,9 @@
 #  endif
 #  include <windows.h>
 #  include <wtsapi32.h>
+#  ifndef WTS_SESSION_DESKTOP_READY
+#    define WTS_SESSION_DESKTOP_READY 0xF
+#  endif
 #  pragma comment(lib, "User32.lib")
 #  pragma comment(lib, "Wtsapi32.lib")
 #endif
@@ -331,7 +334,10 @@ namespace
     bool CanOpenInputDesktop(uint32_t& nativeErrorCode)
     {
         nativeErrorCode = 0;
-        DesktopHandleScope inputDesktop(::OpenInputDesktop(0, FALSE, DESKTOP_READOBJECTS | DESKTOP_SWITCHDESKTOP));
+
+        // 这里仅用于判断当前进程是否能访问输入桌面，不主动切换桌面。
+        // DESKTOP_SWITCHDESKTOP 会引入额外权限要求，容易把可交互会话误判为 NoActiveDesktop。
+        DesktopHandleScope inputDesktop(::OpenInputDesktop(0, FALSE, DESKTOP_READOBJECTS));
         if (!inputDesktop.IsValid())
         {
             nativeErrorCode = ::GetLastError();
@@ -1081,21 +1087,18 @@ public:
             }
             running = false;
             stopRequested = true;
-            eventWorkerStopRequested = true;
         }
 
         GB_SystemResult stopMessageResult = RequestMessageThreadStop();
-        nativeEventCondition.notify_all();
-
         if (stopMessageResult.IsFailed())
         {
             std::lock_guard<std::mutex> stateLock(stateMutex);
             running = true;
             stopRequested = false;
-            eventWorkerStopRequested = false;
             return stopMessageResult;
         }
 
+        RequestEventWorkerStop();
         JoinThreadIfNeeded(messageThread);
         JoinThreadIfNeeded(eventWorkerThread);
 
