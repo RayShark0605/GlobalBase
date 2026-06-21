@@ -24,6 +24,10 @@ int main(int argc, char* argv[])
     {
         return RunGB_SystemSessionTests();
     }
+    if (argc == 2 && argv != nullptr && argv[1] != nullptr && std::string(argv[1]) == "--gb-system-network-only")
+    {
+        return RunGB_SystemNetworkTests();
+    }
 
     int failedCount = 0;
     failedCount += RunGB_Utf8StringTests();
@@ -33,6 +37,7 @@ int main(int argc, char* argv[])
     failedCount += RunGB_SystemWindowTests();
     failedCount += RunGB_SystemProcessTests();
     failedCount += RunGB_SystemSessionTests();
+    failedCount += RunGB_SystemNetworkTests();
 
     if (failedCount != 0)
     {

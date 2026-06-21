@@ -192,6 +192,9 @@
     <ClInclude Include="Desktop\GB_SystemFileWatcher.h">
       <Filter>头文件\Desktop\System</Filter>
     </ClInclude>
+    <ClInclude Include="Desktop\GB_SystemNetwork.h">
+      <Filter>头文件\Desktop\System</Filter>
+    </ClInclude>
     <ClInclude Include="Desktop\GB_SystemShell.h">
       <Filter>头文件\Desktop\System</Filter>
     </ClInclude>
@@ -345,6 +348,9 @@
       <Filter>源文件\Desktop\System</Filter>
     </ClCompile>
     <ClCompile Include="Desktop\GB_SystemFileWatcher.cpp">
+      <Filter>源文件\Desktop\System</Filter>
+    </ClCompile>
+    <ClCompile Include="Desktop\GB_SystemNetwork.cpp">
       <Filter>源文件\Desktop\System</Filter>
     </ClCompile>
     <ClCompile Include="Desktop\GB_SystemShell.cpp">

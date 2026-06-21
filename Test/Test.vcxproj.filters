@@ -30,6 +30,9 @@
     <ClCompile Include="GB_SystemFileWatcher_Test.cpp">
       <Filter>源文件</Filter>
     </ClCompile>
+    <ClCompile Include="GB_SystemNetwork_Test.cpp">
+      <Filter>源文件</Filter>
+    </ClCompile>
     <ClCompile Include="GB_SystemWindow_Test.cpp">
       <Filter>源文件</Filter>
     </ClCompile>
