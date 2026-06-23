@@ -1,4 +1,4 @@
-#ifndef GLOBALBASE_SYSTEM_NETWORK_H_H
+﻿#ifndef GLOBALBASE_SYSTEM_NETWORK_H_H
 #define GLOBALBASE_SYSTEM_NETWORK_H_H
 
 #include "../GlobalBasePort.h"
@@ -107,7 +107,8 @@ enum class GB_SystemWifiSecurityType : uint16_t
     Wpa3Personal = 5,
     WpaEnterprise = 6,
     Wpa2Enterprise = 7,
-    Wpa3Enterprise = 8
+    Wpa3Enterprise = 8,
+    Owe = 9
 };
 
 /** @brief 网络变化事件类型。 */
@@ -306,7 +307,7 @@ struct GB_SystemWifiScanOptions
     bool includeBssDetails = false;
     uint32_t timeoutMilliseconds = 8000;
     uint32_t cancellationPollMilliseconds = 50;
-    const std::atomic<bool> *cancellationFlag = nullptr;
+    const std::atomic<bool>* cancellationFlag = nullptr;
 };
 
 /** @brief Wi-Fi 连接或断开等待选项。 */
@@ -314,14 +315,14 @@ struct GB_SystemWifiOperationOptions
 {
     uint32_t timeoutMilliseconds = 15000;
     uint32_t cancellationPollMilliseconds = 50;
-    const std::atomic<bool> *cancellationFlag = nullptr;
+    const std::atomic<bool>* cancellationFlag = nullptr;
 };
 
 /** @brief 网络变化监听器选项。 */
 struct GB_SystemNetworkWatcherOptions
 {
     uint32_t debounceMilliseconds = 250;
-    uint32_t periodicRefreshMilliseconds = 30000;
+    uint32_t periodicRefreshMilliseconds = 30000; ///< 为 0 时关闭定时刷新，仅响应系统通知。
     size_t maxDispatchQueueSize = 64;
     bool emitInitialSnapshot = true;
 };
@@ -354,25 +355,25 @@ struct GB_SystemNetworkEvent
  */
 class GLOBALBASE_PORT GB_SystemNetwork final
 {
-  public:
+public:
     GB_SystemNetwork() = delete;
     ~GB_SystemNetwork() = delete;
 
-    static GB_SystemResult GetSnapshot(GB_SystemNetworkSnapshot &snapshot, bool forceRefresh = false, uint64_t maxCacheAgeMilliseconds = 1000);
-    static GB_SystemResult RefreshSnapshot(GB_SystemNetworkSnapshot &snapshot);
+    static GB_SystemResult GetSnapshot(GB_SystemNetworkSnapshot& snapshot, bool forceRefresh = false, uint64_t maxCacheAgeMilliseconds = 1000); ///< maxCacheAgeMilliseconds 为 0 时不读取缓存。
+    static GB_SystemResult RefreshSnapshot(GB_SystemNetworkSnapshot& snapshot);
     static void InvalidateSnapshotCache();
 
-    static GB_SystemResult EnumerateInterfaces(std::vector<GB_SystemNetworkInterfaceInfo> &interfaces);
-    static GB_SystemResult EnumerateConnectedNetworks(std::vector<GB_SystemConnectedNetworkInfo> &networks);
-    static GB_SystemResult GetNetworkCost(GB_SystemNetworkCostInfo &costInfo);
-    static GB_SystemResult HasInternetAccess(bool &hasInternetAccess);
+    static GB_SystemResult EnumerateInterfaces(std::vector<GB_SystemNetworkInterfaceInfo>& interfaces);
+    static GB_SystemResult EnumerateConnectedNetworks(std::vector<GB_SystemConnectedNetworkInfo>& networks);
+    static GB_SystemResult GetNetworkCost(GB_SystemNetworkCostInfo& costInfo);
+    static GB_SystemResult HasInternetAccess(bool& hasInternetAccess);
 
-    static GB_SystemResult EnumerateWifiInterfaces(std::vector<GB_SystemWifiInterfaceInfo> &interfaces);
-    static GB_SystemResult GetCurrentWifiConnection(const std::string &interfaceIdUtf8, GB_SystemWifiConnectionInfo &connectionInfo, bool &found);
-    static GB_SystemResult ScanWifiNetworks(const std::string &interfaceIdUtf8, std::vector<GB_SystemWifiNetworkInfo> &networks, const GB_SystemWifiScanOptions &options = GB_SystemWifiScanOptions());
-    static GB_SystemResult EnumerateWifiProfiles(const std::string &interfaceIdUtf8, std::vector<GB_SystemWifiProfileInfo> &profiles);
-    static GB_SystemResult ConnectWifiByProfile(const std::string &interfaceIdUtf8, const std::string &profileNameUtf8, const GB_SystemWifiOperationOptions &options = GB_SystemWifiOperationOptions());
-    static GB_SystemResult DisconnectWifi(const std::string &interfaceIdUtf8, const GB_SystemWifiOperationOptions &options = GB_SystemWifiOperationOptions());
+    static GB_SystemResult EnumerateWifiInterfaces(std::vector<GB_SystemWifiInterfaceInfo>& interfaces);
+    static GB_SystemResult GetCurrentWifiConnection(const std::string& interfaceIdUtf8, GB_SystemWifiConnectionInfo& connectionInfo, bool& found);
+    static GB_SystemResult ScanWifiNetworks(const std::string& interfaceIdUtf8, std::vector<GB_SystemWifiNetworkInfo>& networks, const GB_SystemWifiScanOptions& options = GB_SystemWifiScanOptions());
+    static GB_SystemResult EnumerateWifiProfiles(const std::string& interfaceIdUtf8, std::vector<GB_SystemWifiProfileInfo>& profiles);
+    static GB_SystemResult ConnectWifiByProfile(const std::string& interfaceIdUtf8, const std::string& profileNameUtf8, const GB_SystemWifiOperationOptions& options = GB_SystemWifiOperationOptions());
+    static GB_SystemResult DisconnectWifi(const std::string& interfaceIdUtf8, const GB_SystemWifiOperationOptions& options = GB_SystemWifiOperationOptions());
 
     static std::string GetAddressFamilyName(GB_SystemNetworkAddressFamily family);
     static std::string GetInterfaceTypeName(GB_SystemNetworkInterfaceType interfaceType);
@@ -388,25 +389,25 @@ class GLOBALBASE_PORT GB_SystemNetwork final
 /** @brief Windows 网络变化监听器。 */
 class GLOBALBASE_PORT GB_SystemNetworkWatcher final
 {
-  public:
-    using NetworkEventCallback = std::function<void(const GB_SystemNetworkEvent &event)>;
+public:
+    using NetworkEventCallback = std::function<void(const GB_SystemNetworkEvent& event)>;
 
     GB_SystemNetworkWatcher();
-    explicit GB_SystemNetworkWatcher(const GB_SystemNetworkWatcherOptions &options);
+    explicit GB_SystemNetworkWatcher(const GB_SystemNetworkWatcherOptions& options);
     ~GB_SystemNetworkWatcher() noexcept;
 
-    GB_SystemNetworkWatcher(const GB_SystemNetworkWatcher &) = delete;
-    GB_SystemNetworkWatcher &operator=(const GB_SystemNetworkWatcher &) = delete;
+    GB_SystemNetworkWatcher(const GB_SystemNetworkWatcher&) = delete;
+    GB_SystemNetworkWatcher& operator=(const GB_SystemNetworkWatcher&) = delete;
 
     GB_SystemResult Start();
     GB_SystemResult Stop();
     bool IsRunning() const;
-    void SetNetworkEventCallback(const NetworkEventCallback &callback);
-    GB_EventDispatcher &GetEventDispatcher();
+    void SetNetworkEventCallback(const NetworkEventCallback& callback);
+    GB_EventDispatcher& GetEventDispatcher();
     uint64_t GetCoalescedNativeEventCount() const;
     uint64_t GetRefreshFailureCount() const;
 
-  private:
+private:
     class Impl;
     std::unique_ptr<Impl> impl;
 };
