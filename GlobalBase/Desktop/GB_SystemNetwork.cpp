@@ -19,6 +19,9 @@
 #include <utility>
 
 #if defined(_WIN32)
+#if !defined(_WIN32_WINNT)
+#define _WIN32_WINNT 0x0600
+#endif
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
@@ -28,6 +31,7 @@
 #include <iphlpapi.h>
 #include <netioapi.h>
 #include <netlistmgr.h>
+#include <oleauto.h>
 #include <wlanapi.h>
 #include <wrl/client.h>
 #pragma comment(lib, "Iphlpapi.lib")
@@ -103,8 +107,89 @@ namespace
         return newerTimestamp >= olderTimestamp ? newerTimestamp - olderTimestamp : std::numeric_limits<uint64_t>::max();
     }
 
+    bool IsCancellationRequested(const std::atomic<bool>* cancellationFlag)
+    {
+        return cancellationFlag != nullptr && cancellationFlag->load(std::memory_order_acquire);
+    }
+
+    GB_SystemResult MakeCancelledBeforeNativeCallResult(const std::string& operationName, const std::string& message)
+    {
+        return GB_SystemResult::Failed(GB_SystemErrorCode::Cancelled, operationName, message);
+    }
+
 #if defined(_WIN32)
     using Microsoft::WRL::ComPtr;
+
+    constexpr ULONG InitialAdapterAddressBufferSize = 15 * 1024;
+    constexpr ULONG MaxAdapterAddressBufferSize = 64 * 1024 * 1024;
+    constexpr int MaxAdapterAddressRetryCount = 8;
+
+    DOT11_AUTH_ALGORITHM GetDot11AuthAlgorithmWpa3Enterprise192()
+    {
+#ifdef DOT11_AUTH_ALGO_WPA3_ENT_192
+        return DOT11_AUTH_ALGO_WPA3_ENT_192;
+#else
+        return static_cast<DOT11_AUTH_ALGORITHM>(8);
+#endif
+    }
+
+    DOT11_AUTH_ALGORITHM GetDot11AuthAlgorithmWpa3PersonalSae()
+    {
+#ifdef DOT11_AUTH_ALGO_WPA3_SAE
+        return DOT11_AUTH_ALGO_WPA3_SAE;
+#else
+        return static_cast<DOT11_AUTH_ALGORITHM>(9);
+#endif
+    }
+
+    DOT11_AUTH_ALGORITHM GetDot11AuthAlgorithmOwe()
+    {
+#ifdef DOT11_AUTH_ALGO_OWE
+        return DOT11_AUTH_ALGO_OWE;
+#else
+        return static_cast<DOT11_AUTH_ALGORITHM>(10);
+#endif
+    }
+
+    DOT11_AUTH_ALGORITHM GetDot11AuthAlgorithmWpa3Enterprise()
+    {
+#ifdef DOT11_AUTH_ALGO_WPA3_ENT
+        return DOT11_AUTH_ALGO_WPA3_ENT;
+#else
+        return static_cast<DOT11_AUTH_ALGORITHM>(11);
+#endif
+    }
+
+    bool IsWifiRadioOffError(const DWORD errorCode)
+    {
+#ifdef ERROR_NDIS_DOT11_POWER_STATE_INVALID
+        return errorCode == ERROR_NDIS_DOT11_POWER_STATE_INVALID;
+#else
+        (void)errorCode;
+        return false;
+#endif
+    }
+
+    GB_SystemResult MakeWin32ErrorResult(const DWORD errorCode, const std::string& operationName, const std::string& message)
+    {
+        if (IsWifiRadioOffError(errorCode))
+        {
+            GB_SystemResult result = GB_SystemResult::FromWin32Error(errorCode, operationName, message + " 无线网卡可能处于关闭、飞行模式或电源不可用状态。");
+            result.errorCode = GB_SystemErrorCode::InvalidState;
+            return result;
+        }
+        return GB_SystemResult::FromWin32Error(errorCode, operationName, message);
+    }
+
+    GB_SystemResult MakeWifiWin32ErrorResult(const DWORD errorCode, const std::string& operationName, const std::string& message)
+    {
+        GB_SystemResult result = MakeWin32ErrorResult(errorCode, operationName, message);
+        if (errorCode == ERROR_ACCESS_DENIED)
+        {
+            result.message += " 该 Native Wi-Fi API 在新版 Windows 中可能需要用户授予精确位置权限。";
+        }
+        return result;
+    }
 
     class WlanHandleScope final
     {
@@ -179,10 +264,10 @@ namespace
         WlanNotificationScope& operator=(const WlanNotificationScope&) = delete;
         WlanNotificationScope() = default;
 
-        DWORD Register(HANDLE inputHandle, const DWORD notificationSource, WLAN_NOTIFICATION_CALLBACK callback, void* context, DWORD* previousSource) noexcept
+        DWORD Register(HANDLE inputHandle, const DWORD notificationSource, WLAN_NOTIFICATION_CALLBACK callback, void* context, const bool ignoreDuplicateNotifications, DWORD* previousSource) noexcept
         {
             Reset();
-            const DWORD errorCode = ::WlanRegisterNotification(inputHandle, notificationSource, TRUE, callback, context, nullptr, previousSource);
+            const DWORD errorCode = ::WlanRegisterNotification(inputHandle, notificationSource, ignoreDuplicateNotifications ? TRUE : FALSE, callback, context, nullptr, previousSource);
             if (errorCode == ERROR_SUCCESS)
             {
                 handle = inputHandle;
@@ -195,7 +280,7 @@ namespace
         {
             if (registered && handle != nullptr)
             {
-                (void)::WlanRegisterNotification(handle, WLAN_NOTIFICATION_SOURCE_NONE, TRUE, nullptr, nullptr, nullptr, nullptr);
+                (void)::WlanRegisterNotification(handle, WLAN_NOTIFICATION_SOURCE_NONE, FALSE, nullptr, nullptr, nullptr, nullptr);
             }
             handle = nullptr;
             registered = false;
@@ -293,14 +378,44 @@ namespace
         return length <= 1 ? std::string() : GB_WStringToUtf8(std::wstring(buffer, static_cast<size_t>(length - 1)));
     }
 
+    std::string TrimAsciiWhitespace(const std::string& text)
+    {
+        size_t beginIndex = 0;
+        while (beginIndex < text.size() && static_cast<unsigned char>(text[beginIndex]) <= 0x20)
+        {
+            beginIndex++;
+        }
+
+        size_t endIndex = text.size();
+        while (endIndex > beginIndex && static_cast<unsigned char>(text[endIndex - 1]) <= 0x20)
+        {
+            endIndex--;
+        }
+
+        return text.substr(beginIndex, endIndex - beginIndex);
+    }
+
     bool TryParseGuid(const std::string& textUtf8, GUID& guid)
     {
-        if (textUtf8.empty())
+        const std::string trimmedTextUtf8 = TrimAsciiWhitespace(textUtf8);
+        if (trimmedTextUtf8.empty())
         {
             return false;
         }
-        const std::wstring textWide = GB_Utf8ToWString(textUtf8);
-        return SUCCEEDED(::CLSIDFromString(const_cast<wchar_t*>(textWide.c_str()), &guid));
+
+        const std::wstring textWide = GB_Utf8ToWString(trimmedTextUtf8);
+        if (SUCCEEDED(::CLSIDFromString(textWide.c_str(), &guid)))
+        {
+            return true;
+        }
+
+        if (trimmedTextUtf8.front() == '{' || trimmedTextUtf8.back() == '}')
+        {
+            return false;
+        }
+
+        const std::wstring bracedTextWide = L"{" + textWide + L"}";
+        return SUCCEEDED(::CLSIDFromString(bracedTextWide.c_str(), &guid));
     }
 
     std::string SockaddrToUtf8(const SOCKADDR* address)
@@ -339,11 +454,62 @@ namespace
         return GB_WStringToUtf8(std::wstring(buffer));
     }
 
+    bool IsUsableUnicastAddress(const SOCKADDR* address)
+    {
+        if (address == nullptr)
+        {
+            return false;
+        }
+        if (address->sa_family == AF_INET)
+        {
+            const SOCKADDR_IN* ipv4Address = reinterpret_cast<const SOCKADDR_IN*>(address);
+            const uint32_t hostOrderAddress = ntohl(ipv4Address->sin_addr.S_un.S_addr);
+            if (hostOrderAddress == 0 || hostOrderAddress == 0xFFFFFFFFu)
+            {
+                return false;
+            }
+            if ((hostOrderAddress & 0xFF000000u) == 0x7F000000u)
+            {
+                return false;
+            }
+            if ((hostOrderAddress & 0xF0000000u) == 0xE0000000u)
+            {
+                return false;
+            }
+            return true;
+        }
+        if (address->sa_family == AF_INET6)
+        {
+            const SOCKADDR_IN6* ipv6Address = reinterpret_cast<const SOCKADDR_IN6*>(address);
+            const IN6_ADDR& value = ipv6Address->sin6_addr;
+            const bool isUnspecified = IN6_IS_ADDR_UNSPECIFIED(&value) != 0;
+            const bool isLoopback = IN6_IS_ADDR_LOOPBACK(&value) != 0;
+            const bool isMulticast = IN6_IS_ADDR_MULTICAST(&value) != 0;
+            return !isUnspecified && !isLoopback && !isMulticast;
+        }
+        return false;
+    }
+
+    bool IsUsableGatewayAddress(const SOCKADDR* address)
+    {
+        return IsUsableUnicastAddress(address);
+    }
+
+    uint64_t MakeIpInterfaceMetricKey(const ADDRESS_FAMILY family, const uint64_t interfaceLuid)
+    {
+        return (static_cast<uint64_t>(family) << 48) ^ (interfaceLuid & 0x0000FFFFFFFFFFFFull);
+    }
+
     std::string BytesToHex(const unsigned char* bytes, const size_t byteCount, const char separator)
     {
+        if (bytes == nullptr || byteCount == 0)
+        {
+            return std::string();
+        }
+
         static const char HexDigits[] = "0123456789ABCDEF";
         std::string result;
-        result.reserve(byteCount * 3);
+        result.reserve(separator == '\0' ? byteCount * 2 : byteCount * 3);
         for (size_t index = 0; index < byteCount; index++)
         {
             if (index != 0 && separator != '\0')
@@ -529,20 +695,19 @@ namespace
 
     GB_SystemWifiSecurityType MapWifiSecurity(const DOT11_AUTH_ALGORITHM authentication, const DOT11_CIPHER_ALGORITHM cipher)
     {
-        const uint32_t authenticationValue = static_cast<uint32_t>(authentication);
         if (cipher == DOT11_CIPHER_ALGO_WEP || cipher == DOT11_CIPHER_ALGO_WEP40 || cipher == DOT11_CIPHER_ALGO_WEP104 || authentication == DOT11_AUTH_ALGO_80211_SHARED_KEY)
         {
             return GB_SystemWifiSecurityType::Wep;
         }
-        if (authenticationValue == 9)
+        if (authentication == GetDot11AuthAlgorithmWpa3PersonalSae())
         {
             return GB_SystemWifiSecurityType::Wpa3Personal;
         }
-        if (authenticationValue == 8 || authenticationValue == 11)
+        if (authentication == GetDot11AuthAlgorithmWpa3Enterprise192() || authentication == GetDot11AuthAlgorithmWpa3Enterprise())
         {
             return GB_SystemWifiSecurityType::Wpa3Enterprise;
         }
-        if (authenticationValue == 10)
+        if (authentication == GetDot11AuthAlgorithmOwe())
         {
             return GB_SystemWifiSecurityType::Owe;
         }
@@ -572,27 +737,39 @@ namespace
     GB_SystemResult EnumerateInterfacesInternal(std::vector<GB_SystemNetworkInterfaceInfo>& interfaces)
     {
         interfaces.clear();
-        const ULONG flags = GAA_FLAG_INCLUDE_PREFIX | GAA_FLAG_INCLUDE_GATEWAYS | GAA_FLAG_INCLUDE_ALL_INTERFACES;
-        ULONG bufferSize = 15 * 1024;
+        const ULONG flags = GAA_FLAG_INCLUDE_PREFIX | GAA_FLAG_INCLUDE_GATEWAYS | GAA_FLAG_INCLUDE_ALL_INTERFACES | GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST;
+        ULONG bufferSize = InitialAdapterAddressBufferSize;
         std::vector<unsigned char> buffer(bufferSize);
         ULONG errorCode = ERROR_BUFFER_OVERFLOW;
-        for (int attempt = 0; attempt < 4; attempt++)
+        for (int attempt = 0; attempt < MaxAdapterAddressRetryCount; attempt++)
         {
             IP_ADAPTER_ADDRESSES* addresses = reinterpret_cast<IP_ADAPTER_ADDRESSES*>(buffer.data());
+            bufferSize = static_cast<ULONG>(buffer.size());
             errorCode = ::GetAdaptersAddresses(AF_UNSPEC, flags, nullptr, addresses, &bufferSize);
             if (errorCode != ERROR_BUFFER_OVERFLOW)
             {
                 break;
             }
-            if (bufferSize == 0 || bufferSize > 64 * 1024 * 1024)
+            if (bufferSize == 0 || bufferSize > MaxAdapterAddressBufferSize)
             {
                 return GB_SystemResult::Failed(GB_SystemErrorCode::ResourceAllocationFailed, "GetAdaptersAddresses", "系统请求的网卡枚举缓冲区大小不合理。");
             }
-            buffer.resize(bufferSize);
+            const size_t requestedBufferSize = static_cast<size_t>(bufferSize);
+            const size_t doubledBufferSize = buffer.size() <= static_cast<size_t>(MaxAdapterAddressBufferSize) / 2 ? buffer.size() * 2 : static_cast<size_t>(MaxAdapterAddressBufferSize);
+            const size_t nextBufferSize = (std::min)(static_cast<size_t>(MaxAdapterAddressBufferSize), (std::max)(requestedBufferSize, doubledBufferSize));
+            if (nextBufferSize <= buffer.size())
+            {
+                return GB_SystemResult::Failed(GB_SystemErrorCode::ResourceAllocationFailed, "GetAdaptersAddresses", "系统请求的网卡枚举缓冲区无法继续扩展。");
+            }
+            buffer.resize(nextBufferSize);
+        }
+        if (errorCode == ERROR_NO_DATA)
+        {
+            return GB_SystemResult::Succeeded("GetAdaptersAddresses", "系统当前没有返回符合条件的网络地址。");
         }
         if (errorCode != ERROR_SUCCESS)
         {
-            return GB_SystemResult::FromWin32Error(errorCode, "GetAdaptersAddresses", "枚举本机网络接口失败。");
+            return MakeWin32ErrorResult(errorCode, "GetAdaptersAddresses", "枚举本机网络接口失败。");
         }
 
         const IP_ADAPTER_ADDRESSES* adapter = reinterpret_cast<const IP_ADAPTER_ADDRESSES*>(buffer.data());
@@ -613,7 +790,11 @@ namespace
             info.isPhysical = adapter->PhysicalAddressLength != 0 && !info.isVirtual;
             info.macAddressUtf8 = BytesToHex(adapter->PhysicalAddress, adapter->PhysicalAddressLength, ':');
             info.dhcpV4Enabled = (adapter->Flags & IP_ADAPTER_DHCP_ENABLED) != 0;
+#ifdef IP_ADAPTER_IPV6_MANAGE_ADDRESS_CONFIG
+            info.dhcpV6Enabled = (adapter->Flags & IP_ADAPTER_IPV6_MANAGE_ADDRESS_CONFIG) != 0;
+#else
             info.dhcpV6Enabled = adapter->Dhcpv6ClientDuidLength != 0;
+#endif
             info.mtu = adapter->Mtu;
             info.transmitLinkSpeedBitsPerSecond = adapter->TransmitLinkSpeed;
             info.receiveLinkSpeedBitsPerSecond = adapter->ReceiveLinkSpeed;
@@ -646,14 +827,17 @@ namespace
                 if (!networkAddress.addressUtf8.empty())
                 {
                     info.unicastAddresses.push_back(networkAddress);
-                    info.hasIpv4Address = info.hasIpv4Address || networkAddress.family == GB_SystemNetworkAddressFamily::IPv4;
-                    info.hasIpv6Address = info.hasIpv6Address || networkAddress.family == GB_SystemNetworkAddressFamily::IPv6;
+                    if (IsUsableUnicastAddress(address->Address.lpSockaddr))
+                    {
+                        info.hasIpv4Address = info.hasIpv4Address || networkAddress.family == GB_SystemNetworkAddressFamily::IPv4;
+                        info.hasIpv6Address = info.hasIpv6Address || networkAddress.family == GB_SystemNetworkAddressFamily::IPv6;
+                    }
                 }
             }
             for (const IP_ADAPTER_GATEWAY_ADDRESS_LH* gateway = adapter->FirstGatewayAddress; gateway != nullptr; gateway = gateway->Next)
             {
                 const std::string addressUtf8 = SockaddrToUtf8(gateway->Address.lpSockaddr);
-                if (!addressUtf8.empty())
+                if (!addressUtf8.empty() && IsUsableGatewayAddress(gateway->Address.lpSockaddr))
                 {
                     AppendUnique(info.gatewayAddressesUtf8, addressUtf8);
                 }
@@ -695,6 +879,8 @@ namespace
         {
             MibTableScope routeTableScope;
             routeTableScope.Reset(routeTable);
+            std::unordered_map<uint64_t, uint32_t> interfaceMetricByKey;
+            interfaceMetricByKey.reserve(interfaces.size() * 2);
             for (ULONG routeIndex = 0; routeIndex < routeTable->NumEntries; routeIndex++)
             {
                 const MIB_IPFORWARD_ROW2& route = routeTable->Table[routeIndex];
@@ -711,13 +897,19 @@ namespace
                 {
                     continue;
                 }
+                const uint64_t metricKey = MakeIpInterfaceMetricKey(route.DestinationPrefix.Prefix.si_family, route.InterfaceLuid.Value);
+                std::unordered_map<uint64_t, uint32_t>::const_iterator metricIter = interfaceMetricByKey.find(metricKey);
+                if (metricIter == interfaceMetricByKey.end())
+                {
+                    MIB_IPINTERFACE_ROW ipInterface = {};
+                    ipInterface.Family = route.DestinationPrefix.Prefix.si_family;
+                    ipInterface.InterfaceLuid = route.InterfaceLuid;
+                    ipInterface.InterfaceIndex = route.InterfaceIndex;
+                    const uint32_t interfaceMetric = ::GetIpInterfaceEntry(&ipInterface) == NO_ERROR ? ipInterface.Metric : 0;
+                    metricIter = interfaceMetricByKey.emplace(metricKey, interfaceMetric).first;
+                }
                 GB_SystemNetworkInterfaceInfo& interfaceInfo = interfaces[indexIter->second];
-                MIB_IPINTERFACE_ROW ipInterface = {};
-                ipInterface.Family = route.DestinationPrefix.Prefix.si_family;
-                ipInterface.InterfaceLuid = route.InterfaceLuid;
-                ipInterface.InterfaceIndex = route.InterfaceIndex;
-                const ULONG interfaceMetric = ::GetIpInterfaceEntry(&ipInterface) == NO_ERROR ? ipInterface.Metric : 0;
-                const uint64_t combinedMetric = static_cast<uint64_t>(route.Metric) + interfaceMetric;
+                const uint64_t combinedMetric = static_cast<uint64_t>(route.Metric) + metricIter->second;
                 const uint32_t boundedMetric = combinedMetric > std::numeric_limits<uint32_t>::max() ? std::numeric_limits<uint32_t>::max() : static_cast<uint32_t>(combinedMetric);
                 const bool wasDefaultRouteCandidate = interfaceInfo.isDefaultRouteCandidate;
                 interfaceInfo.isDefaultRouteCandidate = true;
@@ -740,23 +932,71 @@ namespace
         return comScope.IsInitialized() || static_cast<uint32_t>(comScope.GetInitializeHResult()) == 0x80010106u;
     }
 
-    GB_SystemResult EnumerateConnectedNetworksInternal(std::vector<GB_SystemConnectedNetworkInfo>& networks)
+    struct NlmOverallConnectivityInfo
     {
-        networks.clear();
-        GB_ComScope comScope = GB_ComScope::InitializeMta("GB_SystemNetwork::EnumerateConnectedNetworks");
-        if (!IsComUsable(comScope))
+        bool hasInfo = false;
+        bool hasLocalNetworkAccess = false;
+        bool hasInternetAccess = false;
+        GB_SystemNetworkConnectivityLevel connectivityLevel = GB_SystemNetworkConnectivityLevel::Unknown;
+    };
+
+    void FillOverallConnectivityInfo(INetworkListManager* manager, NlmOverallConnectivityInfo& info)
+    {
+        info = NlmOverallConnectivityInfo();
+        if (manager == nullptr)
         {
-            return comScope.GetInitializeResult();
+            return;
         }
 
-        ComPtr<INetworkListManager> manager;
-        HRESULT hresult = ::CoCreateInstance(CLSID_NetworkListManager, nullptr, CLSCTX_ALL, IID_PPV_ARGS(manager.GetAddressOf()));
-        if (FAILED(hresult))
+        NLM_CONNECTIVITY connectivity = NLM_CONNECTIVITY_DISCONNECTED;
+        if (SUCCEEDED(manager->GetConnectivity(&connectivity)))
         {
-            return GB_SystemResult::FromComHResult(static_cast<int32_t>(hresult), "CoCreateInstance(CLSID_NetworkListManager)", "创建 Network List Manager 失败。");
+            const DWORD value = static_cast<DWORD>(connectivity);
+            info.hasInfo = true;
+            info.connectivityLevel = MapConnectivity(connectivity);
+            info.hasLocalNetworkAccess = (value & (NLM_CONNECTIVITY_IPV4_SUBNET | NLM_CONNECTIVITY_IPV4_LOCALNETWORK | NLM_CONNECTIVITY_IPV6_SUBNET | NLM_CONNECTIVITY_IPV6_LOCALNETWORK | NLM_CONNECTIVITY_IPV4_INTERNET | NLM_CONNECTIVITY_IPV6_INTERNET)) != 0;
+            info.hasInternetAccess = (value & (NLM_CONNECTIVITY_IPV4_INTERNET | NLM_CONNECTIVITY_IPV6_INTERNET)) != 0;
         }
+
+        VARIANT_BOOL internetConnected = VARIANT_FALSE;
+        if (SUCCEEDED(manager->get_IsConnectedToInternet(&internetConnected)))
+        {
+            info.hasInfo = true;
+            info.hasInternetAccess = info.hasInternetAccess || internetConnected == VARIANT_TRUE;
+            info.hasLocalNetworkAccess = info.hasLocalNetworkAccess || internetConnected == VARIANT_TRUE;
+            if (internetConnected == VARIANT_TRUE)
+            {
+                info.connectivityLevel = GB_SystemNetworkConnectivityLevel::InternetAccess;
+            }
+        }
+    }
+
+    void FillNetworkCostInfoFromNativeCost(const DWORD cost, GB_SystemNetworkCostInfo& costInfo)
+    {
+        const DWORD costLevel = cost & 0x0000FFFFu;
+        const DWORD costFlags = cost & 0xFFFF0000u;
+        costInfo.nativeCostFlags = cost;
+        costInfo.isUnrestricted = (costLevel & NLM_CONNECTION_COST_UNRESTRICTED) != 0;
+        costInfo.isFixed = (costLevel & NLM_CONNECTION_COST_FIXED) != 0;
+        costInfo.isVariable = (costLevel & NLM_CONNECTION_COST_VARIABLE) != 0;
+        costInfo.isCostUnknown = !costInfo.isUnrestricted && !costInfo.isFixed && !costInfo.isVariable;
+        costInfo.isOverDataLimit = (costFlags & NLM_CONNECTION_COST_OVERDATALIMIT) != 0;
+        costInfo.isApproachingDataLimit = (costFlags & NLM_CONNECTION_COST_APPROACHINGDATALIMIT) != 0;
+        costInfo.isCongested = (costFlags & NLM_CONNECTION_COST_CONGESTED) != 0;
+        costInfo.isRoaming = (costFlags & NLM_CONNECTION_COST_ROAMING) != 0;
+        costInfo.costType = costInfo.isUnrestricted ? GB_SystemNetworkCostType::Unrestricted : (costInfo.isFixed ? GB_SystemNetworkCostType::Fixed : (costInfo.isVariable ? GB_SystemNetworkCostType::Variable : GB_SystemNetworkCostType::Unknown));
+    }
+
+    GB_SystemResult EnumerateConnectedNetworksFromManager(INetworkListManager* manager, std::vector<GB_SystemConnectedNetworkInfo>& networks)
+    {
+        networks.clear();
+        if (manager == nullptr)
+        {
+            return GB_SystemResult::Failed(GB_SystemErrorCode::InvalidArgument, "INetworkListManager::GetNetworks", "Network List Manager 指针为空。");
+        }
+
         ComPtr<IEnumNetworks> enumerator;
-        hresult = manager->GetNetworks(NLM_ENUM_NETWORK_CONNECTED, enumerator.GetAddressOf());
+        HRESULT hresult = manager->GetNetworks(NLM_ENUM_NETWORK_CONNECTED, enumerator.GetAddressOf());
         if (FAILED(hresult))
         {
             return GB_SystemResult::FromComHResult(static_cast<int32_t>(hresult), "INetworkListManager::GetNetworks", "枚举已连接网络失败。");
@@ -773,6 +1013,7 @@ namespace
             }
             if (FAILED(hresult))
             {
+                networks.clear();
                 return GB_SystemResult::FromComHResult(static_cast<int32_t>(hresult), "IEnumNetworks::Next", "读取已连接网络失败。");
             }
 
@@ -822,6 +1063,62 @@ namespace
         return GB_SystemResult::Succeeded("GB_SystemNetwork::EnumerateConnectedNetworks");
     }
 
+    GB_SystemResult QueryNetworkCostFromManager(INetworkListManager* manager, GB_SystemNetworkCostInfo& costInfo)
+    {
+        costInfo = GB_SystemNetworkCostInfo();
+        if (manager == nullptr)
+        {
+            return GB_SystemResult::Failed(GB_SystemErrorCode::InvalidArgument, "INetworkCostManager::GetCost", "Network List Manager 指针为空。");
+        }
+
+        ComPtr<INetworkCostManager> costManager;
+        HRESULT hresult = manager->QueryInterface(IID_PPV_ARGS(costManager.GetAddressOf()));
+        if (FAILED(hresult))
+        {
+            hresult = ::CoCreateInstance(CLSID_NetworkListManager, nullptr, CLSCTX_ALL, IID_PPV_ARGS(costManager.GetAddressOf()));
+            if (FAILED(hresult))
+            {
+                return GB_SystemResult::FromComHResult(static_cast<int32_t>(hresult), "INetworkListManager::QueryInterface(INetworkCostManager)", "获取 Network Cost Manager 接口失败。");
+            }
+        }
+
+        DWORD cost = NLM_CONNECTION_COST_UNKNOWN;
+        hresult = costManager->GetCost(&cost, nullptr);
+        if (FAILED(hresult))
+        {
+            return GB_SystemResult::FromComHResult(static_cast<int32_t>(hresult), "INetworkCostManager::GetCost", "读取当前网络成本失败。");
+        }
+
+        FillNetworkCostInfoFromNativeCost(cost, costInfo);
+        return GB_SystemResult::Succeeded("GB_SystemNetwork::GetNetworkCost");
+    }
+
+    GB_SystemResult EnumerateConnectedNetworksInternal(std::vector<GB_SystemConnectedNetworkInfo>& networks, NlmOverallConnectivityInfo* overallConnectivityInfo)
+    {
+        networks.clear();
+        if (overallConnectivityInfo != nullptr)
+        {
+            *overallConnectivityInfo = NlmOverallConnectivityInfo();
+        }
+        GB_ComScope comScope = GB_ComScope::InitializeMta("GB_SystemNetwork::EnumerateConnectedNetworks");
+        if (!IsComUsable(comScope))
+        {
+            return comScope.GetInitializeResult();
+        }
+
+        ComPtr<INetworkListManager> manager;
+        const HRESULT hresult = ::CoCreateInstance(CLSID_NetworkListManager, nullptr, CLSCTX_ALL, IID_PPV_ARGS(manager.GetAddressOf()));
+        if (FAILED(hresult))
+        {
+            return GB_SystemResult::FromComHResult(static_cast<int32_t>(hresult), "CoCreateInstance(CLSID_NetworkListManager)", "创建 Network List Manager 失败。");
+        }
+        if (overallConnectivityInfo != nullptr)
+        {
+            FillOverallConnectivityInfo(manager.Get(), *overallConnectivityInfo);
+        }
+        return EnumerateConnectedNetworksFromManager(manager.Get(), networks);
+    }
+
     GB_SystemResult GetNetworkCostInternal(GB_SystemNetworkCostInfo& costInfo)
     {
         costInfo = GB_SystemNetworkCostInfo();
@@ -831,30 +1128,81 @@ namespace
             return comScope.GetInitializeResult();
         }
 
-        ComPtr<INetworkCostManager> costManager;
-        const HRESULT createResult = ::CoCreateInstance(CLSID_NetworkListManager, nullptr, CLSCTX_ALL, IID_PPV_ARGS(costManager.GetAddressOf()));
-        if (FAILED(createResult))
+        ComPtr<INetworkListManager> manager;
+        const HRESULT hresult = ::CoCreateInstance(CLSID_NetworkListManager, nullptr, CLSCTX_ALL, IID_PPV_ARGS(manager.GetAddressOf()));
+        if (FAILED(hresult))
         {
-            return GB_SystemResult::FromComHResult(static_cast<int32_t>(createResult), "CoCreateInstance(INetworkCostManager)", "创建 Network Cost Manager 失败。");
+            return GB_SystemResult::FromComHResult(static_cast<int32_t>(hresult), "CoCreateInstance(CLSID_NetworkListManager)", "创建 Network List Manager 失败。");
         }
-        DWORD cost = NLM_CONNECTION_COST_UNKNOWN;
-        const HRESULT costResult = costManager->GetCost(&cost, nullptr);
-        if (FAILED(costResult))
+        return QueryNetworkCostFromManager(manager.Get(), costInfo);
+    }
+
+    void CollectNlmSnapshotData(std::vector<GB_SystemConnectedNetworkInfo>& networks, NlmOverallConnectivityInfo& overallConnectivityInfo, GB_SystemNetworkCostInfo& costInfo, bool& hasCostInfo, bool& connectedNetworksSucceeded, std::string& diagnosticMessage)
+    {
+        networks.clear();
+        overallConnectivityInfo = NlmOverallConnectivityInfo();
+        costInfo = GB_SystemNetworkCostInfo();
+        hasCostInfo = false;
+        connectedNetworksSucceeded = false;
+
+        GB_ComScope comScope = GB_ComScope::InitializeMta("GB_SystemNetwork::RefreshSnapshot");
+        if (!IsComUsable(comScope))
         {
-            return GB_SystemResult::FromComHResult(static_cast<int32_t>(costResult), "INetworkCostManager::GetCost", "读取当前网络成本失败。");
+            AppendDiagnostic(diagnosticMessage, "NLM 查询失败：" + comScope.GetInitializeResult().GetDisplayMessage());
+            return;
         }
 
-        costInfo.nativeCostFlags = cost;
-        costInfo.isUnrestricted = (cost & NLM_CONNECTION_COST_UNRESTRICTED) != 0;
-        costInfo.isFixed = (cost & NLM_CONNECTION_COST_FIXED) != 0;
-        costInfo.isVariable = (cost & NLM_CONNECTION_COST_VARIABLE) != 0;
-        costInfo.isCostUnknown = !costInfo.isUnrestricted && !costInfo.isFixed && !costInfo.isVariable;
-        costInfo.isOverDataLimit = (cost & NLM_CONNECTION_COST_OVERDATALIMIT) != 0;
-        costInfo.isApproachingDataLimit = (cost & NLM_CONNECTION_COST_APPROACHINGDATALIMIT) != 0;
-        costInfo.isCongested = (cost & NLM_CONNECTION_COST_CONGESTED) != 0;
-        costInfo.isRoaming = (cost & NLM_CONNECTION_COST_ROAMING) != 0;
-        costInfo.costType = costInfo.isUnrestricted ? GB_SystemNetworkCostType::Unrestricted : (costInfo.isFixed ? GB_SystemNetworkCostType::Fixed : (costInfo.isVariable ? GB_SystemNetworkCostType::Variable : GB_SystemNetworkCostType::Unknown));
-        return GB_SystemResult::Succeeded("GB_SystemNetwork::GetNetworkCost");
+        ComPtr<INetworkListManager> manager;
+        const HRESULT hresult = ::CoCreateInstance(CLSID_NetworkListManager, nullptr, CLSCTX_ALL, IID_PPV_ARGS(manager.GetAddressOf()));
+        if (FAILED(hresult))
+        {
+            const GB_SystemResult createResult = GB_SystemResult::FromComHResult(static_cast<int32_t>(hresult), "CoCreateInstance(CLSID_NetworkListManager)", "创建 Network List Manager 失败。");
+            AppendDiagnostic(diagnosticMessage, "NLM 查询失败：" + createResult.GetDisplayMessage());
+            return;
+        }
+
+        FillOverallConnectivityInfo(manager.Get(), overallConnectivityInfo);
+
+        const GB_SystemResult networksResult = EnumerateConnectedNetworksFromManager(manager.Get(), networks);
+        connectedNetworksSucceeded = networksResult.IsSucceeded();
+        if (networksResult.IsFailed())
+        {
+            AppendDiagnostic(diagnosticMessage, "NLM 网络枚举失败：" + networksResult.GetDisplayMessage());
+        }
+
+        const GB_SystemResult costResult = QueryNetworkCostFromManager(manager.Get(), costInfo);
+        hasCostInfo = costResult.IsSucceeded();
+        if (costResult.IsFailed())
+        {
+            AppendDiagnostic(diagnosticMessage, "网络成本查询失败：" + costResult.GetDisplayMessage());
+        }
+    }
+
+    GB_SystemResult QueryInternetAccessByNlm(bool& hasInternetAccess)
+    {
+        hasInternetAccess = false;
+        GB_ComScope comScope = GB_ComScope::InitializeMta("GB_SystemNetwork::HasInternetAccess");
+        if (!IsComUsable(comScope))
+        {
+            return comScope.GetInitializeResult().WithOperationName("GB_SystemNetwork::HasInternetAccess");
+        }
+
+        ComPtr<INetworkListManager> manager;
+        const HRESULT createResult = ::CoCreateInstance(CLSID_NetworkListManager, nullptr, CLSCTX_ALL, IID_PPV_ARGS(manager.GetAddressOf()));
+        if (FAILED(createResult))
+        {
+            return GB_SystemResult::FromComHResult(static_cast<int32_t>(createResult), "CoCreateInstance(CLSID_NetworkListManager)", "创建 Network List Manager 失败。").WithOperationName("GB_SystemNetwork::HasInternetAccess");
+        }
+
+        VARIANT_BOOL internetConnected = VARIANT_FALSE;
+        const HRESULT connectedResult = manager->get_IsConnectedToInternet(&internetConnected);
+        if (FAILED(connectedResult))
+        {
+            return GB_SystemResult::FromComHResult(static_cast<int32_t>(connectedResult), "INetworkListManager::get_IsConnectedToInternet", "读取系统互联网连通性失败。").WithOperationName("GB_SystemNetwork::HasInternetAccess");
+        }
+
+        hasInternetAccess = internetConnected == VARIANT_TRUE;
+        return GB_SystemResult::Succeeded("GB_SystemNetwork::HasInternetAccess");
     }
 
     GB_SystemResult BuildSnapshot(GB_SystemNetworkSnapshot& snapshot)
@@ -866,17 +1214,9 @@ namespace
             return result.WithOperationName("GB_SystemNetwork::RefreshSnapshot");
         }
 
-        const GB_SystemResult networksResult = EnumerateConnectedNetworksInternal(snapshot.connectedNetworks);
-        if (networksResult.IsFailed())
-        {
-            AppendDiagnostic(snapshot.diagnosticMessageUtf8, "NLM 查询失败：" + networksResult.GetDisplayMessage());
-        }
-        const GB_SystemResult costResult = GetNetworkCostInternal(snapshot.costInfo);
-        snapshot.hasCostInfo = costResult.IsSucceeded();
-        if (costResult.IsFailed())
-        {
-            AppendDiagnostic(snapshot.diagnosticMessageUtf8, "网络成本查询失败：" + costResult.GetDisplayMessage());
-        }
+        NlmOverallConnectivityInfo overallConnectivityInfo;
+        bool connectedNetworksSucceeded = false;
+        CollectNlmSnapshotData(snapshot.connectedNetworks, overallConnectivityInfo, snapshot.costInfo, snapshot.hasCostInfo, connectedNetworksSucceeded, snapshot.diagnosticMessageUtf8);
 
         bool hasPrimaryInterface = false;
         uint64_t bestPrimaryScore = std::numeric_limits<uint64_t>::max();
@@ -911,11 +1251,32 @@ namespace
             snapshot.hasLocalNetworkAccess = snapshot.hasLocalNetworkAccess || network.hasIpv4LocalAccess || network.hasIpv6LocalAccess || network.hasIpv4InternetAccess || network.hasIpv6InternetAccess;
             snapshot.hasInternetAccess = snapshot.hasInternetAccess || network.hasIpv4InternetAccess || network.hasIpv6InternetAccess;
         }
-        if (networksResult.IsFailed())
+        if (overallConnectivityInfo.hasInfo)
+        {
+            snapshot.hasLocalNetworkAccess = snapshot.hasLocalNetworkAccess || overallConnectivityInfo.hasLocalNetworkAccess;
+            snapshot.hasInternetAccess = snapshot.hasInternetAccess || overallConnectivityInfo.hasInternetAccess;
+        }
+        std::sort(snapshot.activeNetworkNamesUtf8.begin(), snapshot.activeNetworkNamesUtf8.end());
+        if (!connectedNetworksSucceeded && !overallConnectivityInfo.hasInfo)
         {
             snapshot.hasLocalNetworkAccess = snapshot.hasConnectedInterface;
         }
-        snapshot.connectivityLevel = snapshot.hasInternetAccess ? GB_SystemNetworkConnectivityLevel::InternetAccess : (snapshot.hasLocalNetworkAccess ? GB_SystemNetworkConnectivityLevel::LocalAccess : (snapshot.hasConnectedInterface ? GB_SystemNetworkConnectivityLevel::InterfaceOnly : GB_SystemNetworkConnectivityLevel::Disconnected));
+        if (snapshot.hasInternetAccess)
+        {
+            snapshot.connectivityLevel = GB_SystemNetworkConnectivityLevel::InternetAccess;
+        }
+        else if (snapshot.hasLocalNetworkAccess)
+        {
+            snapshot.connectivityLevel = GB_SystemNetworkConnectivityLevel::LocalAccess;
+        }
+        else if (snapshot.hasConnectedInterface)
+        {
+            snapshot.connectivityLevel = GB_SystemNetworkConnectivityLevel::InterfaceOnly;
+        }
+        else
+        {
+            snapshot.connectivityLevel = GB_SystemNetworkConnectivityLevel::Disconnected;
+        }
         snapshot.isMetered = snapshot.hasCostInfo && (snapshot.costInfo.isFixed || snapshot.costInfo.isVariable || snapshot.costInfo.isOverDataLimit || snapshot.costInfo.isApproachingDataLimit || snapshot.costInfo.isRoaming);
         snapshot.isRoaming = snapshot.hasCostInfo && snapshot.costInfo.isRoaming;
         snapshot.timestampMilliseconds = GB_EventDispatcher::GetCurrentTimestampMilliseconds();
@@ -1034,7 +1395,7 @@ GB_SystemResult GB_SystemNetwork::EnumerateConnectedNetworks(std::vector<GB_Syst
 #else
     try
     {
-        return EnumerateConnectedNetworksInternal(networks);
+        return EnumerateConnectedNetworksInternal(networks, nullptr);
     }
     catch (const std::bad_alloc&)
     {
@@ -1075,13 +1436,40 @@ GB_SystemResult GB_SystemNetwork::GetNetworkCost(GB_SystemNetworkCostInfo& costI
 GB_SystemResult GB_SystemNetwork::HasInternetAccess(bool& hasInternetAccess)
 {
     hasInternetAccess = false;
-    GB_SystemNetworkSnapshot snapshot;
-    GB_SystemResult result = GetSnapshot(snapshot);
-    if (result.IsSucceeded())
+#if !defined(_WIN32)
+    return MakeUnsupportedPlatformResult("GB_SystemNetwork::HasInternetAccess");
+#else
+    try
     {
-        hasInternetAccess = snapshot.hasInternetAccess;
+        GB_SystemResult directResult = QueryInternetAccessByNlm(hasInternetAccess);
+        if (directResult.IsSucceeded())
+        {
+            return directResult;
+        }
+
+        GB_SystemNetworkSnapshot snapshot;
+        GB_SystemResult snapshotResult = GetSnapshot(snapshot);
+        if (snapshotResult.IsSucceeded())
+        {
+            hasInternetAccess = snapshot.hasInternetAccess;
+            if (!snapshot.diagnosticMessageUtf8.empty())
+            {
+                return GB_SystemResult::Succeeded("GB_SystemNetwork::HasInternetAccess", snapshot.diagnosticMessageUtf8);
+            }
+            return GB_SystemResult::Succeeded("GB_SystemNetwork::HasInternetAccess");
+        }
+
+        return snapshotResult.WithOperationName("GB_SystemNetwork::HasInternetAccess");
     }
-    return result.WithOperationName("GB_SystemNetwork::HasInternetAccess");
+    catch (const std::bad_alloc&)
+    {
+        return GB_SystemResult::Failed(GB_SystemErrorCode::ResourceAllocationFailed, "GB_SystemNetwork::HasInternetAccess", "判断互联网连通性时内存不足。");
+    }
+    catch (const std::exception& exception)
+    {
+        return GB_SystemResult::Failed(GB_SystemErrorCode::InternalError, "GB_SystemNetwork::HasInternetAccess", std::string("判断互联网连通性时发生异常：") + exception.what());
+    }
+#endif
 }
 
 namespace
@@ -1092,13 +1480,44 @@ namespace
         std::mutex mutex;
         std::condition_variable condition;
         GUID interfaceGuid = {};
+        bool hasTargetProfileName = false;
+        std::wstring targetProfileName;
         bool scanComplete = false;
         bool scanFailed = false;
         bool connectionComplete = false;
         bool connectionFailed = false;
         bool disconnected = false;
+        bool hasConnectionNotificationProfileName = false;
+        std::wstring connectionNotificationProfileName;
         WLAN_REASON_CODE reasonCode = WLAN_REASON_CODE_SUCCESS;
     };
+
+    struct WlanOperationState
+    {
+        bool scanComplete = false;
+        bool scanFailed = false;
+        bool connectionComplete = false;
+        bool connectionFailed = false;
+        bool disconnected = false;
+        bool hasConnectionNotificationProfileName = false;
+        std::wstring connectionNotificationProfileName;
+        WLAN_REASON_CODE reasonCode = WLAN_REASON_CODE_SUCCESS;
+    };
+
+    WlanOperationState CopyWlanOperationState(WlanOperationContext& context)
+    {
+        std::lock_guard<std::mutex> lock(context.mutex);
+        WlanOperationState state;
+        state.scanComplete = context.scanComplete;
+        state.scanFailed = context.scanFailed;
+        state.connectionComplete = context.connectionComplete;
+        state.connectionFailed = context.connectionFailed;
+        state.disconnected = context.disconnected;
+        state.hasConnectionNotificationProfileName = context.hasConnectionNotificationProfileName;
+        state.connectionNotificationProfileName = context.connectionNotificationProfileName;
+        state.reasonCode = context.reasonCode;
+        return state;
+    }
 
     void WINAPI WlanOperationCallback(PWLAN_NOTIFICATION_DATA notificationData, PVOID contextPointer)
     {
@@ -1107,7 +1526,8 @@ namespace
             return;
         }
         WlanOperationContext* context = static_cast<WlanOperationContext*>(contextPointer);
-        if (!::IsEqualGUID(notificationData->InterfaceGuid, context->interfaceGuid))
+        const GUID interfaceGuid = context->interfaceGuid;
+        if (!::IsEqualGUID(notificationData->InterfaceGuid, interfaceGuid))
         {
             return;
         }
@@ -1130,20 +1550,36 @@ namespace
                 notify = true;
                 break;
             case wlan_notification_acm_connection_complete:
-                context->connectionComplete = true;
                 if (notificationData->pData != nullptr && notificationData->dwDataSize >= sizeof(WLAN_CONNECTION_NOTIFICATION_DATA))
                 {
-                    context->reasonCode = static_cast<const WLAN_CONNECTION_NOTIFICATION_DATA*>(notificationData->pData)->wlanReasonCode;
+                    const WLAN_CONNECTION_NOTIFICATION_DATA* connectionData = static_cast<const WLAN_CONNECTION_NOTIFICATION_DATA*>(notificationData->pData);
+                    const std::wstring notificationProfileName = connectionData->strProfileName;
+                    if (context->hasTargetProfileName && !notificationProfileName.empty() && ::CompareStringOrdinal(notificationProfileName.c_str(), -1, context->targetProfileName.c_str(), -1, FALSE) != CSTR_EQUAL)
+                    {
+                        break;
+                    }
+                    context->hasConnectionNotificationProfileName = true;
+                    context->connectionNotificationProfileName = notificationProfileName;
+                    context->reasonCode = connectionData->wlanReasonCode;
                     context->connectionFailed = context->reasonCode != WLAN_REASON_CODE_SUCCESS;
                 }
+                context->connectionComplete = true;
                 notify = true;
                 break;
             case wlan_notification_acm_connection_attempt_fail:
-                context->connectionFailed = true;
                 if (notificationData->pData != nullptr && notificationData->dwDataSize >= sizeof(WLAN_CONNECTION_NOTIFICATION_DATA))
                 {
-                    context->reasonCode = static_cast<const WLAN_CONNECTION_NOTIFICATION_DATA*>(notificationData->pData)->wlanReasonCode;
+                    const WLAN_CONNECTION_NOTIFICATION_DATA* connectionData = static_cast<const WLAN_CONNECTION_NOTIFICATION_DATA*>(notificationData->pData);
+                    const std::wstring notificationProfileName = connectionData->strProfileName;
+                    if (context->hasTargetProfileName && !notificationProfileName.empty() && ::CompareStringOrdinal(notificationProfileName.c_str(), -1, context->targetProfileName.c_str(), -1, FALSE) != CSTR_EQUAL)
+                    {
+                        break;
+                    }
+                    context->hasConnectionNotificationProfileName = true;
+                    context->connectionNotificationProfileName = notificationProfileName;
+                    context->reasonCode = connectionData->wlanReasonCode;
                 }
+                context->connectionFailed = true;
                 notify = true;
                 break;
             case wlan_notification_acm_disconnected:
@@ -1170,7 +1606,74 @@ namespace
         {
             return GB_SystemResult::Failed(GB_SystemErrorCode::InvalidArgument, operationName, "cancellationPollMilliseconds 必须大于 0。");
         }
+        if (timeoutMilliseconds > static_cast<uint32_t>(std::numeric_limits<int32_t>::max()) || cancellationPollMilliseconds > static_cast<uint32_t>(std::numeric_limits<int32_t>::max()))
+        {
+            return GB_SystemResult::Failed(GB_SystemErrorCode::InvalidArgument, operationName, "等待时间参数过大，可能导致底层计时溢出。");
+        }
         return GB_SystemResult::Succeeded(operationName);
+    }
+
+    bool IsSameOrdinal(const std::wstring& left, const std::wstring& right)
+    {
+        return ::CompareStringOrdinal(left.c_str(), -1, right.c_str(), -1, FALSE) == CSTR_EQUAL;
+    }
+
+    bool IsSameProfileNameUtf8(const std::string& profileNameUtf8, const std::wstring& expectedProfileNameWide)
+    {
+        return IsSameOrdinal(GB_Utf8ToWString(profileNameUtf8), expectedProfileNameWide);
+    }
+
+    bool IsSameProfileNameWide(const std::wstring& profileNameWide, const std::wstring& expectedProfileNameWide)
+    {
+        return IsSameOrdinal(profileNameWide, expectedProfileNameWide);
+    }
+
+    void SortWifiBssEntries(std::vector<GB_SystemWifiBssInfo>& bssEntries)
+    {
+        std::sort(bssEntries.begin(), bssEntries.end(), [](const GB_SystemWifiBssInfo& left, const GB_SystemWifiBssInfo& right)
+            {
+                if (left.rssiDbm != right.rssiDbm)
+                {
+                    return left.rssiDbm > right.rssiDbm;
+                }
+                if (left.channelNumber != right.channelNumber)
+                {
+                    return left.channelNumber < right.channelNumber;
+                }
+                return left.bssidUtf8 < right.bssidUtf8;
+            });
+    }
+
+    void SortWifiNetworks(std::vector<GB_SystemWifiNetworkInfo>& networks)
+    {
+        std::sort(networks.begin(), networks.end(), [](const GB_SystemWifiNetworkInfo& left, const GB_SystemWifiNetworkInfo& right)
+            {
+                if (left.isConnected != right.isConnected)
+                {
+                    return left.isConnected;
+                }
+                if (left.isConnectable != right.isConnectable)
+                {
+                    return left.isConnectable;
+                }
+                if (left.signalQuality != right.signalQuality)
+                {
+                    return left.signalQuality > right.signalQuality;
+                }
+                if (left.ssidUtf8 != right.ssidUtf8)
+                {
+                    return left.ssidUtf8 < right.ssidUtf8;
+                }
+                if (left.ssidHexUtf8 != right.ssidHexUtf8)
+                {
+                    return left.ssidHexUtf8 < right.ssidHexUtf8;
+                }
+                if (left.securityType != right.securityType)
+                {
+                    return static_cast<uint16_t>(left.securityType) < static_cast<uint16_t>(right.securityType);
+                }
+                return left.profileNameUtf8 < right.profileNameUtf8;
+            });
     }
 
     template <typename Predicate>
@@ -1180,7 +1683,7 @@ namespace
         std::unique_lock<std::mutex> lock(context.mutex);
         while (!predicate())
         {
-            if (cancellationFlag != nullptr && cancellationFlag->load(std::memory_order_acquire))
+            if (IsCancellationRequested(cancellationFlag))
             {
                 return GB_SystemResult::Failed(GB_SystemErrorCode::Cancelled, operationName, "Wi-Fi 操作已被调用方取消。");
             }
@@ -1208,6 +1711,21 @@ namespace
         return result;
     }
 
+    bool IsNoCurrentWifiConnectionError(const DWORD errorCode)
+    {
+        if (errorCode == ERROR_INVALID_STATE || errorCode == ERROR_NOT_FOUND || errorCode == ERROR_NOT_READY)
+        {
+            return true;
+        }
+#ifdef ERROR_NDIS_DOT11_POWER_STATE_INVALID
+        if (errorCode == ERROR_NDIS_DOT11_POWER_STATE_INVALID)
+        {
+            return true;
+        }
+#endif
+        return false;
+    }
+
     GB_SystemResult QueryCurrentWifiConnection(HANDLE wlanHandle, const GUID& interfaceGuid, GB_SystemWifiConnectionInfo& connectionInfo, bool& found)
     {
         connectionInfo = GB_SystemWifiConnectionInfo();
@@ -1219,13 +1737,13 @@ namespace
         const DWORD errorCode = ::WlanQueryInterface(wlanHandle, &interfaceGuid, wlan_intf_opcode_current_connection, nullptr, &dataSize, reinterpret_cast<PVOID*>(&rawAttributes), &opcodeValueType);
         WlanMemoryScope<WLAN_CONNECTION_ATTRIBUTES> attributes;
         attributes.Reset(rawAttributes);
-        if (errorCode == ERROR_INVALID_STATE || errorCode == ERROR_NOT_FOUND)
+        if (IsNoCurrentWifiConnectionError(errorCode))
         {
             return GB_SystemResult::Succeeded("WlanQueryInterface(CurrentConnection)");
         }
         if (errorCode != ERROR_SUCCESS)
         {
-            return GB_SystemResult::FromWin32Error(errorCode, "WlanQueryInterface(CurrentConnection)", "查询当前 Wi-Fi 连接失败。");
+            return MakeWifiWin32ErrorResult(errorCode, "WlanQueryInterface(CurrentConnection)", "查询当前 Wi-Fi 连接失败。");
         }
         if (attributes.Get() == nullptr)
         {
@@ -1250,6 +1768,27 @@ namespace
         connectionInfo.isSecurityEnabled = value.wlanSecurityAttributes.bSecurityEnabled != FALSE;
         connectionInfo.securityType = MapWifiSecurity(value.wlanSecurityAttributes.dot11AuthAlgorithm, value.wlanSecurityAttributes.dot11CipherAlgorithm);
         return GB_SystemResult::Succeeded("WlanQueryInterface(CurrentConnection)");
+    }
+
+    GB_SystemResult QueryWifiInterfaceState(HANDLE wlanHandle, const GUID& interfaceGuid, GB_SystemWifiInterfaceState& interfaceState)
+    {
+        interfaceState = GB_SystemWifiInterfaceState::Unknown;
+        DWORD dataSize = 0;
+        WLAN_OPCODE_VALUE_TYPE opcodeValueType = wlan_opcode_value_type_invalid;
+        WLAN_INTERFACE_STATE* rawState = nullptr;
+        const DWORD errorCode = ::WlanQueryInterface(wlanHandle, &interfaceGuid, wlan_intf_opcode_interface_state, nullptr, &dataSize, reinterpret_cast<PVOID*>(&rawState), &opcodeValueType);
+        WlanMemoryScope<WLAN_INTERFACE_STATE> state;
+        state.Reset(rawState);
+        if (errorCode != ERROR_SUCCESS)
+        {
+            return GB_SystemResult::FromWin32Error(errorCode, "WlanQueryInterface(InterfaceState)", "查询 Wi-Fi 接口状态失败。");
+        }
+        if (state.Get() == nullptr)
+        {
+            return GB_SystemResult::Failed(GB_SystemErrorCode::InternalError, "WlanQueryInterface(InterfaceState)", "Native Wi-Fi 返回了空接口状态。");
+        }
+        interfaceState = MapWifiInterfaceState(*state.Get());
+        return GB_SystemResult::Succeeded("WlanQueryInterface(InterfaceState)");
     }
 
     uint32_t FrequencyToChannel(const uint32_t frequencyKhz)
@@ -1318,6 +1857,7 @@ GB_SystemResult GB_SystemNetwork::EnumerateWifiInterfaces(std::vector<GB_SystemW
         {
             return GB_SystemResult::Failed(GB_SystemErrorCode::InternalError, "WlanEnumInterfaces", "Native Wi-Fi 返回了空接口列表。");
         }
+        interfaces.reserve(list.Get()->dwNumberOfItems);
         for (DWORD index = 0; index < list.Get()->dwNumberOfItems; index++)
         {
             const WLAN_INTERFACE_INFO& rawInfo = list.Get()->InterfaceInfo[index];
@@ -1351,6 +1891,14 @@ GB_SystemResult GB_SystemNetwork::EnumerateWifiInterfaces(std::vector<GB_SystemW
             }
             interfaces.push_back(info);
         }
+        std::sort(interfaces.begin(), interfaces.end(), [](const GB_SystemWifiInterfaceInfo& left, const GB_SystemWifiInterfaceInfo& right)
+            {
+                if (left.descriptionUtf8 != right.descriptionUtf8)
+                {
+                    return left.descriptionUtf8 < right.descriptionUtf8;
+                }
+                return left.interfaceIdUtf8 < right.interfaceIdUtf8;
+            });
         return GB_SystemResult::Succeeded("GB_SystemNetwork::EnumerateWifiInterfaces");
     }
     catch (const std::bad_alloc&)
@@ -1413,6 +1961,11 @@ GB_SystemResult GB_SystemNetwork::ScanWifiNetworks(const std::string& interfaceI
     {
         return result;
     }
+    const std::string normalizedInterfaceIdUtf8 = GuidToUtf8(interfaceGuid);
+    if (IsCancellationRequested(options.cancellationFlag))
+    {
+        return MakeCancelledBeforeNativeCallResult("GB_SystemNetwork::ScanWifiNetworks", "Wi-Fi 扫描在提交给系统前已被调用方取消。");
+    }
     try
     {
         WlanHandleScope wlanHandle;
@@ -1424,31 +1977,37 @@ GB_SystemResult GB_SystemNetwork::ScanWifiNetworks(const std::string& interfaceI
         WlanOperationContext context;
         context.interfaceGuid = interfaceGuid;
         DWORD previousSource = 0;
+        std::string scanDiagnosticMessageUtf8;
         if (options.requestFreshScan)
         {
             WlanNotificationScope notificationScope;
-            DWORD errorCode = notificationScope.Register(wlanHandle.Get(), WLAN_NOTIFICATION_SOURCE_ACM, &WlanOperationCallback, &context, &previousSource);
+            DWORD errorCode = notificationScope.Register(wlanHandle.Get(), WLAN_NOTIFICATION_SOURCE_ACM, &WlanOperationCallback, &context, false, &previousSource);
             if (errorCode != ERROR_SUCCESS)
             {
-                return GB_SystemResult::FromWin32Error(errorCode, "WlanRegisterNotification", "注册 Wi-Fi 扫描完成通知失败。");
+                return MakeWin32ErrorResult(errorCode, "WlanRegisterNotification", "注册 Wi-Fi 扫描完成通知失败。");
             }
             errorCode = ::WlanScan(wlanHandle.Get(), &interfaceGuid, nullptr, nullptr, nullptr);
             if (errorCode != ERROR_SUCCESS)
             {
-                return GB_SystemResult::FromWin32Error(errorCode, "WlanScan", "请求 Wi-Fi 扫描失败；新版 Windows 可能要求精确位置权限。");
+                return MakeWifiWin32ErrorResult(errorCode, "WlanScan", "请求 Wi-Fi 扫描失败。");
             }
             result = WaitForWlanCondition(context, options.timeoutMilliseconds, options.cancellationPollMilliseconds, options.cancellationFlag, [&context]()
                 {
                     return context.scanComplete || context.scanFailed;
                 }, "GB_SystemNetwork::ScanWifiNetworks");
             notificationScope.Reset();
+            const WlanOperationState operationState = CopyWlanOperationState(context);
             if (result.IsFailed())
             {
-                return result;
+                if (result.errorCode != GB_SystemErrorCode::Timeout)
+                {
+                    return result;
+                }
+                scanDiagnosticMessageUtf8 = "等待 Wi-Fi 扫描完成通知超时，已改为读取系统当前可用网络缓存。";
             }
-            if (context.scanFailed)
+            if (operationState.scanFailed)
             {
-                return MakeWlanReasonFailure(context.reasonCode, "GB_SystemNetwork::ScanWifiNetworks", "Wi-Fi 扫描完成通知报告失败。");
+                return MakeWlanReasonFailure(operationState.reasonCode, "GB_SystemNetwork::ScanWifiNetworks", "Wi-Fi 扫描完成通知报告失败。");
             }
         }
 
@@ -1458,13 +2017,17 @@ GB_SystemResult GB_SystemNetwork::ScanWifiNetworks(const std::string& interfaceI
         list.Reset(rawList);
         if (listError != ERROR_SUCCESS)
         {
-            return GB_SystemResult::FromWin32Error(listError, "WlanGetAvailableNetworkList", "读取 Wi-Fi 扫描结果失败；新版 Windows 可能要求精确位置权限。");
+            return MakeWifiWin32ErrorResult(listError, "WlanGetAvailableNetworkList", "读取 Wi-Fi 扫描结果失败。");
+        }
+        if (list.Get() != nullptr)
+        {
+            networks.reserve(list.Get()->dwNumberOfItems);
         }
         for (DWORD index = 0; list.Get() != nullptr && index < list.Get()->dwNumberOfItems; index++)
         {
             const WLAN_AVAILABLE_NETWORK& rawNetwork = list.Get()->Network[index];
             GB_SystemWifiNetworkInfo info;
-            info.interfaceIdUtf8 = interfaceIdUtf8;
+            info.interfaceIdUtf8 = normalizedInterfaceIdUtf8;
             info.profileNameUtf8 = GB_WStringToUtf8(rawNetwork.strProfileName);
             info.ssidUtf8 = SsidToUtf8(rawNetwork.dot11Ssid);
             info.ssidHexUtf8 = SsidToHex(rawNetwork.dot11Ssid);
@@ -1484,18 +2047,21 @@ GB_SystemResult GB_SystemNetwork::ScanWifiNetworks(const std::string& interfaceI
 
         if (options.includeBssDetails)
         {
-            for (size_t networkIndex = 0; networkIndex < networks.size(); networkIndex++)
-            {
-                networks[networkIndex].strongestRssiDbm = (std::numeric_limits<int32_t>::min)();
-            }
             WLAN_BSS_LIST* rawBssList = nullptr;
             const DWORD bssError = ::WlanGetNetworkBssList(wlanHandle.Get(), &interfaceGuid, nullptr, dot11_BSS_type_any, FALSE, nullptr, &rawBssList);
             WlanMemoryScope<WLAN_BSS_LIST> bssList;
             bssList.Reset(rawBssList);
             if (bssError != ERROR_SUCCESS)
             {
-                GB_SystemResult detailResult = GB_SystemResult::FromWin32Error(bssError, "WlanGetNetworkBssList", "读取 Wi-Fi BSS 详情失败；该能力可能要求精确位置权限。");
-                return GB_SystemResult::Succeeded("GB_SystemNetwork::ScanWifiNetworks", "已返回可用 Wi-Fi 列表，但 BSS 详情不可用：" + detailResult.GetDisplayMessage());
+                SortWifiNetworks(networks);
+                GB_SystemResult detailResult = MakeWifiWin32ErrorResult(bssError, "WlanGetNetworkBssList", "读取 Wi-Fi BSS 详情失败。");
+                const std::string message = scanDiagnosticMessageUtf8.empty() ? ("已返回可用 Wi-Fi 列表，但 BSS 详情不可用：" + detailResult.GetDisplayMessage()) : (scanDiagnosticMessageUtf8 + " 已返回可用 Wi-Fi 列表，但 BSS 详情不可用：" + detailResult.GetDisplayMessage());
+                return GB_SystemResult::Succeeded("GB_SystemNetwork::ScanWifiNetworks", message);
+            }
+
+            for (size_t networkIndex = 0; networkIndex < networks.size(); networkIndex++)
+            {
+                networks[networkIndex].strongestRssiDbm = (std::numeric_limits<int32_t>::min)();
             }
 
             std::unordered_multimap<std::string, size_t> networkIndexesByBssKey;
@@ -1529,9 +2095,14 @@ GB_SystemResult GB_SystemNetwork::ScanWifiNetworks(const std::string& interfaceI
                 {
                     networks[networkIndex].strongestRssiDbm = SignalQualityToRssiDbm(networks[networkIndex].signalQuality);
                 }
+                else
+                {
+                    SortWifiBssEntries(networks[networkIndex].bssEntries);
+                }
             }
         }
-        return GB_SystemResult::Succeeded("GB_SystemNetwork::ScanWifiNetworks");
+        SortWifiNetworks(networks);
+        return GB_SystemResult::Succeeded("GB_SystemNetwork::ScanWifiNetworks", scanDiagnosticMessageUtf8);
     }
     catch (const std::bad_alloc&)
     {
@@ -1558,6 +2129,7 @@ GB_SystemResult GB_SystemNetwork::EnumerateWifiProfiles(const std::string& inter
     {
         return result;
     }
+    const std::string normalizedInterfaceIdUtf8 = GuidToUtf8(interfaceGuid);
     try
     {
         WlanHandleScope wlanHandle;
@@ -1574,14 +2146,26 @@ GB_SystemResult GB_SystemNetwork::EnumerateWifiProfiles(const std::string& inter
         {
             return GB_SystemResult::FromWin32Error(errorCode, "WlanGetProfileList", "枚举已保存 Wi-Fi Profile 失败。");
         }
+        if (list.Get() != nullptr)
+        {
+            profiles.reserve(list.Get()->dwNumberOfItems);
+        }
         for (DWORD index = 0; list.Get() != nullptr && index < list.Get()->dwNumberOfItems; index++)
         {
             GB_SystemWifiProfileInfo info;
-            info.interfaceIdUtf8 = interfaceIdUtf8;
+            info.interfaceIdUtf8 = normalizedInterfaceIdUtf8;
             info.profileNameUtf8 = GB_WStringToUtf8(list.Get()->ProfileInfo[index].strProfileName);
             info.nativeFlags = list.Get()->ProfileInfo[index].dwFlags;
             profiles.push_back(info);
         }
+        std::sort(profiles.begin(), profiles.end(), [](const GB_SystemWifiProfileInfo& left, const GB_SystemWifiProfileInfo& right)
+            {
+                if (left.interfaceIdUtf8 != right.interfaceIdUtf8)
+                {
+                    return left.interfaceIdUtf8 < right.interfaceIdUtf8;
+                }
+                return left.profileNameUtf8 < right.profileNameUtf8;
+            });
         return GB_SystemResult::Succeeded("GB_SystemNetwork::EnumerateWifiProfiles");
     }
     catch (const std::bad_alloc&)
@@ -1616,6 +2200,10 @@ GB_SystemResult GB_SystemNetwork::ConnectWifiByProfile(const std::string& interf
     {
         return result;
     }
+    if (IsCancellationRequested(options.cancellationFlag))
+    {
+        return MakeCancelledBeforeNativeCallResult("GB_SystemNetwork::ConnectWifiByProfile", "Wi-Fi 连接请求在提交给系统前已被调用方取消。");
+    }
     try
     {
         const std::wstring profileNameWide = GB_Utf8ToWString(profileNameUtf8);
@@ -1625,14 +2213,25 @@ GB_SystemResult GB_SystemNetwork::ConnectWifiByProfile(const std::string& interf
         {
             return result.WithOperationName("GB_SystemNetwork::ConnectWifiByProfile");
         }
+
+        GB_SystemWifiConnectionInfo currentConnection;
+        bool currentConnectionFound = false;
+        const GB_SystemResult currentConnectionResult = QueryCurrentWifiConnection(wlanHandle.Get(), interfaceGuid, currentConnection, currentConnectionFound);
+        if (currentConnectionResult.IsSucceeded() && currentConnectionFound && IsSameProfileNameUtf8(currentConnection.profileNameUtf8, profileNameWide))
+        {
+            return GB_SystemResult::Succeeded("GB_SystemNetwork::ConnectWifiByProfile", "目标 Wi-Fi Profile 已处于连接状态。");
+        }
+
         WlanOperationContext context;
         context.interfaceGuid = interfaceGuid;
+        context.hasTargetProfileName = true;
+        context.targetProfileName = profileNameWide;
         DWORD previousSource = 0;
         WlanNotificationScope notificationScope;
-        DWORD errorCode = notificationScope.Register(wlanHandle.Get(), WLAN_NOTIFICATION_SOURCE_ACM, &WlanOperationCallback, &context, &previousSource);
+        DWORD errorCode = notificationScope.Register(wlanHandle.Get(), WLAN_NOTIFICATION_SOURCE_ACM, &WlanOperationCallback, &context, false, &previousSource);
         if (errorCode != ERROR_SUCCESS)
         {
-            return GB_SystemResult::FromWin32Error(errorCode, "WlanRegisterNotification", "注册 Wi-Fi 连接结果通知失败。");
+            return MakeWin32ErrorResult(errorCode, "WlanRegisterNotification", "注册 Wi-Fi 连接结果通知失败。");
         }
         WLAN_CONNECTION_PARAMETERS parameters = {};
         parameters.wlanConnectionMode = wlan_connection_mode_profile;
@@ -1641,33 +2240,61 @@ GB_SystemResult GB_SystemNetwork::ConnectWifiByProfile(const std::string& interf
         errorCode = ::WlanConnect(wlanHandle.Get(), &interfaceGuid, &parameters, nullptr);
         if (errorCode != ERROR_SUCCESS)
         {
-            return GB_SystemResult::FromWin32Error(errorCode, "WlanConnect", "提交 Wi-Fi Profile 连接请求失败。");
+            return MakeWin32ErrorResult(errorCode, "WlanConnect", "提交 Wi-Fi Profile 连接请求失败。");
         }
         result = WaitForWlanCondition(context, options.timeoutMilliseconds, options.cancellationPollMilliseconds, options.cancellationFlag, [&context]()
             {
                 return context.connectionComplete || context.connectionFailed;
             }, "GB_SystemNetwork::ConnectWifiByProfile");
         notificationScope.Reset();
+        const WlanOperationState operationState = CopyWlanOperationState(context);
         if (result.IsFailed())
         {
-            if (result.errorCode == GB_SystemErrorCode::Cancelled || result.errorCode == GB_SystemErrorCode::Timeout)
+            if (result.errorCode == GB_SystemErrorCode::Timeout)
             {
-                (void)::WlanDisconnect(wlanHandle.Get(), &interfaceGuid, nullptr);
+                GB_SystemWifiConnectionInfo connectionInfo;
+                bool found = false;
+                const GB_SystemResult queryResult = QueryCurrentWifiConnection(wlanHandle.Get(), interfaceGuid, connectionInfo, found);
+                if (queryResult.IsSucceeded() && found && IsSameProfileNameUtf8(connectionInfo.profileNameUtf8, profileNameWide))
+                {
+                    InvalidateSnapshotCache();
+                    return GB_SystemResult::Succeeded("GB_SystemNetwork::ConnectWifiByProfile", "等待 Wi-Fi 连接通知超时，但已确认当前连接为目标 Profile。");
+                }
+                return result.WithMessage("等待 Wi-Fi 连接通知超时；Native Wi-Fi 连接请求可能仍在系统后台继续，未主动断开当前接口。");
+            }
+            if (result.errorCode == GB_SystemErrorCode::Cancelled)
+            {
+                return result.WithMessage("Wi-Fi 连接等待已被调用方取消；Native Wi-Fi 连接请求可能仍在系统后台继续，未主动断开当前接口。");
             }
             return result;
         }
-        if (context.connectionFailed || context.reasonCode != WLAN_REASON_CODE_SUCCESS)
+        if (operationState.hasConnectionNotificationProfileName && !IsSameProfileNameWide(operationState.connectionNotificationProfileName, profileNameWide))
         {
-            return MakeWlanReasonFailure(context.reasonCode, "GB_SystemNetwork::ConnectWifiByProfile", "Wi-Fi 连接未达到成功状态。");
+            return GB_SystemResult::Failed(GB_SystemErrorCode::InvalidState, "GB_SystemNetwork::ConnectWifiByProfile", "收到 Wi-Fi 连接通知，但通知中的 Profile 与目标 Profile 不一致。");
         }
+        if (operationState.connectionFailed || operationState.reasonCode != WLAN_REASON_CODE_SUCCESS)
+        {
+            return MakeWlanReasonFailure(operationState.reasonCode, "GB_SystemNetwork::ConnectWifiByProfile", "Wi-Fi 连接未达到成功状态。");
+        }
+        if (operationState.hasConnectionNotificationProfileName)
+        {
+            InvalidateSnapshotCache();
+            return GB_SystemResult::Succeeded("GB_SystemNetwork::ConnectWifiByProfile");
+        }
+
         GB_SystemWifiConnectionInfo connectionInfo;
         bool found = false;
         result = QueryCurrentWifiConnection(wlanHandle.Get(), interfaceGuid, connectionInfo, found);
         if (result.IsFailed())
         {
+            if (result.errorCode == GB_SystemErrorCode::PermissionDenied)
+            {
+                InvalidateSnapshotCache();
+                return GB_SystemResult::Succeeded("GB_SystemNetwork::ConnectWifiByProfile", "已收到 Wi-Fi 连接成功通知；由于系统权限限制，无法读取当前连接作二次校验。");
+            }
             return result.WithOperationName("GB_SystemNetwork::ConnectWifiByProfile");
         }
-        if (!found || ::CompareStringOrdinal(GB_Utf8ToWString(connectionInfo.profileNameUtf8).c_str(), -1, profileNameWide.c_str(), -1, TRUE) != CSTR_EQUAL)
+        if (!found || !IsSameProfileNameUtf8(connectionInfo.profileNameUtf8, profileNameWide))
         {
             return GB_SystemResult::Failed(GB_SystemErrorCode::InvalidState, "GB_SystemNetwork::ConnectWifiByProfile", "收到连接成功通知后，当前连接 Profile 与目标 Profile 不一致。");
         }
@@ -1685,6 +2312,8 @@ GB_SystemResult GB_SystemNetwork::ConnectWifiByProfile(const std::string& interf
 #endif
 }
 
+
+
 GB_SystemResult GB_SystemNetwork::DisconnectWifi(const std::string& interfaceIdUtf8, const GB_SystemWifiOperationOptions& options)
 {
 #if !defined(_WIN32)
@@ -1700,6 +2329,10 @@ GB_SystemResult GB_SystemNetwork::DisconnectWifi(const std::string& interfaceIdU
     {
         return result;
     }
+    if (IsCancellationRequested(options.cancellationFlag))
+    {
+        return MakeCancelledBeforeNativeCallResult("GB_SystemNetwork::DisconnectWifi", "Wi-Fi 断开请求在提交给系统前已被调用方取消。");
+    }
     try
     {
         WlanHandleScope wlanHandle;
@@ -1708,32 +2341,40 @@ GB_SystemResult GB_SystemNetwork::DisconnectWifi(const std::string& interfaceIdU
         {
             return result.WithOperationName("GB_SystemNetwork::DisconnectWifi");
         }
-        GB_SystemWifiConnectionInfo currentConnection;
-        bool found = false;
-        result = QueryCurrentWifiConnection(wlanHandle.Get(), interfaceGuid, currentConnection, found);
-        if (result.IsFailed() || !found)
-        {
-            return result.IsFailed() ? result.WithOperationName("GB_SystemNetwork::DisconnectWifi") : GB_SystemResult::Succeeded("GB_SystemNetwork::DisconnectWifi", "目标 Wi-Fi 接口本来就未连接。");
-        }
         WlanOperationContext context;
         context.interfaceGuid = interfaceGuid;
         DWORD previousSource = 0;
         WlanNotificationScope notificationScope;
-        DWORD errorCode = notificationScope.Register(wlanHandle.Get(), WLAN_NOTIFICATION_SOURCE_ACM, &WlanOperationCallback, &context, &previousSource);
+        DWORD errorCode = notificationScope.Register(wlanHandle.Get(), WLAN_NOTIFICATION_SOURCE_ACM, &WlanOperationCallback, &context, false, &previousSource);
         if (errorCode != ERROR_SUCCESS)
         {
-            return GB_SystemResult::FromWin32Error(errorCode, "WlanRegisterNotification", "注册 Wi-Fi 断开通知失败。");
+            return MakeWin32ErrorResult(errorCode, "WlanRegisterNotification", "注册 Wi-Fi 断开通知失败。");
         }
         errorCode = ::WlanDisconnect(wlanHandle.Get(), &interfaceGuid, nullptr);
+        if (IsNoCurrentWifiConnectionError(errorCode))
+        {
+            InvalidateSnapshotCache();
+            return GB_SystemResult::Succeeded("GB_SystemNetwork::DisconnectWifi", "目标 Wi-Fi 接口本来就未连接。");
+        }
         if (errorCode != ERROR_SUCCESS)
         {
-            return GB_SystemResult::FromWin32Error(errorCode, "WlanDisconnect", "提交 Wi-Fi 断开请求失败。");
+            return MakeWin32ErrorResult(errorCode, "WlanDisconnect", "提交 Wi-Fi 断开请求失败。");
         }
         result = WaitForWlanCondition(context, options.timeoutMilliseconds, options.cancellationPollMilliseconds, options.cancellationFlag, [&context]()
             {
                 return context.disconnected;
             }, "GB_SystemNetwork::DisconnectWifi");
         notificationScope.Reset();
+        if (result.IsFailed() && result.errorCode == GB_SystemErrorCode::Timeout)
+        {
+            GB_SystemWifiInterfaceState interfaceState = GB_SystemWifiInterfaceState::Unknown;
+            const GB_SystemResult queryResult = QueryWifiInterfaceState(wlanHandle.Get(), interfaceGuid, interfaceState);
+            if (queryResult.IsSucceeded() && interfaceState == GB_SystemWifiInterfaceState::Disconnected)
+            {
+                InvalidateSnapshotCache();
+                return GB_SystemResult::Succeeded("GB_SystemNetwork::DisconnectWifi", "等待 Wi-Fi 断开通知超时，但已确认目标接口处于未连接状态。");
+            }
+        }
         if (result.IsSucceeded())
         {
             InvalidateSnapshotCache();
@@ -1750,6 +2391,7 @@ GB_SystemResult GB_SystemNetwork::DisconnectWifi(const std::string& interfaceIdU
     }
 #endif
 }
+
 
 std::string GB_SystemNetwork::GetAddressFamilyName(const GB_SystemNetworkAddressFamily family)
 {
@@ -2058,9 +2700,9 @@ public:
 #if !defined(_WIN32)
         return MakeUnsupportedPlatformResult("GB_SystemNetworkWatcher::Start");
 #else
-        if (options.debounceMilliseconds == 0 || options.maxDispatchQueueSize == 0)
+        if (options.maxDispatchQueueSize == 0)
         {
-            return GB_SystemResult::Failed(GB_SystemErrorCode::InvalidArgument, "GB_SystemNetworkWatcher::Start", "debounceMilliseconds 和 maxDispatchQueueSize 必须大于 0。");
+            return GB_SystemResult::Failed(GB_SystemErrorCode::InvalidArgument, "GB_SystemNetworkWatcher::Start", "maxDispatchQueueSize 必须大于 0。");
         }
         if (callbackSetupResult.IsFailed())
         {
@@ -2123,7 +2765,7 @@ public:
         DWORD negotiatedVersion = 0;
         if (::WlanOpenHandle(2, nullptr, &negotiatedVersion, &newWlanHandle) == ERROR_SUCCESS)
         {
-            if (::WlanRegisterNotification(newWlanHandle, WLAN_NOTIFICATION_SOURCE_ACM, TRUE, &Impl::WifiCallback, this, nullptr, nullptr) != ERROR_SUCCESS)
+            if (::WlanRegisterNotification(newWlanHandle, WLAN_NOTIFICATION_SOURCE_ACM, FALSE, &Impl::WifiCallback, this, nullptr, nullptr) != ERROR_SUCCESS)
             {
                 (void)::WlanCloseHandle(newWlanHandle, nullptr);
                 newWlanHandle = nullptr;
@@ -2138,7 +2780,7 @@ public:
             wlanHandle = newWlanHandle;
             stopRequested = false;
             running = true;
-            pendingReasons = options.emitInitialSnapshot ? InitialReason : InterfaceReason;
+            pendingReasons = options.emitInitialSnapshot ? InitialReason : 0;
         }
         try
         {
@@ -2204,7 +2846,7 @@ public:
         }
         if (localWlanHandle != nullptr)
         {
-            (void)::WlanRegisterNotification(localWlanHandle, WLAN_NOTIFICATION_SOURCE_NONE, TRUE, nullptr, nullptr, nullptr, nullptr);
+            (void)::WlanRegisterNotification(localWlanHandle, WLAN_NOTIFICATION_SOURCE_NONE, FALSE, nullptr, nullptr, nullptr, nullptr);
             (void)::WlanCloseHandle(localWlanHandle, nullptr);
         }
         condition.notify_all();
@@ -2362,8 +3004,6 @@ private:
                     continue;
                 }
                 GB_SystemNetworkEvent networkEvent;
-                networkEvent.eventType = (reasons & InitialReason) != 0 ? GB_SystemNetworkEventType::InitialSnapshot : ((reasons & WifiReason) != 0 ? GB_SystemNetworkEventType::WifiChanged : GB_SystemNetworkEventType::SnapshotChanged);
-                networkEvent.eventName = "SystemNetwork." + GB_SystemNetwork::GetEventTypeName(networkEvent.eventType);
                 networkEvent.sourceName = "NetIO/NativeWifi";
                 networkEvent.timestampMilliseconds = GB_EventDispatcher::GetCurrentTimestampMilliseconds();
                 networkEvent.previousSnapshot = currentSnapshot;
@@ -2375,28 +3015,38 @@ private:
                 networkEvent.networkNamesChanged = HashNetworkNames(currentSnapshot) != HashNetworkNames(refreshedSnapshot);
                 networkEvent.costChanged = HashCost(currentSnapshot) != HashCost(refreshedSnapshot);
                 networkEvent.wifiChanged = (reasons & WifiReason) != 0;
-                currentSnapshot = refreshedSnapshot;
-                if ((reasons & InitialReason) == 0 && (reasons & WifiReason) == 0)
+                const bool hasSnapshotChange = networkEvent.interfacesChanged || networkEvent.addressesChanged || networkEvent.routesChanged || networkEvent.connectivityChanged || networkEvent.networkNamesChanged || networkEvent.costChanged;
+                if ((reasons & InitialReason) != 0)
                 {
-                    if (reasons == InterfaceReason)
-                    {
-                        networkEvent.eventType = GB_SystemNetworkEventType::InterfaceChanged;
-                    }
-                    else if (reasons == AddressReason)
-                    {
-                        networkEvent.eventType = GB_SystemNetworkEventType::AddressChanged;
-                    }
-                    else if (reasons == RouteReason)
-                    {
-                        networkEvent.eventType = GB_SystemNetworkEventType::RouteChanged;
-                    }
-                    else if (reasons == PeriodicReason)
-                    {
-                        networkEvent.eventType = GB_SystemNetworkEventType::PeriodicRefresh;
-                    }
-                    networkEvent.eventName = "SystemNetwork." + GB_SystemNetwork::GetEventTypeName(networkEvent.eventType);
+                    networkEvent.eventType = GB_SystemNetworkEventType::InitialSnapshot;
                 }
-                const bool shouldPublish = (reasons & InitialReason) != 0 || networkEvent.interfacesChanged || networkEvent.addressesChanged || networkEvent.routesChanged || networkEvent.connectivityChanged || networkEvent.networkNamesChanged || networkEvent.costChanged || networkEvent.wifiChanged;
+                else if ((reasons & WifiReason) != 0)
+                {
+                    networkEvent.eventType = GB_SystemNetworkEventType::WifiChanged;
+                }
+                else if (reasons == InterfaceReason)
+                {
+                    networkEvent.eventType = GB_SystemNetworkEventType::InterfaceChanged;
+                }
+                else if (reasons == AddressReason)
+                {
+                    networkEvent.eventType = GB_SystemNetworkEventType::AddressChanged;
+                }
+                else if (reasons == RouteReason)
+                {
+                    networkEvent.eventType = GB_SystemNetworkEventType::RouteChanged;
+                }
+                else if (reasons == PeriodicReason && !hasSnapshotChange)
+                {
+                    networkEvent.eventType = GB_SystemNetworkEventType::PeriodicRefresh;
+                }
+                else
+                {
+                    networkEvent.eventType = GB_SystemNetworkEventType::SnapshotChanged;
+                }
+                networkEvent.eventName = "SystemNetwork." + GB_SystemNetwork::GetEventTypeName(networkEvent.eventType);
+                currentSnapshot = refreshedSnapshot;
+                const bool shouldPublish = (reasons & InitialReason) != 0 || ((reasons & PeriodicReason) != 0 && options.emitUnchangedPeriodicRefresh) || hasSnapshotChange || networkEvent.wifiChanged;
                 if (shouldPublish)
                 {
                     (void)eventDispatcher.Post(networkEvent.eventName, GB_Variant(networkEvent), networkEvent.sourceName);
