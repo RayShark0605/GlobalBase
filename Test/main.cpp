@@ -28,6 +28,10 @@ int main(int argc, char* argv[])
     {
         return RunGB_SystemNetworkTests();
     }
+    if (argc == 2 && argv != nullptr && argv[1] != nullptr && std::string(argv[1]) == "--gb-system-power-only")
+    {
+        return RunGB_SystemPowerTests();
+    }
 
     int failedCount = 0;
     failedCount += RunGB_Utf8StringTests();
@@ -38,6 +42,7 @@ int main(int argc, char* argv[])
     failedCount += RunGB_SystemProcessTests();
     failedCount += RunGB_SystemSessionTests();
     failedCount += RunGB_SystemNetworkTests();
+    failedCount += RunGB_SystemPowerTests();
 
     if (failedCount != 0)
     {

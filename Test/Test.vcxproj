@@ -27,6 +27,9 @@
     <ClCompile Include="GB_SystemNetwork_Test.cpp">
       <AdditionalOptions>/utf-8 %(AdditionalOptions)</AdditionalOptions>
     </ClCompile>
+    <ClCompile Include="GB_SystemPower_Test.cpp">
+      <AdditionalOptions>/utf-8 %(AdditionalOptions)</AdditionalOptions>
+    </ClCompile>
     <ClCompile Include="GB_SystemProcess_Test.cpp" />
     <ClCompile Include="GB_SystemSession_Test.cpp">
       <AdditionalOptions>/utf-8 %(AdditionalOptions)</AdditionalOptions>

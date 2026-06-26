@@ -33,6 +33,9 @@
     <ClCompile Include="GB_SystemNetwork_Test.cpp">
       <Filter>源文件</Filter>
     </ClCompile>
+    <ClCompile Include="GB_SystemPower_Test.cpp">
+      <Filter>源文件</Filter>
+    </ClCompile>
     <ClCompile Include="GB_SystemWindow_Test.cpp">
       <Filter>源文件</Filter>
     </ClCompile>

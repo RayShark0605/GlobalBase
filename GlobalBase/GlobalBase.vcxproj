@@ -33,6 +33,7 @@
     <ClInclude Include="Desktop\GB_SystemError.h" />
     <ClInclude Include="Desktop\GB_SystemFileWatcher.h" />
     <ClInclude Include="Desktop\GB_SystemNetwork.h" />
+    <ClInclude Include="Desktop\GB_SystemPower.h" />
     <ClInclude Include="Desktop\GB_SystemProcess.h" />
     <ClInclude Include="Desktop\GB_SystemResult.h" />
     <ClInclude Include="Desktop\GB_SystemSession.h" />
@@ -92,6 +93,9 @@
       <AdditionalOptions>/utf-8 %(AdditionalOptions)</AdditionalOptions>
     </ClCompile>
     <ClCompile Include="Desktop\GB_SystemNetwork.cpp">
+      <AdditionalOptions>/utf-8 %(AdditionalOptions)</AdditionalOptions>
+    </ClCompile>
+    <ClCompile Include="Desktop\GB_SystemPower.cpp">
       <AdditionalOptions>/utf-8 %(AdditionalOptions)</AdditionalOptions>
     </ClCompile>
     <ClCompile Include="Desktop\GB_SystemProcess.cpp" />
