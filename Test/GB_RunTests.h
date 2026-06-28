@@ -1,6 +1,7 @@
 ﻿#pragma once
 
 int RunGB_Utf8StringTests();
+int RunGB_SystemBluetoothTests();
 int RunGB_SystemDeviceTests();
 int RunGB_SystemFileWatcherTests();
 int RunGB_SystemNetworkTests();

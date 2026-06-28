@@ -19,6 +19,9 @@
     </ProjectConfiguration>
   </ItemGroup>
   <ItemGroup>
+    <ClCompile Include="GB_SystemBluetooth_Test.cpp">
+      <AdditionalOptions>/utf-8 %(AdditionalOptions)</AdditionalOptions>
+    </ClCompile>
     <ClCompile Include="GB_SystemClipboard_Test.cpp" />
     <ClCompile Include="GB_SystemDevice_Test.cpp" />
     <ClCompile Include="GB_SystemFileWatcher_Test.cpp">

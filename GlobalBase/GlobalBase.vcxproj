@@ -29,6 +29,7 @@
     <ClInclude Include="Desktop\GB_PrivilegeScope.h" />
     <ClInclude Include="Desktop\GB_Screen.h" />
     <ClInclude Include="Desktop\GB_SystemClipboard.h" />
+    <ClInclude Include="Desktop\GB_SystemBluetooth.h" />
     <ClInclude Include="Desktop\GB_SystemDevice.h" />
     <ClInclude Include="Desktop\GB_SystemError.h" />
     <ClInclude Include="Desktop\GB_SystemFileWatcher.h" />
@@ -87,6 +88,9 @@
     <ClCompile Include="Desktop\GB_PrivilegeScope.cpp" />
     <ClCompile Include="Desktop\GB_Screen.cpp" />
     <ClCompile Include="Desktop\GB_SystemClipboard.cpp" />
+    <ClCompile Include="Desktop\GB_SystemBluetooth.cpp">
+      <AdditionalOptions>/utf-8 %(AdditionalOptions)</AdditionalOptions>
+    </ClCompile>
     <ClCompile Include="Desktop\GB_SystemDevice.cpp" />
     <ClCompile Include="Desktop\GB_SystemError.cpp" />
     <ClCompile Include="Desktop\GB_SystemFileWatcher.cpp">
