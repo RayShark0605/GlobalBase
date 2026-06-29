@@ -1,4 +1,4 @@
-#ifndef GLOBALBASE_SYSTEM_POWER_H_H
+﻿#ifndef GLOBALBASE_SYSTEM_POWER_H_H
 #define GLOBALBASE_SYSTEM_POWER_H_H
 
 #include "../GlobalBasePort.h"
@@ -91,7 +91,9 @@ enum class GB_SystemPowerEventType : uint16_t
     ActivePowerPlanChanged = 8,
     DisplayStateChanged = 9,
     UserPresenceChanged = 10,
-    PowerSettingChanged = 11
+    PowerSettingChanged = 11,
+    BatterySaverStatusChanged = 12,
+    PowerPlanPersonalityChanged = 13
 };
 
 /**
@@ -145,6 +147,9 @@ struct GB_SystemPowerCapabilities
     bool supportsWakeAlarm = false;
     bool supportsAoAc = false;
     bool supportsFullWake = false;
+    bool supportsVideoDimming = false;
+    bool hasApm = false;
+    bool hasUps = false;
     bool hasBattery = false;
     bool batteriesAreShortTerm = false;
     bool hasThermalControl = false;
@@ -217,7 +222,10 @@ struct GB_SystemPowerPlanInfo
 /**
  * @brief 电源事件数据。
  *
- * @remarks eventName 形如 "SystemPower.PowerSourceChanged"，payload 可通过 GB_Variant::AnyCast<GB_SystemPowerEvent>() 取回。
+ * @remarks
+ * - eventName 形如 "SystemPower.PowerSourceChanged"，payload 可通过 GB_Variant::AnyCast<GB_SystemPowerEvent>() 取回。
+ * - settingDataUInt32 仅在原始电源设置数据长度恰好为 4 字节时有效。
+ * - settingDataGuid 仅在原始电源设置数据长度恰好为 GUID 长度时有效。
  */
 struct GB_SystemPowerEvent
 {
@@ -233,6 +241,8 @@ struct GB_SystemPowerEvent
     std::vector<uint8_t> settingData;
     bool hasSettingDataUInt32 = false;
     uint32_t settingDataUInt32 = 0;
+    bool hasSettingDataGuid = false;
+    std::string settingDataGuid = "";
 };
 
 /**
@@ -242,6 +252,7 @@ struct GB_SystemPowerWatcherOptions
 {
     size_t maxPendingNativeEvents = 1024;
     size_t maxDispatchQueueSize = 1024;
+    bool capturePowerStatusSnapshot = true;
 };
 
 /**
@@ -272,6 +283,7 @@ private:
     friend class GB_SystemPower;
     void MoveFrom(GB_SystemPowerKeepAwakeRequest& other) noexcept;
     void ClearState() noexcept;
+    void ReleaseNoThrow() noexcept;
 
 private:
     void* requestHandle = nullptr;
@@ -308,6 +320,15 @@ public:
     static GB_SystemResult EnumeratePowerPlans(std::vector<GB_SystemPowerPlanInfo>& powerPlans);
     static GB_SystemResult GetActivePowerPlan(GB_SystemPowerPlanInfo& powerPlan);
     static GB_SystemResult SetActivePowerPlan(const std::string& schemeGuid);
+    /**
+     * @brief 读取电源方案中指定设置的 AC 或 DC 索引值。
+     *
+     * @param schemeGuid 电源方案 GUID；为空时读取当前活动电源方案。
+     * @param subgroupGuid 电源设置子组 GUID；为空时使用 Windows NO_SUBGROUP_GUID。
+     * @param settingGuid 电源设置 GUID。
+     * @param readAcValue true 表示读取 AC 值，false 表示读取 DC 值。
+     * @param valueIndex 输出设置索引值。
+     */
     static GB_SystemResult ReadPowerSettingIndex(const std::string& schemeGuid, const std::string& subgroupGuid, const std::string& settingGuid, bool readAcValue, uint32_t& valueIndex);
 
     static std::string GetPowerSourceName(GB_SystemPowerSource powerSource);

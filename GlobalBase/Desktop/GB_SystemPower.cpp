@@ -1,4 +1,4 @@
-#include "GB_SystemPower.h"
+﻿#include "GB_SystemPower.h"
 
 #include "GB_PrivilegeScope.h"
 #include "../GB_Utf8String.h"
@@ -10,6 +10,7 @@
 #include <cstdio>
 #include <cstring>
 #include <deque>
+#include <exception>
 #include <limits>
 #include <mutex>
 #include <new>
@@ -26,6 +27,7 @@
 #  include <windows.h>
 #  include <powerbase.h>
 #  include <powrprof.h>
+#  include <powersetting.h>
 #  include <reason.h>
 #  ifndef EWX_HYBRID_SHUTDOWN
 #    define EWX_HYBRID_SHUTDOWN 0x00400000
@@ -33,15 +35,23 @@
 #  ifdef _MSC_VER
 #    pragma comment(lib, "User32.lib")
 #    pragma comment(lib, "PowrProf.lib")
+#    pragma comment(lib, "Advapi32.lib")
 #  endif
 #endif
 
 namespace
 {
+#if defined(_WIN32)
+    const uint32_t DefaultShutdownReason = static_cast<uint32_t>(SHTDN_REASON_FLAG_PLANNED | SHTDN_REASON_MAJOR_APPLICATION | SHTDN_REASON_MINOR_MAINTENANCE);
+#else
     const uint32_t DefaultShutdownReason = 0x80000000u | 0x00040000u | 0x00000001u;
+#endif
     const uint32_t RequestFlagSystem = 0x00000001u;
     const uint32_t RequestFlagDisplay = 0x00000002u;
     const uint32_t RequestFlagAwayMode = 0x00000004u;
+    const uint32_t MaxPowerSettingPayloadBytes = 4096u;
+    const uint32_t MaxScheduledShutdownDelaySeconds = 10u * 365u * 24u * 60u * 60u;
+    const size_t MaxPowerRequestReasonLength = 1024u;
 
     bool ContainsNullCharacter(const std::string& text)
     {
@@ -93,6 +103,21 @@ namespace
 #if defined(_WIN32)
     const UINT PowerWatcherStopMessage = WM_APP + 0x0626;
 
+    const GUID GbPowerGuidMaxPowerSavings = { 0xA1841308, 0x3541, 0x4FAB, { 0xBC, 0x81, 0xF7, 0x15, 0x56, 0xF2, 0x0B, 0x4A } };
+    const GUID GbPowerGuidTypicalPowerSavings = { 0x381B4222, 0xF694, 0x41F0, { 0x96, 0x85, 0xFF, 0x5B, 0xB2, 0x60, 0xDF, 0x2E } };
+    const GUID GbPowerGuidMinPowerSavings = { 0x8C5E7FDA, 0xE8BF, 0x4A96, { 0x9A, 0x85, 0xA6, 0xE2, 0x3A, 0x8C, 0x63, 0x5C } };
+    const GUID GbPowerGuidNoSubgroup = { 0xFEA3413E, 0x7E05, 0x4911, { 0x9A, 0x71, 0x70, 0x03, 0x31, 0xF1, 0xC2, 0x94 } };
+    const GUID GbPowerGuidPowerSchemePersonality = { 0x245D8541, 0x3943, 0x4422, { 0xB0, 0x25, 0x13, 0xA7, 0x84, 0xF6, 0x79, 0xB7 } };
+    const GUID GbPowerGuidAcdcPowerSource = { 0x5D3E9A59, 0xE9D5, 0x4B00, { 0xA6, 0xBD, 0xFF, 0x34, 0xFF, 0x51, 0x65, 0x48 } };
+    const GUID GbPowerGuidBatteryPercentageRemaining = { 0xA7AD8041, 0xB45A, 0x4CAE, { 0x87, 0xA3, 0xEE, 0xCB, 0xB4, 0x68, 0xA9, 0xE1 } };
+    const GUID GbPowerGuidPowerSavingStatus = { 0xE00958C0, 0xC213, 0x4ACE, { 0xAC, 0x77, 0xFE, 0xCC, 0xED, 0x2E, 0xEE, 0xA5 } };
+    const GUID GbPowerGuidActivePowerScheme = { 0x31F9F286, 0x5084, 0x42FE, { 0xB7, 0x20, 0x2B, 0x02, 0x64, 0x99, 0x37, 0x63 } };
+    const GUID GbPowerGuidConsoleDisplayState = { 0x6FE69556, 0x704A, 0x47A0, { 0x8F, 0x24, 0xC2, 0x8D, 0x93, 0x6F, 0xDA, 0x47 } };
+    const GUID GbPowerGuidMonitorPowerOn = { 0x02731015, 0x4510, 0x4526, { 0x99, 0xE6, 0xE5, 0xA1, 0x7E, 0xBD, 0x1A, 0xEA } };
+    const GUID GbPowerGuidSessionDisplayStatus = { 0x2B84C20E, 0xAD23, 0x4DDF, { 0x93, 0xDB, 0x05, 0xFF, 0xBD, 0x7E, 0xFC, 0xA5 } };
+    const GUID GbPowerGuidGlobalUserPresence = { 0x786E8A1D, 0xB427, 0x4344, { 0x92, 0x07, 0x09, 0xE7, 0x0B, 0xDC, 0xBE, 0xA9 } };
+    const GUID GbPowerGuidSessionUserPresence = { 0x3C0F4548, 0xC03F, 0x4C4D, { 0xB9, 0xF2, 0x23, 0x7E, 0xDE, 0x68, 0x63, 0x76 } };
+
     GB_SystemResult Win32ErrorToResult(const DWORD errorCode, const std::string& operationName, const std::string& message)
     {
         return GB_SystemResult::FromWin32Error(static_cast<uint32_t>(errorCode), operationName, message);
@@ -101,6 +126,27 @@ namespace
     GB_SystemResult PowerErrorToResult(const DWORD errorCode, const std::string& operationName, const std::string& message)
     {
         return GB_SystemResult::FromWin32Error(static_cast<uint32_t>(errorCode), operationName, message);
+    }
+
+    void ClearPowerRequestsByFlags(HANDLE requestHandle, const uint32_t appliedRequestFlags) noexcept
+    {
+        if (requestHandle == nullptr || requestHandle == INVALID_HANDLE_VALUE)
+        {
+            return;
+        }
+
+        if ((appliedRequestFlags & RequestFlagAwayMode) != 0)
+        {
+            (void)::PowerClearRequest(requestHandle, PowerRequestAwayModeRequired);
+        }
+        if ((appliedRequestFlags & RequestFlagDisplay) != 0)
+        {
+            (void)::PowerClearRequest(requestHandle, PowerRequestDisplayRequired);
+        }
+        if ((appliedRequestFlags & RequestFlagSystem) != 0)
+        {
+            (void)::PowerClearRequest(requestHandle, PowerRequestSystemRequired);
+        }
     }
 
     bool TryUtf8ToWide(const std::string& text, std::wstring& wideText)
@@ -231,7 +277,7 @@ namespace
     std::string GuidToString(const GUID& guid)
     {
         char buffer[64] = {};
-        std::snprintf(buffer, sizeof(buffer), "{%08lX-%04X-%04X-%02X%02X-%02X%02X%02X%02X%02X%02X}", static_cast<unsigned long>(guid.Data1), static_cast<unsigned int>(guid.Data2), static_cast<unsigned int>(guid.Data3), static_cast<unsigned int>(guid.Data4[0]), static_cast<unsigned int>(guid.Data4[1]), static_cast<unsigned int>(guid.Data4[2]), static_cast<unsigned int>(guid.Data4[3]), static_cast<unsigned int>(guid.Data4[4]), static_cast<unsigned int>(guid.Data4[5]), static_cast<unsigned int>(guid.Data4[6]), static_cast<unsigned int>(guid.Data4[7]));
+        std::snprintf(buffer, sizeof(buffer), "{%08X-%04X-%04X-%02X%02X-%02X%02X%02X%02X%02X%02X}", static_cast<unsigned int>(guid.Data1), static_cast<unsigned int>(guid.Data2), static_cast<unsigned int>(guid.Data3), static_cast<unsigned int>(guid.Data4[0]), static_cast<unsigned int>(guid.Data4[1]), static_cast<unsigned int>(guid.Data4[2]), static_cast<unsigned int>(guid.Data4[3]), static_cast<unsigned int>(guid.Data4[4]), static_cast<unsigned int>(guid.Data4[5]), static_cast<unsigned int>(guid.Data4[6]), static_cast<unsigned int>(guid.Data4[7]));
         return std::string(buffer);
     }
 
@@ -242,25 +288,39 @@ namespace
 
     std::string WidePowerBufferToUtf8(const std::vector<UCHAR>& buffer, const DWORD byteCount)
     {
-        if (buffer.empty() || byteCount == 0 || (byteCount % sizeof(wchar_t)) != 0)
+        if (buffer.empty() || byteCount == 0 || byteCount > buffer.size() || (byteCount % sizeof(wchar_t)) != 0)
         {
             return std::string();
         }
 
-        const wchar_t* wideBuffer = reinterpret_cast<const wchar_t*>(buffer.data());
-        size_t wcharCount = static_cast<size_t>(byteCount / sizeof(wchar_t));
-        while (wcharCount > 0 && wideBuffer[wcharCount - 1] == L'\0')
+        const size_t totalWcharCount = static_cast<size_t>(byteCount / sizeof(wchar_t));
+        std::wstring wideText;
+        try
         {
-            wcharCount--;
+            wideText.assign(totalWcharCount, L'\0');
         }
-        if (wcharCount == 0)
+        catch (...)
+        {
+            return std::string();
+        }
+
+        if (!wideText.empty())
+        {
+            std::memcpy(&wideText[0], buffer.data(), byteCount);
+        }
+
+        while (!wideText.empty() && wideText.back() == L'\0')
+        {
+            wideText.pop_back();
+        }
+        if (wideText.empty())
         {
             return std::string();
         }
 
         try
         {
-            return GB_WStringToUtf8(std::wstring(wideBuffer, wideBuffer + wcharCount));
+            return GB_WStringToUtf8(wideText);
         }
         catch (...)
         {
@@ -283,28 +343,39 @@ namespace
         {
             return std::string();
         }
-        if (bufferSize == 0 || bufferSize > 64u * 1024u)
+
+        for (size_t attemptIndex = 0; attemptIndex < 2; attemptIndex++)
         {
-            return std::string();
+            if (bufferSize == 0 || bufferSize > 64u * 1024u)
+            {
+                return std::string();
+            }
+
+            std::vector<UCHAR> buffer;
+            try
+            {
+                buffer.assign(bufferSize, 0);
+            }
+            catch (...)
+            {
+                return std::string();
+            }
+
+            DWORD actualBufferSize = bufferSize;
+            errorCode = readFunc(nullptr, &schemeGuid, nullptr, nullptr, buffer.data(), &actualBufferSize);
+            if (errorCode == ERROR_SUCCESS)
+            {
+                return WidePowerBufferToUtf8(buffer, actualBufferSize);
+            }
+            if (errorCode != ERROR_MORE_DATA || actualBufferSize <= bufferSize)
+            {
+                return std::string();
+            }
+
+            bufferSize = actualBufferSize;
         }
 
-        std::vector<UCHAR> buffer;
-        try
-        {
-            buffer.assign(bufferSize, 0);
-        }
-        catch (...)
-        {
-            return std::string();
-        }
-
-        errorCode = readFunc(nullptr, &schemeGuid, nullptr, nullptr, buffer.data(), &bufferSize);
-        if (errorCode != ERROR_SUCCESS)
-        {
-            return std::string();
-        }
-
-        return WidePowerBufferToUtf8(buffer, bufferSize);
+        return std::string();
     }
 
     GB_SystemPowerSleepState MapSystemPowerState(const SYSTEM_POWER_STATE powerState)
@@ -352,7 +423,8 @@ namespace
             powerStatus.powerSource = GB_SystemPowerSource::Unknown;
         }
 
-        if (nativeStatus.BatteryFlag != 255)
+        const bool hasKnownBatteryFlag = nativeStatus.BatteryFlag != 255;
+        if (hasKnownBatteryFlag)
         {
             powerStatus.batteryPresent = (nativeStatus.BatteryFlag & 128) == 0;
             powerStatus.isBatteryCritical = (nativeStatus.BatteryFlag & 4) != 0;
@@ -360,15 +432,19 @@ namespace
             powerStatus.isCharging = (nativeStatus.BatteryFlag & 8) != 0;
         }
 
-        if (nativeStatus.ACLineStatus == 0 && !powerStatus.batteryPresent)
+        if (nativeStatus.ACLineStatus == 0 && hasKnownBatteryFlag && !powerStatus.batteryPresent)
         {
             powerStatus.powerSource = GB_SystemPowerSource::Offline;
         }
 
-        if (nativeStatus.BatteryLifePercent != 255)
+        if (nativeStatus.BatteryLifePercent != 255 && nativeStatus.BatteryLifePercent <= 100)
         {
             powerStatus.hasBatteryPercent = true;
             powerStatus.batteryPercent = static_cast<uint8_t>(nativeStatus.BatteryLifePercent);
+            if (!hasKnownBatteryFlag)
+            {
+                powerStatus.batteryPresent = true;
+            }
         }
 
         if (nativeStatus.BatteryLifeTime != static_cast<DWORD>(-1))
@@ -383,7 +459,7 @@ namespace
             powerStatus.batteryFullLifeSeconds = static_cast<uint32_t>(nativeStatus.BatteryFullLifeTime);
         }
 
-        powerStatus.isBatterySaverOn = nativeStatus.SystemStatusFlag != 0;
+        powerStatus.isBatterySaverOn = (nativeStatus.SystemStatusFlag & 1) != 0;
     }
 
     void FillPowerCapabilitiesFromNative(const SYSTEM_POWER_CAPABILITIES& nativeCapabilities, GB_SystemPowerCapabilities& powerCapabilities)
@@ -403,6 +479,9 @@ namespace
         powerCapabilities.supportsWakeAlarm = nativeCapabilities.WakeAlarmPresent != FALSE;
         powerCapabilities.supportsAoAc = nativeCapabilities.AoAc != FALSE;
         powerCapabilities.supportsFullWake = nativeCapabilities.FullWake != FALSE;
+        powerCapabilities.supportsVideoDimming = nativeCapabilities.VideoDimPresent != FALSE;
+        powerCapabilities.hasApm = nativeCapabilities.ApmPresent != FALSE;
+        powerCapabilities.hasUps = nativeCapabilities.UpsPresent != FALSE;
         powerCapabilities.hasBattery = nativeCapabilities.SystemBatteriesPresent != FALSE;
         powerCapabilities.batteriesAreShortTerm = nativeCapabilities.BatteriesAreShortTerm != FALSE;
         powerCapabilities.hasThermalControl = nativeCapabilities.ThermalControl != FALSE;
@@ -441,17 +520,38 @@ namespace
         return true;
     }
 
+    bool TryReadPowerPlanPersonalityGuid(const GUID& schemeGuid, GUID& personalityGuid)
+    {
+        personalityGuid = GUID();
+
+        DWORD valueType = 0;
+        DWORD bufferSize = static_cast<DWORD>(sizeof(personalityGuid));
+        DWORD errorCode = ::PowerReadACValue(nullptr, &schemeGuid, &GbPowerGuidNoSubgroup, &GbPowerGuidPowerSchemePersonality, &valueType, reinterpret_cast<UCHAR*>(&personalityGuid), &bufferSize);
+        if (errorCode == ERROR_SUCCESS && bufferSize == sizeof(personalityGuid))
+        {
+            return true;
+        }
+
+        valueType = 0;
+        bufferSize = static_cast<DWORD>(sizeof(personalityGuid));
+        errorCode = ::PowerReadDCValue(nullptr, &schemeGuid, &GbPowerGuidNoSubgroup, &GbPowerGuidPowerSchemePersonality, &valueType, reinterpret_cast<UCHAR*>(&personalityGuid), &bufferSize);
+        return errorCode == ERROR_SUCCESS && bufferSize == sizeof(personalityGuid);
+    }
+
     GB_SystemPowerPlanPersonality ClassifyPowerPlanPersonality(const GUID& schemeGuid)
     {
-        if (EqualsGuid(schemeGuid, GUID_MAX_POWER_SAVINGS))
+        GUID personalityGuid = {};
+        const GUID& effectivePersonalityGuid = TryReadPowerPlanPersonalityGuid(schemeGuid, personalityGuid) ? personalityGuid : schemeGuid;
+
+        if (EqualsGuid(effectivePersonalityGuid, GbPowerGuidMaxPowerSavings))
         {
             return GB_SystemPowerPlanPersonality::PowerSaver;
         }
-        if (EqualsGuid(schemeGuid, GUID_TYPICAL_POWER_SAVINGS))
+        if (EqualsGuid(effectivePersonalityGuid, GbPowerGuidTypicalPowerSavings))
         {
             return GB_SystemPowerPlanPersonality::Balanced;
         }
-        if (EqualsGuid(schemeGuid, GUID_MIN_POWER_SAVINGS))
+        if (EqualsGuid(effectivePersonalityGuid, GbPowerGuidMinPowerSavings))
         {
             return GB_SystemPowerPlanPersonality::HighPerformance;
         }
@@ -509,23 +609,31 @@ namespace
 
     GB_SystemPowerEventType MapPowerSettingGuidToEventType(const GUID& settingGuid)
     {
-        if (EqualsGuid(settingGuid, GUID_ACDC_POWER_SOURCE))
+        if (EqualsGuid(settingGuid, GbPowerGuidAcdcPowerSource))
         {
             return GB_SystemPowerEventType::PowerSourceChanged;
         }
-        if (EqualsGuid(settingGuid, GUID_BATTERY_PERCENTAGE_REMAINING))
+        if (EqualsGuid(settingGuid, GbPowerGuidBatteryPercentageRemaining))
         {
             return GB_SystemPowerEventType::BatteryPercentageChanged;
         }
-        if (EqualsGuid(settingGuid, GUID_ACTIVE_POWERSCHEME))
+        if (EqualsGuid(settingGuid, GbPowerGuidPowerSavingStatus))
+        {
+            return GB_SystemPowerEventType::BatterySaverStatusChanged;
+        }
+        if (EqualsGuid(settingGuid, GbPowerGuidActivePowerScheme))
         {
             return GB_SystemPowerEventType::ActivePowerPlanChanged;
         }
-        if (EqualsGuid(settingGuid, GUID_CONSOLE_DISPLAY_STATE) || EqualsGuid(settingGuid, GUID_MONITOR_POWER_ON) || EqualsGuid(settingGuid, GUID_SESSION_DISPLAY_STATUS))
+        if (EqualsGuid(settingGuid, GbPowerGuidPowerSchemePersonality))
+        {
+            return GB_SystemPowerEventType::PowerPlanPersonalityChanged;
+        }
+        if (EqualsGuid(settingGuid, GbPowerGuidConsoleDisplayState) || EqualsGuid(settingGuid, GbPowerGuidMonitorPowerOn) || EqualsGuid(settingGuid, GbPowerGuidSessionDisplayStatus))
         {
             return GB_SystemPowerEventType::DisplayStateChanged;
         }
-        if (EqualsGuid(settingGuid, GUID_GLOBAL_USER_PRESENCE) || EqualsGuid(settingGuid, GUID_SESSION_USER_PRESENCE))
+        if (EqualsGuid(settingGuid, GbPowerGuidGlobalUserPresence) || EqualsGuid(settingGuid, GbPowerGuidSessionUserPresence))
         {
             return GB_SystemPowerEventType::UserPresenceChanged;
         }
@@ -552,6 +660,10 @@ namespace
             return GB_SystemPowerEventType::ResumeCritical;
         case PBT_APMPOWERSTATUSCHANGE:
             return GB_SystemPowerEventType::PowerStatusChanged;
+#ifdef PBT_APMBATTERYLOW
+        case PBT_APMBATTERYLOW:
+            return GB_SystemPowerEventType::PowerStatusChanged;
+#endif
         default:
             break;
         }
@@ -565,7 +677,7 @@ GB_SystemPowerKeepAwakeRequest::GB_SystemPowerKeepAwakeRequest() = default;
 
 GB_SystemPowerKeepAwakeRequest::~GB_SystemPowerKeepAwakeRequest() noexcept
 {
-    (void)Release();
+    ReleaseNoThrow();
 }
 
 GB_SystemPowerKeepAwakeRequest::GB_SystemPowerKeepAwakeRequest(GB_SystemPowerKeepAwakeRequest&& other) noexcept
@@ -577,7 +689,7 @@ GB_SystemPowerKeepAwakeRequest& GB_SystemPowerKeepAwakeRequest::operator=(GB_Sys
 {
     if (this != &other)
     {
-        (void)Release();
+        ReleaseNoThrow();
         MoveFrom(other);
     }
 
@@ -587,25 +699,27 @@ GB_SystemPowerKeepAwakeRequest& GB_SystemPowerKeepAwakeRequest::operator=(GB_Sys
 GB_SystemResult GB_SystemPowerKeepAwakeRequest::Release()
 {
 #if defined(_WIN32)
-    if (requestHandle == nullptr)
+    if (requestHandle == nullptr || requestHandle == INVALID_HANDLE_VALUE)
     {
         ClearState();
         return GB_SystemResult::Succeeded(u8"GB_SystemPowerKeepAwakeRequest::Release");
     }
 
     HANDLE nativeHandle = static_cast<HANDLE>(requestHandle);
+    const uint32_t localRequestFlags = appliedRequestFlags;
     GB_SystemResult firstFailure = GB_SystemResult::Succeeded(u8"GB_SystemPowerKeepAwakeRequest::Release");
-    if ((appliedRequestFlags & RequestFlagDisplay) != 0 && ::PowerClearRequest(nativeHandle, PowerRequestDisplayRequired) == FALSE && firstFailure.IsSucceeded())
+
+    if ((localRequestFlags & RequestFlagAwayMode) != 0 && ::PowerClearRequest(nativeHandle, PowerRequestAwayModeRequired) == FALSE && firstFailure.IsSucceeded())
+    {
+        firstFailure = GB_SystemResult::FromLastWin32Error(u8"GB_SystemPowerKeepAwakeRequest::Release", u8"清理 Away Mode 保持唤醒请求失败。");
+    }
+    if ((localRequestFlags & RequestFlagDisplay) != 0 && ::PowerClearRequest(nativeHandle, PowerRequestDisplayRequired) == FALSE && firstFailure.IsSucceeded())
     {
         firstFailure = GB_SystemResult::FromLastWin32Error(u8"GB_SystemPowerKeepAwakeRequest::Release", u8"清理显示器保持唤醒请求失败。");
     }
-    if ((appliedRequestFlags & RequestFlagSystem) != 0 && ::PowerClearRequest(nativeHandle, PowerRequestSystemRequired) == FALSE && firstFailure.IsSucceeded())
+    if ((localRequestFlags & RequestFlagSystem) != 0 && ::PowerClearRequest(nativeHandle, PowerRequestSystemRequired) == FALSE && firstFailure.IsSucceeded())
     {
         firstFailure = GB_SystemResult::FromLastWin32Error(u8"GB_SystemPowerKeepAwakeRequest::Release", u8"清理系统保持唤醒请求失败。");
-    }
-    if ((appliedRequestFlags & RequestFlagAwayMode) != 0 && ::PowerClearRequest(nativeHandle, PowerRequestAwayModeRequired) == FALSE && firstFailure.IsSucceeded())
-    {
-        firstFailure = GB_SystemResult::FromLastWin32Error(u8"GB_SystemPowerKeepAwakeRequest::Release", u8"清理 Away Mode 保持唤醒请求失败。");
     }
 
     if (::CloseHandle(nativeHandle) == FALSE && firstFailure.IsSucceeded())
@@ -621,9 +735,39 @@ GB_SystemResult GB_SystemPowerKeepAwakeRequest::Release()
 #endif
 }
 
+void GB_SystemPowerKeepAwakeRequest::ReleaseNoThrow() noexcept
+{
+#if defined(_WIN32)
+    if (requestHandle != nullptr && requestHandle != INVALID_HANDLE_VALUE)
+    {
+        HANDLE nativeHandle = static_cast<HANDLE>(requestHandle);
+        const uint32_t localRequestFlags = appliedRequestFlags;
+
+        if ((localRequestFlags & RequestFlagAwayMode) != 0)
+        {
+            (void)::PowerClearRequest(nativeHandle, PowerRequestAwayModeRequired);
+        }
+        if ((localRequestFlags & RequestFlagDisplay) != 0)
+        {
+            (void)::PowerClearRequest(nativeHandle, PowerRequestDisplayRequired);
+        }
+        if ((localRequestFlags & RequestFlagSystem) != 0)
+        {
+            (void)::PowerClearRequest(nativeHandle, PowerRequestSystemRequired);
+        }
+        (void)::CloseHandle(nativeHandle);
+    }
+#endif
+    ClearState();
+}
+
 bool GB_SystemPowerKeepAwakeRequest::IsActive() const
 {
-    return requestHandle != nullptr;
+#if defined(_WIN32)
+    return requestHandle != nullptr && requestHandle != INVALID_HANDLE_VALUE;
+#else
+    return false;
+#endif
 }
 
 GB_SystemPowerKeepAwakeRequest::operator bool() const
@@ -640,7 +784,8 @@ void GB_SystemPowerKeepAwakeRequest::MoveFrom(GB_SystemPowerKeepAwakeRequest& ot
 {
     requestHandle = other.requestHandle;
     appliedRequestFlags = other.appliedRequestFlags;
-    options = other.options;
+    options.mode = other.options.mode;
+    options.reasonUtf8.swap(other.options.reasonUtf8);
     other.ClearState();
 }
 
@@ -648,7 +793,8 @@ void GB_SystemPowerKeepAwakeRequest::ClearState() noexcept
 {
     requestHandle = nullptr;
     appliedRequestFlags = 0;
-    options = GB_SystemPowerKeepAwakeOptions();
+    options.mode = GB_SystemPowerKeepAwakeMode::System;
+    options.reasonUtf8.clear();
 }
 
 GB_SystemResult GB_SystemPower::GetPowerStatus(GB_SystemPowerStatus& powerStatus)
@@ -832,6 +978,11 @@ GB_SystemResult GB_SystemPower::Hibernate(const GB_SystemSuspendOptions& options
 GB_SystemResult GB_SystemPower::ScheduleShutdown(const GB_SystemScheduledShutdownOptions& options)
 {
 #if defined(_WIN32)
+    if (options.delaySeconds > MaxScheduledShutdownDelaySeconds)
+    {
+        return GB_SystemResult::Failed(GB_SystemErrorCode::InvalidArgument, u8"GB_SystemPower::ScheduleShutdown", u8"计划关机延迟时间不能超过 Windows MAX_SHUTDOWN_TIMEOUT 限制。");
+    }
+
     const std::string messageUtf8 = options.messageUtf8.empty() ? std::string(u8"GlobalBase 计划关机或计划重启请求。") : options.messageUtf8;
     std::wstring messageWide;
     if (!TryUtf8ToWide(messageUtf8, messageWide))
@@ -902,27 +1053,51 @@ GB_SystemResult GB_SystemPower::CreateKeepAwakeRequest(const GB_SystemPowerKeepA
         return GB_SystemResult::Failed(GB_SystemErrorCode::EncodingConversionFailed, u8"GB_SystemPower::CreateKeepAwakeRequest", u8"保持唤醒 reason 从 UTF-8 转 UTF-16 失败。");
     }
 
+    if (reasonWide.length() > MaxPowerRequestReasonLength)
+    {
+        return GB_SystemResult::Failed(GB_SystemErrorCode::InvalidArgument, u8"GB_SystemPower::CreateKeepAwakeRequest", u8"保持唤醒 reason 过长。");
+    }
+
     GB_SystemResult releaseResult = request.Release();
     if (releaseResult.IsFailed())
     {
         return releaseResult.WithOperationName(u8"GB_SystemPower::CreateKeepAwakeRequest").WithMessage(u8"创建新保持唤醒请求前释放旧请求失败。");
     }
 
-    POWER_REQUEST_CONTEXT context = {};
+    REASON_CONTEXT context = {};
     context.Version = POWER_REQUEST_CONTEXT_VERSION;
     context.Flags = POWER_REQUEST_CONTEXT_SIMPLE_STRING;
     context.Reason.SimpleReasonString = const_cast<PWSTR>(reasonWide.c_str());
 
     HANDLE requestHandle = ::PowerCreateRequest(&context);
-    if (requestHandle == nullptr || requestHandle == INVALID_HANDLE_VALUE)
+    if (requestHandle == INVALID_HANDLE_VALUE || requestHandle == nullptr)
     {
-        return GB_SystemResult::FromLastWin32Error(u8"GB_SystemPower::CreateKeepAwakeRequest", u8"创建 Power Request 句柄失败。");
+        const DWORD lastError = ::GetLastError();
+        const DWORD effectiveError = lastError == ERROR_SUCCESS ? ERROR_INVALID_HANDLE : lastError;
+        return GB_SystemResult::FromWin32Error(effectiveError, u8"GB_SystemPower::CreateKeepAwakeRequest", u8"创建 Power Request 句柄失败。");
+    }
+
+    GB_SystemPowerKeepAwakeOptions storedOptions;
+    storedOptions.mode = options.mode;
+    try
+    {
+        storedOptions.reasonUtf8 = options.reasonUtf8;
+    }
+    catch (const std::bad_alloc&)
+    {
+        (void)::CloseHandle(requestHandle);
+        return GB_SystemResult::Failed(GB_SystemErrorCode::ResourceAllocationFailed, u8"GB_SystemPower::CreateKeepAwakeRequest", u8"保存保持唤醒请求参数时内存不足。");
+    }
+    catch (...)
+    {
+        (void)::CloseHandle(requestHandle);
+        return GB_SystemResult::Failed(GB_SystemErrorCode::InternalError, u8"GB_SystemPower::CreateKeepAwakeRequest", u8"保存保持唤醒请求参数时发生未知异常。");
     }
 
     uint32_t appliedRequestFlags = 0;
-    const bool needSystem = options.mode == GB_SystemPowerKeepAwakeMode::System || options.mode == GB_SystemPowerKeepAwakeMode::Display || options.mode == GB_SystemPowerKeepAwakeMode::SystemAndDisplay || options.mode == GB_SystemPowerKeepAwakeMode::AwayMode;
     const bool needDisplay = options.mode == GB_SystemPowerKeepAwakeMode::Display || options.mode == GB_SystemPowerKeepAwakeMode::SystemAndDisplay;
     const bool needAwayMode = options.mode == GB_SystemPowerKeepAwakeMode::AwayMode;
+    const bool needSystem = options.mode == GB_SystemPowerKeepAwakeMode::System || needDisplay || needAwayMode;
 
     if (needSystem && ::PowerSetRequest(requestHandle, PowerRequestSystemRequired) == FALSE)
     {
@@ -938,7 +1113,7 @@ GB_SystemResult GB_SystemPower::CreateKeepAwakeRequest(const GB_SystemPowerKeepA
     if (needDisplay && ::PowerSetRequest(requestHandle, PowerRequestDisplayRequired) == FALSE)
     {
         const GB_SystemResult result = GB_SystemResult::FromLastWin32Error(u8"GB_SystemPower::CreateKeepAwakeRequest", u8"设置显示器保持唤醒请求失败。");
-        (void)::PowerClearRequest(requestHandle, PowerRequestSystemRequired);
+        ClearPowerRequestsByFlags(requestHandle, appliedRequestFlags);
         (void)::CloseHandle(requestHandle);
         return result;
     }
@@ -950,14 +1125,7 @@ GB_SystemResult GB_SystemPower::CreateKeepAwakeRequest(const GB_SystemPowerKeepA
     if (needAwayMode && ::PowerSetRequest(requestHandle, PowerRequestAwayModeRequired) == FALSE)
     {
         const GB_SystemResult result = GB_SystemResult::FromLastWin32Error(u8"GB_SystemPower::CreateKeepAwakeRequest", u8"设置 Away Mode 保持唤醒请求失败。");
-        if ((appliedRequestFlags & RequestFlagDisplay) != 0)
-        {
-            (void)::PowerClearRequest(requestHandle, PowerRequestDisplayRequired);
-        }
-        if ((appliedRequestFlags & RequestFlagSystem) != 0)
-        {
-            (void)::PowerClearRequest(requestHandle, PowerRequestSystemRequired);
-        }
+        ClearPowerRequestsByFlags(requestHandle, appliedRequestFlags);
         (void)::CloseHandle(requestHandle);
         return result;
     }
@@ -966,9 +1134,10 @@ GB_SystemResult GB_SystemPower::CreateKeepAwakeRequest(const GB_SystemPowerKeepA
         appliedRequestFlags |= RequestFlagAwayMode;
     }
 
+    request.options.mode = storedOptions.mode;
+    request.options.reasonUtf8.swap(storedOptions.reasonUtf8);
     request.requestHandle = requestHandle;
     request.appliedRequestFlags = appliedRequestFlags;
-    request.options = options;
     return GB_SystemResult::Succeeded(u8"GB_SystemPower::CreateKeepAwakeRequest");
 #else
     (void)options;
@@ -1005,16 +1174,21 @@ GB_SystemResult GB_SystemPower::EnumeratePowerPlans(std::vector<GB_SystemPowerPl
             return GB_SystemResult::Failed(GB_SystemErrorCode::NativeApiFailed, u8"GB_SystemPower::EnumeratePowerPlans", u8"PowerEnumerate 返回的电源方案 GUID 大小无效。");
         }
 
-        GB_SystemPowerPlanInfo powerPlan;
-        FillPowerPlanInfo(schemeGuid, activeSchemeGuid, hasActiveSchemeGuid, powerPlan);
         try
         {
-            powerPlans.push_back(powerPlan);
+            GB_SystemPowerPlanInfo powerPlan;
+            FillPowerPlanInfo(schemeGuid, activeSchemeGuid, hasActiveSchemeGuid, powerPlan);
+            powerPlans.push_back(std::move(powerPlan));
+        }
+        catch (const std::bad_alloc&)
+        {
+            powerPlans.clear();
+            return GB_SystemResult::Failed(GB_SystemErrorCode::ResourceAllocationFailed, u8"GB_SystemPower::EnumeratePowerPlans", u8"保存电源方案列表时内存不足。");
         }
         catch (...)
         {
             powerPlans.clear();
-            return GB_SystemResult::Failed(GB_SystemErrorCode::ResourceAllocationFailed, u8"GB_SystemPower::EnumeratePowerPlans", u8"保存电源方案列表时内存不足。");
+            return GB_SystemResult::Failed(GB_SystemErrorCode::InternalError, u8"GB_SystemPower::EnumeratePowerPlans", u8"保存电源方案列表时发生未知异常。");
         }
     }
 
@@ -1040,7 +1214,21 @@ GB_SystemResult GB_SystemPower::GetActivePowerPlan(GB_SystemPowerPlanInfo& power
         return PowerErrorToResult(errorCode, u8"GB_SystemPower::GetActivePowerPlan", u8"读取活动电源方案失败。");
     }
 
-    FillPowerPlanInfo(activeSchemeGuid, activeSchemeGuid, true, powerPlan);
+    try
+    {
+        FillPowerPlanInfo(activeSchemeGuid, activeSchemeGuid, true, powerPlan);
+    }
+    catch (const std::bad_alloc&)
+    {
+        powerPlan = GB_SystemPowerPlanInfo();
+        return GB_SystemResult::Failed(GB_SystemErrorCode::ResourceAllocationFailed, u8"GB_SystemPower::GetActivePowerPlan", u8"保存活动电源方案信息时内存不足。");
+    }
+    catch (...)
+    {
+        powerPlan = GB_SystemPowerPlanInfo();
+        return GB_SystemResult::Failed(GB_SystemErrorCode::InternalError, u8"GB_SystemPower::GetActivePowerPlan", u8"保存活动电源方案信息时发生未知异常。");
+    }
+
     return GB_SystemResult::Succeeded(u8"GB_SystemPower::GetActivePowerPlan");
 #else
     return MakeUnsupportedPlatformResult("GB_SystemPower::GetActivePowerPlan");
@@ -1089,7 +1277,11 @@ GB_SystemResult GB_SystemPower::ReadPowerSettingIndex(const std::string& schemeG
 
     GUID parsedSubgroupGuid = {};
     GUID parsedSettingGuid = {};
-    if (!TryParseGuidString(subgroupGuid, parsedSubgroupGuid))
+    if (subgroupGuid.empty())
+    {
+        parsedSubgroupGuid = GbPowerGuidNoSubgroup;
+    }
+    else if (!TryParseGuidString(subgroupGuid, parsedSubgroupGuid))
     {
         return GB_SystemResult::Failed(GB_SystemErrorCode::InvalidArgument, u8"GB_SystemPower::ReadPowerSettingIndex", u8"电源设置 subgroup GUID 格式无效。");
     }
@@ -1230,6 +1422,10 @@ std::string GB_SystemPower::GetPowerEventTypeName(const GB_SystemPowerEventType 
         return "UserPresenceChanged";
     case GB_SystemPowerEventType::PowerSettingChanged:
         return "PowerSettingChanged";
+    case GB_SystemPowerEventType::BatterySaverStatusChanged:
+        return "BatterySaverStatusChanged";
+    case GB_SystemPowerEventType::PowerPlanPersonalityChanged:
+        return "PowerPlanPersonalityChanged";
     case GB_SystemPowerEventType::Unknown:
     default:
         return "Unknown";
@@ -1249,7 +1445,13 @@ public:
 
     ~Impl() noexcept
     {
-        (void)Stop();
+        try
+        {
+            (void)Stop();
+        }
+        catch (...)
+        {
+        }
     }
 
     GB_SystemResult Start()
@@ -1295,7 +1497,7 @@ public:
 
         try
         {
-            eventWorkerThread = std::thread(&Impl::EventWorkerMain, this);
+            eventWorkerThread = std::thread(&Impl::EventWorkerMainSafe, this);
             messageThread = std::thread(&Impl::MessageThreadMainSafe, this);
         }
         catch (const std::bad_alloc&)
@@ -1338,8 +1540,6 @@ public:
                 (void)eventDispatcher.Stop(GB_EventDispatcherStopMode::Discard);
                 return failedResult;
             }
-
-            running = true;
         }
 
         return GB_SystemResult::Succeeded(u8"GB_SystemPowerWatcher::Start");
@@ -1352,6 +1552,15 @@ public:
         return GB_SystemResult::Succeeded("GB_SystemPowerWatcher::Stop");
 #else
         std::unique_lock<std::mutex> operationLock(operationMutex);
+        if (messageThread.joinable() && std::this_thread::get_id() == messageThread.get_id())
+        {
+            return GB_SystemResult::Failed(GB_SystemErrorCode::InvalidState, u8"GB_SystemPowerWatcher::Stop", u8"不能在电源消息线程内停止监听器。请在外部线程或事件回调线程中停止。");
+        }
+        if (eventWorkerThread.joinable() && std::this_thread::get_id() == eventWorkerThread.get_id())
+        {
+            return GB_SystemResult::Failed(GB_SystemErrorCode::InvalidState, u8"GB_SystemPowerWatcher::Stop", u8"不能在电源事件工作线程内停止监听器。请在外部线程或事件回调线程中停止。");
+        }
+
         bool hadThreads = false;
         {
             std::lock_guard<std::mutex> stateLock(stateMutex);
@@ -1371,6 +1580,18 @@ public:
         JoinThreadIfNeeded(eventWorkerThread);
 
         GB_SystemResult dispatcherStopResult = eventDispatcher.Stop(GB_EventDispatcherStopMode::Drain);
+
+        {
+            std::lock_guard<std::mutex> stateLock(stateMutex);
+            nativeEventQueue.clear();
+            windowHandle = nullptr;
+            messageThreadId = 0;
+            running = false;
+            stopRequested = false;
+            eventWorkerStopRequested = false;
+            startCompleted = false;
+        }
+
         if (dispatcherStopResult.IsFailed())
         {
             return dispatcherStopResult.WithOperationName(u8"GB_SystemPowerWatcher::Stop");
@@ -1378,13 +1599,6 @@ public:
         if (stopMessageResult.IsFailed())
         {
             return stopMessageResult;
-        }
-
-        {
-            std::lock_guard<std::mutex> stateLock(stateMutex);
-            nativeEventQueue.clear();
-            windowHandle = nullptr;
-            messageThreadId = 0;
         }
 
         return GB_SystemResult::Succeeded(u8"GB_SystemPowerWatcher::Stop");
@@ -1414,16 +1628,17 @@ public:
     }
 
 private:
+#if defined(_WIN32)
     struct NativePowerEvent
     {
         uint32_t nativeMessage = 0;
         uint64_t nativeWParam = 0;
         uint64_t timestampMilliseconds = 0;
         bool hasPowerSetting = false;
-        std::string settingGuid = "";
         GUID settingGuidNative = {};
         std::vector<uint8_t> settingData;
     };
+#endif
 
     void DispatchTypedCallback(const GB_Event& event)
     {
@@ -1595,24 +1810,39 @@ private:
     {
         const GUID* settingGuids[] =
         {
-            &GUID_ACDC_POWER_SOURCE,
-            &GUID_BATTERY_PERCENTAGE_REMAINING,
-            &GUID_ACTIVE_POWERSCHEME,
-            &GUID_CONSOLE_DISPLAY_STATE,
-            &GUID_MONITOR_POWER_ON,
-            &GUID_SESSION_DISPLAY_STATUS,
-            &GUID_GLOBAL_USER_PRESENCE,
-            &GUID_SESSION_USER_PRESENCE
+            &GbPowerGuidAcdcPowerSource,
+            &GbPowerGuidBatteryPercentageRemaining,
+            &GbPowerGuidPowerSavingStatus,
+            &GbPowerGuidActivePowerScheme,
+            &GbPowerGuidPowerSchemePersonality,
+            &GbPowerGuidConsoleDisplayState,
+            &GbPowerGuidMonitorPowerOn,
+            &GbPowerGuidSessionDisplayStatus,
+            &GbPowerGuidGlobalUserPresence,
+            &GbPowerGuidSessionUserPresence
         };
 
+        try
+        {
+            notificationHandles.reserve(sizeof(settingGuids) / sizeof(settingGuids[0]));
+        }
+        catch (...)
+        {
+            return GB_SystemResult::Failed(GB_SystemErrorCode::ResourceAllocationFailed, u8"GB_SystemPowerWatcher::Start", u8"预分配电源设置通知句柄数组时内存不足。");
+        }
+
+        DWORD firstRegisterErrorCode = ERROR_SUCCESS;
         for (size_t index = 0; index < sizeof(settingGuids) / sizeof(settingGuids[0]); index++)
         {
             HPOWERNOTIFY notifyHandle = ::RegisterPowerSettingNotification(createdWindowHandle, settingGuids[index], DEVICE_NOTIFY_WINDOW_HANDLE);
             if (notifyHandle == nullptr)
             {
                 const DWORD lastError = ::GetLastError();
-                UnregisterPowerNotifications(notificationHandles);
-                return GB_SystemResult::FromWin32Error(lastError, u8"GB_SystemPowerWatcher::Start", u8"注册电源设置通知失败。");
+                if (firstRegisterErrorCode == ERROR_SUCCESS)
+                {
+                    firstRegisterErrorCode = lastError == ERROR_SUCCESS ? ERROR_INVALID_DATA : lastError;
+                }
+                continue;
             }
 
             try
@@ -1625,6 +1855,11 @@ private:
                 UnregisterPowerNotifications(notificationHandles);
                 return GB_SystemResult::Failed(GB_SystemErrorCode::ResourceAllocationFailed, u8"GB_SystemPowerWatcher::Start", u8"保存电源设置通知句柄时内存不足。");
             }
+        }
+
+        if (notificationHandles.empty() && firstRegisterErrorCode != ERROR_SUCCESS)
+        {
+            return GB_SystemResult::FromWin32Error(firstRegisterErrorCode, u8"GB_SystemPowerWatcher::Start", u8"所有电源设置通知注册均失败。");
         }
 
         return GB_SystemResult::Succeeded(u8"GB_SystemPowerWatcher::Start");
@@ -1665,7 +1900,7 @@ private:
             return;
         }
 
-        HWND createdWindowHandle = ::CreateWindowExW(0, className.c_str(), L"GB_SystemPowerWatcher", 0, 0, 0, 0, 0, HWND_MESSAGE, nullptr, windowClass.hInstance, this);
+        HWND createdWindowHandle = ::CreateWindowExW(WS_EX_TOOLWINDOW, className.c_str(), L"GB_SystemPowerWatcher", WS_POPUP, 0, 0, 0, 0, nullptr, nullptr, windowClass.hInstance, this);
         if (createdWindowHandle == nullptr)
         {
             const GB_SystemResult result = GB_SystemResult::FromLastWin32Error(u8"GB_SystemPowerWatcher::Start", u8"创建电源监听隐藏窗口失败。");
@@ -1690,6 +1925,7 @@ private:
             std::lock_guard<std::mutex> stateLock(stateMutex);
             windowHandle = createdWindowHandle;
             notificationHandles.swap(localNotificationHandles);
+            running = true;
         }
         SignalStartResult(GB_SystemResult::Succeeded(u8"GB_SystemPowerWatcher::Start"));
 
@@ -1711,10 +1947,23 @@ private:
 
     void ClearMessageThreadState()
     {
-        std::lock_guard<std::mutex> stateLock(stateMutex);
-        windowHandle = nullptr;
-        messageThreadId = 0;
-        running = false;
+        bool shouldNotifyEventWorker = false;
+        {
+            std::lock_guard<std::mutex> stateLock(stateMutex);
+            windowHandle = nullptr;
+            messageThreadId = 0;
+            running = false;
+            if (!stopRequested)
+            {
+                eventWorkerStopRequested = true;
+                shouldNotifyEventWorker = true;
+            }
+        }
+
+        if (shouldNotifyEventWorker)
+        {
+            nativeEventCondition.notify_all();
+        }
     }
 
     static LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam)
@@ -1768,11 +2017,13 @@ private:
                 const POWERBROADCAST_SETTING* powerSetting = reinterpret_cast<const POWERBROADCAST_SETTING*>(lParam);
                 event.hasPowerSetting = true;
                 event.settingGuidNative = powerSetting->PowerSetting;
-                event.settingGuid = GuidToString(powerSetting->PowerSetting);
-                if (powerSetting->DataLength <= 4096)
+                if (powerSetting->DataLength <= MaxPowerSettingPayloadBytes)
                 {
-                    const uint8_t* dataBegin = reinterpret_cast<const uint8_t*>(powerSetting->Data);
-                    event.settingData.assign(dataBegin, dataBegin + powerSetting->DataLength);
+                    if (powerSetting->DataLength > 0)
+                    {
+                        const uint8_t* dataBegin = reinterpret_cast<const uint8_t*>(powerSetting->Data);
+                        event.settingData.assign(dataBegin, dataBegin + powerSetting->DataLength);
+                    }
                 }
                 else
                 {
@@ -1792,7 +2043,7 @@ private:
                     nativeEventQueue.pop_front();
                     droppedNativeEventCount.fetch_add(1, std::memory_order_acq_rel);
                 }
-                nativeEventQueue.push_back(event);
+                nativeEventQueue.push_back(std::move(event));
             }
         }
         catch (...)
@@ -1802,6 +2053,20 @@ private:
         }
 
         nativeEventCondition.notify_one();
+    }
+
+    void EventWorkerMainSafe()
+    {
+        try
+        {
+            EventWorkerMain();
+        }
+        catch (...)
+        {
+            droppedNativeEventCount.fetch_add(1, std::memory_order_acq_rel);
+            std::lock_guard<std::mutex> stateLock(stateMutex);
+            eventWorkerStopRequested = true;
+        }
     }
 
     void EventWorkerMain()
@@ -1816,7 +2081,7 @@ private:
                 {
                     break;
                 }
-                nativeEvent = nativeEventQueue.front();
+                nativeEvent = std::move(nativeEventQueue.front());
                 nativeEventQueue.pop_front();
             }
 
@@ -1856,34 +2121,56 @@ private:
         {
             event.SetAttribute("settingDataUInt32", GB_Variant(static_cast<unsigned int>(powerEvent.settingDataUInt32)));
         }
+        if (powerEvent.hasSettingDataGuid)
+        {
+            event.SetAttribute("settingDataGuid", GB_Variant(powerEvent.settingDataGuid));
+        }
     }
 
-    GB_SystemPowerEvent BuildPowerEvent(const NativePowerEvent& nativeEvent)
+    GB_SystemPowerEvent BuildPowerEvent(NativePowerEvent& nativeEvent)
     {
         GB_SystemPowerEvent powerEvent;
         powerEvent.eventType = MapPowerBroadcastToEventType(static_cast<WPARAM>(nativeEvent.nativeWParam), nativeEvent.hasPowerSetting, nativeEvent.settingGuidNative);
+        if (powerEvent.eventType == GB_SystemPowerEventType::Unknown)
+        {
+            return powerEvent;
+        }
+
         powerEvent.eventName = "SystemPower." + GB_SystemPower::GetPowerEventTypeName(powerEvent.eventType);
         powerEvent.sourceName = nativeEvent.hasPowerSetting ? "RegisterPowerSettingNotification" : "WM_POWERBROADCAST";
         powerEvent.timestampMilliseconds = nativeEvent.timestampMilliseconds;
         powerEvent.nativeMessage = nativeEvent.nativeMessage;
         powerEvent.nativeWParam = nativeEvent.nativeWParam;
-        powerEvent.settingGuid = nativeEvent.settingGuid;
-        powerEvent.settingData = nativeEvent.settingData;
+        if (nativeEvent.hasPowerSetting)
+        {
+            powerEvent.settingGuid = GuidToString(nativeEvent.settingGuidNative);
+        }
+        powerEvent.settingData = std::move(nativeEvent.settingData);
 
-        if (powerEvent.settingData.size() >= sizeof(uint32_t))
+        if (powerEvent.settingData.size() == sizeof(uint32_t))
         {
             uint32_t dataValue = 0;
             std::memcpy(&dataValue, powerEvent.settingData.data(), sizeof(dataValue));
             powerEvent.hasSettingDataUInt32 = true;
             powerEvent.settingDataUInt32 = dataValue;
         }
-
-        GB_SystemPowerStatus powerStatus;
-        const GB_SystemResult statusResult = GB_SystemPower::GetPowerStatus(powerStatus);
-        if (statusResult.IsSucceeded())
+        else if (powerEvent.settingData.size() == sizeof(GUID))
         {
-            powerEvent.powerStatus = powerStatus;
-            powerEvent.hasPowerStatus = true;
+            GUID dataGuid = {};
+            std::memcpy(&dataGuid, powerEvent.settingData.data(), sizeof(dataGuid));
+            powerEvent.hasSettingDataGuid = true;
+            powerEvent.settingDataGuid = GuidToString(dataGuid);
+        }
+
+        if (options.capturePowerStatusSnapshot)
+        {
+            GB_SystemPowerStatus powerStatus;
+            const GB_SystemResult statusResult = GB_SystemPower::GetPowerStatus(powerStatus);
+            if (statusResult.IsSucceeded())
+            {
+                powerEvent.powerStatus = powerStatus;
+                powerEvent.hasPowerStatus = true;
+            }
         }
 
         return powerEvent;
@@ -1899,19 +2186,20 @@ private:
     mutable std::mutex callbackMutex;
     mutable std::mutex operationMutex;
     mutable std::mutex stateMutex;
+#if defined(_WIN32)
     std::condition_variable startCondition;
     std::condition_variable nativeEventCondition;
     std::deque<NativePowerEvent> nativeEventQueue;
     std::thread messageThread;
     std::thread eventWorkerThread;
+#endif
     std::atomic<uint64_t> droppedNativeEventCount{ 0 };
     bool running = false;
     bool stopRequested = false;
+#if defined(_WIN32)
     bool eventWorkerStopRequested = false;
     bool startCompleted = false;
     GB_SystemResult startResult;
-
-#if defined(_WIN32)
     HWND windowHandle = nullptr;
     DWORD messageThreadId = 0;
     std::vector<HPOWERNOTIFY> notificationHandles;
