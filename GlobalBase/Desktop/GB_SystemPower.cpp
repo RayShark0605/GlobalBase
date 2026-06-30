@@ -49,6 +49,7 @@ namespace
     const uint32_t RequestFlagSystem = 0x00000001u;
     const uint32_t RequestFlagDisplay = 0x00000002u;
     const uint32_t RequestFlagAwayMode = 0x00000004u;
+    const uint32_t RequestFlagExecution = 0x00000008u;
     const uint32_t MaxPowerSettingPayloadBytes = 4096u;
     const uint32_t MaxScheduledShutdownDelaySeconds = 10u * 365u * 24u * 60u * 60u;
     const size_t MaxPowerRequestReasonLength = 1024u;
@@ -87,6 +88,8 @@ namespace
         case GB_SystemPowerKeepAwakeMode::Display:
         case GB_SystemPowerKeepAwakeMode::SystemAndDisplay:
         case GB_SystemPowerKeepAwakeMode::AwayMode:
+        case GB_SystemPowerKeepAwakeMode::Execution:
+        case GB_SystemPowerKeepAwakeMode::SystemAndExecution:
             return true;
         default:
             break;
@@ -128,6 +131,12 @@ namespace
         return GB_SystemResult::FromWin32Error(static_cast<uint32_t>(errorCode), operationName, message);
     }
 
+
+    POWER_REQUEST_TYPE GetPowerRequestExecutionRequiredType()
+    {
+        return static_cast<POWER_REQUEST_TYPE>(3);
+    }
+
     void ClearPowerRequestsByFlags(HANDLE requestHandle, const uint32_t appliedRequestFlags) noexcept
     {
         if (requestHandle == nullptr || requestHandle == INVALID_HANDLE_VALUE)
@@ -135,6 +144,10 @@ namespace
             return;
         }
 
+        if ((appliedRequestFlags & RequestFlagExecution) != 0)
+        {
+            (void)::PowerClearRequest(requestHandle, GetPowerRequestExecutionRequiredType());
+        }
         if ((appliedRequestFlags & RequestFlagAwayMode) != 0)
         {
             (void)::PowerClearRequest(requestHandle, PowerRequestAwayModeRequired);
@@ -709,6 +722,10 @@ GB_SystemResult GB_SystemPowerKeepAwakeRequest::Release()
     const uint32_t localRequestFlags = appliedRequestFlags;
     GB_SystemResult firstFailure = GB_SystemResult::Succeeded(u8"GB_SystemPowerKeepAwakeRequest::Release");
 
+    if ((localRequestFlags & RequestFlagExecution) != 0 && ::PowerClearRequest(nativeHandle, GetPowerRequestExecutionRequiredType()) == FALSE && firstFailure.IsSucceeded())
+    {
+        firstFailure = GB_SystemResult::FromLastWin32Error(u8"GB_SystemPowerKeepAwakeRequest::Release", u8"清理进程执行保持请求失败。");
+    }
     if ((localRequestFlags & RequestFlagAwayMode) != 0 && ::PowerClearRequest(nativeHandle, PowerRequestAwayModeRequired) == FALSE && firstFailure.IsSucceeded())
     {
         firstFailure = GB_SystemResult::FromLastWin32Error(u8"GB_SystemPowerKeepAwakeRequest::Release", u8"清理 Away Mode 保持唤醒请求失败。");
@@ -743,6 +760,10 @@ void GB_SystemPowerKeepAwakeRequest::ReleaseNoThrow() noexcept
         HANDLE nativeHandle = static_cast<HANDLE>(requestHandle);
         const uint32_t localRequestFlags = appliedRequestFlags;
 
+        if ((localRequestFlags & RequestFlagExecution) != 0)
+        {
+            (void)::PowerClearRequest(nativeHandle, GetPowerRequestExecutionRequiredType());
+        }
         if ((localRequestFlags & RequestFlagAwayMode) != 0)
         {
             (void)::PowerClearRequest(nativeHandle, PowerRequestAwayModeRequired);
@@ -1097,7 +1118,8 @@ GB_SystemResult GB_SystemPower::CreateKeepAwakeRequest(const GB_SystemPowerKeepA
     uint32_t appliedRequestFlags = 0;
     const bool needDisplay = options.mode == GB_SystemPowerKeepAwakeMode::Display || options.mode == GB_SystemPowerKeepAwakeMode::SystemAndDisplay;
     const bool needAwayMode = options.mode == GB_SystemPowerKeepAwakeMode::AwayMode;
-    const bool needSystem = options.mode == GB_SystemPowerKeepAwakeMode::System || needDisplay || needAwayMode;
+    const bool needExecution = options.mode == GB_SystemPowerKeepAwakeMode::Execution || options.mode == GB_SystemPowerKeepAwakeMode::SystemAndExecution;
+    const bool needSystem = options.mode == GB_SystemPowerKeepAwakeMode::System || needDisplay || needAwayMode || options.mode == GB_SystemPowerKeepAwakeMode::SystemAndExecution;
 
     if (needSystem && ::PowerSetRequest(requestHandle, PowerRequestSystemRequired) == FALSE)
     {
@@ -1132,6 +1154,18 @@ GB_SystemResult GB_SystemPower::CreateKeepAwakeRequest(const GB_SystemPowerKeepA
     if (needAwayMode)
     {
         appliedRequestFlags |= RequestFlagAwayMode;
+    }
+
+    if (needExecution && ::PowerSetRequest(requestHandle, GetPowerRequestExecutionRequiredType()) == FALSE)
+    {
+        const GB_SystemResult result = GB_SystemResult::FromLastWin32Error(u8"GB_SystemPower::CreateKeepAwakeRequest", u8"设置进程执行保持请求失败。");
+        ClearPowerRequestsByFlags(requestHandle, appliedRequestFlags);
+        (void)::CloseHandle(requestHandle);
+        return result;
+    }
+    if (needExecution)
+    {
+        appliedRequestFlags |= RequestFlagExecution;
     }
 
     request.options.mode = storedOptions.mode;
@@ -1375,6 +1409,10 @@ std::string GB_SystemPower::GetKeepAwakeModeName(const GB_SystemPowerKeepAwakeMo
         return "SystemAndDisplay";
     case GB_SystemPowerKeepAwakeMode::AwayMode:
         return "AwayMode";
+    case GB_SystemPowerKeepAwakeMode::Execution:
+        return "Execution";
+    case GB_SystemPowerKeepAwakeMode::SystemAndExecution:
+        return "SystemAndExecution";
     default:
         return "Unknown";
     }
