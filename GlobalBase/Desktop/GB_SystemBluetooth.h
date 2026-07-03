@@ -73,7 +73,8 @@ enum class GB_BluetoothEventType : uint16_t
  * 说明：
  * - radioId 当前使用蓝牙地址作为稳定 ID；没有地址时为空；
  * - address 为标准冒号分隔十六进制文本，例如 "AA:BB:CC:DD:EE:FF"；
- * - Win32 Bluetooth API 不提供可靠的统一开关状态，isConnectable / isDiscoverable 仅表示当前可连接/可发现属性；
+ * - Win32 Bluetooth API 不提供可靠的统一蓝牙电源开关状态，isConnectable / isDiscoverable 仅表示当前可连接/可发现属性；
+ * - SetRadioConnectable / SetRadioDiscoverable 控制的是入站连接和可发现性，不等价于启用或禁用蓝牙适配器电源；
  * - isLowEnergySupported 当前为保守默认值，完整 BLE 能力探测需要 WinRT BluetoothAdapter。
  */
 struct GB_BluetoothRadioInfo
@@ -214,6 +215,26 @@ public:
     static GB_SystemResult GetRadios(std::vector<GB_BluetoothRadioInfo>& radios);
     static GB_SystemResult GetDefaultRadio(GB_BluetoothRadioInfo& radio, bool& found);
     static GB_SystemResult IsBluetoothAvailable(bool& available);
+
+    /**
+     * @brief 设置本机蓝牙无线电是否接受入站连接。
+     *
+     * 说明：
+     * - radioAddress 为空时作用于当前发现的全部本机蓝牙无线电；非空时只作用于指定地址的无线电；
+     * - enabled=false 时会先关闭可发现性，再关闭入站连接，以满足 Windows Bluetooth API 的状态前置条件；
+     * - 本接口不等价于系统蓝牙总开关，不会启用或禁用蓝牙适配器设备。
+     */
+    static GB_SystemResult SetRadioConnectable(const std::string& radioAddress, bool enabled);
+
+    /**
+     * @brief 设置本机蓝牙无线电是否可被其他设备发现。
+     *
+     * 说明：
+     * - radioAddress 为空时作用于当前发现的全部本机蓝牙无线电；非空时只作用于指定地址的无线电；
+     * - enabled=true 时会先打开入站连接，再打开可发现性，以满足 Windows Bluetooth API 的状态前置条件；
+     * - Windows 对可发现性的改变只保证在调用进程生命周期内有效，进程结束后系统会恢复原状态。
+     */
+    static GB_SystemResult SetRadioDiscoverable(const std::string& radioAddress, bool enabled);
 
     static GB_SystemResult GetClassicDevices(std::vector<GB_BluetoothDeviceInfo>& devices, const GB_BluetoothClassicDeviceQueryOptions& options = GB_BluetoothClassicDeviceQueryOptions());
     static GB_SystemResult GetLowEnergyDevices(std::vector<GB_BluetoothDeviceInfo>& devices);

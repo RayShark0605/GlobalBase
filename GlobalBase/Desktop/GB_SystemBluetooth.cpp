@@ -487,6 +487,49 @@ namespace
         return GB_SystemResult::Succeeded(u8"GB_SystemBluetooth::GetRadios");
     }
 
+    static GB_SystemResult BuildBluetoothBooleanApiFailureResult(const std::string& operationName, const std::string& message)
+    {
+        const DWORD lastError = ::GetLastError();
+        if (lastError != ERROR_SUCCESS)
+        {
+            return GB_SystemResult::FromWin32Error(static_cast<uint32_t>(lastError), operationName, message);
+        }
+
+        return GB_SystemResult::Failed(GB_SystemErrorCode::NativeApiFailed, operationName, message);
+    }
+
+    static GB_SystemResult SetRadioIncomingConnections(HANDLE radioHandle, const bool enabled, const std::string& operationName)
+    {
+        if (radioHandle == nullptr || radioHandle == INVALID_HANDLE_VALUE)
+        {
+            return GB_SystemResult::Failed(GB_SystemErrorCode::InvalidArgument, operationName, u8"蓝牙无线电句柄无效。");
+        }
+
+        ::SetLastError(ERROR_SUCCESS);
+        if (::BluetoothEnableIncomingConnections(radioHandle, enabled ? TRUE : FALSE) == FALSE)
+        {
+            return BuildBluetoothBooleanApiFailureResult(operationName, enabled ? u8"BluetoothEnableIncomingConnections 打开入站连接失败。" : u8"BluetoothEnableIncomingConnections 关闭入站连接失败。");
+        }
+
+        return GB_SystemResult::Succeeded(operationName);
+    }
+
+    static GB_SystemResult SetRadioDiscovery(HANDLE radioHandle, const bool enabled, const std::string& operationName)
+    {
+        if (radioHandle == nullptr || radioHandle == INVALID_HANDLE_VALUE)
+        {
+            return GB_SystemResult::Failed(GB_SystemErrorCode::InvalidArgument, operationName, u8"蓝牙无线电句柄无效。");
+        }
+
+        ::SetLastError(ERROR_SUCCESS);
+        if (::BluetoothEnableDiscovery(radioHandle, enabled ? TRUE : FALSE) == FALSE)
+        {
+            return BuildBluetoothBooleanApiFailureResult(operationName, enabled ? u8"BluetoothEnableDiscovery 打开可发现性失败。" : u8"BluetoothEnableDiscovery 关闭可发现性失败。");
+        }
+
+        return GB_SystemResult::Succeeded(operationName);
+    }
+
     static GB_SystemResult EnumerateRadioHandles(std::vector<BluetoothRadioHandleEntry>& radioHandles)
     {
         radioHandles.clear();
@@ -546,6 +589,58 @@ namespace
         }
 
         return GB_SystemResult::Succeeded(u8"GB_SystemBluetooth::GetRadios");
+    }
+
+    static GB_SystemResult FindTargetRadioHandles(const std::string& radioAddress, std::vector<BluetoothRadioHandleEntry>& radioHandles, std::vector<BluetoothRadioHandleEntry*>& targetRadioHandles, const std::string& operationName)
+    {
+        radioHandles.clear();
+        targetRadioHandles.clear();
+
+        std::string targetRadioAddress;
+        if (!radioAddress.empty())
+        {
+            targetRadioAddress = NormalizeBluetoothAddress(radioAddress);
+            if (targetRadioAddress.empty())
+            {
+                return GB_SystemResult::Failed(GB_SystemErrorCode::InvalidArgument, operationName, u8"radioAddress 不是有效蓝牙地址。");
+            }
+        }
+
+        GB_SystemResult radioResult = EnumerateRadioHandles(radioHandles);
+        if (radioResult.IsFailed())
+        {
+            return radioResult.WithOperationName(operationName);
+        }
+        if (radioHandles.empty())
+        {
+            return GB_SystemResult::Failed(GB_SystemErrorCode::NotFound, operationName, u8"当前系统未发现蓝牙无线电。");
+        }
+
+        try
+        {
+            targetRadioHandles.reserve(radioHandles.size());
+        }
+        catch (...)
+        {
+            return GB_SystemResult::Failed(GB_SystemErrorCode::ResourceAllocationFailed, operationName, u8"保存目标蓝牙无线电句柄时内存不足。");
+        }
+
+        for (size_t index = 0; index < radioHandles.size(); index++)
+        {
+            if (!targetRadioAddress.empty() && radioHandles[index].GetInfo().address != targetRadioAddress)
+            {
+                continue;
+            }
+
+            targetRadioHandles.push_back(&radioHandles[index]);
+        }
+
+        if (targetRadioHandles.empty())
+        {
+            return GB_SystemResult::Failed(GB_SystemErrorCode::NotFound, operationName, u8"未找到指定 radioAddress 对应的本机蓝牙无线电。");
+        }
+
+        return GB_SystemResult::Succeeded(operationName);
     }
 
     static GB_SystemResult ValidateClassicDeviceQueryOptions(const GB_BluetoothClassicDeviceQueryOptions& options)
@@ -908,6 +1003,82 @@ GB_SystemResult GB_SystemBluetooth::IsBluetoothAvailable(bool& available)
     return GB_SystemResult::Succeeded(u8"GB_SystemBluetooth::IsBluetoothAvailable");
 }
 
+GB_SystemResult GB_SystemBluetooth::SetRadioConnectable(const std::string& radioAddress, const bool enabled)
+{
+#if !defined(_WIN32)
+    (void)radioAddress;
+    (void)enabled;
+    return GB_SystemResult::Failed(GB_SystemErrorCode::UnsupportedPlatform, u8"GB_SystemBluetooth::SetRadioConnectable", u8"当前平台不支持 Windows 蓝牙入站连接状态设置。");
+#else
+    std::vector<BluetoothRadioHandleEntry> radioHandles;
+    std::vector<BluetoothRadioHandleEntry*> targetRadioHandles;
+    GB_SystemResult targetResult = FindTargetRadioHandles(radioAddress, radioHandles, targetRadioHandles, u8"GB_SystemBluetooth::SetRadioConnectable");
+    if (targetResult.IsFailed())
+    {
+        return targetResult;
+    }
+
+    for (size_t index = 0; index < targetRadioHandles.size(); index++)
+    {
+        HANDLE radioHandle = targetRadioHandles[index]->GetHandle();
+        if (!enabled && ::BluetoothIsDiscoverable(radioHandle) != FALSE)
+        {
+            GB_SystemResult discoveryResult = SetRadioDiscovery(radioHandle, false, u8"GB_SystemBluetooth::SetRadioConnectable");
+            if (discoveryResult.IsFailed())
+            {
+                return discoveryResult;
+            }
+        }
+
+        GB_SystemResult connectableResult = SetRadioIncomingConnections(radioHandle, enabled, u8"GB_SystemBluetooth::SetRadioConnectable");
+        if (connectableResult.IsFailed())
+        {
+            return connectableResult;
+        }
+    }
+
+    return GB_SystemResult::Succeeded(u8"GB_SystemBluetooth::SetRadioConnectable");
+#endif
+}
+
+GB_SystemResult GB_SystemBluetooth::SetRadioDiscoverable(const std::string& radioAddress, const bool enabled)
+{
+#if !defined(_WIN32)
+    (void)radioAddress;
+    (void)enabled;
+    return GB_SystemResult::Failed(GB_SystemErrorCode::UnsupportedPlatform, u8"GB_SystemBluetooth::SetRadioDiscoverable", u8"当前平台不支持 Windows 蓝牙可发现状态设置。");
+#else
+    std::vector<BluetoothRadioHandleEntry> radioHandles;
+    std::vector<BluetoothRadioHandleEntry*> targetRadioHandles;
+    GB_SystemResult targetResult = FindTargetRadioHandles(radioAddress, radioHandles, targetRadioHandles, u8"GB_SystemBluetooth::SetRadioDiscoverable");
+    if (targetResult.IsFailed())
+    {
+        return targetResult;
+    }
+
+    for (size_t index = 0; index < targetRadioHandles.size(); index++)
+    {
+        HANDLE radioHandle = targetRadioHandles[index]->GetHandle();
+        if (enabled && ::BluetoothIsConnectable(radioHandle) == FALSE)
+        {
+            GB_SystemResult connectableResult = SetRadioIncomingConnections(radioHandle, true, u8"GB_SystemBluetooth::SetRadioDiscoverable");
+            if (connectableResult.IsFailed())
+            {
+                return connectableResult;
+            }
+        }
+
+        GB_SystemResult discoveryResult = SetRadioDiscovery(radioHandle, enabled, u8"GB_SystemBluetooth::SetRadioDiscoverable");
+        if (discoveryResult.IsFailed())
+        {
+            return discoveryResult;
+        }
+    }
+
+    return GB_SystemResult::Succeeded(u8"GB_SystemBluetooth::SetRadioDiscoverable");
+#endif
+}
+
 GB_SystemResult GB_SystemBluetooth::GetClassicDevices(std::vector<GB_BluetoothDeviceInfo>& devices, const GB_BluetoothClassicDeviceQueryOptions& options)
 {
     devices.clear();
@@ -935,6 +1106,16 @@ GB_SystemResult GB_SystemBluetooth::GetClassicDevices(std::vector<GB_BluetoothDe
 
     bool matchedRadio = options.radioAddress.empty();
     std::unordered_set<std::string> seenAddresses;
+    try
+    {
+        seenAddresses.reserve(radioHandles.size() * 8u + 8u);
+        devices.reserve(radioHandles.size() * 8u);
+    }
+    catch (...)
+    {
+        return GB_SystemResult::Failed(GB_SystemErrorCode::ResourceAllocationFailed, u8"GB_SystemBluetooth::GetClassicDevices", u8"预分配经典蓝牙设备结果缓冲区时内存不足。");
+    }
+
     for (size_t index = 0; index < radioHandles.size(); index++)
     {
         if (!options.radioAddress.empty() && radioHandles[index].GetInfo().address != targetRadioAddress)
