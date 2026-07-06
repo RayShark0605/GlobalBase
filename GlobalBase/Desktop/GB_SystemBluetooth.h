@@ -95,7 +95,7 @@ struct GB_BluetoothRadioInfo
  * @brief 蓝牙设备 ID。
  *
  * 说明：
- * - address 用于经典蓝牙设备，格式接受冒号、短横线或 12 位十六进制，内部会归一化；
+ * - address 用于经典蓝牙设备，接受 12 位十六进制、AA:BB:CC:DD:EE:FF 或 AA-BB-CC-DD-EE-FF 形式，允许首尾 ASCII 空白，不接受内嵌空白或混合分隔符，内部会归一化；
  * - nativeDeviceId 预留给 WinRT DeviceInformation ID，不要求等价于 MAC 地址；
  * - 当前 PairDevice / RemoveDevice / IsDeviceConnected 只支持具有 address 的经典蓝牙设备。
  */
@@ -110,9 +110,9 @@ struct GB_BluetoothDeviceId
  * @brief 蓝牙设备信息。
  *
  * 说明：
- * - deviceId 当前对经典蓝牙设备使用标准化 address；后续 BLE/WinRT 实现可使用 DeviceInformation ID；
+ * - deviceId 当前对经典蓝牙设备使用标准化 address；同一远端设备可能被多个本机无线电观察到，必要时应结合 radioAddress 区分；后续 BLE/WinRT 实现可使用 DeviceInformation ID；
  * - pairStatus、connectionStatus 明确区分“已配对”和“已连接”；
- * - installedServiceGuids 仅在查询选项 includeInstalledServices=true 且系统返回成功时填充。
+ * - installedServiceGuids 仅在查询选项 includeInstalledServices=true 且系统返回成功时填充；系统报告没有服务或缓存记录不存在时保持为空。
  */
 struct GB_BluetoothDeviceInfo
 {
@@ -147,7 +147,7 @@ struct GB_BluetoothDeviceInfo
  * - requestFreshInquiry=true 会触发经典蓝牙 Inquiry，可能持续数秒；
  * - inquiryTimeoutMultiplier 单位为 1.28 秒，Windows API 最大有效值为 48；
  * - includeUnknown=true 才返回本机未记住/未配对但 Inquiry 发现的设备；
- * - radioAddress 非空时只查询指定本机蓝牙无线电。
+ * - radioAddress 非空时只查询指定本机蓝牙无线电；多无线电环境下，同一远端地址可能返回多条不同 radioAddress 的记录。
  */
 struct GB_BluetoothClassicDeviceQueryOptions
 {

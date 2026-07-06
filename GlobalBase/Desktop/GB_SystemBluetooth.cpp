@@ -92,6 +92,33 @@ namespace
         return -1;
     }
 
+    static bool IsAsciiWhitespace(const char character)
+    {
+        return character == ' ' || character == '\t' || character == '\r' || character == '\n' || character == '\f' || character == '\v';
+    }
+
+    static std::string TrimAsciiWhitespace(const std::string& text)
+    {
+        size_t beginIndex = 0;
+        while (beginIndex < text.size() && IsAsciiWhitespace(text[beginIndex]))
+        {
+            beginIndex++;
+        }
+
+        size_t endIndex = text.size();
+        while (endIndex > beginIndex && IsAsciiWhitespace(text[endIndex - 1]))
+        {
+            endIndex--;
+        }
+
+        return text.substr(beginIndex, endIndex - beginIndex);
+    }
+
+    static bool IsHexPairAt(const std::string& text, const size_t index)
+    {
+        return index + 1 < text.size() && HexValue(text[index]) >= 0 && HexValue(text[index + 1]) >= 0;
+    }
+
     static bool TryParseBluetoothAddressValue(const std::string& address, uint64_t& addressValue)
     {
         addressValue = 0;
@@ -100,33 +127,59 @@ namespace
             return false;
         }
 
-        char digits[13] = {};
-        size_t digitCount = 0;
-        for (size_t index = 0; index < address.size(); index++)
+        const std::string trimmedAddress = TrimAsciiWhitespace(address);
+        if (trimmedAddress.empty())
         {
-            const char character = address[index];
-            if (character == ':' || character == '-' || character == ' ' || character == '\t' || character == '\r' || character == '\n')
-            {
-                continue;
-            }
+            return false;
+        }
 
-            const int value = HexValue(character);
-            if (value < 0 || digitCount >= 12)
+        char digits[13] = {};
+        if (trimmedAddress.size() == 12)
+        {
+            for (size_t index = 0; index < trimmedAddress.size(); index++)
+            {
+                if (HexValue(trimmedAddress[index]) < 0)
+                {
+                    return false;
+                }
+
+                digits[index] = trimmedAddress[index];
+            }
+        }
+        else if (trimmedAddress.size() == 17)
+        {
+            const char separator = trimmedAddress[2];
+            if (separator != ':' && separator != '-')
             {
                 return false;
             }
 
-            digits[digitCount] = character;
-            digitCount++;
-        }
+            size_t digitIndex = 0;
+            for (size_t groupIndex = 0; groupIndex < 6; groupIndex++)
+            {
+                const size_t textIndex = groupIndex * 3;
+                if (!IsHexPairAt(trimmedAddress, textIndex))
+                {
+                    return false;
+                }
+                if (groupIndex < 5 && trimmedAddress[textIndex + 2] != separator)
+                {
+                    return false;
+                }
 
-        if (digitCount != 12)
+                digits[digitIndex] = trimmedAddress[textIndex];
+                digitIndex++;
+                digits[digitIndex] = trimmedAddress[textIndex + 1];
+                digitIndex++;
+            }
+        }
+        else
         {
             return false;
         }
 
         uint64_t parsedValue = 0;
-        for (size_t index = 0; index < digitCount; index++)
+        for (size_t index = 0; index < 12; index++)
         {
             const int value = HexValue(digits[index]);
             if (value < 0)
@@ -135,6 +188,11 @@ namespace
             }
 
             parsedValue = (parsedValue << 4) | static_cast<uint64_t>(value);
+        }
+
+        if (parsedValue == 0)
+        {
+            return false;
         }
 
         addressValue = parsedValue;
@@ -505,9 +563,20 @@ namespace
             return GB_SystemResult::Failed(GB_SystemErrorCode::InvalidArgument, operationName, u8"蓝牙无线电句柄无效。");
         }
 
+        const bool currentEnabled = ::BluetoothIsConnectable(radioHandle) != FALSE;
+        if (currentEnabled == enabled)
+        {
+            return GB_SystemResult::Succeeded(operationName);
+        }
+
         ::SetLastError(ERROR_SUCCESS);
         if (::BluetoothEnableIncomingConnections(radioHandle, enabled ? TRUE : FALSE) == FALSE)
         {
+            if ((::BluetoothIsConnectable(radioHandle) != FALSE) == enabled)
+            {
+                return GB_SystemResult::Succeeded(operationName);
+            }
+
             return BuildBluetoothBooleanApiFailureResult(operationName, enabled ? u8"BluetoothEnableIncomingConnections 打开入站连接失败。" : u8"BluetoothEnableIncomingConnections 关闭入站连接失败。");
         }
 
@@ -521,9 +590,20 @@ namespace
             return GB_SystemResult::Failed(GB_SystemErrorCode::InvalidArgument, operationName, u8"蓝牙无线电句柄无效。");
         }
 
+        const bool currentEnabled = ::BluetoothIsDiscoverable(radioHandle) != FALSE;
+        if (currentEnabled == enabled)
+        {
+            return GB_SystemResult::Succeeded(operationName);
+        }
+
         ::SetLastError(ERROR_SUCCESS);
         if (::BluetoothEnableDiscovery(radioHandle, enabled ? TRUE : FALSE) == FALSE)
         {
+            if ((::BluetoothIsDiscoverable(radioHandle) != FALSE) == enabled)
+            {
+                return GB_SystemResult::Succeeded(operationName);
+            }
+
             return BuildBluetoothBooleanApiFailureResult(operationName, enabled ? u8"BluetoothEnableDiscovery 打开可发现性失败。" : u8"BluetoothEnableDiscovery 关闭可发现性失败。");
         }
 
@@ -727,6 +807,10 @@ namespace
 
         DWORD serviceCount = 0;
         DWORD serviceResult = ::BluetoothEnumerateInstalledServices(radioHandle, &nativeDeviceInfo, &serviceCount, nullptr);
+        if (serviceResult == ERROR_NOT_FOUND || serviceResult == ERROR_SERVICE_DOES_NOT_EXIST)
+        {
+            return GB_SystemResult::Succeeded(u8"GB_SystemBluetooth::ReadInstalledServices");
+        }
         if (serviceResult != ERROR_SUCCESS && serviceResult != ERROR_MORE_DATA)
         {
             return GB_SystemResult::FromWin32Error(serviceResult, u8"GB_SystemBluetooth::ReadInstalledServices", u8"BluetoothEnumerateInstalledServices 查询经典蓝牙设备已安装服务数量失败。");
@@ -742,25 +826,37 @@ namespace
 
         try
         {
-            std::vector<GUID> nativeServiceGuids(static_cast<size_t>(serviceCount));
-            DWORD retryServiceCount = serviceCount;
-            serviceResult = ::BluetoothEnumerateInstalledServices(radioHandle, &nativeDeviceInfo, &retryServiceCount, nativeServiceGuids.data());
-            if (serviceResult == ERROR_MORE_DATA && retryServiceCount > serviceCount && retryServiceCount <= 1024)
+            for (int retryIndex = 0; retryIndex < 2; retryIndex++)
             {
-                nativeServiceGuids.assign(static_cast<size_t>(retryServiceCount), GUID());
-                serviceCount = retryServiceCount;
-                serviceResult = ::BluetoothEnumerateInstalledServices(radioHandle, &nativeDeviceInfo, &retryServiceCount, nativeServiceGuids.data());
-            }
-            if (serviceResult != ERROR_SUCCESS)
-            {
+                std::vector<GUID> nativeServiceGuids(static_cast<size_t>(serviceCount));
+                DWORD returnedServiceCount = serviceCount;
+                serviceResult = ::BluetoothEnumerateInstalledServices(radioHandle, &nativeDeviceInfo, &returnedServiceCount, nativeServiceGuids.data());
+                if (serviceResult == ERROR_SUCCESS)
+                {
+                    serviceGuids.reserve(static_cast<size_t>(returnedServiceCount));
+                    const DWORD validServiceCount = returnedServiceCount < static_cast<DWORD>(nativeServiceGuids.size()) ? returnedServiceCount : static_cast<DWORD>(nativeServiceGuids.size());
+                    for (DWORD index = 0; index < validServiceCount; index++)
+                    {
+                        serviceGuids.push_back(GuidToString(nativeServiceGuids[index]));
+                    }
+
+                    return GB_SystemResult::Succeeded(u8"GB_SystemBluetooth::ReadInstalledServices");
+                }
+
+                if (serviceResult == ERROR_MORE_DATA && returnedServiceCount > serviceCount && returnedServiceCount <= 1024)
+                {
+                    serviceCount = returnedServiceCount;
+                    continue;
+                }
+
+                if (serviceResult == ERROR_NOT_FOUND || serviceResult == ERROR_SERVICE_DOES_NOT_EXIST)
+                {
+                    serviceGuids.clear();
+                    return GB_SystemResult::Succeeded(u8"GB_SystemBluetooth::ReadInstalledServices");
+                }
+
                 serviceGuids.clear();
                 return GB_SystemResult::FromWin32Error(serviceResult, u8"GB_SystemBluetooth::ReadInstalledServices", u8"BluetoothEnumerateInstalledServices 读取经典蓝牙设备已安装服务失败。");
-            }
-
-            serviceGuids.reserve(static_cast<size_t>(retryServiceCount));
-            for (DWORD index = 0; index < retryServiceCount && index < nativeServiceGuids.size(); index++)
-            {
-                serviceGuids.push_back(GuidToString(nativeServiceGuids[index]));
             }
         }
         catch (...)
@@ -769,7 +865,48 @@ namespace
             return GB_SystemResult::Failed(GB_SystemErrorCode::ResourceAllocationFailed, u8"GB_SystemBluetooth::ReadInstalledServices", u8"保存经典蓝牙服务 GUID 时内存不足。");
         }
 
-        return GB_SystemResult::Succeeded(u8"GB_SystemBluetooth::ReadInstalledServices");
+        serviceGuids.clear();
+        return GB_SystemResult::Failed(GB_SystemErrorCode::OperationFailed, u8"GB_SystemBluetooth::ReadInstalledServices", u8"BluetoothEnumerateInstalledServices 多次返回更多数据，服务 GUID 数量不稳定。");
+    }
+
+    static GB_SystemResult TryGetNativeClassicDeviceInfoByAddress(HANDLE radioHandle, const GB_BluetoothRadioInfo& radioInfo, const std::string& targetAddress, const bool includeInstalledServices, BLUETOOTH_DEVICE_INFO& nativeDeviceInfo, GB_BluetoothDeviceInfo* publicDevice, bool& found)
+    {
+        found = false;
+        nativeDeviceInfo = {};
+        nativeDeviceInfo.dwSize = sizeof(nativeDeviceInfo);
+
+        uint64_t addressValue = 0;
+        if (!TryParseBluetoothAddressValue(targetAddress, addressValue))
+        {
+            return GB_SystemResult::Failed(GB_SystemErrorCode::InvalidArgument, u8"GB_SystemBluetooth::TryGetNativeClassicDeviceInfoByAddress", u8"蓝牙设备地址格式无效。");
+        }
+
+        nativeDeviceInfo.Address = MakeBluetoothAddress(addressValue);
+        const DWORD getResult = ::BluetoothGetDeviceInfo(radioHandle, &nativeDeviceInfo);
+        if (getResult == ERROR_NOT_FOUND || getResult == ERROR_FILE_NOT_FOUND || getResult == ERROR_NO_MORE_ITEMS)
+        {
+            return GB_SystemResult::Succeeded(u8"GB_SystemBluetooth::TryGetNativeClassicDeviceInfoByAddress");
+        }
+        if (getResult != ERROR_SUCCESS)
+        {
+            return GB_SystemResult::FromWin32Error(getResult, u8"GB_SystemBluetooth::TryGetNativeClassicDeviceInfoByAddress", u8"BluetoothGetDeviceInfo 按地址读取经典蓝牙设备信息失败。");
+        }
+
+        if (publicDevice != nullptr)
+        {
+            *publicDevice = ConvertDeviceInfo(nativeDeviceInfo, radioInfo);
+            if (includeInstalledServices)
+            {
+                GB_SystemResult serviceResult = ReadInstalledServices(radioHandle, nativeDeviceInfo, publicDevice->installedServiceGuids);
+                if (serviceResult.IsFailed())
+                {
+                    return serviceResult.WithOperationName(u8"GB_SystemBluetooth::TryGetNativeClassicDeviceInfoByAddress");
+                }
+            }
+        }
+
+        found = true;
+        return GB_SystemResult::Succeeded(u8"GB_SystemBluetooth::TryGetNativeClassicDeviceInfoByAddress");
     }
 
     static GB_SystemResult FindNativeClassicDeviceForRadio(HANDLE radioHandle, const GB_BluetoothRadioInfo& radioInfo, const GB_BluetoothClassicDeviceQueryOptions& options, const std::string& targetAddress, BLUETOOTH_DEVICE_INFO& nativeDeviceInfo, GB_BluetoothDeviceInfo* publicDevice, bool& found)
@@ -777,6 +914,19 @@ namespace
         found = false;
         nativeDeviceInfo = {};
         nativeDeviceInfo.dwSize = sizeof(nativeDeviceInfo);
+
+        if (!options.requestFreshInquiry)
+        {
+            GB_SystemResult fastLookupResult = TryGetNativeClassicDeviceInfoByAddress(radioHandle, radioInfo, targetAddress, options.includeInstalledServices, nativeDeviceInfo, publicDevice, found);
+            if (fastLookupResult.IsFailed())
+            {
+                return fastLookupResult.WithOperationName(u8"GB_SystemBluetooth::FindNativeClassicDeviceForRadio");
+            }
+            if (found)
+            {
+                return GB_SystemResult::Succeeded(u8"GB_SystemBluetooth::FindNativeClassicDeviceForRadio");
+            }
+        }
 
         BLUETOOTH_DEVICE_SEARCH_PARAMS searchParams = BuildSearchParams(radioHandle, options);
         HBLUETOOTH_DEVICE_FIND findHandle = ::BluetoothFindFirstDevice(&searchParams, &nativeDeviceInfo);
@@ -854,7 +1004,8 @@ namespace
         while (true)
         {
             GB_BluetoothDeviceInfo device = ConvertDeviceInfo(nativeDeviceInfo, radioInfo);
-            if (seenAddresses.insert(device.address).second)
+            const std::string seenKey = device.radioAddress + "|" + device.address;
+            if (seenAddresses.insert(seenKey).second)
             {
                 if (options.includeInstalledServices)
                 {
@@ -1584,7 +1735,7 @@ private:
             return false;
         }
 
-        if (StartsWithAsciiNoCase(text, "BTH\\") || StartsWithAsciiNoCase(text, "BTHENUM\\") || StartsWithAsciiNoCase(text, "BTHLEDEVICE\\") || StartsWithAsciiNoCase(text, "BTHLEENUM\\"))
+        if (StartsWithAsciiNoCase(text, "BTH\\") || StartsWithAsciiNoCase(text, "BTHLE\\") || StartsWithAsciiNoCase(text, "BTHENUM\\") || StartsWithAsciiNoCase(text, "BTHLEDEVICE\\") || StartsWithAsciiNoCase(text, "BTHLEENUM\\") || StartsWithAsciiNoCase(text, "BTHHFENUM\\") || StartsWithAsciiNoCase(text, "BTHMODEM\\") || StartsWithAsciiNoCase(text, "Bluetooth\\") || StartsWithAsciiNoCase(text, "SWD\\RADIO\\Bluetooth"))
         {
             return true;
         }
@@ -1594,6 +1745,16 @@ private:
         }
 
         return false;
+    }
+
+    static bool HasBluetoothRadioPnPIdentity(const std::string& text)
+    {
+        if (text.empty())
+        {
+            return false;
+        }
+
+        return StartsWithAsciiNoCase(text, "SWD\\RADIO\\Bluetooth") || ContainsAsciiNoCase(text, "SWD\\RADIO\\Bluetooth") || ContainsAsciiNoCase(text, "BTH\\MS_BTH") || ContainsAsciiNoCase(text, "#BTH#MS_BTH");
     }
 
     static bool IsBluetoothRelatedDeviceEvent(const GB_SystemDeviceEvent& deviceEvent)
@@ -1606,9 +1767,19 @@ private:
         return false;
     }
 
-    static GB_BluetoothEventType MapDeviceEventType(const GB_SystemDeviceEventType eventType)
+    static bool IsBluetoothRadioDeviceEvent(const GB_SystemDeviceEvent& deviceEvent)
     {
-        switch (eventType)
+        return HasBluetoothRadioPnPIdentity(deviceEvent.deviceInstanceId) || HasBluetoothRadioPnPIdentity(deviceEvent.deviceInterfacePath);
+    }
+
+    static GB_BluetoothEventType MapDeviceEventType(const GB_SystemDeviceEvent& deviceEvent)
+    {
+        if (IsBluetoothRadioDeviceEvent(deviceEvent))
+        {
+            return GB_BluetoothEventType::RadioChanged;
+        }
+
+        switch (deviceEvent.eventType)
         {
         case GB_SystemDeviceEventType::DeviceInstanceEnumerated:
         case GB_SystemDeviceEventType::DeviceInstanceStarted:
@@ -1634,7 +1805,7 @@ private:
     static GB_BluetoothEvent BuildBluetoothEvent(const GB_SystemDeviceEvent& deviceEvent)
     {
         GB_BluetoothEvent bluetoothEvent;
-        bluetoothEvent.eventType = MapDeviceEventType(deviceEvent.eventType);
+        bluetoothEvent.eventType = MapDeviceEventType(deviceEvent);
         bluetoothEvent.eventName = GetBluetoothEventName(bluetoothEvent.eventType);
         bluetoothEvent.sourceName = deviceEvent.sourceName.empty() ? u8"GB_SystemDeviceWatcher" : deviceEvent.sourceName;
         bluetoothEvent.timestampMilliseconds = deviceEvent.timestampMilliseconds;
