@@ -165,9 +165,9 @@ struct GB_BluetoothClassicDeviceQueryOptions
  * @brief 经典蓝牙配对选项。
  *
  * 说明：
- * - 当前实现使用 BluetoothAuthenticateDeviceEx 发起基础系统配对，可能弹出系统配对 UI；
- * - pinCodeUtf8 预留给后续自定义认证回调实现，当前非空时会返回 UnsupportedPlatform；
- * - 当前 C++14 实现不承诺超时、PIN 输入或自定义 SSP 交互。
+ * - pinCodeUtf8 非空时使用 BluetoothAuthenticateDevice 的透明 PIN 配对模式；
+ * - pinCodeUtf8 为空时使用 BluetoothAuthenticateDeviceEx 发起系统配对流程，可能弹出系统 UI；
+ * - 当前 C++14 实现不承诺超时控制或自定义 SSP 交互。
  */
 struct GB_BluetoothPairingOptions
 {
@@ -198,13 +198,81 @@ struct GB_BluetoothEvent
     uint32_t nativeAction = 0;
 };
 
+
+/**
+ * @brief BLE GATT 特征属性位。
+ */
+enum class GB_BluetoothGattCharacteristicProperty : uint32_t
+{
+    None = 0,
+    Broadcast = 1u << 0,
+    Read = 1u << 1,
+    Write = 1u << 2,
+    WriteWithoutResponse = 1u << 3,
+    SignedWrite = 1u << 4,
+    Notify = 1u << 5,
+    Indicate = 1u << 6,
+    ExtendedProperties = 1u << 7
+};
+
+/**
+ * @brief BLE GATT 服务信息。
+ *
+ * 说明：
+ * - deviceInterfacePath 是 GUID_BLUETOOTHLE_DEVICE_INTERFACE 枚举得到的 BLE 设备接口路径，可直接用于底层 CreateFileW；
+ * - uuid 为 "0x180D" 这类 16 位短 UUID 或 "{XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX}" 形式 128 位 UUID；
+ * - attributeHandle 是 Windows GATT API 返回的服务属性句柄，用于继续枚举特征。
+ */
+struct GB_BluetoothGattServiceInfo
+{
+    std::string deviceId = "";
+    std::string deviceInterfacePath = "";
+    std::string uuid = "";
+    uint16_t shortUuid = 0;
+    bool isShortUuid = false;
+    uint16_t attributeHandle = 0;
+};
+
+/**
+ * @brief BLE GATT 特征信息。
+ *
+ * 说明：
+ * - 本结构保存从 BluetoothGATTGetCharacteristics 返回的全部关键字段；
+ * - ReadGattCharacteristic / WriteGattCharacteristic 会根据这些字段重建原生 BTH_LE_GATT_CHARACTERISTIC；
+ * - 调用方不应手工伪造 attributeHandle / characteristicValueHandle，建议始终使用 GetGattCharacteristics 的返回值。
+ */
+struct GB_BluetoothGattCharacteristicInfo
+{
+    std::string deviceId = "";
+    std::string deviceInterfacePath = "";
+    std::string serviceUuid = "";
+    uint16_t serviceShortUuid = 0;
+    bool isServiceShortUuid = false;
+    uint16_t serviceAttributeHandle = 0;
+    std::string characteristicUuid = "";
+    uint16_t characteristicShortUuid = 0;
+    bool isCharacteristicShortUuid = false;
+    uint16_t attributeHandle = 0;
+    uint16_t characteristicValueHandle = 0;
+    uint32_t propertyFlags = 0;
+    bool isBroadcastable = false;
+    bool isReadable = false;
+    bool isWritable = false;
+    bool isWritableWithoutResponse = false;
+    bool isSignedWritable = false;
+    bool isNotifiable = false;
+    bool isIndicatable = false;
+    bool hasExtendedProperties = false;
+};
+
 /**
  * @brief Windows 系统蓝牙能力入口。
  *
  * 说明：
  * - 所有 std::string 输入输出均约定为 UTF-8；
- * - 当前实现覆盖 Win32 经典蓝牙无线电和设备能力；
- * - BLE / GATT / RFCOMM 完整能力需要 WinRT ABI 或隔离的 C++17 实现单元，本类不会用经典蓝牙枚举伪装 BLE 结果。
+ * - 当前实现覆盖 Win32 经典蓝牙无线电、经典蓝牙设备、BLE 设备接口枚举和基础 BLE GATT 读写能力；
+ * - BLE 广播扫描、主动配对、通知订阅和 RFCOMM Socket 仍应使用 WinRT 或专用通信模块补充；
+ * - 本类不会用经典蓝牙枚举伪装 BLE 结果。
  */
 class GLOBALBASE_PORT GB_SystemBluetooth final
 {
@@ -238,6 +306,10 @@ public:
 
     static GB_SystemResult GetClassicDevices(std::vector<GB_BluetoothDeviceInfo>& devices, const GB_BluetoothClassicDeviceQueryOptions& options = GB_BluetoothClassicDeviceQueryOptions());
     static GB_SystemResult GetLowEnergyDevices(std::vector<GB_BluetoothDeviceInfo>& devices);
+    static GB_SystemResult GetGattServices(const std::string& deviceInterfacePath, std::vector<GB_BluetoothGattServiceInfo>& services);
+    static GB_SystemResult GetGattCharacteristics(const std::string& deviceInterfacePath, const GB_BluetoothGattServiceInfo& service, std::vector<GB_BluetoothGattCharacteristicInfo>& characteristics);
+    static GB_SystemResult ReadGattCharacteristic(const std::string& deviceInterfacePath, const GB_BluetoothGattCharacteristicInfo& characteristic, std::vector<uint8_t>& value, bool forceReadFromDevice = false);
+    static GB_SystemResult WriteGattCharacteristic(const std::string& deviceInterfacePath, const GB_BluetoothGattCharacteristicInfo& characteristic, const std::vector<uint8_t>& value, bool writeWithoutResponse = false, bool requireEncryptedConnection = false, bool requireAuthenticatedConnection = false);
     static GB_SystemResult GetClassicDeviceByAddress(const std::string& address, GB_BluetoothDeviceInfo& device, bool& found, const GB_BluetoothClassicDeviceQueryOptions& options = GB_BluetoothClassicDeviceQueryOptions());
 
     static GB_SystemResult IsDeviceConnected(const GB_BluetoothDeviceId& deviceId, bool& connected);
