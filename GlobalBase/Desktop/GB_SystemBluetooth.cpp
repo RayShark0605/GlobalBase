@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cstddef>
 #include <cstdio>
 #include <cstring>
 #include <limits>
@@ -798,20 +799,45 @@ namespace
         }
 
         HANDLE deviceHandle = ::CreateFileW(deviceInterfacePathWide.c_str(), desiredAccess, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
-        if (deviceHandle == INVALID_HANDLE_VALUE && (desiredAccess & GENERIC_WRITE) != 0)
-        {
-            const DWORD firstError = ::GetLastError();
-            if (firstError == ERROR_ACCESS_DENIED)
-            {
-                deviceHandle = ::CreateFileW(deviceInterfacePathWide.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
-            }
-        }
         if (deviceHandle == INVALID_HANDLE_VALUE)
         {
             return GB_SystemResult::FromLastWin32Error(operationName, u8"CreateFileW 打开 BLE 设备接口失败。");
         }
 
         handleScope.Reset(deviceHandle);
+        return GB_SystemResult::Succeeded(operationName);
+    }
+
+    static size_t GetGattCharacteristicValueHeaderSize()
+    {
+        return offsetof(BTH_LE_GATT_CHARACTERISTIC_VALUE, Data);
+    }
+
+    static GB_SystemResult AllocateGattCharacteristicValueBuffer(const size_t dataSize, std::vector<unsigned char>& valueBuffer, const std::string& operationName, const std::string& failureMessage)
+    {
+        valueBuffer.clear();
+        const size_t headerSize = GetGattCharacteristicValueHeaderSize();
+        if (dataSize > static_cast<size_t>(std::numeric_limits<ULONG>::max()) || headerSize > std::numeric_limits<size_t>::max() - dataSize)
+        {
+            return GB_SystemResult::Failed(GB_SystemErrorCode::InvalidArgument, operationName, u8"BLE GATT 特征值长度过大。");
+        }
+
+        size_t bufferSize = headerSize + dataSize;
+        if (bufferSize < sizeof(BTH_LE_GATT_CHARACTERISTIC_VALUE))
+        {
+            bufferSize = sizeof(BTH_LE_GATT_CHARACTERISTIC_VALUE);
+        }
+
+        try
+        {
+            valueBuffer.assign(bufferSize, 0);
+        }
+        catch (...)
+        {
+            valueBuffer.clear();
+            return GB_SystemResult::Failed(GB_SystemErrorCode::ResourceAllocationFailed, operationName, failureMessage);
+        }
+
         return GB_SystemResult::Succeeded(operationName);
     }
 
@@ -910,34 +936,48 @@ namespace
         {
             return GB_SystemResult::Succeeded(operationName);
         }
-        if (serviceCount > 4096)
-        {
-            return GB_SystemResult::Failed(GB_SystemErrorCode::OperationFailed, operationName, u8"系统返回的 BLE GATT 服务数量异常，已拒绝分配过大的服务缓冲区。");
-        }
 
-        try
+        for (int retryIndex = 0; retryIndex < 3; retryIndex++)
         {
-            services.assign(static_cast<size_t>(serviceCount), BTH_LE_GATT_SERVICE());
-        }
-        catch (...)
-        {
-            services.clear();
-            return GB_SystemResult::Failed(GB_SystemErrorCode::ResourceAllocationFailed, operationName, u8"分配 BLE GATT 服务缓冲区时内存不足。");
-        }
+            if (serviceCount > 4096)
+            {
+                services.clear();
+                return GB_SystemResult::Failed(GB_SystemErrorCode::OperationFailed, operationName, u8"系统返回的 BLE GATT 服务数量异常，已拒绝分配过大的服务缓冲区。");
+            }
 
-        USHORT returnedServiceCount = 0;
-        hresult = ::BluetoothGATTGetServices(deviceHandle, serviceCount, services.data(), &returnedServiceCount, BLUETOOTH_GATT_FLAG_NONE);
-        if (hresult != S_OK)
-        {
+            try
+            {
+                services.assign(static_cast<size_t>(serviceCount), BTH_LE_GATT_SERVICE());
+            }
+            catch (...)
+            {
+                services.clear();
+                return GB_SystemResult::Failed(GB_SystemErrorCode::ResourceAllocationFailed, operationName, u8"分配 BLE GATT 服务缓冲区时内存不足。");
+            }
+
+            USHORT returnedServiceCount = serviceCount;
+            hresult = ::BluetoothGATTGetServices(deviceHandle, serviceCount, services.data(), &returnedServiceCount, BLUETOOTH_GATT_FLAG_NONE);
+            if (hresult == S_OK)
+            {
+                if (returnedServiceCount < serviceCount)
+                {
+                    services.resize(static_cast<size_t>(returnedServiceCount));
+                }
+                return GB_SystemResult::Succeeded(operationName);
+            }
+
+            if ((IsHResultFromWin32Error(hresult, ERROR_MORE_DATA) || IsHResultFromWin32Error(hresult, ERROR_INVALID_USER_BUFFER)) && returnedServiceCount > serviceCount)
+            {
+                serviceCount = returnedServiceCount;
+                continue;
+            }
+
             services.clear();
             return MapBluetoothGattHResult(hresult, operationName, u8"BluetoothGATTGetServices 读取 BLE GATT 服务失败。");
         }
-        if (returnedServiceCount < serviceCount)
-        {
-            services.resize(static_cast<size_t>(returnedServiceCount));
-        }
 
-        return GB_SystemResult::Succeeded(operationName);
+        services.clear();
+        return GB_SystemResult::Failed(GB_SystemErrorCode::OperationFailed, operationName, u8"BluetoothGATTGetServices 多次返回更多数据，服务数量不稳定。");
     }
 
     static GB_SystemResult ReadNativeGattCharacteristics(HANDLE deviceHandle, const BTH_LE_GATT_SERVICE& service, std::vector<BTH_LE_GATT_CHARACTERISTIC>& characteristics, const std::string& operationName)
@@ -958,34 +998,48 @@ namespace
         {
             return GB_SystemResult::Succeeded(operationName);
         }
-        if (characteristicCount > 4096)
-        {
-            return GB_SystemResult::Failed(GB_SystemErrorCode::OperationFailed, operationName, u8"系统返回的 BLE GATT 特征数量异常，已拒绝分配过大的特征缓冲区。");
-        }
 
-        try
+        for (int retryIndex = 0; retryIndex < 3; retryIndex++)
         {
-            characteristics.assign(static_cast<size_t>(characteristicCount), BTH_LE_GATT_CHARACTERISTIC());
-        }
-        catch (...)
-        {
-            characteristics.clear();
-            return GB_SystemResult::Failed(GB_SystemErrorCode::ResourceAllocationFailed, operationName, u8"分配 BLE GATT 特征缓冲区时内存不足。");
-        }
+            if (characteristicCount > 4096)
+            {
+                characteristics.clear();
+                return GB_SystemResult::Failed(GB_SystemErrorCode::OperationFailed, operationName, u8"系统返回的 BLE GATT 特征数量异常，已拒绝分配过大的特征缓冲区。");
+            }
 
-        USHORT returnedCharacteristicCount = 0;
-        hresult = ::BluetoothGATTGetCharacteristics(deviceHandle, const_cast<BTH_LE_GATT_SERVICE*>(&service), characteristicCount, characteristics.data(), &returnedCharacteristicCount, BLUETOOTH_GATT_FLAG_NONE);
-        if (hresult != S_OK)
-        {
+            try
+            {
+                characteristics.assign(static_cast<size_t>(characteristicCount), BTH_LE_GATT_CHARACTERISTIC());
+            }
+            catch (...)
+            {
+                characteristics.clear();
+                return GB_SystemResult::Failed(GB_SystemErrorCode::ResourceAllocationFailed, operationName, u8"分配 BLE GATT 特征缓冲区时内存不足。");
+            }
+
+            USHORT returnedCharacteristicCount = characteristicCount;
+            hresult = ::BluetoothGATTGetCharacteristics(deviceHandle, const_cast<BTH_LE_GATT_SERVICE*>(&service), characteristicCount, characteristics.data(), &returnedCharacteristicCount, BLUETOOTH_GATT_FLAG_NONE);
+            if (hresult == S_OK)
+            {
+                if (returnedCharacteristicCount < characteristicCount)
+                {
+                    characteristics.resize(static_cast<size_t>(returnedCharacteristicCount));
+                }
+                return GB_SystemResult::Succeeded(operationName);
+            }
+
+            if ((IsHResultFromWin32Error(hresult, ERROR_MORE_DATA) || IsHResultFromWin32Error(hresult, ERROR_INVALID_USER_BUFFER)) && returnedCharacteristicCount > characteristicCount)
+            {
+                characteristicCount = returnedCharacteristicCount;
+                continue;
+            }
+
             characteristics.clear();
             return MapBluetoothGattHResult(hresult, operationName, u8"BluetoothGATTGetCharacteristics 读取 BLE GATT 特征失败。");
         }
-        if (returnedCharacteristicCount < characteristicCount)
-        {
-            characteristics.resize(static_cast<size_t>(returnedCharacteristicCount));
-        }
 
-        return GB_SystemResult::Succeeded(operationName);
+        characteristics.clear();
+        return GB_SystemResult::Failed(GB_SystemErrorCode::OperationFailed, operationName, u8"BluetoothGATTGetCharacteristics 多次返回更多数据，特征数量不稳定。");
     }
 
     static GB_SystemResult FindNativeGattService(HANDLE deviceHandle, const GB_BluetoothGattServiceInfo& service, BTH_LE_GATT_SERVICE& nativeService, const std::string& operationName)
@@ -1131,14 +1185,13 @@ namespace
         if (TryExtractBluetoothAddressFromText(deviceInterface.deviceInstanceId, address) || TryExtractBluetoothAddressFromText(deviceInterface.interfacePath, address))
         {
             device.address = address;
-            device.deviceId = address;
         }
 
         device.deviceKind = GB_BluetoothDeviceKind::LowEnergy;
-        device.pairStatus = GB_BluetoothPairStatus::Paired;
+        device.pairStatus = GB_BluetoothPairStatus::Unknown;
         device.connectionStatus = GB_BluetoothConnectionStatus::Unknown;
         device.isRemembered = true;
-        device.isAuthenticated = true;
+        device.isAuthenticated = false;
         device.isConnected = false;
         device.isClassicSupported = false;
         device.isLowEnergySupported = true;
@@ -2110,57 +2163,73 @@ GB_SystemResult GB_SystemBluetooth::ReadGattCharacteristic(const std::string& de
         return characteristicResult;
     }
 
-    USHORT requiredValueSize = 0;
     const ULONG flags = forceReadFromDevice ? BLUETOOTH_GATT_FLAG_FORCE_READ_FROM_DEVICE : BLUETOOTH_GATT_FLAG_NONE;
-    HRESULT hresult = ::BluetoothGATTGetCharacteristicValue(deviceHandle.Get(), &nativeCharacteristic, 0, nullptr, &requiredValueSize, flags);
-    if (hresult != S_OK && !IsHResultFromWin32Error(hresult, ERROR_MORE_DATA))
+    for (int retryIndex = 0; retryIndex < 3; retryIndex++)
     {
-        return MapBluetoothGattHResult(hresult, u8"GB_SystemBluetooth::ReadGattCharacteristic", u8"BluetoothGATTGetCharacteristicValue 查询 BLE GATT 特征值缓冲区大小失败。");
-    }
-    if (requiredValueSize == 0)
-    {
-        return GB_SystemResult::Succeeded(u8"GB_SystemBluetooth::ReadGattCharacteristic");
-    }
+        USHORT requiredValueSize = 0;
+        HRESULT hresult = ::BluetoothGATTGetCharacteristicValue(deviceHandle.Get(), &nativeCharacteristic, 0, nullptr, &requiredValueSize, flags);
+        if (hresult != S_OK && !IsHResultFromWin32Error(hresult, ERROR_MORE_DATA))
+        {
+            return MapBluetoothGattHResult(hresult, u8"GB_SystemBluetooth::ReadGattCharacteristic", u8"BluetoothGATTGetCharacteristicValue 查询 BLE GATT 特征值缓冲区大小失败。");
+        }
+        if (requiredValueSize == 0)
+        {
+            return GB_SystemResult::Succeeded(u8"GB_SystemBluetooth::ReadGattCharacteristic");
+        }
+        if (static_cast<size_t>(requiredValueSize) < GetGattCharacteristicValueHeaderSize())
+        {
+            return GB_SystemResult::Failed(GB_SystemErrorCode::OperationFailed, u8"GB_SystemBluetooth::ReadGattCharacteristic", u8"系统返回的 BLE GATT 特征值缓冲区大小异常。");
+        }
 
-    std::vector<unsigned char> valueBuffer;
-    try
-    {
-        valueBuffer.assign(static_cast<size_t>(requiredValueSize) + sizeof(BTH_LE_GATT_CHARACTERISTIC_VALUE), 0);
-    }
-    catch (...)
-    {
-        return GB_SystemResult::Failed(GB_SystemErrorCode::ResourceAllocationFailed, u8"GB_SystemBluetooth::ReadGattCharacteristic", u8"分配 BLE GATT 特征值缓冲区时内存不足。");
-    }
+        std::vector<unsigned char> valueBuffer;
+        GB_SystemResult allocationResult = AllocateGattCharacteristicValueBuffer(static_cast<size_t>(requiredValueSize) - GetGattCharacteristicValueHeaderSize(), valueBuffer, u8"GB_SystemBluetooth::ReadGattCharacteristic", u8"分配 BLE GATT 特征值缓冲区时内存不足。");
+        if (allocationResult.IsFailed())
+        {
+            return allocationResult;
+        }
+        if (valueBuffer.size() < requiredValueSize)
+        {
+            valueBuffer.resize(requiredValueSize, 0);
+        }
 
-    PBTH_LE_GATT_CHARACTERISTIC_VALUE nativeValue = reinterpret_cast<PBTH_LE_GATT_CHARACTERISTIC_VALUE>(valueBuffer.data());
-    USHORT actualValueSize = 0;
-    hresult = ::BluetoothGATTGetCharacteristicValue(deviceHandle.Get(), &nativeCharacteristic, requiredValueSize, nativeValue, &actualValueSize, flags);
-    if (hresult != S_OK)
-    {
+        PBTH_LE_GATT_CHARACTERISTIC_VALUE nativeValue = reinterpret_cast<PBTH_LE_GATT_CHARACTERISTIC_VALUE>(valueBuffer.data());
+        USHORT actualValueSize = requiredValueSize;
+        hresult = ::BluetoothGATTGetCharacteristicValue(deviceHandle.Get(), &nativeCharacteristic, requiredValueSize, nativeValue, &actualValueSize, flags);
+        if (hresult == S_OK)
+        {
+            const ULONG dataSize = nativeValue->DataSize;
+            const size_t headerSize = GetGattCharacteristicValueHeaderSize();
+            if (static_cast<size_t>(dataSize) > valueBuffer.size() - headerSize)
+            {
+                return GB_SystemResult::Failed(GB_SystemErrorCode::OperationFailed, u8"GB_SystemBluetooth::ReadGattCharacteristic", u8"系统返回的 BLE GATT 特征值长度超过已分配缓冲区。");
+            }
+
+            try
+            {
+                value.assign(nativeValue->Data, nativeValue->Data + dataSize);
+            }
+            catch (...)
+            {
+                value.clear();
+                return GB_SystemResult::Failed(GB_SystemErrorCode::ResourceAllocationFailed, u8"GB_SystemBluetooth::ReadGattCharacteristic", u8"保存 BLE GATT 特征值时内存不足。");
+            }
+
+            return GB_SystemResult::Succeeded(u8"GB_SystemBluetooth::ReadGattCharacteristic");
+        }
+
+        if ((IsHResultFromWin32Error(hresult, ERROR_MORE_DATA) || IsHResultFromWin32Error(hresult, ERROR_INVALID_USER_BUFFER)) && actualValueSize > requiredValueSize)
+        {
+            continue;
+        }
+
         return MapBluetoothGattHResult(hresult, u8"GB_SystemBluetooth::ReadGattCharacteristic", u8"BluetoothGATTGetCharacteristicValue 读取 BLE GATT 特征值失败。");
     }
 
-    const ULONG dataSize = nativeValue->DataSize;
-    if (dataSize > requiredValueSize)
-    {
-        return GB_SystemResult::Failed(GB_SystemErrorCode::OperationFailed, u8"GB_SystemBluetooth::ReadGattCharacteristic", u8"系统返回的 BLE GATT 特征值长度超过已分配缓冲区。");
-    }
-
-    try
-    {
-        value.assign(nativeValue->Data, nativeValue->Data + dataSize);
-    }
-    catch (...)
-    {
-        value.clear();
-        return GB_SystemResult::Failed(GB_SystemErrorCode::ResourceAllocationFailed, u8"GB_SystemBluetooth::ReadGattCharacteristic", u8"保存 BLE GATT 特征值时内存不足。");
-    }
-
-    return GB_SystemResult::Succeeded(u8"GB_SystemBluetooth::ReadGattCharacteristic");
+    return GB_SystemResult::Failed(GB_SystemErrorCode::OperationFailed, u8"GB_SystemBluetooth::ReadGattCharacteristic", u8"BluetoothGATTGetCharacteristicValue 多次返回更多数据，特征值长度不稳定。");
 #endif
 }
 
-GB_SystemResult GB_SystemBluetooth::WriteGattCharacteristic(const std::string& deviceInterfacePath, const GB_BluetoothGattCharacteristicInfo& characteristic, const std::vector<uint8_t>& value, const bool writeWithoutResponse, const bool requireEncryptedConnection, const bool requireAuthenticatedConnection)
+GB_SystemResult GB_SystemBluetooth::WriteGattCharacteristic(const std::string& deviceInterfacePath, const GB_BluetoothGattCharacteristicInfo& characteristic, const std::vector<uint8_t>& value, const bool writeWithoutResponse, const bool requireEncryptedConnection, const bool requireAuthenticatedConnection, const bool signedWrite)
 {
 #if !defined(_WIN32)
     (void)deviceInterfacePath;
@@ -2169,6 +2238,7 @@ GB_SystemResult GB_SystemBluetooth::WriteGattCharacteristic(const std::string& d
     (void)writeWithoutResponse;
     (void)requireEncryptedConnection;
     (void)requireAuthenticatedConnection;
+    (void)signedWrite;
     return GB_SystemResult::Failed(GB_SystemErrorCode::UnsupportedPlatform, u8"GB_SystemBluetooth::WriteGattCharacteristic", u8"当前平台不支持 Windows BLE GATT 特征写入。");
 #else
     const std::string targetDeviceInterfacePath = !deviceInterfacePath.empty() ? deviceInterfacePath : characteristic.deviceInterfacePath;
@@ -2186,6 +2256,21 @@ GB_SystemResult GB_SystemBluetooth::WriteGattCharacteristic(const std::string& d
     else if (!characteristic.isWritable)
     {
         return GB_SystemResult::Failed(GB_SystemErrorCode::InvalidState, u8"GB_SystemBluetooth::WriteGattCharacteristic", u8"指定 BLE GATT 特征未声明可写属性。");
+    }
+    if (signedWrite)
+    {
+        if (!writeWithoutResponse)
+        {
+            return GB_SystemResult::Failed(GB_SystemErrorCode::InvalidArgument, u8"GB_SystemBluetooth::WriteGattCharacteristic", u8"Signed Write 必须与 WriteWithoutResponse 一起使用。");
+        }
+        if (!characteristic.isSignedWritable)
+        {
+            return GB_SystemResult::Failed(GB_SystemErrorCode::InvalidState, u8"GB_SystemBluetooth::WriteGattCharacteristic", u8"指定 BLE GATT 特征未声明 SignedWrite 属性。");
+        }
+        if (requireEncryptedConnection || requireAuthenticatedConnection)
+        {
+            return GB_SystemResult::Failed(GB_SystemErrorCode::InvalidArgument, u8"GB_SystemBluetooth::WriteGattCharacteristic", u8"Signed Write 不能同时要求加密或认证链路。");
+        }
     }
     if (value.size() > static_cast<size_t>(std::numeric_limits<ULONG>::max()))
     {
@@ -2207,13 +2292,10 @@ GB_SystemResult GB_SystemBluetooth::WriteGattCharacteristic(const std::string& d
     }
 
     std::vector<unsigned char> valueBuffer;
-    try
+    GB_SystemResult allocationResult = AllocateGattCharacteristicValueBuffer(value.size(), valueBuffer, u8"GB_SystemBluetooth::WriteGattCharacteristic", u8"分配 BLE GATT 特征写入缓冲区时内存不足。");
+    if (allocationResult.IsFailed())
     {
-        valueBuffer.assign(sizeof(BTH_LE_GATT_CHARACTERISTIC_VALUE) + value.size(), 0);
-    }
-    catch (...)
-    {
-        return GB_SystemResult::Failed(GB_SystemErrorCode::ResourceAllocationFailed, u8"GB_SystemBluetooth::WriteGattCharacteristic", u8"分配 BLE GATT 特征写入缓冲区时内存不足。");
+        return allocationResult;
     }
 
     PBTH_LE_GATT_CHARACTERISTIC_VALUE nativeValue = reinterpret_cast<PBTH_LE_GATT_CHARACTERISTIC_VALUE>(valueBuffer.data());
@@ -2227,6 +2309,10 @@ GB_SystemResult GB_SystemBluetooth::WriteGattCharacteristic(const std::string& d
     if (writeWithoutResponse)
     {
         flags |= BLUETOOTH_GATT_FLAG_WRITE_WITHOUT_RESPONSE;
+    }
+    if (signedWrite)
+    {
+        flags |= BLUETOOTH_GATT_FLAG_SIGNED_WRITE;
     }
     if (requireEncryptedConnection)
     {
@@ -2261,17 +2347,17 @@ GB_SystemResult GB_SystemBluetooth::GetClassicDeviceByAddress(const std::string&
     (void)options;
     return GB_SystemResult::Failed(GB_SystemErrorCode::UnsupportedPlatform, u8"GB_SystemBluetooth::GetClassicDeviceByAddress", u8"当前平台不支持 Windows 经典蓝牙设备查询。");
 #else
-    GB_SystemResult validateResult = ValidateClassicDeviceQueryOptions(options);
-    if (validateResult.IsFailed())
-    {
-        return validateResult.WithOperationName(u8"GB_SystemBluetooth::GetClassicDeviceByAddress");
-    }
-
     GB_BluetoothClassicDeviceQueryOptions lookupOptions = options;
     lookupOptions.includeAuthenticated = true;
     lookupOptions.includeRemembered = true;
     lookupOptions.includeUnknown = true;
     lookupOptions.includeConnected = true;
+
+    GB_SystemResult validateResult = ValidateClassicDeviceQueryOptions(lookupOptions);
+    if (validateResult.IsFailed())
+    {
+        return validateResult.WithOperationName(u8"GB_SystemBluetooth::GetClassicDeviceByAddress");
+    }
 
     std::vector<BluetoothRadioHandleEntry> radioHandles;
     GB_SystemResult radioResult = EnumerateRadioHandles(radioHandles);

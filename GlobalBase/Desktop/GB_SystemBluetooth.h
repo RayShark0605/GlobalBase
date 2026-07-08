@@ -112,6 +112,7 @@ struct GB_BluetoothDeviceId
  * 说明：
  * - deviceId 当前对经典蓝牙设备使用标准化 address；同一远端设备可能被多个本机无线电观察到，必要时应结合 radioAddress 区分；后续 BLE/WinRT 实现可使用 DeviceInformation ID；
  * - pairStatus、connectionStatus 明确区分“已配对”和“已连接”；
+ * - 对 BLE 设备接口枚举结果，Win32 设备接口无法可靠表达配对状态，因此 pairStatus 通常保持 Unknown；
  * - installedServiceGuids 仅在查询选项 includeInstalledServices=true 且系统返回成功时填充；系统报告没有服务或缓存记录不存在时保持为空。
  */
 struct GB_BluetoothDeviceInfo
@@ -309,7 +310,15 @@ public:
     static GB_SystemResult GetGattServices(const std::string& deviceInterfacePath, std::vector<GB_BluetoothGattServiceInfo>& services);
     static GB_SystemResult GetGattCharacteristics(const std::string& deviceInterfacePath, const GB_BluetoothGattServiceInfo& service, std::vector<GB_BluetoothGattCharacteristicInfo>& characteristics);
     static GB_SystemResult ReadGattCharacteristic(const std::string& deviceInterfacePath, const GB_BluetoothGattCharacteristicInfo& characteristic, std::vector<uint8_t>& value, bool forceReadFromDevice = false);
-    static GB_SystemResult WriteGattCharacteristic(const std::string& deviceInterfacePath, const GB_BluetoothGattCharacteristicInfo& characteristic, const std::vector<uint8_t>& value, bool writeWithoutResponse = false, bool requireEncryptedConnection = false, bool requireAuthenticatedConnection = false);
+    /**
+     * @brief 写入 BLE GATT 特征值。
+     *
+     * 说明：
+     * - writeWithoutResponse=true 时要求特征声明 WriteWithoutResponse；
+     * - signedWrite=true 时要求 writeWithoutResponse=true，并且不能同时要求加密或认证链路；
+     * - requireEncryptedConnection / requireAuthenticatedConnection 只是向 Windows GATT API 传递链路安全要求，是否满足由系统蓝牙栈和远端设备共同决定。
+     */
+    static GB_SystemResult WriteGattCharacteristic(const std::string& deviceInterfacePath, const GB_BluetoothGattCharacteristicInfo& characteristic, const std::vector<uint8_t>& value, bool writeWithoutResponse = false, bool requireEncryptedConnection = false, bool requireAuthenticatedConnection = false, bool signedWrite = false);
     static GB_SystemResult GetClassicDeviceByAddress(const std::string& address, GB_BluetoothDeviceInfo& device, bool& found, const GB_BluetoothClassicDeviceQueryOptions& options = GB_BluetoothClassicDeviceQueryOptions());
 
     static GB_SystemResult IsDeviceConnected(const GB_BluetoothDeviceId& deviceId, bool& connected);
