@@ -110,15 +110,19 @@ struct GB_BluetoothDeviceId
  * @brief 蓝牙设备信息。
  *
  * 说明：
- * - deviceId 当前对经典蓝牙设备使用标准化 address；同一远端设备可能被多个本机无线电观察到，必要时应结合 radioAddress 区分；后续 BLE/WinRT 实现可使用 DeviceInformation ID；
+ * - deviceId 对经典蓝牙设备使用标准化 address；对 BLE 设备接口优先使用 PnP deviceInstanceId，缺失时退化为 deviceInterfacePath；
+ * - deviceInstanceId 与 deviceInterfacePath 分别表达 Windows PnP 设备实例 ID 和可供 CreateFileW 打开的设备接口路径，不能混为同一概念；
+ * - 同一远端经典蓝牙设备可能被多个本机无线电观察到，必要时应结合 radioAddress 区分；
  * - pairStatus、connectionStatus 明确区分“已配对”和“已连接”；
- * - 对 BLE 设备接口枚举结果，Win32 设备接口无法可靠表达配对状态，因此 pairStatus 通常保持 Unknown；
+ * - 对 BLE 设备接口枚举结果，单纯的 Win32 PnP 接口无法可靠表达配对、记忆和实时连接状态，因此相关字段保持 Unknown/false，而不是根据“接口存在”进行猜测；
  * - installedServiceGuids 仅在查询选项 includeInstalledServices=true 且系统返回成功时填充；系统报告没有服务或缓存记录不存在时保持为空。
  */
 struct GB_BluetoothDeviceInfo
 {
     std::string deviceId = "";
     std::string nativeDeviceId = "";
+    std::string deviceInstanceId = "";
+    std::string deviceInterfacePath = "";
     std::string radioId = "";
     std::string radioAddress = "";
     std::string address = "";
@@ -282,7 +286,10 @@ public:
     ~GB_SystemBluetooth() = delete;
 
     static GB_SystemResult GetRadios(std::vector<GB_BluetoothRadioInfo>& radios);
+
+    /** @brief 获取 BluetoothFindFirstRadio 返回的第一块本机蓝牙无线电；Windows API 不保证它具有独立的“系统默认无线电”语义。 */
     static GB_SystemResult GetDefaultRadio(GB_BluetoothRadioInfo& radio, bool& found);
+
     static GB_SystemResult IsBluetoothAvailable(bool& available);
 
     /**
@@ -306,7 +313,17 @@ public:
     static GB_SystemResult SetRadioDiscoverable(const std::string& radioAddress, bool enabled);
 
     static GB_SystemResult GetClassicDevices(std::vector<GB_BluetoothDeviceInfo>& devices, const GB_BluetoothClassicDeviceQueryOptions& options = GB_BluetoothClassicDeviceQueryOptions());
+
+    /**
+     * @brief 枚举当前由 Windows PnP 暴露的 BLE 设备接口。
+     *
+     * 说明：
+     * - 本接口不是主动 BLE 广播扫描，不保证返回附近所有正在广播的 BLE 设备；
+     * - 返回项来自 GUID_BLUETOOTHLE_DEVICE_INTERFACE 对应的当前 present 设备接口；
+     * - deviceInterfacePath 可继续用于 GetGattServices / GetGattCharacteristics / GATT 读写。
+     */
     static GB_SystemResult GetLowEnergyDevices(std::vector<GB_BluetoothDeviceInfo>& devices);
+
     static GB_SystemResult GetGattServices(const std::string& deviceInterfacePath, std::vector<GB_BluetoothGattServiceInfo>& services);
     static GB_SystemResult GetGattCharacteristics(const std::string& deviceInterfacePath, const GB_BluetoothGattServiceInfo& service, std::vector<GB_BluetoothGattCharacteristicInfo>& characteristics);
     static GB_SystemResult ReadGattCharacteristic(const std::string& deviceInterfacePath, const GB_BluetoothGattCharacteristicInfo& characteristic, std::vector<uint8_t>& value, bool forceReadFromDevice = false);
@@ -338,8 +355,9 @@ public:
  *
  * 说明：
  * - 当前监听器复用 GB_SystemDeviceWatcher 的 PnP 事件，只转发带有蓝牙语义的设备实例或接口变化；
- * - 回调通过 GB_EventDispatcher 异步分发，避免阻塞底层系统设备通知线程；
- * - 它不替代 BLE AdvertisementWatcher 或 WinRT DeviceWatcher，后续 BLE 扫描应作为独立能力补充。
+ * - 回调通过单个 GB_EventDispatcher 异步分发，避免阻塞底层系统设备通知线程，同时避免为同一批蓝牙事件额外维护两条工作线程和两份队列；
+ * - GetEventDispatcher() 发布的事件 payload 为 GB_BluetoothEvent，attributes 同时保留常用字段，便于通用事件订阅者使用；
+ * - 它不替代 BLE AdvertisementWatcher 或 WinRT DeviceWatcher，后续 BLE 广播扫描应作为独立能力补充。
  */
 class GLOBALBASE_PORT GB_SystemBluetoothWatcher final
 {

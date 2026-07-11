@@ -79,6 +79,14 @@ namespace
         return true;
     }
 
+    static bool EqualsAsciiNoCase(const std::string& leftText, const std::string& rightText)
+    {
+        return leftText.size() == rightText.size() && StartsWithAsciiNoCase(leftText, rightText);
+    }
+
+    static const char* const GB_BluetoothLeDeviceInterfaceGuid = "{781AEE18-7733-4CE4-ADD0-91F41C67B592}";
+    static const char* const GB_BluetoothRadioInterfaceGuid = "{0850302A-B344-4FDA-9BE9-90576B8D46F0}";
+
     static int HexValue(const char character)
     {
         if (character >= '0' && character <= '9')
@@ -102,23 +110,6 @@ namespace
         return character == ' ' || character == '\t' || character == '\r' || character == '\n' || character == '\f' || character == '\v';
     }
 
-    static std::string TrimAsciiWhitespace(const std::string& text)
-    {
-        size_t beginIndex = 0;
-        while (beginIndex < text.size() && IsAsciiWhitespace(text[beginIndex]))
-        {
-            beginIndex++;
-        }
-
-        size_t endIndex = text.size();
-        while (endIndex > beginIndex && IsAsciiWhitespace(text[endIndex - 1]))
-        {
-            endIndex--;
-        }
-
-        return text.substr(beginIndex, endIndex - beginIndex);
-    }
-
     static bool IsHexPairAt(const std::string& text, const size_t index)
     {
         return index + 1 < text.size() && HexValue(text[index]) >= 0 && HexValue(text[index + 1]) >= 0;
@@ -132,28 +123,36 @@ namespace
             return false;
         }
 
-        const std::string trimmedAddress = TrimAsciiWhitespace(address);
-        if (trimmedAddress.empty())
+        size_t beginIndex = 0;
+        while (beginIndex < address.size() && IsAsciiWhitespace(address[beginIndex]))
         {
-            return false;
+            beginIndex++;
         }
 
-        char digits[13] = {};
-        if (trimmedAddress.size() == 12)
+        size_t endIndex = address.size();
+        while (endIndex > beginIndex && IsAsciiWhitespace(address[endIndex - 1]))
         {
-            for (size_t index = 0; index < trimmedAddress.size(); index++)
+            endIndex--;
+        }
+
+        const size_t addressLength = endIndex - beginIndex;
+        char digits[12] = {};
+        if (addressLength == 12)
+        {
+            for (size_t index = 0; index < 12; index++)
             {
-                if (HexValue(trimmedAddress[index]) < 0)
+                const char character = address[beginIndex + index];
+                if (HexValue(character) < 0)
                 {
                     return false;
                 }
 
-                digits[index] = trimmedAddress[index];
+                digits[index] = character;
             }
         }
-        else if (trimmedAddress.size() == 17)
+        else if (addressLength == 17)
         {
-            const char separator = trimmedAddress[2];
+            const char separator = address[beginIndex + 2];
             if (separator != ':' && separator != '-')
             {
                 return false;
@@ -162,19 +161,19 @@ namespace
             size_t digitIndex = 0;
             for (size_t groupIndex = 0; groupIndex < 6; groupIndex++)
             {
-                const size_t textIndex = groupIndex * 3;
-                if (!IsHexPairAt(trimmedAddress, textIndex))
+                const size_t textIndex = beginIndex + groupIndex * 3;
+                if (!IsHexPairAt(address, textIndex))
                 {
                     return false;
                 }
-                if (groupIndex < 5 && trimmedAddress[textIndex + 2] != separator)
+                if (groupIndex < 5 && address[textIndex + 2] != separator)
                 {
                     return false;
                 }
 
-                digits[digitIndex] = trimmedAddress[textIndex];
+                digits[digitIndex] = address[textIndex];
                 digitIndex++;
-                digits[digitIndex] = trimmedAddress[textIndex + 1];
+                digits[digitIndex] = address[textIndex + 1];
                 digitIndex++;
             }
         }
@@ -297,12 +296,12 @@ namespace
         return std::string("SystemBluetooth.") + GB_SystemBluetooth::GetEventTypeName(eventType);
     }
 
+#if defined(_WIN32)
     static GB_SystemResult MakeUnsupportedBleResult(const std::string& operationName)
     {
-        return GB_SystemResult::Failed(GB_SystemErrorCode::UnsupportedPlatform, operationName, u8"当前 C++14 实现未接入 Windows Runtime BLE 枚举；需要后续通过 WinRT ABI 或独立 C++17 实现单元补充，不能用经典蓝牙 API 伪装 BLE 结果。");
+        return GB_SystemResult::Failed(GB_SystemErrorCode::UnsupportedPlatform, operationName, u8"当前操作只支持经典蓝牙设备；BLE 配对、实时连接状态和广播扫描需要 Windows Runtime 等对应能力，不能用经典蓝牙 API 伪装结果。");
     }
 
-#if defined(_WIN32)
     class BluetoothRadioFindScope
     {
     public:
@@ -432,9 +431,8 @@ namespace
         void MoveFrom(BluetoothRadioHandleEntry& other) noexcept
         {
             radioHandle = other.radioHandle;
-            radioInfo = other.radioInfo;
+            radioInfo = std::move(other.radioInfo);
             other.radioHandle = nullptr;
-            other.radioInfo = GB_BluetoothRadioInfo();
         }
 
     private:
@@ -501,24 +499,8 @@ namespace
         {
             return GB_SystemResult::Succeeded(operationName, message);
         }
-        if (win32Error == ERROR_CANCELLED)
-        {
-            return GB_SystemResult::Failed(GB_SystemErrorCode::Cancelled, operationName, message);
-        }
-        if (win32Error == ERROR_NOT_FOUND || win32Error == ERROR_NO_MORE_ITEMS)
-        {
-            return GB_SystemResult::Failed(GB_SystemErrorCode::NotFound, operationName, message);
-        }
-        if (win32Error == ERROR_ACCESS_DENIED)
-        {
-            return GB_SystemResult::FromWin32Error(win32Error, operationName, message).WithMessage(message);
-        }
-        if (win32Error == ERROR_BUSY)
-        {
-            return GB_SystemResult::FromWin32Error(win32Error, operationName, message).WithMessage(message);
-        }
 
-        return GB_SystemResult::FromWin32Error(win32Error, operationName, message);
+        return GB_SystemResult::FromWin32Error(static_cast<uint32_t>(win32Error), operationName, message).WithMessage(message);
     }
 
     class GenericHandleScope
@@ -591,6 +573,56 @@ namespace
         return hresult;
     }
 
+    static GB_SystemErrorCode GetBluetoothGattErrorCode(const HRESULT normalizedHResult)
+    {
+        if (IsHResultFromWin32Error(normalizedHResult, ERROR_NOT_FOUND) || IsHResultFromWin32Error(normalizedHResult, ERROR_FILE_NOT_FOUND))
+        {
+            return GB_SystemErrorCode::NotFound;
+        }
+        if (IsHResultFromWin32Error(normalizedHResult, ERROR_BAD_COMMAND) || IsHResultFromWin32Error(normalizedHResult, ERROR_INVALID_FUNCTION))
+        {
+            return GB_SystemErrorCode::InvalidState;
+        }
+        if (IsHResultFromWin32Error(normalizedHResult, ERROR_BAD_NET_RESP))
+        {
+            return GB_SystemErrorCode::OperationFailed;
+        }
+        if (IsHResultFromWin32Error(normalizedHResult, ERROR_INVALID_USER_BUFFER))
+        {
+            return GB_SystemErrorCode::InvalidArgument;
+        }
+
+#if defined(E_BLUETOOTH_ATT_INVALID_HANDLE)
+        if (normalizedHResult == E_BLUETOOTH_ATT_INVALID_HANDLE || normalizedHResult == E_BLUETOOTH_ATT_ATTRIBUTE_NOT_FOUND)
+        {
+            return GB_SystemErrorCode::NotFound;
+        }
+        if (normalizedHResult == E_BLUETOOTH_ATT_READ_NOT_PERMITTED || normalizedHResult == E_BLUETOOTH_ATT_WRITE_NOT_PERMITTED || normalizedHResult == E_BLUETOOTH_ATT_INSUFFICIENT_AUTHENTICATION || normalizedHResult == E_BLUETOOTH_ATT_INSUFFICIENT_AUTHORIZATION || normalizedHResult == E_BLUETOOTH_ATT_INSUFFICIENT_ENCRYPTION_KEY_SIZE || normalizedHResult == E_BLUETOOTH_ATT_INSUFFICIENT_ENCRYPTION)
+        {
+            return GB_SystemErrorCode::PermissionDenied;
+        }
+        if (normalizedHResult == E_BLUETOOTH_ATT_INVALID_PDU || normalizedHResult == E_BLUETOOTH_ATT_INVALID_OFFSET || normalizedHResult == E_BLUETOOTH_ATT_INVALID_ATTRIBUTE_VALUE_LENGTH)
+        {
+            return GB_SystemErrorCode::InvalidArgument;
+        }
+        if (normalizedHResult == E_BLUETOOTH_ATT_PREPARE_QUEUE_FULL)
+        {
+            return GB_SystemErrorCode::ResourceBusy;
+        }
+        if (normalizedHResult == E_BLUETOOTH_ATT_INSUFFICIENT_RESOURCES)
+        {
+            return GB_SystemErrorCode::ResourceAllocationFailed;
+        }
+        if (normalizedHResult == E_BLUETOOTH_ATT_REQUEST_NOT_SUPPORTED || normalizedHResult == E_BLUETOOTH_ATT_UNSUPPORTED_GROUP_TYPE)
+        {
+            return GB_SystemErrorCode::OperationFailed;
+        }
+#endif
+
+        const GB_SystemResult mappedResult = GB_SystemResult::FromHResult(static_cast<int32_t>(normalizedHResult));
+        return mappedResult.IsSucceeded() ? GB_SystemErrorCode::OperationFailed : mappedResult.errorCode;
+    }
+
     static GB_SystemResult MapBluetoothGattHResult(const HRESULT hresult, const std::string& operationName, const std::string& message)
     {
         const HRESULT normalizedHResult = NormalizeBluetoothGattHResult(hresult);
@@ -598,52 +630,10 @@ namespace
         {
             return GB_SystemResult::Succeeded(operationName, message);
         }
-        if (IsHResultFromWin32Error(normalizedHResult, ERROR_NOT_FOUND) || IsHResultFromWin32Error(normalizedHResult, ERROR_FILE_NOT_FOUND))
-        {
-            return GB_SystemResult::Failed(GB_SystemErrorCode::NotFound, operationName, message);
-        }
-        if (IsHResultFromWin32Error(normalizedHResult, ERROR_ACCESS_DENIED))
-        {
-            return GB_SystemResult::FromHResult(normalizedHResult, operationName, message).WithMessage(message);
-        }
-        if (IsHResultFromWin32Error(normalizedHResult, ERROR_SEM_TIMEOUT) || IsHResultFromWin32Error(normalizedHResult, WAIT_TIMEOUT))
-        {
-            return GB_SystemResult::Failed(GB_SystemErrorCode::Timeout, operationName, message);
-        }
-        if (IsHResultFromWin32Error(normalizedHResult, ERROR_NO_SYSTEM_RESOURCES) || IsHResultFromWin32Error(normalizedHResult, ERROR_OUTOFMEMORY))
-        {
-            return GB_SystemResult::Failed(GB_SystemErrorCode::ResourceAllocationFailed, operationName, message);
-        }
-        if (IsHResultFromWin32Error(normalizedHResult, ERROR_INVALID_PARAMETER) || IsHResultFromWin32Error(normalizedHResult, ERROR_INVALID_USER_BUFFER))
-        {
-            return GB_SystemResult::FromHResult(normalizedHResult, operationName, message).WithMessage(message);
-        }
 
-        return GB_SystemResult::FromHResult(normalizedHResult, operationName, message);
-    }
-
-    static bool TryParseHexUInt16(const std::string& text, uint16_t& value)
-    {
-        value = 0;
-        if (text.empty() || text.size() > 4)
-        {
-            return false;
-        }
-
-        uint32_t parsedValue = 0;
-        for (size_t index = 0; index < text.size(); index++)
-        {
-            const int hexValue = HexValue(text[index]);
-            if (hexValue < 0)
-            {
-                return false;
-            }
-
-            parsedValue = (parsedValue << 4) | static_cast<uint32_t>(hexValue);
-        }
-
-        value = static_cast<uint16_t>(parsedValue);
-        return true;
+        GB_SystemResult result = GB_SystemResult::FromHResult(static_cast<int32_t>(normalizedHResult), operationName, message).WithMessage(message);
+        result.errorCode = GetBluetoothGattErrorCode(normalizedHResult);
+        return result;
     }
 
     static bool TryParseHexUInt32Fixed(const std::string& text, const size_t beginIndex, const size_t digitCount, uint32_t& value)
@@ -673,27 +663,36 @@ namespace
     static bool TryParseGuidString(const std::string& guidText, GUID& guid)
     {
         guid = GUID();
-        const std::string trimmedGuid = TrimAsciiWhitespace(guidText);
-        if (trimmedGuid.empty() || ContainsNullCharacter(trimmedGuid))
+        if (guidText.empty() || ContainsNullCharacter(guidText))
         {
             return false;
         }
 
-        std::string body;
-        if (trimmedGuid.size() == 38 && trimmedGuid.front() == '{' && trimmedGuid.back() == '}')
+        size_t beginIndex = 0;
+        while (beginIndex < guidText.size() && IsAsciiWhitespace(guidText[beginIndex]))
         {
-            body = trimmedGuid.substr(1, 36);
+            beginIndex++;
         }
-        else if (trimmedGuid.size() == 36)
+
+        size_t endIndex = guidText.size();
+        while (endIndex > beginIndex && IsAsciiWhitespace(guidText[endIndex - 1]))
         {
-            body = trimmedGuid;
+            endIndex--;
         }
-        else
+
+        size_t bodyBeginIndex = beginIndex;
+        const size_t trimmedLength = endIndex - beginIndex;
+        if (trimmedLength == 38 && guidText[beginIndex] == '{' && guidText[endIndex - 1] == '}')
+        {
+            bodyBeginIndex++;
+            endIndex--;
+        }
+        else if (trimmedLength != 36)
         {
             return false;
         }
 
-        if (body[8] != '-' || body[13] != '-' || body[18] != '-' || body[23] != '-')
+        if (endIndex - bodyBeginIndex != 36 || guidText[bodyBeginIndex + 8] != '-' || guidText[bodyBeginIndex + 13] != '-' || guidText[bodyBeginIndex + 18] != '-' || guidText[bodyBeginIndex + 23] != '-')
         {
             return false;
         }
@@ -709,7 +708,7 @@ namespace
         uint32_t data4Part5 = 0;
         uint32_t data4Part6 = 0;
         uint32_t data4Part7 = 0;
-        if (!TryParseHexUInt32Fixed(body, 0, 8, data1) || !TryParseHexUInt32Fixed(body, 9, 4, data2) || !TryParseHexUInt32Fixed(body, 14, 4, data3) || !TryParseHexUInt32Fixed(body, 19, 2, data4Part0) || !TryParseHexUInt32Fixed(body, 21, 2, data4Part1) || !TryParseHexUInt32Fixed(body, 24, 2, data4Part2) || !TryParseHexUInt32Fixed(body, 26, 2, data4Part3) || !TryParseHexUInt32Fixed(body, 28, 2, data4Part4) || !TryParseHexUInt32Fixed(body, 30, 2, data4Part5) || !TryParseHexUInt32Fixed(body, 32, 2, data4Part6) || !TryParseHexUInt32Fixed(body, 34, 2, data4Part7))
+        if (!TryParseHexUInt32Fixed(guidText, bodyBeginIndex, 8, data1) || !TryParseHexUInt32Fixed(guidText, bodyBeginIndex + 9, 4, data2) || !TryParseHexUInt32Fixed(guidText, bodyBeginIndex + 14, 4, data3) || !TryParseHexUInt32Fixed(guidText, bodyBeginIndex + 19, 2, data4Part0) || !TryParseHexUInt32Fixed(guidText, bodyBeginIndex + 21, 2, data4Part1) || !TryParseHexUInt32Fixed(guidText, bodyBeginIndex + 24, 2, data4Part2) || !TryParseHexUInt32Fixed(guidText, bodyBeginIndex + 26, 2, data4Part3) || !TryParseHexUInt32Fixed(guidText, bodyBeginIndex + 28, 2, data4Part4) || !TryParseHexUInt32Fixed(guidText, bodyBeginIndex + 30, 2, data4Part5) || !TryParseHexUInt32Fixed(guidText, bodyBeginIndex + 32, 2, data4Part6) || !TryParseHexUInt32Fixed(guidText, bodyBeginIndex + 34, 2, data4Part7))
         {
             return false;
         }
@@ -813,11 +812,21 @@ namespace
         return offsetof(BTH_LE_GATT_CHARACTERISTIC_VALUE, Data);
     }
 
-    static GB_SystemResult AllocateGattCharacteristicValueBuffer(const size_t dataSize, std::vector<unsigned char>& valueBuffer, const std::string& operationName, const std::string& failureMessage)
+    static size_t GetGattCharacteristicValueBufferByteCapacity(const std::vector<ULONG>& valueBuffer)
+    {
+        if (valueBuffer.size() > (std::numeric_limits<size_t>::max)() / sizeof(ULONG))
+        {
+            return 0;
+        }
+
+        return valueBuffer.size() * sizeof(ULONG);
+    }
+
+    static GB_SystemResult AllocateGattCharacteristicValueBuffer(const size_t dataSize, std::vector<ULONG>& valueBuffer, const std::string& operationName, const std::string& failureMessage)
     {
         valueBuffer.clear();
         const size_t headerSize = GetGattCharacteristicValueHeaderSize();
-        if (dataSize > static_cast<size_t>(std::numeric_limits<ULONG>::max()) || headerSize > std::numeric_limits<size_t>::max() - dataSize)
+        if (dataSize > static_cast<size_t>((std::numeric_limits<ULONG>::max)()) || headerSize > (std::numeric_limits<size_t>::max)() - dataSize)
         {
             return GB_SystemResult::Failed(GB_SystemErrorCode::InvalidArgument, operationName, u8"BLE GATT 特征值长度过大。");
         }
@@ -828,9 +837,10 @@ namespace
             bufferSize = sizeof(BTH_LE_GATT_CHARACTERISTIC_VALUE);
         }
 
+        const size_t wordCount = bufferSize / sizeof(ULONG) + (bufferSize % sizeof(ULONG) == 0 ? 0 : 1);
         try
         {
-            valueBuffer.assign(bufferSize, 0);
+            valueBuffer.assign(wordCount, 0);
         }
         catch (...)
         {
@@ -959,6 +969,11 @@ namespace
             hresult = ::BluetoothGATTGetServices(deviceHandle, serviceCount, services.data(), &returnedServiceCount, BLUETOOTH_GATT_FLAG_NONE);
             if (hresult == S_OK)
             {
+                if (returnedServiceCount > serviceCount)
+                {
+                    services.clear();
+                    return GB_SystemResult::Failed(GB_SystemErrorCode::OperationFailed, operationName, u8"BluetoothGATTGetServices 返回的服务数量超过调用方提供的缓冲区容量。");
+                }
                 if (returnedServiceCount < serviceCount)
                 {
                     services.resize(static_cast<size_t>(returnedServiceCount));
@@ -1021,6 +1036,11 @@ namespace
             hresult = ::BluetoothGATTGetCharacteristics(deviceHandle, const_cast<BTH_LE_GATT_SERVICE*>(&service), characteristicCount, characteristics.data(), &returnedCharacteristicCount, BLUETOOTH_GATT_FLAG_NONE);
             if (hresult == S_OK)
             {
+                if (returnedCharacteristicCount > characteristicCount)
+                {
+                    characteristics.clear();
+                    return GB_SystemResult::Failed(GB_SystemErrorCode::OperationFailed, operationName, u8"BluetoothGATTGetCharacteristics 返回的特征数量超过调用方提供的缓冲区容量。");
+                }
                 if (returnedCharacteristicCount < characteristicCount)
                 {
                     characteristics.resize(static_cast<size_t>(returnedCharacteristicCount));
@@ -1085,12 +1105,19 @@ namespace
         }
 
         GB_BluetoothGattServiceInfo service;
-        service.deviceId = characteristic.deviceId;
-        service.deviceInterfacePath = characteristic.deviceInterfacePath;
-        service.uuid = characteristic.serviceUuid;
-        service.shortUuid = characteristic.serviceShortUuid;
-        service.isShortUuid = characteristic.isServiceShortUuid;
-        service.attributeHandle = characteristic.serviceAttributeHandle;
+        try
+        {
+            service.deviceId = characteristic.deviceId;
+            service.deviceInterfacePath = characteristic.deviceInterfacePath;
+            service.uuid = characteristic.serviceUuid;
+            service.shortUuid = characteristic.serviceShortUuid;
+            service.isShortUuid = characteristic.isServiceShortUuid;
+            service.attributeHandle = characteristic.serviceAttributeHandle;
+        }
+        catch (...)
+        {
+            return GB_SystemResult::Failed(GB_SystemErrorCode::ResourceAllocationFailed, operationName, u8"保存 BLE GATT 服务定位信息时内存不足。");
+        }
 
         BTH_LE_GATT_SERVICE nativeService = BTH_LE_GATT_SERVICE();
         GB_SystemResult serviceResult = FindNativeGattService(deviceHandle, service, nativeService, operationName);
@@ -1128,36 +1155,49 @@ namespace
     static bool TryExtractBluetoothAddressFromText(const std::string& text, std::string& address)
     {
         address.clear();
-        if (text.empty())
+        if (text.size() < 16)
         {
             return false;
         }
 
-        const char* prefixes[] = { "DEV_", "DEV-", "Dev_", "Dev-", "dev_", "dev-" };
-        for (size_t prefixIndex = 0; prefixIndex < sizeof(prefixes) / sizeof(prefixes[0]); prefixIndex++)
+        for (size_t index = 0; index + 16 <= text.size(); index++)
         {
-            size_t searchOffset = 0;
-            while (searchOffset < text.size())
+            if (ToLowerAsciiChar(text[index]) != 'd' || ToLowerAsciiChar(text[index + 1]) != 'e' || ToLowerAsciiChar(text[index + 2]) != 'v' || (text[index + 3] != '_' && text[index + 3] != '-'))
             {
-                const size_t prefixPosition = text.find(prefixes[prefixIndex], searchOffset);
-                if (prefixPosition == std::string::npos)
+                continue;
+            }
+
+            const size_t addressBegin = index + 4;
+            bool allHex = true;
+            for (size_t digitIndex = 0; digitIndex < 12; digitIndex++)
+            {
+                if (HexValue(text[addressBegin + digitIndex]) < 0)
                 {
+                    allHex = false;
                     break;
                 }
-
-                const size_t addressBegin = prefixPosition + std::strlen(prefixes[prefixIndex]);
-                if (addressBegin + 12 <= text.size())
-                {
-                    const std::string candidate = text.substr(addressBegin, 12);
-                    if (NormalizeBluetoothAddress(candidate).size() == 17)
-                    {
-                        address = NormalizeBluetoothAddress(candidate);
-                        return true;
-                    }
-                }
-
-                searchOffset = prefixPosition + 1;
             }
+            if (!allHex)
+            {
+                continue;
+            }
+            if (addressBegin + 12 < text.size() && HexValue(text[addressBegin + 12]) >= 0)
+            {
+                continue;
+            }
+
+            uint64_t addressValue = 0;
+            for (size_t digitIndex = 0; digitIndex < 12; digitIndex++)
+            {
+                addressValue = (addressValue << 4) | static_cast<uint64_t>(HexValue(text[addressBegin + digitIndex]));
+            }
+            if (addressValue == 0)
+            {
+                continue;
+            }
+
+            address = FormatBluetoothAddressValue(addressValue);
+            return true;
         }
 
         return false;
@@ -1166,8 +1206,10 @@ namespace
     static GB_BluetoothDeviceInfo ConvertLowEnergyDeviceInterfaceInfo(const GB_SystemDeviceInterfaceInfo& deviceInterface, const GB_SystemDeviceInfo* systemDevice)
     {
         GB_BluetoothDeviceInfo device;
-        device.nativeDeviceId = deviceInterface.interfacePath;
-        device.deviceId = deviceInterface.interfacePath;
+        device.deviceInstanceId = deviceInterface.deviceInstanceId;
+        device.deviceInterfacePath = deviceInterface.interfacePath;
+        device.nativeDeviceId = !device.deviceInstanceId.empty() ? device.deviceInstanceId : device.deviceInterfacePath;
+        device.deviceId = device.nativeDeviceId;
         device.name = deviceInterface.associatedDeviceName;
         if (systemDevice != nullptr)
         {
@@ -1182,7 +1224,7 @@ namespace
         }
 
         std::string address;
-        if (TryExtractBluetoothAddressFromText(deviceInterface.deviceInstanceId, address) || TryExtractBluetoothAddressFromText(deviceInterface.interfacePath, address))
+        if (TryExtractBluetoothAddressFromText(device.deviceInstanceId, address) || TryExtractBluetoothAddressFromText(device.deviceInterfacePath, address))
         {
             device.address = address;
         }
@@ -1190,7 +1232,7 @@ namespace
         device.deviceKind = GB_BluetoothDeviceKind::LowEnergy;
         device.pairStatus = GB_BluetoothPairStatus::Unknown;
         device.connectionStatus = GB_BluetoothConnectionStatus::Unknown;
-        device.isRemembered = true;
+        device.isRemembered = false;
         device.isAuthenticated = false;
         device.isConnected = false;
         device.isClassicSupported = false;
@@ -1215,22 +1257,64 @@ namespace
             return GB_SystemResult::FromWin32Error(radioResult, u8"GB_SystemBluetooth::GetRadios", u8"BluetoothGetRadioInfo 读取蓝牙无线电信息失败。");
         }
 
-        radio.address = FormatBluetoothAddress(nativeRadioInfo.address);
-        radio.radioId = radio.address;
-        radio.nativeDeviceId = radio.address;
-        radio.name = WideNullTerminatedStringToUtf8(nativeRadioInfo.szName);
-        radio.classOfDevice = nativeRadioInfo.ulClassofDevice;
-        radio.manufacturer = nativeRadioInfo.manufacturer;
-        radio.isClassicSupported = true;
-        radio.isLowEnergySupported = false;
-        radio.isConnectable = ::BluetoothIsConnectable(radioHandle) != FALSE;
-        radio.isDiscoverable = ::BluetoothIsDiscoverable(radioHandle) != FALSE;
+        try
+        {
+            radio.address = FormatBluetoothAddress(nativeRadioInfo.address);
+            radio.radioId = radio.address;
+            radio.nativeDeviceId.clear();
+            radio.name = WideNullTerminatedStringToUtf8(nativeRadioInfo.szName);
+            radio.classOfDevice = nativeRadioInfo.ulClassofDevice;
+            radio.manufacturer = nativeRadioInfo.manufacturer;
+            radio.isClassicSupported = true;
+            radio.isLowEnergySupported = false;
+            radio.isConnectable = ::BluetoothIsConnectable(radioHandle) != FALSE;
+            radio.isDiscoverable = ::BluetoothIsDiscoverable(radioHandle) != FALSE;
+        }
+        catch (...)
+        {
+            radio = GB_BluetoothRadioInfo();
+            return GB_SystemResult::Failed(GB_SystemErrorCode::ResourceAllocationFailed, u8"GB_SystemBluetooth::GetRadios", u8"保存蓝牙无线电信息时内存不足。");
+        }
+
         return GB_SystemResult::Succeeded(u8"GB_SystemBluetooth::GetRadios");
     }
 
-    static GB_SystemResult BuildBluetoothBooleanApiFailureResult(const std::string& operationName, const std::string& message)
+    static GB_SystemResult GetFirstRadioInfo(GB_BluetoothRadioInfo& radio, bool& found, const std::string& operationName)
     {
-        const DWORD lastError = ::GetLastError();
+        radio = GB_BluetoothRadioInfo();
+        found = false;
+
+        BLUETOOTH_FIND_RADIO_PARAMS radioParams = {};
+        radioParams.dwSize = sizeof(radioParams);
+
+        HANDLE firstRadioHandle = nullptr;
+        ::SetLastError(ERROR_SUCCESS);
+        HBLUETOOTH_RADIO_FIND findHandle = ::BluetoothFindFirstRadio(&radioParams, &firstRadioHandle);
+        if (findHandle == nullptr)
+        {
+            const DWORD lastError = ::GetLastError();
+            if (lastError == ERROR_SUCCESS || lastError == ERROR_NO_MORE_ITEMS || lastError == ERROR_FILE_NOT_FOUND || lastError == ERROR_SERVICE_DOES_NOT_EXIST)
+            {
+                return GB_SystemResult::Succeeded(operationName, u8"当前系统未发现蓝牙无线电。");
+            }
+
+            return GB_SystemResult::FromWin32Error(lastError, operationName, u8"BluetoothFindFirstRadio 查找第一块蓝牙无线电失败。");
+        }
+
+        BluetoothRadioFindScope findScope(findHandle);
+        GenericHandleScope radioHandle(firstRadioHandle);
+        GB_SystemResult infoResult = BuildRadioInfo(radioHandle.Get(), radio);
+        if (infoResult.IsFailed())
+        {
+            return infoResult.WithOperationName(operationName);
+        }
+
+        found = true;
+        return GB_SystemResult::Succeeded(operationName);
+    }
+
+    static GB_SystemResult BuildBluetoothBooleanApiFailureResult(const DWORD lastError, const std::string& operationName, const std::string& message)
+    {
         if (lastError != ERROR_SUCCESS)
         {
             return GB_SystemResult::FromWin32Error(static_cast<uint32_t>(lastError), operationName, message);
@@ -1255,12 +1339,13 @@ namespace
         ::SetLastError(ERROR_SUCCESS);
         if (::BluetoothEnableIncomingConnections(radioHandle, enabled ? TRUE : FALSE) == FALSE)
         {
+            const DWORD lastError = ::GetLastError();
             if ((::BluetoothIsConnectable(radioHandle) != FALSE) == enabled)
             {
                 return GB_SystemResult::Succeeded(operationName);
             }
 
-            return BuildBluetoothBooleanApiFailureResult(operationName, enabled ? u8"BluetoothEnableIncomingConnections 打开入站连接失败。" : u8"BluetoothEnableIncomingConnections 关闭入站连接失败。");
+            return BuildBluetoothBooleanApiFailureResult(lastError, operationName, enabled ? u8"BluetoothEnableIncomingConnections 打开入站连接失败。" : u8"BluetoothEnableIncomingConnections 关闭入站连接失败。");
         }
 
         return GB_SystemResult::Succeeded(operationName);
@@ -1282,15 +1367,115 @@ namespace
         ::SetLastError(ERROR_SUCCESS);
         if (::BluetoothEnableDiscovery(radioHandle, enabled ? TRUE : FALSE) == FALSE)
         {
+            const DWORD lastError = ::GetLastError();
             if ((::BluetoothIsDiscoverable(radioHandle) != FALSE) == enabled)
             {
                 return GB_SystemResult::Succeeded(operationName);
             }
 
-            return BuildBluetoothBooleanApiFailureResult(operationName, enabled ? u8"BluetoothEnableDiscovery 打开可发现性失败。" : u8"BluetoothEnableDiscovery 关闭可发现性失败。");
+            return BuildBluetoothBooleanApiFailureResult(lastError, operationName, enabled ? u8"BluetoothEnableDiscovery 打开可发现性失败。" : u8"BluetoothEnableDiscovery 关闭可发现性失败。");
         }
 
         return GB_SystemResult::Succeeded(operationName);
+    }
+
+    static std::mutex& GetRadioStateChangeMutex()
+    {
+        static std::mutex radioStateChangeMutex;
+        return radioStateChangeMutex;
+    }
+
+    struct BluetoothRadioStateSnapshot
+    {
+        HANDLE radioHandle = nullptr;
+        bool isConnectable = false;
+        bool isDiscoverable = false;
+    };
+
+    static GB_SystemResult CaptureRadioStateSnapshots(const std::vector<BluetoothRadioHandleEntry*>& targetRadioHandles, std::vector<BluetoothRadioStateSnapshot>& snapshots, const std::string& operationName)
+    {
+        snapshots.clear();
+        try
+        {
+            snapshots.reserve(targetRadioHandles.size());
+            for (size_t index = 0; index < targetRadioHandles.size(); index++)
+            {
+                HANDLE radioHandle = targetRadioHandles[index] != nullptr ? targetRadioHandles[index]->GetHandle() : nullptr;
+                if (radioHandle == nullptr || radioHandle == INVALID_HANDLE_VALUE)
+                {
+                    snapshots.clear();
+                    return GB_SystemResult::Failed(GB_SystemErrorCode::InvalidState, operationName, u8"目标蓝牙无线电句柄无效，无法创建状态快照。");
+                }
+
+                BluetoothRadioStateSnapshot snapshot;
+                snapshot.radioHandle = radioHandle;
+                snapshot.isConnectable = ::BluetoothIsConnectable(radioHandle) != FALSE;
+                snapshot.isDiscoverable = ::BluetoothIsDiscoverable(radioHandle) != FALSE;
+                snapshots.push_back(snapshot);
+            }
+        }
+        catch (...)
+        {
+            snapshots.clear();
+            return GB_SystemResult::Failed(GB_SystemErrorCode::ResourceAllocationFailed, operationName, u8"保存蓝牙无线电原始状态时内存不足。");
+        }
+
+        return GB_SystemResult::Succeeded(operationName);
+    }
+
+    static GB_SystemResult RestoreRadioState(const BluetoothRadioStateSnapshot& snapshot, const std::string& operationName)
+    {
+        if (snapshot.isDiscoverable)
+        {
+            GB_SystemResult connectableResult = SetRadioIncomingConnections(snapshot.radioHandle, true, operationName);
+            if (connectableResult.IsFailed())
+            {
+                return connectableResult;
+            }
+
+            return SetRadioDiscovery(snapshot.radioHandle, true, operationName);
+        }
+
+        GB_SystemResult discoveryResult = SetRadioDiscovery(snapshot.radioHandle, false, operationName);
+        if (discoveryResult.IsFailed())
+        {
+            return discoveryResult;
+        }
+
+        return SetRadioIncomingConnections(snapshot.radioHandle, snapshot.isConnectable, operationName);
+    }
+
+    static GB_SystemResult RestoreRadioStateSnapshots(const std::vector<BluetoothRadioStateSnapshot>& snapshots, const std::string& operationName)
+    {
+        GB_SystemResult firstFailure = GB_SystemResult::Succeeded(operationName);
+        for (size_t reverseIndex = snapshots.size(); reverseIndex > 0; reverseIndex--)
+        {
+            GB_SystemResult restoreResult = RestoreRadioState(snapshots[reverseIndex - 1], operationName);
+            if (restoreResult.IsFailed() && firstFailure.IsSucceeded())
+            {
+                firstFailure = std::move(restoreResult);
+            }
+        }
+
+        return firstFailure;
+    }
+
+    static GB_SystemResult RollbackRadioStatesAfterFailure(GB_SystemResult failureResult, const std::vector<BluetoothRadioStateSnapshot>& snapshots, const std::string& operationName)
+    {
+        const GB_SystemResult rollbackResult = RestoreRadioStateSnapshots(snapshots, operationName);
+        if (rollbackResult.IsFailed())
+        {
+            try
+            {
+                failureResult.message += u8" 状态修改失败后尝试回滚，但至少一个蓝牙无线电未能恢复到原始状态：";
+                failureResult.message += rollbackResult.GetDisplayMessage();
+            }
+            catch (...)
+            {
+            }
+        }
+
+        return failureResult;
     }
 
     static GB_SystemResult EnumerateRadioHandles(std::vector<BluetoothRadioHandleEntry>& radioHandles)
@@ -1301,6 +1486,7 @@ namespace
         radioParams.dwSize = sizeof(radioParams);
 
         HANDLE firstRadioHandle = nullptr;
+        ::SetLastError(ERROR_SUCCESS);
         HBLUETOOTH_RADIO_FIND findHandle = ::BluetoothFindFirstRadio(&radioParams, &firstRadioHandle);
         if (findHandle == nullptr)
         {
@@ -1338,6 +1524,7 @@ namespace
             }
 
             currentRadioHandle = nullptr;
+            ::SetLastError(ERROR_SUCCESS);
             if (::BluetoothFindNextRadio(findScope.Get(), &currentRadioHandle) == FALSE)
             {
                 const DWORD nextError = ::GetLastError();
@@ -1416,22 +1603,12 @@ namespace
         {
             return GB_SystemResult::Failed(GB_SystemErrorCode::InvalidArgument, u8"GB_SystemBluetooth::GetClassicDevices", u8"radioAddress 不是有效蓝牙地址。");
         }
+        if (options.requestFreshInquiry && options.inquiryTimeoutMultiplier > 48)
+        {
+            return GB_SystemResult::Failed(GB_SystemErrorCode::InvalidArgument, u8"GB_SystemBluetooth::GetClassicDevices", u8"inquiryTimeoutMultiplier 不能大于 48；Windows Bluetooth API 对更大的值会立即返回 E_INVALIDARG。");
+        }
 
         return GB_SystemResult::Succeeded(u8"GB_SystemBluetooth::GetClassicDevices");
-    }
-
-    static UCHAR NormalizeInquiryTimeoutMultiplier(const uint8_t timeoutMultiplier)
-    {
-        if (timeoutMultiplier == 0)
-        {
-            return 1;
-        }
-        if (timeoutMultiplier > 48)
-        {
-            return 48;
-        }
-
-        return static_cast<UCHAR>(timeoutMultiplier);
     }
 
     static BLUETOOTH_DEVICE_SEARCH_PARAMS BuildSearchParams(HANDLE radioHandle, const GB_BluetoothClassicDeviceQueryOptions& options)
@@ -1443,7 +1620,7 @@ namespace
         searchParams.fReturnUnknown = options.includeUnknown ? TRUE : FALSE;
         searchParams.fReturnConnected = options.includeConnected ? TRUE : FALSE;
         searchParams.fIssueInquiry = options.requestFreshInquiry ? TRUE : FALSE;
-        searchParams.cTimeoutMultiplier = options.requestFreshInquiry ? NormalizeInquiryTimeoutMultiplier(options.inquiryTimeoutMultiplier) : 0;
+        searchParams.cTimeoutMultiplier = options.requestFreshInquiry ? static_cast<UCHAR>(options.inquiryTimeoutMultiplier) : 0;
         searchParams.hRadio = radioHandle;
         return searchParams;
     }
@@ -1516,9 +1693,14 @@ namespace
                 serviceResult = ::BluetoothEnumerateInstalledServices(radioHandle, &nativeDeviceInfo, &returnedServiceCount, nativeServiceGuids.data());
                 if (serviceResult == ERROR_SUCCESS)
                 {
+                    if (returnedServiceCount > static_cast<DWORD>(nativeServiceGuids.size()))
+                    {
+                        serviceGuids.clear();
+                        return GB_SystemResult::Failed(GB_SystemErrorCode::OperationFailed, u8"GB_SystemBluetooth::ReadInstalledServices", u8"BluetoothEnumerateInstalledServices 返回的服务数量超过调用方提供的缓冲区容量。");
+                    }
+
                     serviceGuids.reserve(static_cast<size_t>(returnedServiceCount));
-                    const DWORD validServiceCount = returnedServiceCount < static_cast<DWORD>(nativeServiceGuids.size()) ? returnedServiceCount : static_cast<DWORD>(nativeServiceGuids.size());
-                    for (DWORD index = 0; index < validServiceCount; index++)
+                    for (DWORD index = 0; index < returnedServiceCount; index++)
                     {
                         serviceGuids.push_back(GuidToString(nativeServiceGuids[index]));
                     }
@@ -1577,7 +1759,16 @@ namespace
 
         if (publicDevice != nullptr)
         {
-            *publicDevice = ConvertDeviceInfo(nativeDeviceInfo, radioInfo);
+            try
+            {
+                *publicDevice = ConvertDeviceInfo(nativeDeviceInfo, radioInfo);
+            }
+            catch (...)
+            {
+                *publicDevice = GB_BluetoothDeviceInfo();
+                return GB_SystemResult::Failed(GB_SystemErrorCode::ResourceAllocationFailed, u8"GB_SystemBluetooth::TryGetNativeClassicDeviceInfoByAddress", u8"保存经典蓝牙设备信息时内存不足。");
+            }
+
             if (includeInstalledServices)
             {
                 GB_SystemResult serviceResult = ReadInstalledServices(radioHandle, nativeDeviceInfo, publicDevice->installedServiceGuids);
@@ -1612,6 +1803,7 @@ namespace
         }
 
         BLUETOOTH_DEVICE_SEARCH_PARAMS searchParams = BuildSearchParams(radioHandle, options);
+        ::SetLastError(ERROR_SUCCESS);
         HBLUETOOTH_DEVICE_FIND findHandle = ::BluetoothFindFirstDevice(&searchParams, &nativeDeviceInfo);
         if (findHandle == nullptr)
         {
@@ -1632,7 +1824,16 @@ namespace
             {
                 if (publicDevice != nullptr)
                 {
-                    *publicDevice = ConvertDeviceInfo(nativeDeviceInfo, radioInfo);
+                    try
+                    {
+                        *publicDevice = ConvertDeviceInfo(nativeDeviceInfo, radioInfo);
+                    }
+                    catch (...)
+                    {
+                        *publicDevice = GB_BluetoothDeviceInfo();
+                        return GB_SystemResult::Failed(GB_SystemErrorCode::ResourceAllocationFailed, u8"GB_SystemBluetooth::FindNativeClassicDeviceForRadio", u8"保存经典蓝牙设备信息时内存不足。");
+                    }
+
                     if (options.includeInstalledServices)
                     {
                         GB_SystemResult serviceResult = ReadInstalledServices(radioHandle, nativeDeviceInfo, publicDevice->installedServiceGuids);
@@ -1649,6 +1850,7 @@ namespace
 
             BLUETOOTH_DEVICE_INFO nextDeviceInfo = {};
             nextDeviceInfo.dwSize = sizeof(nextDeviceInfo);
+            ::SetLastError(ERROR_SUCCESS);
             if (::BluetoothFindNextDevice(findScope.Get(), &nextDeviceInfo) == FALSE)
             {
                 const DWORD nextError = ::GetLastError();
@@ -1665,12 +1867,61 @@ namespace
         return GB_SystemResult::Succeeded(u8"GB_SystemBluetooth::FindNativeClassicDeviceForRadio");
     }
 
+    static GB_SystemResult FindNativeClassicDeviceAcrossRadios(const GB_BluetoothClassicDeviceQueryOptions& options, const std::string& targetAddress, BLUETOOTH_DEVICE_INFO& nativeDeviceInfo, bool& found)
+    {
+        found = false;
+        nativeDeviceInfo = {};
+        nativeDeviceInfo.dwSize = sizeof(nativeDeviceInfo);
+
+        BLUETOOTH_DEVICE_SEARCH_PARAMS searchParams = BuildSearchParams(nullptr, options);
+        ::SetLastError(ERROR_SUCCESS);
+        HBLUETOOTH_DEVICE_FIND findHandle = ::BluetoothFindFirstDevice(&searchParams, &nativeDeviceInfo);
+        if (findHandle == nullptr)
+        {
+            const DWORD lastError = ::GetLastError();
+            if (lastError == ERROR_SUCCESS || lastError == ERROR_NO_MORE_ITEMS || lastError == ERROR_FILE_NOT_FOUND || lastError == ERROR_NOT_FOUND)
+            {
+                return GB_SystemResult::Succeeded(u8"GB_SystemBluetooth::FindNativeClassicDeviceAcrossRadios");
+            }
+
+            return GB_SystemResult::FromWin32Error(lastError, u8"GB_SystemBluetooth::FindNativeClassicDeviceAcrossRadios", u8"BluetoothFindFirstDevice 跨全部本机蓝牙无线电查找经典蓝牙设备失败。");
+        }
+
+        BluetoothDeviceFindScope findScope(findHandle);
+        while (true)
+        {
+            if (FormatBluetoothAddress(nativeDeviceInfo.Address) == targetAddress)
+            {
+                found = true;
+                return GB_SystemResult::Succeeded(u8"GB_SystemBluetooth::FindNativeClassicDeviceAcrossRadios");
+            }
+
+            BLUETOOTH_DEVICE_INFO nextDeviceInfo = {};
+            nextDeviceInfo.dwSize = sizeof(nextDeviceInfo);
+            ::SetLastError(ERROR_SUCCESS);
+            if (::BluetoothFindNextDevice(findScope.Get(), &nextDeviceInfo) == FALSE)
+            {
+                const DWORD nextError = ::GetLastError();
+                if (nextError == ERROR_SUCCESS || nextError == ERROR_NO_MORE_ITEMS)
+                {
+                    break;
+                }
+
+                return GB_SystemResult::FromWin32Error(nextError, u8"GB_SystemBluetooth::FindNativeClassicDeviceAcrossRadios", u8"BluetoothFindNextDevice 跨全部本机蓝牙无线电查找下一个经典蓝牙设备失败。");
+            }
+            nativeDeviceInfo = nextDeviceInfo;
+        }
+
+        return GB_SystemResult::Succeeded(u8"GB_SystemBluetooth::FindNativeClassicDeviceAcrossRadios");
+    }
+
     static GB_SystemResult EnumerateClassicDevicesForRadio(HANDLE radioHandle, const GB_BluetoothRadioInfo& radioInfo, const GB_BluetoothClassicDeviceQueryOptions& options, std::vector<GB_BluetoothDeviceInfo>& devices, std::unordered_set<std::string>& seenAddresses)
     {
         BLUETOOTH_DEVICE_INFO nativeDeviceInfo = {};
         nativeDeviceInfo.dwSize = sizeof(nativeDeviceInfo);
 
         BLUETOOTH_DEVICE_SEARCH_PARAMS searchParams = BuildSearchParams(radioHandle, options);
+        ::SetLastError(ERROR_SUCCESS);
         HBLUETOOTH_DEVICE_FIND findHandle = ::BluetoothFindFirstDevice(&searchParams, &nativeDeviceInfo);
         if (findHandle == nullptr)
         {
@@ -1686,9 +1937,21 @@ namespace
         BluetoothDeviceFindScope findScope(findHandle);
         while (true)
         {
-            GB_BluetoothDeviceInfo device = ConvertDeviceInfo(nativeDeviceInfo, radioInfo);
-            const std::string seenKey = device.radioAddress + "|" + device.address;
-            if (seenAddresses.insert(seenKey).second)
+            GB_BluetoothDeviceInfo device;
+            std::string seenKey;
+            bool isNewDevice = false;
+            try
+            {
+                device = ConvertDeviceInfo(nativeDeviceInfo, radioInfo);
+                seenKey = device.radioAddress + "|" + device.address;
+                isNewDevice = seenAddresses.insert(seenKey).second;
+            }
+            catch (...)
+            {
+                return GB_SystemResult::Failed(GB_SystemErrorCode::ResourceAllocationFailed, u8"GB_SystemBluetooth::GetClassicDevices", u8"保存经典蓝牙设备索引时内存不足。");
+            }
+
+            if (isNewDevice)
             {
                 if (options.includeInstalledServices)
                 {
@@ -1700,7 +1963,7 @@ namespace
                 }
                 try
                 {
-                    devices.push_back(device);
+                    devices.push_back(std::move(device));
                 }
                 catch (...)
                 {
@@ -1710,6 +1973,7 @@ namespace
 
             BLUETOOTH_DEVICE_INFO nextDeviceInfo = {};
             nextDeviceInfo.dwSize = sizeof(nextDeviceInfo);
+            ::SetLastError(ERROR_SUCCESS);
             if (::BluetoothFindNextDevice(findScope.Get(), &nextDeviceInfo) == FALSE)
             {
                 const DWORD nextError = ::GetLastError();
@@ -1804,37 +2068,30 @@ GB_SystemResult GB_SystemBluetooth::GetDefaultRadio(GB_BluetoothRadioInfo& radio
 {
     radio = GB_BluetoothRadioInfo();
     found = false;
-
-    std::vector<GB_BluetoothRadioInfo> radios;
-    GB_SystemResult result = GetRadios(radios);
-    if (result.IsFailed())
-    {
-        return result.WithOperationName(u8"GB_SystemBluetooth::GetDefaultRadio");
-    }
-
-    if (radios.empty())
-    {
-        return GB_SystemResult::Succeeded(u8"GB_SystemBluetooth::GetDefaultRadio", u8"当前系统未发现蓝牙无线电。");
-    }
-
-    radio = radios.front();
-    found = true;
-    return GB_SystemResult::Succeeded(u8"GB_SystemBluetooth::GetDefaultRadio");
+#if !defined(_WIN32)
+    return GB_SystemResult::Failed(GB_SystemErrorCode::UnsupportedPlatform, u8"GB_SystemBluetooth::GetDefaultRadio", u8"当前平台不支持 Windows 蓝牙无线电枚举。");
+#else
+    return GetFirstRadioInfo(radio, found, u8"GB_SystemBluetooth::GetDefaultRadio");
+#endif
 }
 
 GB_SystemResult GB_SystemBluetooth::IsBluetoothAvailable(bool& available)
 {
     available = false;
-
-    std::vector<GB_BluetoothRadioInfo> radios;
-    GB_SystemResult result = GetRadios(radios);
+#if !defined(_WIN32)
+    return GB_SystemResult::Failed(GB_SystemErrorCode::UnsupportedPlatform, u8"GB_SystemBluetooth::IsBluetoothAvailable", u8"当前平台不支持 Windows 蓝牙无线电枚举。");
+#else
+    GB_BluetoothRadioInfo radio;
+    bool found = false;
+    GB_SystemResult result = GetFirstRadioInfo(radio, found, u8"GB_SystemBluetooth::IsBluetoothAvailable");
     if (result.IsFailed())
     {
-        return result.WithOperationName(u8"GB_SystemBluetooth::IsBluetoothAvailable");
+        return result;
     }
 
-    available = !radios.empty();
+    available = found;
     return GB_SystemResult::Succeeded(u8"GB_SystemBluetooth::IsBluetoothAvailable");
+#endif
 }
 
 GB_SystemResult GB_SystemBluetooth::SetRadioConnectable(const std::string& radioAddress, const bool enabled)
@@ -1844,12 +2101,21 @@ GB_SystemResult GB_SystemBluetooth::SetRadioConnectable(const std::string& radio
     (void)enabled;
     return GB_SystemResult::Failed(GB_SystemErrorCode::UnsupportedPlatform, u8"GB_SystemBluetooth::SetRadioConnectable", u8"当前平台不支持 Windows 蓝牙入站连接状态设置。");
 #else
+    const std::lock_guard<std::mutex> changeLock(GetRadioStateChangeMutex());
+
     std::vector<BluetoothRadioHandleEntry> radioHandles;
     std::vector<BluetoothRadioHandleEntry*> targetRadioHandles;
     GB_SystemResult targetResult = FindTargetRadioHandles(radioAddress, radioHandles, targetRadioHandles, u8"GB_SystemBluetooth::SetRadioConnectable");
     if (targetResult.IsFailed())
     {
         return targetResult;
+    }
+
+    std::vector<BluetoothRadioStateSnapshot> snapshots;
+    GB_SystemResult snapshotResult = CaptureRadioStateSnapshots(targetRadioHandles, snapshots, u8"GB_SystemBluetooth::SetRadioConnectable");
+    if (snapshotResult.IsFailed())
+    {
+        return snapshotResult;
     }
 
     for (size_t index = 0; index < targetRadioHandles.size(); index++)
@@ -1860,14 +2126,14 @@ GB_SystemResult GB_SystemBluetooth::SetRadioConnectable(const std::string& radio
             GB_SystemResult discoveryResult = SetRadioDiscovery(radioHandle, false, u8"GB_SystemBluetooth::SetRadioConnectable");
             if (discoveryResult.IsFailed())
             {
-                return discoveryResult;
+                return RollbackRadioStatesAfterFailure(std::move(discoveryResult), snapshots, u8"GB_SystemBluetooth::SetRadioConnectable");
             }
         }
 
         GB_SystemResult connectableResult = SetRadioIncomingConnections(radioHandle, enabled, u8"GB_SystemBluetooth::SetRadioConnectable");
         if (connectableResult.IsFailed())
         {
-            return connectableResult;
+            return RollbackRadioStatesAfterFailure(std::move(connectableResult), snapshots, u8"GB_SystemBluetooth::SetRadioConnectable");
         }
     }
 
@@ -1882,12 +2148,21 @@ GB_SystemResult GB_SystemBluetooth::SetRadioDiscoverable(const std::string& radi
     (void)enabled;
     return GB_SystemResult::Failed(GB_SystemErrorCode::UnsupportedPlatform, u8"GB_SystemBluetooth::SetRadioDiscoverable", u8"当前平台不支持 Windows 蓝牙可发现状态设置。");
 #else
+    const std::lock_guard<std::mutex> changeLock(GetRadioStateChangeMutex());
+
     std::vector<BluetoothRadioHandleEntry> radioHandles;
     std::vector<BluetoothRadioHandleEntry*> targetRadioHandles;
     GB_SystemResult targetResult = FindTargetRadioHandles(radioAddress, radioHandles, targetRadioHandles, u8"GB_SystemBluetooth::SetRadioDiscoverable");
     if (targetResult.IsFailed())
     {
         return targetResult;
+    }
+
+    std::vector<BluetoothRadioStateSnapshot> snapshots;
+    GB_SystemResult snapshotResult = CaptureRadioStateSnapshots(targetRadioHandles, snapshots, u8"GB_SystemBluetooth::SetRadioDiscoverable");
+    if (snapshotResult.IsFailed())
+    {
+        return snapshotResult;
     }
 
     for (size_t index = 0; index < targetRadioHandles.size(); index++)
@@ -1898,14 +2173,14 @@ GB_SystemResult GB_SystemBluetooth::SetRadioDiscoverable(const std::string& radi
             GB_SystemResult connectableResult = SetRadioIncomingConnections(radioHandle, true, u8"GB_SystemBluetooth::SetRadioDiscoverable");
             if (connectableResult.IsFailed())
             {
-                return connectableResult;
+                return RollbackRadioStatesAfterFailure(std::move(connectableResult), snapshots, u8"GB_SystemBluetooth::SetRadioDiscoverable");
             }
         }
 
         GB_SystemResult discoveryResult = SetRadioDiscovery(radioHandle, enabled, u8"GB_SystemBluetooth::SetRadioDiscoverable");
         if (discoveryResult.IsFailed())
         {
-            return discoveryResult;
+            return RollbackRadioStatesAfterFailure(std::move(discoveryResult), snapshots, u8"GB_SystemBluetooth::SetRadioDiscoverable");
         }
     }
 
@@ -1917,6 +2192,7 @@ GB_SystemResult GB_SystemBluetooth::GetClassicDevices(std::vector<GB_BluetoothDe
 {
     devices.clear();
 #if !defined(_WIN32)
+    (void)options;
     return GB_SystemResult::Failed(GB_SystemErrorCode::UnsupportedPlatform, u8"GB_SystemBluetooth::GetClassicDevices", u8"当前平台不支持 Windows 经典蓝牙设备枚举。");
 #else
     GB_SystemResult validateResult = ValidateClassicDeviceQueryOptions(options);
@@ -1982,7 +2258,7 @@ GB_SystemResult GB_SystemBluetooth::GetLowEnergyDevices(std::vector<GB_Bluetooth
     return GB_SystemResult::Failed(GB_SystemErrorCode::UnsupportedPlatform, u8"GB_SystemBluetooth::GetLowEnergyDevices", u8"当前平台不支持 Windows BLE 设备接口枚举。");
 #else
     std::vector<GB_SystemDeviceInterfaceInfo> deviceInterfaces;
-    GB_SystemResult interfaceResult = GB_SystemDevice::GetDeviceInterfacesByClassGuid("{781AEE18-7733-4CE4-ADD0-91F41C67B592}", deviceInterfaces, true);
+    GB_SystemResult interfaceResult = GB_SystemDevice::GetDeviceInterfacesByClassGuid(GB_BluetoothLeDeviceInterfaceGuid, deviceInterfaces, true);
     if (interfaceResult.IsFailed())
     {
         return interfaceResult.WithOperationName(u8"GB_SystemBluetooth::GetLowEnergyDevices");
@@ -2005,7 +2281,17 @@ GB_SystemResult GB_SystemBluetooth::GetLowEnergyDevices(std::vector<GB_Bluetooth
         {
             continue;
         }
-        if (!seenInterfacePaths.insert(deviceInterfaces[index].interfacePath).second)
+        bool isNewInterface = false;
+        try
+        {
+            isNewInterface = seenInterfacePaths.insert(deviceInterfaces[index].interfacePath).second;
+        }
+        catch (...)
+        {
+            devices.clear();
+            return GB_SystemResult::Failed(GB_SystemErrorCode::ResourceAllocationFailed, u8"GB_SystemBluetooth::GetLowEnergyDevices", u8"保存 BLE 设备接口索引时内存不足。");
+        }
+        if (!isNewInterface)
         {
             continue;
         }
@@ -2111,9 +2397,9 @@ GB_SystemResult GB_SystemBluetooth::GetGattCharacteristics(const std::string& de
         return characteristicResult;
     }
 
-    GB_BluetoothGattServiceInfo normalizedService = ConvertGattServiceInfo(nativeService, targetDeviceInterfacePath);
     try
     {
+        const GB_BluetoothGattServiceInfo normalizedService = ConvertGattServiceInfo(nativeService, targetDeviceInterfacePath);
         characteristics.reserve(nativeCharacteristics.size());
         for (size_t index = 0; index < nativeCharacteristics.size(); index++)
         {
@@ -2144,11 +2430,6 @@ GB_SystemResult GB_SystemBluetooth::ReadGattCharacteristic(const std::string& de
     {
         return GB_SystemResult::Failed(GB_SystemErrorCode::InvalidArgument, u8"GB_SystemBluetooth::ReadGattCharacteristic", u8"deviceInterfacePath 与 characteristic.deviceInterfacePath 不一致。");
     }
-    if (!characteristic.isReadable)
-    {
-        return GB_SystemResult::Failed(GB_SystemErrorCode::InvalidState, u8"GB_SystemBluetooth::ReadGattCharacteristic", u8"指定 BLE GATT 特征未声明可读属性。");
-    }
-
     GenericHandleScope deviceHandle;
     GB_SystemResult openResult = OpenBluetoothLeDeviceHandle(targetDeviceInterfacePath, GENERIC_READ, deviceHandle, u8"GB_SystemBluetooth::ReadGattCharacteristic");
     if (openResult.IsFailed())
@@ -2161,6 +2442,10 @@ GB_SystemResult GB_SystemBluetooth::ReadGattCharacteristic(const std::string& de
     if (characteristicResult.IsFailed())
     {
         return characteristicResult;
+    }
+    if (nativeCharacteristic.IsReadable == FALSE)
+    {
+        return GB_SystemResult::Failed(GB_SystemErrorCode::InvalidState, u8"GB_SystemBluetooth::ReadGattCharacteristic", u8"当前系统枚举到的 BLE GATT 特征未声明可读属性。");
     }
 
     const ULONG flags = forceReadFromDevice ? BLUETOOTH_GATT_FLAG_FORCE_READ_FROM_DEVICE : BLUETOOTH_GATT_FLAG_NONE;
@@ -2181,15 +2466,15 @@ GB_SystemResult GB_SystemBluetooth::ReadGattCharacteristic(const std::string& de
             return GB_SystemResult::Failed(GB_SystemErrorCode::OperationFailed, u8"GB_SystemBluetooth::ReadGattCharacteristic", u8"系统返回的 BLE GATT 特征值缓冲区大小异常。");
         }
 
-        std::vector<unsigned char> valueBuffer;
+        std::vector<ULONG> valueBuffer;
         GB_SystemResult allocationResult = AllocateGattCharacteristicValueBuffer(static_cast<size_t>(requiredValueSize) - GetGattCharacteristicValueHeaderSize(), valueBuffer, u8"GB_SystemBluetooth::ReadGattCharacteristic", u8"分配 BLE GATT 特征值缓冲区时内存不足。");
         if (allocationResult.IsFailed())
         {
             return allocationResult;
         }
-        if (valueBuffer.size() < requiredValueSize)
+        if (GetGattCharacteristicValueBufferByteCapacity(valueBuffer) < requiredValueSize)
         {
-            valueBuffer.resize(requiredValueSize, 0);
+            return GB_SystemResult::Failed(GB_SystemErrorCode::InternalError, u8"GB_SystemBluetooth::ReadGattCharacteristic", u8"BLE GATT 特征值缓冲区容量计算错误。");
         }
 
         PBTH_LE_GATT_CHARACTERISTIC_VALUE nativeValue = reinterpret_cast<PBTH_LE_GATT_CHARACTERISTIC_VALUE>(valueBuffer.data());
@@ -2199,9 +2484,10 @@ GB_SystemResult GB_SystemBluetooth::ReadGattCharacteristic(const std::string& de
         {
             const ULONG dataSize = nativeValue->DataSize;
             const size_t headerSize = GetGattCharacteristicValueHeaderSize();
-            if (static_cast<size_t>(dataSize) > valueBuffer.size() - headerSize)
+            const size_t bufferByteCapacity = GetGattCharacteristicValueBufferByteCapacity(valueBuffer);
+            if (actualValueSize > requiredValueSize || bufferByteCapacity < headerSize || static_cast<size_t>(dataSize) > bufferByteCapacity - headerSize)
             {
-                return GB_SystemResult::Failed(GB_SystemErrorCode::OperationFailed, u8"GB_SystemBluetooth::ReadGattCharacteristic", u8"系统返回的 BLE GATT 特征值长度超过已分配缓冲区。");
+                return GB_SystemResult::Failed(GB_SystemErrorCode::OperationFailed, u8"GB_SystemBluetooth::ReadGattCharacteristic", u8"系统返回的 BLE GATT 特征值长度超过已分配缓冲区或返回长度不一致。");
             }
 
             try
@@ -2246,26 +2532,11 @@ GB_SystemResult GB_SystemBluetooth::WriteGattCharacteristic(const std::string& d
     {
         return GB_SystemResult::Failed(GB_SystemErrorCode::InvalidArgument, u8"GB_SystemBluetooth::WriteGattCharacteristic", u8"deviceInterfacePath 与 characteristic.deviceInterfacePath 不一致。");
     }
-    if (writeWithoutResponse)
-    {
-        if (!characteristic.isWritableWithoutResponse)
-        {
-            return GB_SystemResult::Failed(GB_SystemErrorCode::InvalidState, u8"GB_SystemBluetooth::WriteGattCharacteristic", u8"指定 BLE GATT 特征未声明 WriteWithoutResponse 属性。");
-        }
-    }
-    else if (!characteristic.isWritable)
-    {
-        return GB_SystemResult::Failed(GB_SystemErrorCode::InvalidState, u8"GB_SystemBluetooth::WriteGattCharacteristic", u8"指定 BLE GATT 特征未声明可写属性。");
-    }
     if (signedWrite)
     {
         if (!writeWithoutResponse)
         {
             return GB_SystemResult::Failed(GB_SystemErrorCode::InvalidArgument, u8"GB_SystemBluetooth::WriteGattCharacteristic", u8"Signed Write 必须与 WriteWithoutResponse 一起使用。");
-        }
-        if (!characteristic.isSignedWritable)
-        {
-            return GB_SystemResult::Failed(GB_SystemErrorCode::InvalidState, u8"GB_SystemBluetooth::WriteGattCharacteristic", u8"指定 BLE GATT 特征未声明 SignedWrite 属性。");
         }
         if (requireEncryptedConnection || requireAuthenticatedConnection)
         {
@@ -2290,8 +2561,23 @@ GB_SystemResult GB_SystemBluetooth::WriteGattCharacteristic(const std::string& d
     {
         return characteristicResult;
     }
+    if (writeWithoutResponse)
+    {
+        if (nativeCharacteristic.IsWritableWithoutResponse == FALSE)
+        {
+            return GB_SystemResult::Failed(GB_SystemErrorCode::InvalidState, u8"GB_SystemBluetooth::WriteGattCharacteristic", u8"当前系统枚举到的 BLE GATT 特征未声明 WriteWithoutResponse 属性。");
+        }
+    }
+    else if (nativeCharacteristic.IsWritable == FALSE)
+    {
+        return GB_SystemResult::Failed(GB_SystemErrorCode::InvalidState, u8"GB_SystemBluetooth::WriteGattCharacteristic", u8"当前系统枚举到的 BLE GATT 特征未声明可写属性。");
+    }
+    if (signedWrite && nativeCharacteristic.IsSignedWritable == FALSE)
+    {
+        return GB_SystemResult::Failed(GB_SystemErrorCode::InvalidState, u8"GB_SystemBluetooth::WriteGattCharacteristic", u8"当前系统枚举到的 BLE GATT 特征未声明 SignedWrite 属性。");
+    }
 
-    std::vector<unsigned char> valueBuffer;
+    std::vector<ULONG> valueBuffer;
     GB_SystemResult allocationResult = AllocateGattCharacteristicValueBuffer(value.size(), valueBuffer, u8"GB_SystemBluetooth::WriteGattCharacteristic", u8"分配 BLE GATT 特征写入缓冲区时内存不足。");
     if (allocationResult.IsFailed())
     {
@@ -2404,6 +2690,7 @@ GB_SystemResult GB_SystemBluetooth::IsDeviceConnected(const GB_BluetoothDeviceId
 {
     connected = false;
 #if !defined(_WIN32)
+    (void)deviceId;
     return GB_SystemResult::Failed(GB_SystemErrorCode::UnsupportedPlatform, u8"GB_SystemBluetooth::IsDeviceConnected", u8"当前平台不支持 Windows 蓝牙连接状态查询。");
 #else
     std::string address;
@@ -2448,6 +2735,7 @@ GB_SystemResult GB_SystemBluetooth::PairDevice(const GB_BluetoothDeviceId& devic
     {
         return GB_SystemResult::Failed(GB_SystemErrorCode::InvalidArgument, u8"GB_SystemBluetooth::PairDevice", u8"pinCodeUtf8 必须是合法 UTF-8 且不能包含空字符。");
     }
+
     std::wstring pinCodeWide;
     if (!options.pinCodeUtf8.empty())
     {
@@ -2481,29 +2769,39 @@ GB_SystemResult GB_SystemBluetooth::PairDevice(const GB_BluetoothDeviceId& devic
     }
 
     BLUETOOTH_DEVICE_INFO nativeDeviceInfo = {};
-    HANDLE matchedRadioHandle = nullptr;
-    GB_BluetoothDeviceInfo publicDevice;
-    const GB_BluetoothClassicDeviceQueryOptions lookupOptions = MakeLookupOptions(true);
+    bool matchedDevice = false;
+
+    const GB_BluetoothClassicDeviceQueryOptions cachedLookupOptions = MakeLookupOptions(false);
     for (size_t index = 0; index < radioHandles.size(); index++)
     {
         bool currentFound = false;
-        GB_SystemResult findResult = FindNativeClassicDeviceForRadio(radioHandles[index].GetHandle(), radioHandles[index].GetInfo(), lookupOptions, address, nativeDeviceInfo, &publicDevice, currentFound);
+        GB_SystemResult findResult = FindNativeClassicDeviceForRadio(radioHandles[index].GetHandle(), radioHandles[index].GetInfo(), cachedLookupOptions, address, nativeDeviceInfo, nullptr, currentFound);
         if (findResult.IsFailed())
         {
             return findResult.WithOperationName(u8"GB_SystemBluetooth::PairDevice");
         }
         if (currentFound)
         {
-            matchedRadioHandle = radioHandles[index].GetHandle();
+            matchedDevice = true;
             break;
         }
     }
 
-    if (matchedRadioHandle == nullptr)
+    if (!matchedDevice)
+    {
+        const GB_BluetoothClassicDeviceQueryOptions freshLookupOptions = MakeLookupOptions(true);
+        GB_SystemResult findResult = FindNativeClassicDeviceAcrossRadios(freshLookupOptions, address, nativeDeviceInfo, matchedDevice);
+        if (findResult.IsFailed())
+        {
+            return findResult.WithOperationName(u8"GB_SystemBluetooth::PairDevice");
+        }
+    }
+
+    if (!matchedDevice)
     {
         return GB_SystemResult::Failed(GB_SystemErrorCode::NotFound, u8"GB_SystemBluetooth::PairDevice", u8"未找到指定经典蓝牙设备；请确认设备处于可发现或已记住状态。");
     }
-    if (publicDevice.isAuthenticated)
+    if (nativeDeviceInfo.fAuthenticated != FALSE)
     {
         return GB_SystemResult::Succeeded(u8"GB_SystemBluetooth::PairDevice", u8"指定经典蓝牙设备已经完成配对。");
     }
@@ -2515,7 +2813,7 @@ GB_SystemResult GB_SystemBluetooth::PairDevice(const GB_BluetoothDeviceId& devic
 #pragma warning(push)
 #pragma warning(disable : 4995)
 #endif
-        pairResult = ::BluetoothAuthenticateDevice(nullptr, matchedRadioHandle, &nativeDeviceInfo, const_cast<wchar_t*>(pinCodeWide.c_str()), static_cast<ULONG>(pinCodeWide.size()));
+        pairResult = ::BluetoothAuthenticateDevice(nullptr, nullptr, &nativeDeviceInfo, const_cast<wchar_t*>(pinCodeWide.c_str()), static_cast<ULONG>(pinCodeWide.size()));
 #if defined(_MSC_VER)
 #pragma warning(pop)
 #endif
@@ -2531,7 +2829,7 @@ GB_SystemResult GB_SystemBluetooth::PairDevice(const GB_BluetoothDeviceId& devic
         return MapBluetoothWin32Result(pairResult, u8"GB_SystemBluetooth::PairDevice", u8"BluetoothAuthenticateDevice 使用 PIN 配对经典蓝牙设备失败。");
     }
 
-    pairResult = ::BluetoothAuthenticateDeviceEx(nullptr, matchedRadioHandle, &nativeDeviceInfo, nullptr, MITMProtectionNotRequiredBonding);
+    pairResult = ::BluetoothAuthenticateDeviceEx(nullptr, nullptr, &nativeDeviceInfo, nullptr, MITMProtectionNotRequiredBonding);
     if (pairResult == ERROR_SUCCESS)
     {
         return GB_SystemResult::Succeeded(u8"GB_SystemBluetooth::PairDevice", u8"经典蓝牙配对请求已成功完成。");
@@ -2685,12 +2983,8 @@ std::string GB_SystemBluetooth::GetEventTypeName(const GB_BluetoothEventType eve
 class GB_SystemBluetoothWatcher::Impl
 {
 public:
-    explicit Impl(const GB_SystemBluetoothWatcherOptions& inputOptions) : options(NormalizeOptions(inputOptions)), typedDispatcher(GB_EventDispatcher::MakeQueuedOptions(options.maxDispatchQueueSize, GB_EventQueueOverflowPolicy::DropOldest, u8"GB_SystemBluetoothWatcher.Typed")), publicDispatcher(GB_EventDispatcher::MakeQueuedOptions(options.maxDispatchQueueSize, GB_EventQueueOverflowPolicy::DropOldest, u8"GB_SystemBluetoothWatcher.Public")), acceptingDeviceEvents(false)
+    explicit Impl(const GB_SystemBluetoothWatcherOptions& inputOptions) : options(NormalizeOptions(inputOptions)), acceptingDeviceEvents(false), eventDispatcher(GB_EventDispatcher::MakeQueuedOptions(options.maxDispatchQueueSize, GB_EventQueueOverflowPolicy::DropOldest, u8"GB_SystemBluetoothWatcher"))
     {
-        (void)typedDispatcher.SubscribeAll([this](const GB_Event& event)
-            {
-                DispatchTypedCallback(event);
-            }, typedSubscriptionToken);
     }
 
     ~Impl() noexcept
@@ -2709,15 +3003,21 @@ public:
             }
         }
 
-        GB_SystemResult result = typedDispatcher.Start();
-        if (result.IsFailed())
+        if (!typedSubscriptionToken.IsValid())
         {
-            return result.WithOperationName(u8"GB_SystemBluetoothWatcher::Start");
+            GB_SystemResult subscribeResult = eventDispatcher.SubscribeAll([this](const GB_Event& event)
+                {
+                    DispatchTypedCallback(event);
+                }, typedSubscriptionToken);
+            if (subscribeResult.IsFailed())
+            {
+                return subscribeResult.WithOperationName(u8"GB_SystemBluetoothWatcher::Start");
+            }
         }
-        result = publicDispatcher.Start();
+
+        GB_SystemResult result = eventDispatcher.Start();
         if (result.IsFailed())
         {
-            (void)typedDispatcher.Stop(GB_EventDispatcherStopMode::Discard);
             return result.WithOperationName(u8"GB_SystemBluetoothWatcher::Start");
         }
 
@@ -2732,8 +3032,7 @@ public:
         {
             acceptingDeviceEvents.store(false, std::memory_order_release);
             deviceWatcher.SetDeviceEventCallback(GB_SystemDeviceWatcher::DeviceEventCallback());
-            (void)publicDispatcher.Stop(GB_EventDispatcherStopMode::Discard);
-            (void)typedDispatcher.Stop(GB_EventDispatcherStopMode::Discard);
+            (void)eventDispatcher.Stop(GB_EventDispatcherStopMode::Discard);
             return result.WithOperationName(u8"GB_SystemBluetoothWatcher::Start");
         }
 
@@ -2759,11 +3058,14 @@ public:
         acceptingDeviceEvents.store(false, std::memory_order_release);
         deviceWatcher.SetDeviceEventCallback(GB_SystemDeviceWatcher::DeviceEventCallback());
         GB_SystemResult deviceStopResult = deviceWatcher.Stop();
-        (void)publicDispatcher.Stop(GB_EventDispatcherStopMode::Drain);
-        (void)typedDispatcher.Stop(GB_EventDispatcherStopMode::Drain);
+        GB_SystemResult dispatcherStopResult = eventDispatcher.Stop(GB_EventDispatcherStopMode::Drain);
         if (deviceStopResult.IsFailed())
         {
             return deviceStopResult.WithOperationName(u8"GB_SystemBluetoothWatcher::Stop");
+        }
+        if (dispatcherStopResult.IsFailed())
+        {
+            return dispatcherStopResult.WithOperationName(u8"GB_SystemBluetoothWatcher::Stop");
         }
 
         return GB_SystemResult::Succeeded(u8"GB_SystemBluetoothWatcher::Stop");
@@ -2783,7 +3085,7 @@ public:
 
     GB_EventDispatcher& GetEventDispatcher()
     {
-        return publicDispatcher;
+        return eventDispatcher;
     }
 
 private:
@@ -2829,6 +3131,10 @@ private:
 
     static bool IsBluetoothRelatedDeviceEvent(const GB_SystemDeviceEvent& deviceEvent)
     {
+        if (EqualsAsciiNoCase(deviceEvent.interfaceClassGuid, GB_BluetoothLeDeviceInterfaceGuid) || EqualsAsciiNoCase(deviceEvent.interfaceClassGuid, GB_BluetoothRadioInterfaceGuid))
+        {
+            return true;
+        }
         if (HasBluetoothPnPIdentity(deviceEvent.deviceInstanceId) || HasBluetoothPnPIdentity(deviceEvent.deviceInterfacePath))
         {
             return true;
@@ -2839,6 +3145,11 @@ private:
 
     static bool IsBluetoothRadioDeviceEvent(const GB_SystemDeviceEvent& deviceEvent)
     {
+        if (EqualsAsciiNoCase(deviceEvent.interfaceClassGuid, GB_BluetoothRadioInterfaceGuid))
+        {
+            return true;
+        }
+
         return HasBluetoothRadioPnPIdentity(deviceEvent.deviceInstanceId) || HasBluetoothRadioPnPIdentity(deviceEvent.deviceInterfacePath);
     }
 
@@ -2925,20 +3236,16 @@ private:
                 return;
             }
 
-            GB_Event typedEvent(bluetoothEvent.eventName, GB_Variant(bluetoothEvent), u8"GB_SystemBluetoothWatcher");
-            typedEvent.timestampMilliseconds = bluetoothEvent.timestampMilliseconds;
-            (void)typedDispatcher.Post(typedEvent);
-
-            GB_Event publicEvent(bluetoothEvent.eventName, GB_SystemBluetooth::GetEventTypeName(bluetoothEvent.eventType), u8"GB_SystemBluetoothWatcher");
-            publicEvent.timestampMilliseconds = bluetoothEvent.timestampMilliseconds;
-            publicEvent.SetAttribute("eventType", GB_Variant(static_cast<unsigned int>(bluetoothEvent.eventType)));
-            publicEvent.SetAttribute("eventTypeName", GB_Variant(GB_SystemBluetooth::GetEventTypeName(bluetoothEvent.eventType)));
-            publicEvent.SetAttribute("sourceName", GB_Variant(bluetoothEvent.sourceName));
-            publicEvent.SetAttribute("deviceInstanceId", GB_Variant(bluetoothEvent.deviceInstanceId));
-            publicEvent.SetAttribute("deviceInterfacePath", GB_Variant(bluetoothEvent.deviceInterfacePath));
-            publicEvent.SetAttribute("interfaceClassGuid", GB_Variant(bluetoothEvent.interfaceClassGuid));
-            publicEvent.SetAttribute("nativeAction", GB_Variant(bluetoothEvent.nativeAction));
-            (void)publicDispatcher.Post(publicEvent);
+            GB_Event event(bluetoothEvent.eventName, GB_Variant(bluetoothEvent), u8"GB_SystemBluetoothWatcher");
+            event.timestampMilliseconds = bluetoothEvent.timestampMilliseconds;
+            event.SetAttribute("eventType", GB_Variant(static_cast<unsigned int>(bluetoothEvent.eventType)));
+            event.SetAttribute("eventTypeName", GB_Variant(GB_SystemBluetooth::GetEventTypeName(bluetoothEvent.eventType)));
+            event.SetAttribute("sourceName", GB_Variant(bluetoothEvent.sourceName));
+            event.SetAttribute("deviceInstanceId", GB_Variant(bluetoothEvent.deviceInstanceId));
+            event.SetAttribute("deviceInterfacePath", GB_Variant(bluetoothEvent.deviceInterfacePath));
+            event.SetAttribute("interfaceClassGuid", GB_Variant(bluetoothEvent.interfaceClassGuid));
+            event.SetAttribute("nativeAction", GB_Variant(bluetoothEvent.nativeAction));
+            (void)eventDispatcher.Post(event);
         }
         catch (...)
         {
@@ -2953,8 +3260,7 @@ private:
     bool running = false;
     std::atomic<bool> acceptingDeviceEvents;
     GB_SystemDeviceWatcher deviceWatcher;
-    GB_EventDispatcher typedDispatcher;
-    GB_EventDispatcher publicDispatcher;
+    GB_EventDispatcher eventDispatcher;
     GB_EventSubscriptionToken typedSubscriptionToken;
     GB_SystemBluetoothWatcher::BluetoothEventCallback bluetoothEventCallback;
 };
@@ -2967,13 +3273,7 @@ GB_SystemBluetoothWatcher::GB_SystemBluetoothWatcher(const GB_SystemBluetoothWat
 {
 }
 
-GB_SystemBluetoothWatcher::~GB_SystemBluetoothWatcher() noexcept
-{
-    if (impl)
-    {
-        (void)impl->Stop();
-    }
-}
+GB_SystemBluetoothWatcher::~GB_SystemBluetoothWatcher() noexcept = default;
 
 GB_SystemResult GB_SystemBluetoothWatcher::Start()
 {
