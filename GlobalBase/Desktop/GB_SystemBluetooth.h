@@ -115,6 +115,7 @@ struct GB_BluetoothDeviceId
  * - 同一远端经典蓝牙设备可能被多个本机无线电观察到，必要时应结合 radioAddress 区分；
  * - pairStatus、connectionStatus 明确区分“已配对”和“已连接”；
  * - 对 BLE 设备接口枚举结果，单纯的 Win32 PnP 接口无法可靠表达配对、记忆和实时连接状态，因此相关字段保持 Unknown/false，而不是根据“接口存在”进行猜测；
+ * - BLE address 仅在设备实例 ID 或接口路径明确包含地址时尝试解析；随机私有地址不应被当作长期稳定身份；
  * - installedServiceGuids 仅在查询选项 includeInstalledServices=true 且系统返回成功时填充；系统报告没有服务或缓存记录不存在时保持为空。
  */
 struct GB_BluetoothDeviceInfo
@@ -189,7 +190,7 @@ struct GB_SystemBluetoothWatcherOptions
 };
 
 /**
- * @brief 蓝牙状态变化事件。
+ * @brief 蓝牙相关 PnP 设备变化事件。
  */
 struct GB_BluetoothEvent
 {
@@ -203,6 +204,20 @@ struct GB_BluetoothEvent
     uint32_t nativeAction = 0;
 };
 
+/**
+ * @brief BLE GATT 特征值读取缓存策略。
+ */
+enum class GB_BluetoothGattCacheMode : uint16_t
+{
+    /** @brief 使用 Windows GATT API 默认策略：优先使用缓存，缓存不存在时访问设备。 */
+    Default = 0,
+
+    /** @brief 强制从远端设备读取，并用读取结果更新系统缓存。 */
+    ForceReadFromDevice = 1,
+
+    /** @brief 强制只从系统缓存读取。 */
+    ForceReadFromCache = 2
+};
 
 /**
  * @brief BLE GATT 特征属性位。
@@ -271,11 +286,44 @@ struct GB_BluetoothGattCharacteristicInfo
 };
 
 /**
+ * @brief BLE GATT 特征值读取选项。
+ *
+ * 说明：
+ * - cacheMode 控制读取缓存策略；
+ * - requireEncryptedConnection / requireAuthenticatedConnection 会把对应链路安全要求传递给 Windows GATT API；
+ * - ForceReadFromDevice 与 ForceReadFromCache 通过枚举互斥表达，避免同时设置两个冲突标志。
+ */
+struct GB_BluetoothGattReadOptions
+{
+    GB_BluetoothGattCacheMode cacheMode = GB_BluetoothGattCacheMode::Default;
+    bool requireEncryptedConnection = false;
+    bool requireAuthenticatedConnection = false;
+};
+
+/**
+ * @brief BLE GATT 特征值写入选项。
+ *
+ * 说明：
+ * - 普通 writeWithoutResponse 写入要求特征声明 WriteWithoutResponse；
+ * - signedWrite=true 时要求特征声明 SignedWrite，并且必须同时设置 writeWithoutResponse=true，但不要求特征另外声明普通 WriteWithoutResponse；
+ * - signedWrite 不能同时要求加密或认证链路；
+ * - requireEncryptedConnection / requireAuthenticatedConnection 只是向 Windows GATT API 传递链路安全要求，最终是否满足由系统蓝牙栈和远端设备共同决定。
+ */
+struct GB_BluetoothGattWriteOptions
+{
+    bool writeWithoutResponse = false;
+    bool requireEncryptedConnection = false;
+    bool requireAuthenticatedConnection = false;
+    bool signedWrite = false;
+};
+
+/**
  * @brief Windows 系统蓝牙能力入口。
  *
  * 说明：
  * - 所有 std::string 输入输出均约定为 UTF-8；
  * - 当前实现覆盖 Win32 经典蓝牙无线电、经典蓝牙设备、BLE 设备接口枚举和基础 BLE GATT 读写能力；
+ * - BLE GATT 桌面 API 需要 Windows 8 或更高版本；单个 ATT 属性值最大为 512 字节；
  * - BLE 广播扫描、主动配对、通知订阅和 RFCOMM Socket 仍应使用 WinRT 或专用通信模块补充；
  * - 本类不会用经典蓝牙枚举伪装 BLE 结果。
  */
@@ -326,16 +374,12 @@ public:
 
     static GB_SystemResult GetGattServices(const std::string& deviceInterfacePath, std::vector<GB_BluetoothGattServiceInfo>& services);
     static GB_SystemResult GetGattCharacteristics(const std::string& deviceInterfacePath, const GB_BluetoothGattServiceInfo& service, std::vector<GB_BluetoothGattCharacteristicInfo>& characteristics);
-    static GB_SystemResult ReadGattCharacteristic(const std::string& deviceInterfacePath, const GB_BluetoothGattCharacteristicInfo& characteristic, std::vector<uint8_t>& value, bool forceReadFromDevice = false);
-    /**
-     * @brief 写入 BLE GATT 特征值。
-     *
-     * 说明：
-     * - writeWithoutResponse=true 时要求特征声明 WriteWithoutResponse；
-     * - signedWrite=true 时要求 writeWithoutResponse=true，并且不能同时要求加密或认证链路；
-     * - requireEncryptedConnection / requireAuthenticatedConnection 只是向 Windows GATT API 传递链路安全要求，是否满足由系统蓝牙栈和远端设备共同决定。
-     */
-    static GB_SystemResult WriteGattCharacteristic(const std::string& deviceInterfacePath, const GB_BluetoothGattCharacteristicInfo& characteristic, const std::vector<uint8_t>& value, bool writeWithoutResponse = false, bool requireEncryptedConnection = false, bool requireAuthenticatedConnection = false, bool signedWrite = false);
+
+    /** @brief 按指定缓存与链路安全选项读取 BLE GATT 特征值。 */
+    static GB_SystemResult ReadGattCharacteristic(const std::string& deviceInterfacePath, const GB_BluetoothGattCharacteristicInfo& characteristic, std::vector<uint8_t>& value, const GB_BluetoothGattReadOptions& options = GB_BluetoothGattReadOptions());
+
+    /** @brief 按指定写入模式与链路安全选项写入 BLE GATT 特征值；value 最大为 512 字节。 */
+    static GB_SystemResult WriteGattCharacteristic(const std::string& deviceInterfacePath, const GB_BluetoothGattCharacteristicInfo& characteristic, const std::vector<uint8_t>& value, const GB_BluetoothGattWriteOptions& options = GB_BluetoothGattWriteOptions());
     static GB_SystemResult GetClassicDeviceByAddress(const std::string& address, GB_BluetoothDeviceInfo& device, bool& found, const GB_BluetoothClassicDeviceQueryOptions& options = GB_BluetoothClassicDeviceQueryOptions());
 
     static GB_SystemResult IsDeviceConnected(const GB_BluetoothDeviceId& deviceId, bool& connected);
@@ -348,16 +392,19 @@ public:
     static std::string GetPairStatusName(GB_BluetoothPairStatus pairStatus);
     static std::string GetConnectionStatusName(GB_BluetoothConnectionStatus connectionStatus);
     static std::string GetEventTypeName(GB_BluetoothEventType eventType);
+    static bool IsValidGattCacheModeValue(uint64_t cacheModeValue);
+    static std::string GetGattCacheModeName(GB_BluetoothGattCacheMode cacheMode);
 };
 
 /**
- * @brief 蓝牙设备变化监听器。
+ * @brief 蓝牙相关 PnP 设备变化监听器。
  *
  * 说明：
- * - 当前监听器复用 GB_SystemDeviceWatcher 的 PnP 事件，只转发带有蓝牙语义的设备实例或接口变化；
+ * - 当前监听器复用 GB_SystemDeviceWatcher 的 PnP 事件，只转发带有蓝牙语义的设备实例或接口变化；它不表示实时无线链路连接状态；
  * - 回调通过单个 GB_EventDispatcher 异步分发，避免阻塞底层系统设备通知线程，同时避免为同一批蓝牙事件额外维护两条工作线程和两份队列；
  * - GetEventDispatcher() 发布的事件 payload 为 GB_BluetoothEvent，attributes 同时保留常用字段，便于通用事件订阅者使用；
- * - 它不替代 BLE AdvertisementWatcher 或 WinRT DeviceWatcher，后续 BLE 广播扫描应作为独立能力补充。
+ * - 它不替代 BLE AdvertisementWatcher 或 WinRT DeviceWatcher，后续 BLE 广播扫描应作为独立能力补充；
+ * - 不应在监听回调执行期间销毁当前监听器；如需销毁，应先让回调返回，再从其它线程或外层控制流释放对象。
  */
 class GLOBALBASE_PORT GB_SystemBluetoothWatcher final
 {
