@@ -183,6 +183,10 @@ struct GB_BluetoothPairingOptions
 
 /**
  * @brief 蓝牙监听器选项。
+ *
+ * 说明：
+ * - maxDispatchQueueSize 限制异步事件队列容量，队列满时丢弃最旧事件；
+ * - maxDispatchQueueSize=0 会归一化为默认值 64，避免形成无容量限制或无法入队的歧义配置。
  */
 struct GB_SystemBluetoothWatcherOptions
 {
@@ -257,8 +261,8 @@ struct GB_BluetoothGattServiceInfo
  * @brief BLE GATT 特征信息。
  *
  * 说明：
- * - 本结构保存从 BluetoothGATTGetCharacteristics 返回的全部关键字段；
- * - ReadGattCharacteristic / WriteGattCharacteristic 会根据这些字段重建原生 BTH_LE_GATT_CHARACTERISTIC；
+ * - 本结构保存从 BluetoothGATTGetCharacteristics 返回的全部关键定位字段和属性；
+ * - ReadGattCharacteristic / WriteGattCharacteristic 不会把本结构直接伪装成原生对象，而会重新枚举当前设备缓存，并按服务、特征 UUID 与句柄定位系统返回的未修改原生结构；
  * - 调用方不应手工伪造 attributeHandle / characteristicValueHandle，建议始终使用 GetGattCharacteristics 的返回值。
  */
 struct GB_BluetoothGattCharacteristicInfo
@@ -324,7 +328,7 @@ struct GB_BluetoothGattWriteOptions
  * - 所有 std::string 输入输出均约定为 UTF-8；
  * - 当前实现覆盖 Win32 经典蓝牙无线电、经典蓝牙设备、BLE 设备接口枚举和基础 BLE GATT 读写能力；
  * - BLE GATT 桌面 API 需要 Windows 8 或更高版本；单个 ATT 属性值最大为 512 字节；
- * - BLE 广播扫描、主动配对、通知订阅和 RFCOMM Socket 仍应使用 WinRT 或专用通信模块补充；
+ * - BLE 广播扫描、BLE 主动配对、GATT 通知订阅和 RFCOMM Socket 仍应使用 WinRT 或专用通信模块补充；
  * - 本类不会用经典蓝牙枚举伪装 BLE 结果。
  */
 class GLOBALBASE_PORT GB_SystemBluetooth final
@@ -372,13 +376,20 @@ public:
      */
     static GB_SystemResult GetLowEnergyDevices(std::vector<GB_BluetoothDeviceInfo>& devices);
 
+    /**
+     * @brief 枚举 BLE 设备的 GATT 服务。
+     *
+     * 说明：读取类操作会优先以读写权限打开设备接口，以兼容部分桌面蓝牙栈；若失败则自动降级为只读权限。
+     */
     static GB_SystemResult GetGattServices(const std::string& deviceInterfacePath, std::vector<GB_BluetoothGattServiceInfo>& services);
+
+    /** @brief 枚举指定 GATT 服务的特征；内部会重新定位系统返回的未修改原生服务结构。 */
     static GB_SystemResult GetGattCharacteristics(const std::string& deviceInterfacePath, const GB_BluetoothGattServiceInfo& service, std::vector<GB_BluetoothGattCharacteristicInfo>& characteristics);
 
-    /** @brief 按指定缓存与链路安全选项读取 BLE GATT 特征值。 */
+    /** @brief 按指定缓存与链路安全选项读取 BLE GATT 特征值；内部会重新定位当前设备缓存中的原生服务和特征结构。 */
     static GB_SystemResult ReadGattCharacteristic(const std::string& deviceInterfacePath, const GB_BluetoothGattCharacteristicInfo& characteristic, std::vector<uint8_t>& value, const GB_BluetoothGattReadOptions& options = GB_BluetoothGattReadOptions());
 
-    /** @brief 按指定写入模式与链路安全选项写入 BLE GATT 特征值；value 最大为 512 字节。 */
+    /** @brief 按指定写入模式与链路安全选项写入 BLE GATT 特征值；需要以读写权限打开设备接口，value 最大为 512 字节。 */
     static GB_SystemResult WriteGattCharacteristic(const std::string& deviceInterfacePath, const GB_BluetoothGattCharacteristicInfo& characteristic, const std::vector<uint8_t>& value, const GB_BluetoothGattWriteOptions& options = GB_BluetoothGattWriteOptions());
     static GB_SystemResult GetClassicDeviceByAddress(const std::string& address, GB_BluetoothDeviceInfo& device, bool& found, const GB_BluetoothClassicDeviceQueryOptions& options = GB_BluetoothClassicDeviceQueryOptions());
 
@@ -402,7 +413,9 @@ public:
  * 说明：
  * - 当前监听器复用 GB_SystemDeviceWatcher 的 PnP 事件，只转发带有蓝牙语义的设备实例或接口变化；它不表示实时无线链路连接状态；
  * - 回调通过单个 GB_EventDispatcher 异步分发，避免阻塞底层系统设备通知线程，同时避免为同一批蓝牙事件额外维护两条工作线程和两份队列；
- * - GetEventDispatcher() 发布的事件 payload 为 GB_BluetoothEvent，attributes 同时保留常用字段，便于通用事件订阅者使用；
+ * - GetEventDispatcher() 发布的事件 payload 为 GB_BluetoothEvent，attributes 同时保留常用字段，便于通用事件订阅者使用；内部强类型订阅会在启动和事件投递前自检并在被清除后自动重建；
+ * - Start()/Stop() 使用显式生命周期状态串行化转换；并发启动、启动期间停止或重复等待同一次停止会返回 ResourceBusy，停止失败后可再次调用 Stop() 重试清理；
+ * - 从蓝牙事件回调内部调用 Stop() 时，事件分发线程不能等待自身退出，因此停止会在当前回调返回后完成；
  * - 它不替代 BLE AdvertisementWatcher 或 WinRT DeviceWatcher，后续 BLE 广播扫描应作为独立能力补充；
  * - 不应在监听回调执行期间销毁当前监听器；如需销毁，应先让回调返回，再从其它线程或外层控制流释放对象。
  */
@@ -418,8 +431,12 @@ public:
     GB_SystemBluetoothWatcher(const GB_SystemBluetoothWatcher&) = delete;
     GB_SystemBluetoothWatcher& operator=(const GB_SystemBluetoothWatcher&) = delete;
 
+    /** @brief 启动监听；已经运行时幂等成功，生命周期转换进行中或上次停止未清理完成时返回对应失败结果。 */
     GB_SystemResult Start();
+
+    /** @brief 停止监听；首次外部调用会等待已入队回调排空，停止失败时可再次调用本函数重试。 */
     GB_SystemResult Stop();
+
     bool IsRunning() const;
 
     void SetBluetoothEventCallback(const BluetoothEventCallback& callback);
