@@ -97,6 +97,7 @@ struct GB_BluetoothRadioInfo
  * 说明：
  * - address 用于经典蓝牙设备，接受 12 位十六进制、AA:BB:CC:DD:EE:FF 或 AA-BB-CC-DD-EE-FF 形式，允许首尾 ASCII 空白，不接受内嵌空白或混合分隔符，内部会归一化；
  * - nativeDeviceId 预留给 WinRT DeviceInformation ID，不要求等价于 MAC 地址；
+ * - radioAddress 可选，用于多无线电环境下限定查询或配对所使用的本机无线电；为空时由系统或模块自动选择；
  * - 当前 PairDevice / RemoveDevice / IsDeviceConnected 只支持具有 address 的经典蓝牙设备。
  */
 struct GB_BluetoothDeviceId
@@ -104,6 +105,7 @@ struct GB_BluetoothDeviceId
     GB_BluetoothDeviceKind deviceKind = GB_BluetoothDeviceKind::Unknown;
     std::string address = "";
     std::string nativeDeviceId = "";
+    std::string radioAddress = "";
 };
 
 /**
@@ -168,17 +170,39 @@ struct GB_BluetoothClassicDeviceQueryOptions
 };
 
 /**
+ * @brief 经典蓝牙 SSP 配对认证要求。
+ *
+ * 说明：
+ * - 该枚举映射 Windows AUTHENTICATION_REQUIREMENTS；
+ * - 仅在 pinCodeUtf8 为空、使用 BluetoothAuthenticateDeviceEx 时生效；
+ * - Required 系列会要求中间人攻击保护，远端设备能力不足时配对会失败。
+ */
+enum class GB_BluetoothAuthenticationRequirement : uint16_t
+{
+    MitmProtectionNotRequired = 0,
+    MitmProtectionRequired = 1,
+    MitmProtectionNotRequiredBonding = 2,
+    MitmProtectionRequiredBonding = 3,
+    MitmProtectionNotRequiredGeneralBonding = 4,
+    MitmProtectionRequiredGeneralBonding = 5
+};
+
+/**
  * @brief 经典蓝牙配对选项。
  *
  * 说明：
  * - pinCodeUtf8 非空时使用 BluetoothAuthenticateDevice 的透明 PIN 配对模式；
  * - pinCodeUtf8 为空时使用 BluetoothAuthenticateDeviceEx 发起系统配对流程，可能弹出系统 UI；
+ * - authenticationRequirement 只用于 BluetoothAuthenticateDeviceEx；
+ * - parentWindowHandle 可传入 HWND 的 void* 表达，使系统配对向导归属于指定窗口；
  * - 当前 C++14 实现不承诺超时控制或自定义 SSP 交互。
  */
 struct GB_BluetoothPairingOptions
 {
     std::string pinCodeUtf8 = "";
     bool allowSystemPairingUi = true;
+    GB_BluetoothAuthenticationRequirement authenticationRequirement = GB_BluetoothAuthenticationRequirement::MitmProtectionNotRequiredBonding;
+    void* parentWindowHandle = nullptr;
 };
 
 /**
@@ -240,6 +264,18 @@ enum class GB_BluetoothGattCharacteristicProperty : uint32_t
 };
 
 /**
+ * @brief BLE GATT 会话访问模式。
+ */
+enum class GB_BluetoothGattSessionAccessMode : uint16_t
+{
+    /** @brief 只允许服务枚举、特征枚举和读取操作。 */
+    ReadOnly = 0,
+
+    /** @brief 允许读取和写入操作；设备接口必须能够以读写权限打开。 */
+    ReadWrite = 1
+};
+
+/**
  * @brief BLE GATT 服务信息。
  *
  * 说明：
@@ -262,8 +298,8 @@ struct GB_BluetoothGattServiceInfo
  *
  * 说明：
  * - 本结构保存从 BluetoothGATTGetCharacteristics 返回的全部关键定位字段和属性；
- * - ReadGattCharacteristic / WriteGattCharacteristic 不会把本结构直接伪装成原生对象，而会重新枚举当前设备缓存，并按服务、特征 UUID 与句柄定位系统返回的未修改原生结构；
- * - 调用方不应手工伪造 attributeHandle / characteristicValueHandle，建议始终使用 GetGattCharacteristics 的返回值。
+ * - 静态 GATT 接口会创建临时会话；GB_BluetoothGattSession 会缓存 Windows GATT API 原样返回的原生服务和特征结构，并按 UUID 与句柄定位；
+ * - 调用方不应手工伪造 attributeHandle / characteristicValueHandle，建议始终使用同一会话或静态 GetGattCharacteristics 的返回值。
  */
 struct GB_BluetoothGattCharacteristicInfo
 {
@@ -322,11 +358,55 @@ struct GB_BluetoothGattWriteOptions
 };
 
 /**
+ * @brief 可复用的 BLE GATT 设备会话。
+ *
+ * 说明：
+ * - 会话在 Open() 后持续持有 BLE 设备接口句柄，并缓存由 Windows GATT API 原样返回的服务和特征结构；
+ * - 连续读写同一设备时，可避免每次操作都重新 CreateFileW、枚举服务和枚举特征；
+ * - RefreshCache() 用于服务变更、设备重连或系统缓存变化后重新获取服务层次；
+ * - 所有公开方法会串行化同一会话上的访问，同一对象可由多个线程调用，但耗时 GATT 操作仍会互斥执行；
+ * - 移动后的源对象为空会话，可再次调用 Open()；
+ * - 非 Windows 平台下实际操作返回 UnsupportedPlatform。
+ */
+class GLOBALBASE_PORT GB_BluetoothGattSession final
+{
+public:
+    GB_BluetoothGattSession();
+    ~GB_BluetoothGattSession() noexcept;
+
+    GB_BluetoothGattSession(const GB_BluetoothGattSession&) = delete;
+    GB_BluetoothGattSession& operator=(const GB_BluetoothGattSession&) = delete;
+
+    GB_BluetoothGattSession(GB_BluetoothGattSession&& other) noexcept;
+    GB_BluetoothGattSession& operator=(GB_BluetoothGattSession&& other) noexcept;
+
+    GB_SystemResult Open(const std::string& deviceInterfacePath, GB_BluetoothGattSessionAccessMode accessMode = GB_BluetoothGattSessionAccessMode::ReadWrite);
+    GB_SystemResult Close();
+    bool IsOpen() const;
+    bool IsWriteEnabled() const;
+    std::string GetDeviceInterfacePath() const;
+
+    GB_SystemResult RefreshCache();
+    GB_SystemResult GetServices(std::vector<GB_BluetoothGattServiceInfo>& services);
+    GB_SystemResult GetCharacteristics(const GB_BluetoothGattServiceInfo& service, std::vector<GB_BluetoothGattCharacteristicInfo>& characteristics);
+    GB_SystemResult ReadCharacteristic(const GB_BluetoothGattCharacteristicInfo& characteristic, std::vector<uint8_t>& value, const GB_BluetoothGattReadOptions& options = GB_BluetoothGattReadOptions());
+    GB_SystemResult WriteCharacteristic(const GB_BluetoothGattCharacteristicInfo& characteristic, const std::vector<uint8_t>& value, const GB_BluetoothGattWriteOptions& options = GB_BluetoothGattWriteOptions());
+
+    static bool IsValidAccessModeValue(uint64_t accessModeValue);
+    static std::string GetAccessModeName(GB_BluetoothGattSessionAccessMode accessMode);
+
+private:
+    class Impl;
+    std::unique_ptr<Impl> impl;
+};
+
+/**
  * @brief Windows 系统蓝牙能力入口。
  *
  * 说明：
  * - 所有 std::string 输入输出均约定为 UTF-8；
  * - 当前实现覆盖 Win32 经典蓝牙无线电、经典蓝牙设备、BLE 设备接口枚举和基础 BLE GATT 读写能力；
+ * - 静态 GATT 接口适合一次性调用；连续通信应复用 GB_BluetoothGattSession，以避免重复打开设备和重建 GATT 层次缓存；
  * - BLE GATT 桌面 API 需要 Windows 8 或更高版本；单个 ATT 属性值最大为 512 字节；
  * - BLE 广播扫描、BLE 主动配对、GATT 通知订阅和 RFCOMM Socket 仍应使用 WinRT 或专用通信模块补充；
  * - 本类不会用经典蓝牙枚举伪装 BLE 结果。
@@ -383,13 +463,13 @@ public:
      */
     static GB_SystemResult GetGattServices(const std::string& deviceInterfacePath, std::vector<GB_BluetoothGattServiceInfo>& services);
 
-    /** @brief 枚举指定 GATT 服务的特征；内部会重新定位系统返回的未修改原生服务结构。 */
+    /** @brief 枚举指定 GATT 服务的特征；一次性调用使用临时会话，连续操作应复用 GB_BluetoothGattSession。 */
     static GB_SystemResult GetGattCharacteristics(const std::string& deviceInterfacePath, const GB_BluetoothGattServiceInfo& service, std::vector<GB_BluetoothGattCharacteristicInfo>& characteristics);
 
-    /** @brief 按指定缓存与链路安全选项读取 BLE GATT 特征值；内部会重新定位当前设备缓存中的原生服务和特征结构。 */
+    /** @brief 按指定缓存与链路安全选项读取 BLE GATT 特征值；一次性调用使用临时会话，连续读取应复用 GB_BluetoothGattSession。 */
     static GB_SystemResult ReadGattCharacteristic(const std::string& deviceInterfacePath, const GB_BluetoothGattCharacteristicInfo& characteristic, std::vector<uint8_t>& value, const GB_BluetoothGattReadOptions& options = GB_BluetoothGattReadOptions());
 
-    /** @brief 按指定写入模式与链路安全选项写入 BLE GATT 特征值；需要以读写权限打开设备接口，value 最大为 512 字节。 */
+    /** @brief 按指定写入模式与链路安全选项写入 BLE GATT 特征值；一次性调用使用临时读写会话，value 最大为 512 字节。 */
     static GB_SystemResult WriteGattCharacteristic(const std::string& deviceInterfacePath, const GB_BluetoothGattCharacteristicInfo& characteristic, const std::vector<uint8_t>& value, const GB_BluetoothGattWriteOptions& options = GB_BluetoothGattWriteOptions());
     static GB_SystemResult GetClassicDeviceByAddress(const std::string& address, GB_BluetoothDeviceInfo& device, bool& found, const GB_BluetoothClassicDeviceQueryOptions& options = GB_BluetoothClassicDeviceQueryOptions());
 
@@ -403,6 +483,8 @@ public:
     static std::string GetPairStatusName(GB_BluetoothPairStatus pairStatus);
     static std::string GetConnectionStatusName(GB_BluetoothConnectionStatus connectionStatus);
     static std::string GetEventTypeName(GB_BluetoothEventType eventType);
+    static bool IsValidAuthenticationRequirementValue(uint64_t authenticationRequirementValue);
+    static std::string GetAuthenticationRequirementName(GB_BluetoothAuthenticationRequirement authenticationRequirement);
     static bool IsValidGattCacheModeValue(uint64_t cacheModeValue);
     static std::string GetGattCacheModeName(GB_BluetoothGattCacheMode cacheMode);
 };
