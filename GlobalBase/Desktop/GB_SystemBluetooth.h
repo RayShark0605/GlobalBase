@@ -116,7 +116,9 @@ struct GB_BluetoothDeviceId
  * - deviceInstanceId 与 deviceInterfacePath 分别表达 Windows PnP 设备实例 ID 和可供 CreateFileW 打开的设备接口路径，不能混为同一概念；
  * - 同一远端经典蓝牙设备可能被多个本机无线电观察到，必要时应结合 radioAddress 区分；
  * - pairStatus、connectionStatus 明确区分“已配对”和“已连接”；
- * - 对 BLE 设备接口枚举结果，单纯的 Win32 PnP 接口无法可靠表达配对、记忆和实时连接状态，因此相关字段保持 Unknown/false，而不是根据“接口存在”进行猜测；
+ * - GUID_BLUETOOTHLE_DEVICE_INTERFACE 仅枚举已由 Windows 配对并暴露为设备接口的 BLE 设备，因此 BLE 枚举结果会标记为 Paired/Remembered；
+ * - 该接口不提供配对所用的认证方式或链路安全级别，因此 BLE isAuthenticated 保持 false，不把“已配对”误写为“已完成 MITM 认证”；
+ * - 单纯的 Win32 PnP 接口仍无法可靠表达实时无线链路连接状态，因此 BLE connectionStatus 保持 Unknown，而不是根据“接口存在”进行猜测；
  * - BLE address 仅在设备实例 ID 或接口路径明确包含地址时尝试解析；随机私有地址不应被当作长期稳定身份；
  * - installedServiceGuids 仅在查询选项 includeInstalledServices=true 且系统返回成功时填充；系统报告没有服务或缓存记录不存在时保持为空。
  */
@@ -191,7 +193,7 @@ enum class GB_BluetoothAuthenticationRequirement : uint16_t
  * @brief 经典蓝牙配对选项。
  *
  * 说明：
- * - pinCodeUtf8 非空时使用 BluetoothAuthenticateDevice 的透明 PIN 配对模式；
+ * - pinCodeUtf8 非空时使用 BluetoothAuthenticateDevice 的透明 PIN 配对模式，转换后的 PIN 长度不能超过 16 个 UTF-16 字符；
  * - pinCodeUtf8 为空时使用 BluetoothAuthenticateDeviceEx 发起系统配对流程，可能弹出系统 UI；
  * - authenticationRequirement 只用于 BluetoothAuthenticateDeviceEx；
  * - parentWindowHandle 可传入 HWND 的 void* 表达，使系统配对向导归属于指定窗口；
@@ -271,7 +273,7 @@ enum class GB_BluetoothGattSessionAccessMode : uint16_t
     /** @brief 只允许服务枚举、特征枚举和读取操作。 */
     ReadOnly = 0,
 
-    /** @brief 允许读取和写入操作；设备接口必须能够以读写权限打开。 */
+    /** @brief 允许读取和写入操作；目标 GATT 服务接口必须能够以读写权限打开。 */
     ReadWrite = 1
 };
 
@@ -279,7 +281,9 @@ enum class GB_BluetoothGattSessionAccessMode : uint16_t
  * @brief BLE GATT 服务信息。
  *
  * 说明：
- * - deviceInterfacePath 是 GUID_BLUETOOTHLE_DEVICE_INTERFACE 枚举得到的 BLE 设备接口路径，可直接用于底层 CreateFileW；
+ * - deviceInterfacePath 是 GUID_BLUETOOTHLE_DEVICE_INTERFACE 枚举得到的 BLE 设备接口路径，用于标识所属远端设备；
+ * - serviceInterfacePath 是 GUID_BLUETOOTH_GATT_SERVICE_DEVICE_INTERFACE 枚举得到的服务接口路径；特征枚举和特征值读写必须打开该路径，而不能继续复用设备接口句柄；
+ * - serviceDeviceInstanceId 是服务接口所属的 Windows PnP 设备实例 ID，用于诊断和设备关联；
  * - uuid 为 "0x180D" 这类 16 位短 UUID 或 "{XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX}" 形式 128 位 UUID；
  * - attributeHandle 是 Windows GATT API 返回的服务属性句柄，用于继续枚举特征。
  */
@@ -287,6 +291,8 @@ struct GB_BluetoothGattServiceInfo
 {
     std::string deviceId = "";
     std::string deviceInterfacePath = "";
+    std::string serviceDeviceInstanceId = "";
+    std::string serviceInterfacePath = "";
     std::string uuid = "";
     uint16_t shortUuid = 0;
     bool isShortUuid = false;
@@ -305,6 +311,8 @@ struct GB_BluetoothGattCharacteristicInfo
 {
     std::string deviceId = "";
     std::string deviceInterfacePath = "";
+    std::string serviceDeviceInstanceId = "";
+    std::string serviceInterfacePath = "";
     std::string serviceUuid = "";
     uint16_t serviceShortUuid = 0;
     bool isServiceShortUuid = false;
@@ -361,8 +369,9 @@ struct GB_BluetoothGattWriteOptions
  * @brief 可复用的 BLE GATT 设备会话。
  *
  * 说明：
- * - 会话在 Open() 后持续持有 BLE 设备接口句柄，并缓存由 Windows GATT API 原样返回的服务和特征结构；
- * - 连续读写同一设备时，可避免每次操作都重新 CreateFileW、枚举服务和枚举特征；
+ * - 会话在 Open() 后持有 BLE 设备接口句柄，并在加载服务缓存时持续持有该设备对应的 GATT 服务接口句柄；
+ * - 服务枚举使用 BLE 设备接口句柄；特征枚举和特征值读写使用对应的 GATT 服务接口句柄，严格遵循 Windows GATT 句柄层级；
+ * - 连续读写同一设备时，可避免每次操作都重新枚举设备/服务接口、重复 CreateFileW 和重建 GATT 层次缓存；
  * - RefreshCache() 用于服务变更、设备重连或系统缓存变化后重新获取服务层次；
  * - 所有公开方法会串行化同一会话上的访问，同一对象可由多个线程调用，但耗时 GATT 操作仍会互斥执行；
  * - 移动后的源对象为空会话，可再次调用 Open()；
@@ -383,7 +392,10 @@ public:
     GB_SystemResult Open(const std::string& deviceInterfacePath, GB_BluetoothGattSessionAccessMode accessMode = GB_BluetoothGattSessionAccessMode::ReadWrite);
     GB_SystemResult Close();
     bool IsOpen() const;
+
+    /** @brief 判断当前会话是否按 ReadWrite 模式打开；实际写入仍要求目标服务接口具备写访问权限且特征声明相应写属性。 */
     bool IsWriteEnabled() const;
+
     std::string GetDeviceInterfacePath() const;
 
     GB_SystemResult RefreshCache();
@@ -452,14 +464,17 @@ public:
      * 说明：
      * - 本接口不是主动 BLE 广播扫描，不保证返回附近所有正在广播的 BLE 设备；
      * - 返回项来自 GUID_BLUETOOTHLE_DEVICE_INTERFACE 对应的当前 present 设备接口；
-     * - deviceInterfacePath 可继续用于 GetGattServices / GetGattCharacteristics / GATT 读写。
+     * - deviceInterfacePath 用于打开 GATT 会话并枚举服务；后续特征枚举和读写会自动使用服务结果中的 serviceInterfacePath。
      */
     static GB_SystemResult GetLowEnergyDevices(std::vector<GB_BluetoothDeviceInfo>& devices);
 
     /**
      * @brief 枚举 BLE 设备的 GATT 服务。
      *
-     * 说明：读取类操作会优先以读写权限打开设备接口，以兼容部分桌面蓝牙栈；若失败则自动降级为只读权限。
+     * 说明：
+     * - deviceInterfacePath 必须来自 GetLowEnergyDevices()；
+     * - 内部先通过 BLE 设备接口刷新主服务缓存，再枚举并关联 GUID_BLUETOOTH_GATT_SERVICE_DEVICE_INTERFACE；
+     * - 返回的每个服务都会包含可用于后续特征枚举和读写的 serviceInterfacePath。
      */
     static GB_SystemResult GetGattServices(const std::string& deviceInterfacePath, std::vector<GB_BluetoothGattServiceInfo>& services);
 
@@ -497,7 +512,7 @@ public:
  * - 回调通过单个 GB_EventDispatcher 异步分发，避免阻塞底层系统设备通知线程，同时避免为同一批蓝牙事件额外维护两条工作线程和两份队列；
  * - GetEventDispatcher() 发布的事件 payload 为 GB_BluetoothEvent，attributes 同时保留常用字段，便于通用事件订阅者使用；内部强类型订阅会在启动和事件投递前自检并在被清除后自动重建；
  * - Start()/Stop() 使用显式生命周期状态串行化转换；并发启动、启动期间停止或重复等待同一次停止会返回 ResourceBusy，停止失败后可再次调用 Stop() 重试清理；
- * - 从蓝牙事件回调内部调用 Stop() 时，事件分发线程不能等待自身退出，因此停止会在当前回调返回后完成；
+ * - 从 SetBluetoothEventCallback() 设置的强类型回调内部调用 Stop() 时，Stop() 会返回 InvalidState；通过 GetEventDispatcher() 添加的通用订阅回调同样不得调用 Stop()，因为底层事件分发器不能安全等待自身退出；
  * - 它不替代 BLE AdvertisementWatcher 或 WinRT DeviceWatcher，后续 BLE 广播扫描应作为独立能力补充；
  * - 不应在监听回调执行期间销毁当前监听器；如需销毁，应先让回调返回，再从其它线程或外层控制流释放对象。
  */
