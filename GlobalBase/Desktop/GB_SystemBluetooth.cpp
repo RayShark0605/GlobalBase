@@ -681,26 +681,24 @@ namespace
         HANDLE handle = INVALID_HANDLE_VALUE;
     };
 
-    class SensitiveWideStringScope
+    template<size_t BufferSize>
+    class SensitiveWideBufferScope final
     {
     public:
-        explicit SensitiveWideStringScope(std::wstring& text) noexcept : text(text)
+        explicit SensitiveWideBufferScope(std::array<wchar_t, BufferSize>& buffer) noexcept : buffer(buffer)
         {
         }
 
-        ~SensitiveWideStringScope() noexcept
+        ~SensitiveWideBufferScope() noexcept
         {
-            if (!text.empty())
-            {
-                (void)::SecureZeroMemory(&text[0], text.size() * sizeof(wchar_t));
-            }
+            (void)::SecureZeroMemory(buffer.data(), buffer.size() * sizeof(wchar_t));
         }
 
-        SensitiveWideStringScope(const SensitiveWideStringScope&) = delete;
-        SensitiveWideStringScope& operator=(const SensitiveWideStringScope&) = delete;
+        SensitiveWideBufferScope(const SensitiveWideBufferScope&) = delete;
+        SensitiveWideBufferScope& operator=(const SensitiveWideBufferScope&) = delete;
 
     private:
-        std::wstring& text;
+        std::array<wchar_t, BufferSize>& buffer;
     };
 
     static bool IsHResultFromWin32Error(const HRESULT hresult, const DWORD win32Error)
@@ -1047,7 +1045,7 @@ namespace
         ReadWrite
     };
 
-    static GB_SystemResult OpenBluetoothLeInterfaceHandle(const std::string& interfacePath, const BluetoothLeInterfaceHandleAccess accessMode, GenericHandleScope& handleScope, const std::string& operationName, bool* openedWithWriteAccess = nullptr)
+    static GB_SystemResult OpenBluetoothLeInterfaceHandle(const std::string& interfacePath, const BluetoothLeInterfaceHandleAccess accessMode, const bool allowReadOnlyFallback, GenericHandleScope& handleScope, const std::string& operationName, bool* openedWithWriteAccess = nullptr)
     {
         handleScope.Reset(INVALID_HANDLE_VALUE);
         if (openedWithWriteAccess != nullptr)
@@ -1073,30 +1071,35 @@ namespace
             return GB_SystemResult::Failed(GB_SystemErrorCode::EncodingConversionFailed, operationName, u8"BLE 接口路径 UTF-8 转 UTF-16 失败。");
         }
 
-        const DWORD readOnlyAccess = GENERIC_READ;
-        const DWORD readWriteAccess = GENERIC_READ | GENERIC_WRITE;
-        const bool preferWriteAccess = accessMode == BluetoothLeInterfaceHandleAccess::ReadWrite;
-        const DWORD firstDesiredAccess = preferWriteAccess ? readWriteAccess : readOnlyAccess;
-        const DWORD secondDesiredAccess = preferWriteAccess ? readOnlyAccess : readWriteAccess;
+        const DWORD desiredAccess = accessMode == BluetoothLeInterfaceHandleAccess::ReadWrite ? GENERIC_READ | GENERIC_WRITE : GENERIC_READ;
+        HANDLE deviceHandle = ::CreateFileW(interfacePathWide.c_str(), desiredAccess, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        const DWORD primaryOpenError = deviceHandle == INVALID_HANDLE_VALUE ? ::GetLastError() : ERROR_SUCCESS;
+        bool hasWriteAccess = deviceHandle != INVALID_HANDLE_VALUE && accessMode == BluetoothLeInterfaceHandleAccess::ReadWrite;
+        bool attemptedSecondaryOpen = false;
 
-        HANDLE deviceHandle = ::CreateFileW(interfacePathWide.c_str(), firstDesiredAccess, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
-        const DWORD firstOpenError = deviceHandle == INVALID_HANDLE_VALUE ? ::GetLastError() : ERROR_SUCCESS;
-        bool hasWriteAccess = deviceHandle != INVALID_HANDLE_VALUE && firstDesiredAccess == readWriteAccess;
-        if (deviceHandle == INVALID_HANDLE_VALUE)
+        if (deviceHandle == INVALID_HANDLE_VALUE && accessMode == BluetoothLeInterfaceHandleAccess::ReadWrite && allowReadOnlyFallback)
         {
-            deviceHandle = ::CreateFileW(interfacePathWide.c_str(), secondDesiredAccess, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
-            hasWriteAccess = deviceHandle != INVALID_HANDLE_VALUE && secondDesiredAccess == readWriteAccess;
+            attemptedSecondaryOpen = true;
+            deviceHandle = ::CreateFileW(interfacePathWide.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+            hasWriteAccess = false;
+        }
+        else if (deviceHandle == INVALID_HANDLE_VALUE && accessMode == BluetoothLeInterfaceHandleAccess::ReadOnly)
+        {
+            attemptedSecondaryOpen = true;
+            deviceHandle = ::CreateFileW(interfacePathWide.c_str(), GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+            hasWriteAccess = deviceHandle != INVALID_HANDLE_VALUE;
         }
         if (deviceHandle == INVALID_HANDLE_VALUE)
         {
-            const DWORD secondOpenError = ::GetLastError();
-            GB_SystemResult result = MakeBluetoothBooleanFailureResult(secondOpenError, operationName, u8"CreateFileW 无法以只读或读写权限打开 BLE 设备接口或 GATT 服务接口。");
-            if (firstOpenError != ERROR_SUCCESS && firstOpenError != secondOpenError)
+            const DWORD finalOpenError = ::GetLastError();
+            const char* const failureMessage = accessMode == BluetoothLeInterfaceHandleAccess::ReadWrite ? (attemptedSecondaryOpen ? u8"CreateFileW 无法以读写或只读权限打开 BLE 设备接口或 GATT 服务接口。" : u8"CreateFileW 无法以读写权限打开 BLE 设备接口或 GATT 服务接口。") : (attemptedSecondaryOpen ? u8"CreateFileW 无法以只读或读写权限打开 BLE 设备接口或 GATT 服务接口。" : u8"CreateFileW 无法以只读权限打开 BLE 设备接口或 GATT 服务接口。");
+            GB_SystemResult result = MakeBluetoothBooleanFailureResult(finalOpenError, operationName, failureMessage);
+            if (primaryOpenError != ERROR_SUCCESS && primaryOpenError != finalOpenError)
             {
                 try
                 {
-                    result.message += preferWriteAccess ? u8" 首次读写打开的 Win32 错误码=" : u8" 首次只读打开的 Win32 错误码=";
-                    result.message += std::to_string(static_cast<uint32_t>(firstOpenError));
+                    result.message += u8" 首次打开的 Win32 错误码=";
+                    result.message += std::to_string(static_cast<uint32_t>(primaryOpenError));
                     result.message += ".";
                 }
                 catch (...)
@@ -1312,7 +1315,7 @@ namespace
         HRESULT hresult = ::BluetoothGATTGetServices(deviceHandle, 0, nullptr, &serviceCount, BLUETOOTH_GATT_FLAG_NONE);
         if (IsHResultFromWin32Error(hresult, ERROR_INVALID_FUNCTION))
         {
-            return GB_SystemResult::Succeeded(operationName);
+            return GB_SystemResult::Failed(GB_SystemErrorCode::InvalidState, operationName, u8"Windows GATT 缓存中没有可用主服务，无法完成服务枚举；请确认设备已配对、处于可访问状态，并在设备重连后重试。");
         }
         if (hresult != S_OK && !IsHResultFromWin32Error(hresult, ERROR_MORE_DATA) && !IsHResultFromWin32Error(hresult, ERROR_INVALID_USER_BUFFER))
         {
@@ -1361,7 +1364,7 @@ namespace
                 if (IsHResultFromWin32Error(countHResult, ERROR_INVALID_FUNCTION))
                 {
                     services.clear();
-                    return GB_SystemResult::Succeeded(operationName);
+                    return GB_SystemResult::Failed(GB_SystemErrorCode::InvalidState, operationName, u8"重新查询 BLE GATT 主服务时发现 Windows 缓存中没有可用服务。");
                 }
                 const bool countQuerySucceeded = countHResult == S_OK || IsHResultFromWin32Error(countHResult, ERROR_MORE_DATA) || IsHResultFromWin32Error(countHResult, ERROR_INVALID_USER_BUFFER);
                 USHORT nextServiceCount = serviceCount;
@@ -2827,7 +2830,7 @@ public:
         std::lock_guard<std::mutex> lock(stateMutex);
 
         GenericHandleScope newDeviceHandle;
-        GB_SystemResult openResult = OpenBluetoothLeInterfaceHandle(inputDeviceInterfacePath, BluetoothLeInterfaceHandleAccess::ReadOnly, newDeviceHandle, u8"GB_BluetoothGattSession::Open");
+        GB_SystemResult openResult = OpenBluetoothLeInterfaceHandle(inputDeviceInterfacePath, BluetoothLeInterfaceHandleAccess::ReadOnly, false, newDeviceHandle, u8"GB_BluetoothGattSession::Open");
         if (openResult.IsFailed())
         {
             return openResult;
@@ -2965,6 +2968,12 @@ public:
         (void)options;
         return GB_SystemResult::Failed(GB_SystemErrorCode::UnsupportedPlatform, u8"GB_BluetoothGattSession::ReadCharacteristic", u8"当前平台不支持 Windows BLE GATT 会话。");
 #else
+        const GB_SystemResult validateResult = ValidateGattReadOptions(options, u8"GB_BluetoothGattSession::ReadCharacteristic");
+        if (validateResult.IsFailed())
+        {
+            return validateResult;
+        }
+
         std::lock_guard<std::mutex> lock(stateMutex);
         size_t serviceIndex = 0;
         size_t characteristicIndex = 0;
@@ -2992,6 +3001,16 @@ public:
         (void)options;
         return GB_SystemResult::Failed(GB_SystemErrorCode::UnsupportedPlatform, u8"GB_BluetoothGattSession::WriteCharacteristic", u8"当前平台不支持 Windows BLE GATT 会话。");
 #else
+        const GB_SystemResult validateResult = ValidateGattWriteOptions(options, u8"GB_BluetoothGattSession::WriteCharacteristic");
+        if (validateResult.IsFailed())
+        {
+            return validateResult;
+        }
+        if (value.size() > GetMaxGattCharacteristicValueDataSize())
+        {
+            return GB_SystemResult::Failed(GB_SystemErrorCode::InvalidArgument, u8"GB_BluetoothGattSession::WriteCharacteristic", u8"BLE GATT 特征写入数据超过 ATT 属性值上限。");
+        }
+
         std::lock_guard<std::mutex> lock(stateMutex);
         if (!isOpen)
         {
@@ -3015,9 +3034,10 @@ public:
         {
             return GB_SystemResult::Failed(GB_SystemErrorCode::InvalidState, u8"GB_BluetoothGattSession::WriteCharacteristic", u8"BLE GATT 服务接口句柄无效，请调用 RefreshCache() 重新建立服务缓存。");
         }
-        if (!cachedService.serviceHandleHasWriteAccess)
+        const GB_SystemResult writeAccessResult = EnsureServiceWriteAccessLocked(cachedService, u8"GB_BluetoothGattSession::WriteCharacteristic");
+        if (writeAccessResult.IsFailed())
         {
-            return GB_SystemResult::Failed(GB_SystemErrorCode::PermissionDenied, u8"GB_BluetoothGattSession::WriteCharacteristic", u8"目标 GATT 服务接口只能以只读权限打开，无法写入特征值。");
+            return writeAccessResult;
         }
 
         return WriteGattCharacteristicValue(cachedService.serviceHandle.Get(), cachedService.nativeCharacteristics[characteristicIndex], value, options, u8"GB_BluetoothGattSession::WriteCharacteristic");
@@ -3131,7 +3151,7 @@ private:
             GenericHandleScope serviceHandle;
             bool serviceHandleHasWriteAccess = false;
             const BluetoothLeInterfaceHandleAccess preferredAccess = accessMode == GB_BluetoothGattSessionAccessMode::ReadWrite ? BluetoothLeInterfaceHandleAccess::ReadWrite : BluetoothLeInterfaceHandleAccess::ReadOnly;
-            GB_SystemResult handleResult = OpenBluetoothLeInterfaceHandle(serviceInterfaces[interfaceIndex].interfacePath, preferredAccess, serviceHandle, operationName, &serviceHandleHasWriteAccess);
+            GB_SystemResult handleResult = OpenBluetoothLeInterfaceHandle(serviceInterfaces[interfaceIndex].interfacePath, preferredAccess, accessMode == GB_BluetoothGattSessionAccessMode::ReadWrite, serviceHandle, operationName, &serviceHandleHasWriteAccess);
             if (handleResult.IsFailed())
             {
                 if (firstInterfaceFailure.IsSucceeded())
@@ -3141,15 +3161,6 @@ private:
                 }
                 continue;
             }
-            if (accessMode == GB_BluetoothGattSessionAccessMode::ReadWrite && !serviceHandleHasWriteAccess)
-            {
-                if (firstInterfaceFailure.IsSucceeded())
-                {
-                    firstInterfaceFailure = GB_SystemResult::Failed(GB_SystemErrorCode::PermissionDenied, operationName, u8"GATT 服务接口只能以只读权限打开，不能加入 ReadWrite 会话缓存。");
-                }
-                continue;
-            }
-
             for (size_t serviceIndex = 0; serviceIndex < nativeDeviceServices.size(); serviceIndex++)
             {
                 if (ContainsCachedService(newCachedServices, nativeDeviceServices[serviceIndex]))
@@ -3274,6 +3285,45 @@ private:
         }
 
         return GB_SystemResult::Failed(GB_SystemErrorCode::NotFound, operationName, u8"未在当前 GATT 会话缓存中找到指定服务；设备服务层次或服务接口路径可能已经变化，请调用 RefreshCache() 后重新枚举。");
+    }
+
+    GB_SystemResult EnsureServiceWriteAccessLocked(CachedService& cachedService, const std::string& operationName)
+    {
+        if (cachedService.serviceHandleHasWriteAccess && cachedService.serviceHandle.IsValid())
+        {
+            return GB_SystemResult::Succeeded(operationName);
+        }
+        if (cachedService.serviceInfo.serviceInterfacePath.empty())
+        {
+            return GB_SystemResult::Failed(GB_SystemErrorCode::InvalidState, operationName, u8"目标 GATT 服务缺少设备接口路径，无法重新申请写权限。");
+        }
+
+        GenericHandleScope writeHandle;
+        bool openedWithWriteAccess = false;
+        GB_SystemResult openResult = OpenBluetoothLeInterfaceHandle(cachedService.serviceInfo.serviceInterfacePath, BluetoothLeInterfaceHandleAccess::ReadWrite, false, writeHandle, operationName, &openedWithWriteAccess);
+        if (openResult.IsFailed())
+        {
+            return openResult.WithMessage(u8"目标 GATT 服务接口无法以读写权限打开，无法写入特征值。");
+        }
+        if (!openedWithWriteAccess || !writeHandle.IsValid())
+        {
+            return GB_SystemResult::Failed(GB_SystemErrorCode::PermissionDenied, operationName, u8"目标 GATT 服务接口未获得有效写访问权限。");
+        }
+
+        bool compatible = false;
+        GB_SystemResult probeResult = ProbeGattServiceHierarchy(writeHandle.Get(), cachedService.nativeService, compatible, operationName);
+        if (probeResult.IsFailed())
+        {
+            return probeResult.WithMessage(u8"重新以读写权限打开 GATT 服务接口后，验证服务层级关系失败。");
+        }
+        if (!compatible)
+        {
+            return GB_SystemResult::Failed(GB_SystemErrorCode::InvalidState, operationName, u8"重新以读写权限打开的 GATT 服务接口与当前缓存服务不匹配，请调用 RefreshCache() 后重新枚举。");
+        }
+
+        cachedService.serviceHandle = std::move(writeHandle);
+        cachedService.serviceHandleHasWriteAccess = true;
+        return GB_SystemResult::Succeeded(operationName);
     }
 
     GB_SystemResult EnsureCharacteristicsLoadedLocked(CachedService& cachedService, const std::string& operationName)
@@ -4046,30 +4096,41 @@ GB_SystemResult GB_SystemBluetooth::PairDevice(const GB_BluetoothDeviceId& devic
         return GB_SystemResult::Failed(GB_SystemErrorCode::InvalidArgument, u8"GB_SystemBluetooth::PairDevice", u8"pinCodeUtf8 必须是合法 UTF-8 且不能包含空字符。");
     }
 
-    std::wstring pinCodeWide;
-    SensitiveWideStringScope pinCodeScope(pinCodeWide);
+    std::array<wchar_t, BLUETOOTH_MAX_PASSKEY_SIZE + 1> pinCodeWide = {};
+    SensitiveWideBufferScope<BLUETOOTH_MAX_PASSKEY_SIZE + 1> pinCodeScope(pinCodeWide);
+    ULONG pinCodeLength = 0;
     if (!options.pinCodeUtf8.empty())
     {
-        try
+        if (options.pinCodeUtf8.size() > static_cast<size_t>((std::numeric_limits<int>::max)()))
         {
-            pinCodeWide = GB_Utf8ToWString(options.pinCodeUtf8);
+            return GB_SystemResult::Failed(GB_SystemErrorCode::InvalidArgument, u8"GB_SystemBluetooth::PairDevice", u8"pinCodeUtf8 过长。");
         }
-        catch (const std::bad_alloc&)
+
+        const int inputLength = static_cast<int>(options.pinCodeUtf8.size());
+        const int requiredLength = ::MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, options.pinCodeUtf8.data(), inputLength, nullptr, 0);
+        if (requiredLength <= 0)
         {
-            return GB_SystemResult::Failed(GB_SystemErrorCode::ResourceAllocationFailed, u8"GB_SystemBluetooth::PairDevice", u8"转换经典蓝牙 PIN 时内存不足。");
+            return GB_SystemResult::FromLastWin32Error(u8"GB_SystemBluetooth::PairDevice", u8"pinCodeUtf8 转换为 UTF-16 失败。");
         }
-        catch (...)
+        if (requiredLength > BLUETOOTH_MAX_PASSKEY_SIZE)
         {
-            return GB_SystemResult::Failed(GB_SystemErrorCode::EncodingConversionFailed, u8"GB_SystemBluetooth::PairDevice", u8"pinCodeUtf8 转换为 UTF-16 失败。");
+            return GB_SystemResult::Failed(GB_SystemErrorCode::InvalidArgument, u8"GB_SystemBluetooth::PairDevice", u8"PIN 长度不能超过 BLUETOOTH_MAX_PASSKEY_SIZE 个 UTF-16 字符。");
         }
-        if (pinCodeWide.empty() || pinCodeWide.size() > BLUETOOTH_MAX_PASSKEY_SIZE)
+
+        const int convertedLength = ::MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, options.pinCodeUtf8.data(), inputLength, pinCodeWide.data(), requiredLength);
+        if (convertedLength != requiredLength)
         {
-            return GB_SystemResult::Failed(GB_SystemErrorCode::InvalidArgument, u8"GB_SystemBluetooth::PairDevice", u8"PIN 长度必须大于 0 且不能超过 BLUETOOTH_MAX_PASSKEY_SIZE 个 UTF-16 字符。");
+            return GB_SystemResult::FromLastWin32Error(u8"GB_SystemBluetooth::PairDevice", u8"pinCodeUtf8 转换为 UTF-16 失败。");
         }
+        pinCodeLength = static_cast<ULONG>(convertedLength);
     }
-    if (!options.allowSystemPairingUi && pinCodeWide.empty())
+    if (!options.allowSystemPairingUi && pinCodeLength == 0)
     {
         return GB_SystemResult::Failed(GB_SystemErrorCode::InvalidArgument, u8"GB_SystemBluetooth::PairDevice", u8"不允许系统配对 UI 时必须提供 pinCodeUtf8。");
+    }
+    if (options.parentWindowHandle != nullptr && ::IsWindow(static_cast<HWND>(options.parentWindowHandle)) == FALSE)
+    {
+        return GB_SystemResult::Failed(GB_SystemErrorCode::InvalidArgument, u8"GB_SystemBluetooth::PairDevice", u8"parentWindowHandle 不是有效 HWND。");
     }
 
     const std::lock_guard<std::mutex> deviceMutationLock(GetClassicBluetoothDeviceMutationMutex(address));
@@ -4165,14 +4226,13 @@ GB_SystemResult GB_SystemBluetooth::PairDevice(const GB_BluetoothDeviceId& devic
 
     const HWND parentWindowHandle = static_cast<HWND>(options.parentWindowHandle);
     DWORD pairResult = ERROR_SUCCESS;
-    if (!pinCodeWide.empty())
+    if (pinCodeLength > 0)
     {
 #if defined(_MSC_VER)
 #pragma warning(push)
 #pragma warning(disable : 4995)
 #endif
-        const ULONG pinCodeLength = static_cast<ULONG>(pinCodeWide.size());
-        pairResult = ::BluetoothAuthenticateDevice(parentWindowHandle, matchedRadioHandle, &nativeDeviceInfo, &pinCodeWide[0], pinCodeLength);
+        pairResult = ::BluetoothAuthenticateDevice(parentWindowHandle, matchedRadioHandle, &nativeDeviceInfo, pinCodeWide.data(), pinCodeLength);
 #if defined(_MSC_VER)
 #pragma warning(pop)
 #endif
@@ -4661,7 +4721,7 @@ private:
         {
             return true;
         }
-        if (ContainsAsciiNoCase(text, "\\BTH") || ContainsAsciiNoCase(text, "#BTH") || ContainsAsciiNoCase(text, "Bluetooth"))
+        if (ContainsAsciiNoCase(text, "\\BTH\\") || ContainsAsciiNoCase(text, "#BTH#") || ContainsAsciiNoCase(text, "\\BTHLE\\") || ContainsAsciiNoCase(text, "#BTHLE#") || ContainsAsciiNoCase(text, "SWD\\RADIO\\Bluetooth"))
         {
             return true;
         }

@@ -193,7 +193,7 @@ enum class GB_BluetoothAuthenticationRequirement : uint16_t
  * @brief 经典蓝牙配对选项。
  *
  * 说明：
- * - pinCodeUtf8 非空时使用 BluetoothAuthenticateDevice 的透明 PIN 配对模式，转换后的 PIN 长度不能超过 16 个 UTF-16 字符；
+ * - pinCodeUtf8 非空时使用 BluetoothAuthenticateDevice 的透明 PIN 配对模式，转换后的 PIN 长度不能超过 16 个 UTF-16 字符；内部使用固定长度敏感缓冲区并在退出时清零；
  * - pinCodeUtf8 为空时使用 BluetoothAuthenticateDeviceEx 发起系统配对流程，可能弹出系统 UI；
  * - authenticationRequirement 只用于 BluetoothAuthenticateDeviceEx；
  * - parentWindowHandle 可传入 HWND 的 void* 表达，使系统配对向导归属于指定窗口；
@@ -273,7 +273,7 @@ enum class GB_BluetoothGattSessionAccessMode : uint16_t
     /** @brief 只允许服务枚举、特征枚举和读取操作。 */
     ReadOnly = 0,
 
-    /** @brief 允许读取和写入操作；目标 GATT 服务接口必须能够以读写权限打开。 */
+    /** @brief 允许读取和写入操作；服务枚举允许保留只读服务，写入时会对目标服务严格申请写权限。 */
     ReadWrite = 1
 };
 
@@ -370,6 +370,7 @@ struct GB_BluetoothGattWriteOptions
  *
  * 说明：
  * - 会话在 Open() 后持有 BLE 设备接口句柄，并在加载服务缓存时持续持有该设备对应的 GATT 服务接口句柄；
+ * - ReadWrite 会话会优先以读写权限打开每个服务接口；不能取得写权限的服务仍会以只读方式加入缓存，只有写入该服务时才会返回权限错误或再次申请写权限；
  * - 服务枚举使用 BLE 设备接口句柄；特征枚举和特征值读写使用对应的 GATT 服务接口句柄，严格遵循 Windows GATT 句柄层级；
  * - 连续读写同一设备时，可避免每次操作都重新枚举设备/服务接口、重复 CreateFileW 和重建 GATT 层次缓存；
  * - RefreshCache() 用于服务变更、设备重连或系统缓存变化后重新获取服务层次；
@@ -393,7 +394,7 @@ public:
     GB_SystemResult Close();
     bool IsOpen() const;
 
-    /** @brief 判断当前会话是否按 ReadWrite 模式打开；实际写入仍要求目标服务接口具备写访问权限且特征声明相应写属性。 */
+    /** @brief 判断当前会话是否允许执行写操作；该值只表达会话模式，实际写入仍要求目标服务接口可取得写权限且特征声明相应写属性。 */
     bool IsWriteEnabled() const;
 
     std::string GetDeviceInterfacePath() const;
