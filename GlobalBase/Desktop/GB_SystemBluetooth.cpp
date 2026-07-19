@@ -555,14 +555,20 @@ namespace
         }
     }
 
-    static std::string WideNullTerminatedStringToUtf8(const wchar_t* text)
+    template<size_t BufferSize>
+    static std::string WideFixedBufferToUtf8(const wchar_t(&text)[BufferSize])
     {
-        if (text == nullptr || text[0] == L'\0')
+        size_t textLength = 0;
+        while (textLength < BufferSize && text[textLength] != L'\0')
+        {
+            textLength++;
+        }
+        if (textLength == 0)
         {
             return std::string();
         }
 
-        return WideStringToUtf8Safe(std::wstring(text));
+        return WideStringToUtf8Safe(std::wstring(text, textLength));
     }
 
     static std::string GuidToString(const GUID& guid)
@@ -935,16 +941,7 @@ namespace
 
     static bool AreBthLeUuidsEqual(const BTH_LE_UUID& left, const BTH_LE_UUID& right)
     {
-        if ((left.IsShortUuid != FALSE) != (right.IsShortUuid != FALSE))
-        {
-            return false;
-        }
-        if (left.IsShortUuid != FALSE)
-        {
-            return left.Value.ShortUuid == right.Value.ShortUuid;
-        }
-
-        return ::IsEqualGUID(left.Value.LongUuid, right.Value.LongUuid) != FALSE;
+        return ::IsBthLEUuidMatch(left, right) != FALSE;
     }
 
     static GB_SystemResult BuildNativeBthLeUuid(const std::string& uuidText, const bool isShortUuid, const uint16_t shortUuid, BTH_LE_UUID& uuid, const std::string& operationName)
@@ -1354,7 +1351,7 @@ namespace
             if (IsHResultFromWin32Error(hresult, ERROR_INVALID_FUNCTION))
             {
                 services.clear();
-                return GB_SystemResult::Succeeded(operationName);
+                return GB_SystemResult::Failed(GB_SystemErrorCode::InvalidState, operationName, u8"读取 BLE GATT 主服务时发现 Windows 缓存中已经没有可用服务，原有会话缓存保持不变；请确认设备仍处于可访问状态并重试。");
             }
 
             if (hresult == S_OK || IsHResultFromWin32Error(hresult, ERROR_MORE_DATA) || IsHResultFromWin32Error(hresult, ERROR_INVALID_USER_BUFFER))
@@ -1712,7 +1709,7 @@ namespace
             radio.address = FormatBluetoothAddress(nativeRadioInfo.address);
             radio.radioId = radio.address;
             radio.nativeDeviceId.clear();
-            radio.name = WideNullTerminatedStringToUtf8(nativeRadioInfo.szName);
+            radio.name = WideFixedBufferToUtf8(nativeRadioInfo.szName);
             radio.classOfDevice = nativeRadioInfo.ulClassofDevice;
             radio.manufacturer = nativeRadioInfo.manufacturer;
             radio.isClassicSupported = true;
@@ -2168,6 +2165,25 @@ namespace
         device.minorDeviceClass = (device.classOfDevice >> 2) & 0x3fu;
     }
 
+    static bool ClassicDeviceMatchesQueryOptions(const BLUETOOTH_DEVICE_INFO& nativeDeviceInfo, const GB_BluetoothClassicDeviceQueryOptions& options)
+    {
+        if (nativeDeviceInfo.fAuthenticated != FALSE && options.includeAuthenticated)
+        {
+            return true;
+        }
+        if (nativeDeviceInfo.fRemembered != FALSE && options.includeRemembered)
+        {
+            return true;
+        }
+        if (nativeDeviceInfo.fConnected != FALSE && options.includeConnected)
+        {
+            return true;
+        }
+
+        const bool isUnknownDevice = nativeDeviceInfo.fAuthenticated == FALSE && nativeDeviceInfo.fRemembered == FALSE && nativeDeviceInfo.fConnected == FALSE;
+        return isUnknownDevice && options.includeUnknown;
+    }
+
     static GB_BluetoothDeviceInfo ConvertDeviceInfo(const BLUETOOTH_DEVICE_INFO& nativeDeviceInfo, const GB_BluetoothRadioInfo& radioInfo)
     {
         GB_BluetoothDeviceInfo device;
@@ -2176,7 +2192,7 @@ namespace
         device.nativeDeviceId = device.address;
         device.radioId = radioInfo.radioId;
         device.radioAddress = radioInfo.address;
-        device.name = WideNullTerminatedStringToUtf8(nativeDeviceInfo.szName);
+        device.name = WideFixedBufferToUtf8(nativeDeviceInfo.szName);
         device.deviceKind = GB_BluetoothDeviceKind::Classic;
         device.isRemembered = nativeDeviceInfo.fRemembered != FALSE;
         device.isAuthenticated = nativeDeviceInfo.fAuthenticated != FALSE;
@@ -2294,7 +2310,7 @@ namespace
         return GB_SystemResult::Failed(GB_SystemErrorCode::OperationFailed, u8"GB_SystemBluetooth::ReadInstalledServices", u8"BluetoothEnumerateInstalledServices 多次返回更多数据，服务 GUID 数量持续变化。");
     }
 
-    static GB_SystemResult TryGetNativeClassicDeviceInfoByAddress(HANDLE radioHandle, const GB_BluetoothRadioInfo& radioInfo, const std::string& targetAddress, const bool includeInstalledServices, BLUETOOTH_DEVICE_INFO& nativeDeviceInfo, GB_BluetoothDeviceInfo* publicDevice, bool& found)
+    static GB_SystemResult TryGetNativeClassicDeviceInfoByAddress(HANDLE radioHandle, const GB_BluetoothRadioInfo& radioInfo, const std::string& targetAddress, const GB_BluetoothClassicDeviceQueryOptions& options, BLUETOOTH_DEVICE_INFO& nativeDeviceInfo, GB_BluetoothDeviceInfo* publicDevice, bool& found)
     {
         found = false;
         nativeDeviceInfo = {};
@@ -2316,6 +2332,12 @@ namespace
         {
             return GB_SystemResult::FromWin32Error(getResult, u8"GB_SystemBluetooth::TryGetNativeClassicDeviceInfoByAddress", u8"BluetoothGetDeviceInfo 按地址读取经典蓝牙设备信息失败。");
         }
+        if (!ClassicDeviceMatchesQueryOptions(nativeDeviceInfo, options))
+        {
+            nativeDeviceInfo = {};
+            nativeDeviceInfo.dwSize = sizeof(nativeDeviceInfo);
+            return GB_SystemResult::Succeeded(u8"GB_SystemBluetooth::TryGetNativeClassicDeviceInfoByAddress", u8"设备存在，但不符合当前经典蓝牙查询返回类别。");
+        }
 
         if (publicDevice != nullptr)
         {
@@ -2329,7 +2351,7 @@ namespace
                 return GB_SystemResult::Failed(GB_SystemErrorCode::ResourceAllocationFailed, u8"GB_SystemBluetooth::TryGetNativeClassicDeviceInfoByAddress", u8"保存经典蓝牙设备信息时内存不足。");
             }
 
-            if (includeInstalledServices)
+            if (options.includeInstalledServices)
             {
                 GB_SystemResult serviceResult = ReadInstalledServices(radioHandle, nativeDeviceInfo, publicDevice->installedServiceGuids);
                 if (serviceResult.IsFailed())
@@ -2351,7 +2373,7 @@ namespace
 
         if (!options.requestFreshInquiry)
         {
-            GB_SystemResult fastLookupResult = TryGetNativeClassicDeviceInfoByAddress(radioHandle, radioInfo, targetAddress, options.includeInstalledServices, nativeDeviceInfo, publicDevice, found);
+            GB_SystemResult fastLookupResult = TryGetNativeClassicDeviceInfoByAddress(radioHandle, radioInfo, targetAddress, options, nativeDeviceInfo, publicDevice, found);
             if (fastLookupResult.IsFailed())
             {
                 return fastLookupResult.WithOperationName(u8"GB_SystemBluetooth::FindNativeClassicDeviceForRadio");
@@ -2623,7 +2645,7 @@ namespace
 
     static GB_SystemResult EnrichBluetoothInterfaceIdentity(BluetoothInterfaceIdentity& identity, const std::string& operationName)
     {
-        if (identity.deviceInstanceId.empty() || !identity.parentInstanceId.empty() || !identity.containerId.empty())
+        if (identity.deviceInstanceId.empty() || (!identity.parentInstanceId.empty() && !identity.containerId.empty()))
         {
             return GB_SystemResult::Succeeded(operationName);
         }
@@ -2919,7 +2941,7 @@ public:
         }
 
         services.swap(outputServices);
-        return GB_SystemResult::Succeeded(u8"GB_BluetoothGattSession::GetServices");
+        return GB_SystemResult::Succeeded(u8"GB_BluetoothGattSession::GetServices", ensureResult.message);
 #endif
     }
 
@@ -3201,13 +3223,13 @@ private:
             }
         }
 
-        if (newCachedServices.size() != nativeDeviceServices.size())
+        if (newCachedServices.empty())
         {
             if (firstInterfaceFailure.IsFailed())
             {
                 try
                 {
-                    firstInterfaceFailure.message += u8" 未能为 Windows 返回的全部 BLE 主服务建立完整的可用服务接口缓存；为避免使用错误句柄层级，未提交部分结果。";
+                    firstInterfaceFailure.message += u8" Windows 已返回 BLE 主服务，但没有任何主服务能够通过独立 GATT 服务接口完成层级验证，原有会话缓存保持不变。";
                 }
                 catch (...)
                 {
@@ -3215,9 +3237,10 @@ private:
                 return firstInterfaceFailure;
             }
 
-            return GB_SystemResult::Failed(GB_SystemErrorCode::OperationFailed, operationName, u8"未能为 Windows 返回的全部 BLE 主服务找到匹配的 GATT 服务设备接口；为避免使用错误句柄层级，未提交不完整缓存。");
+            return GB_SystemResult::Failed(GB_SystemErrorCode::OperationFailed, operationName, u8"Windows 已返回 BLE 主服务，但没有任何主服务能够匹配并打开对应的 GATT 服务设备接口，原有会话缓存保持不变。");
         }
 
+        const size_t skippedServiceCount = nativeDeviceServices.size() - newCachedServices.size();
         std::sort(newCachedServices.begin(), newCachedServices.end(), [](const CachedService& leftService, const CachedService& rightService)
             {
                 if (leftService.nativeService.AttributeHandle != rightService.nativeService.AttributeHandle)
@@ -3228,7 +3251,29 @@ private:
             });
         cachedServices.swap(newCachedServices);
         servicesLoaded = true;
-        return GB_SystemResult::Succeeded(operationName);
+        if (skippedServiceCount == 0)
+        {
+            return GB_SystemResult::Succeeded(operationName);
+        }
+
+        try
+        {
+            std::string message = u8"BLE GATT 服务缓存已刷新；可用服务数量=";
+            message += std::to_string(cachedServices.size());
+            message += u8"，因服务接口不可打开、无法关联或层级验证失败而跳过的主服务数量=";
+            message += std::to_string(skippedServiceCount);
+            message += u8"。已保留全部经过服务句柄层级验证的可用服务。";
+            if (firstInterfaceFailure.IsFailed())
+            {
+                message += u8" 首个跳过原因：";
+                message += firstInterfaceFailure.GetDisplayMessage();
+            }
+            return GB_SystemResult::Succeeded(operationName, message);
+        }
+        catch (...)
+        {
+            return GB_SystemResult::Succeeded(operationName, u8"BLE GATT 服务缓存已刷新，并跳过了无法安全建立服务接口缓存的主服务。");
+        }
     }
 
     GB_SystemResult EnsureServicesLoadedLocked(const std::string& operationName)
@@ -4598,7 +4643,7 @@ public:
     {
         if (IsCurrentThreadExecutingBluetoothCallback())
         {
-            return GB_SystemResult::Failed(GB_SystemErrorCode::InvalidState, u8"GB_SystemBluetoothWatcher::Stop", u8"不能在蓝牙强类型事件回调内部停止监听器；请让回调返回后从其它线程或外层控制流调用 Stop()。");
+            return GB_SystemResult::Failed(GB_SystemErrorCode::InvalidState, u8"GB_SystemBluetoothWatcher::Stop", u8"不能在蓝牙事件回调内部停止监听器；请让回调返回后从其它线程或外层控制流调用 Stop()。");
         }
 
         {
@@ -4660,12 +4705,143 @@ public:
         bluetoothEventCallback = callback;
     }
 
-    GB_EventDispatcher& GetEventDispatcher()
+    GB_SystemResult Subscribe(const GB_BluetoothEventType eventType, const GB_SystemBluetoothWatcher::BluetoothEventCallback& callback, GB_EventSubscriptionToken& subscriptionToken)
     {
-        return eventDispatcher;
+        if (!IsValidBluetoothEventType(eventType) || eventType == GB_BluetoothEventType::Unknown)
+        {
+            subscriptionToken.Reset();
+            return GB_SystemResult::Failed(GB_SystemErrorCode::InvalidArgument, u8"GB_SystemBluetoothWatcher::Subscribe", u8"eventType 必须是有效且非 Unknown 的蓝牙事件类型。");
+        }
+
+        try
+        {
+            const std::string eventName = GetBluetoothEventName(eventType);
+            return SubscribeInternal(eventName, callback, subscriptionToken, u8"GB_SystemBluetoothWatcher::Subscribe");
+        }
+        catch (const std::bad_alloc&)
+        {
+            subscriptionToken.Reset();
+            return GB_SystemResult::Failed(GB_SystemErrorCode::ResourceAllocationFailed, u8"GB_SystemBluetoothWatcher::Subscribe", u8"构建蓝牙事件订阅名称时内存不足。");
+        }
+        catch (...)
+        {
+            subscriptionToken.Reset();
+            return GB_SystemResult::Failed(GB_SystemErrorCode::InternalError, u8"GB_SystemBluetoothWatcher::Subscribe", u8"构建蓝牙事件订阅名称时发生内部错误。");
+        }
+    }
+
+    GB_SystemResult SubscribeAll(const GB_SystemBluetoothWatcher::BluetoothEventCallback& callback, GB_EventSubscriptionToken& subscriptionToken)
+    {
+        return SubscribeInternal(std::string(), callback, subscriptionToken, u8"GB_SystemBluetoothWatcher::SubscribeAll");
+    }
+
+    GB_SystemResult Unsubscribe(const GB_EventSubscriptionToken& subscriptionToken)
+    {
+        if (!subscriptionToken.IsValid())
+        {
+            return GB_SystemResult::Failed(GB_SystemErrorCode::InvalidArgument, u8"GB_SystemBluetoothWatcher::Unsubscribe", u8"订阅 token 无效。");
+        }
+
+        std::lock_guard<std::mutex> lock(subscriptionMutex);
+        size_t tokenIndex = externalSubscriptionTokens.size();
+        for (size_t index = 0; index < externalSubscriptionTokens.size(); index++)
+        {
+            if (externalSubscriptionTokens[index] == subscriptionToken)
+            {
+                tokenIndex = index;
+                break;
+            }
+        }
+        if (tokenIndex == externalSubscriptionTokens.size())
+        {
+            return GB_SystemResult::Failed(GB_SystemErrorCode::NotFound, u8"GB_SystemBluetoothWatcher::Unsubscribe", u8"指定 token 不是当前监听器创建的外部蓝牙事件订阅。");
+        }
+
+        GB_SystemResult unsubscribeResult = eventDispatcher.Unsubscribe(subscriptionToken);
+        externalSubscriptionTokens.erase(externalSubscriptionTokens.begin() + static_cast<std::ptrdiff_t>(tokenIndex));
+        if (unsubscribeResult.IsFailed() && unsubscribeResult.errorCode != GB_SystemErrorCode::NotFound)
+        {
+            return unsubscribeResult.WithOperationName(u8"GB_SystemBluetoothWatcher::Unsubscribe");
+        }
+
+        return GB_SystemResult::Succeeded(u8"GB_SystemBluetoothWatcher::Unsubscribe", u8"已取消蓝牙事件订阅。");
+    }
+
+    GB_SystemResult ClearSubscriptions()
+    {
+        std::lock_guard<std::mutex> lock(subscriptionMutex);
+        GB_SystemResult firstFailure = GB_SystemResult::Succeeded(u8"GB_SystemBluetoothWatcher::ClearSubscriptions");
+        for (size_t index = 0; index < externalSubscriptionTokens.size(); index++)
+        {
+            GB_SystemResult unsubscribeResult = eventDispatcher.Unsubscribe(externalSubscriptionTokens[index]);
+            if (unsubscribeResult.IsFailed() && unsubscribeResult.errorCode != GB_SystemErrorCode::NotFound && firstFailure.IsSucceeded())
+            {
+                firstFailure = std::move(unsubscribeResult);
+            }
+        }
+        externalSubscriptionTokens.clear();
+
+        if (firstFailure.IsFailed())
+        {
+            return firstFailure.WithOperationName(u8"GB_SystemBluetoothWatcher::ClearSubscriptions");
+        }
+        return GB_SystemResult::Succeeded(u8"GB_SystemBluetoothWatcher::ClearSubscriptions", u8"已清除全部外部蓝牙事件订阅。");
+    }
+
+    size_t GetSubscriptionCount() const
+    {
+        std::lock_guard<std::mutex> lock(subscriptionMutex);
+        return externalSubscriptionTokens.size();
     }
 
 private:
+    GB_SystemResult SubscribeInternal(const std::string& eventName, const GB_SystemBluetoothWatcher::BluetoothEventCallback& callback, GB_EventSubscriptionToken& subscriptionToken, const std::string& operationName)
+    {
+        subscriptionToken.Reset();
+        if (!callback)
+        {
+            return GB_SystemResult::Failed(GB_SystemErrorCode::InvalidArgument, operationName, u8"蓝牙事件订阅回调不能为空。");
+        }
+
+        GB_EventDispatcher::Callback eventCallback;
+        try
+        {
+            eventCallback = [this, callback](const GB_Event& event)
+                {
+                    DispatchSubscribedCallback(event, callback);
+                };
+        }
+        catch (const std::bad_alloc&)
+        {
+            return GB_SystemResult::Failed(GB_SystemErrorCode::ResourceAllocationFailed, operationName, u8"复制蓝牙事件订阅回调时内存不足。");
+        }
+        catch (...)
+        {
+            return GB_SystemResult::Failed(GB_SystemErrorCode::InternalError, operationName, u8"复制蓝牙事件订阅回调时发生内部错误。");
+        }
+
+        std::lock_guard<std::mutex> lock(subscriptionMutex);
+        GB_SystemResult subscribeResult = eventName.empty() ? eventDispatcher.SubscribeAll(eventCallback, subscriptionToken) : eventDispatcher.Subscribe(eventName, eventCallback, subscriptionToken);
+        if (subscribeResult.IsFailed())
+        {
+            subscriptionToken.Reset();
+            return subscribeResult.WithOperationName(operationName);
+        }
+
+        try
+        {
+            externalSubscriptionTokens.push_back(subscriptionToken);
+        }
+        catch (...)
+        {
+            (void)eventDispatcher.Unsubscribe(subscriptionToken);
+            subscriptionToken.Reset();
+            return GB_SystemResult::Failed(GB_SystemErrorCode::ResourceAllocationFailed, operationName, u8"保存蓝牙事件订阅 token 时内存不足。");
+        }
+
+        return GB_SystemResult::Succeeded(operationName, eventName.empty() ? u8"已订阅全部蓝牙事件。" : u8"已订阅指定类型的蓝牙事件。");
+    }
+
     void SetLifecycleState(const LifecycleState state)
     {
         std::lock_guard<std::mutex> lock(stateMutex);
@@ -4828,6 +5004,23 @@ private:
         }
     }
 
+    void DispatchSubscribedCallback(const GB_Event& event, const GB_SystemBluetoothWatcher::BluetoothEventCallback& callback)
+    {
+        if (!callback)
+        {
+            return;
+        }
+
+        const GB_BluetoothEvent* bluetoothEvent = event.payload.AnyCast<GB_BluetoothEvent>();
+        if (bluetoothEvent == nullptr)
+        {
+            return;
+        }
+
+        BluetoothCallbackExecutionScope executionScope(*this);
+        callback(*bluetoothEvent);
+    }
+
     class BluetoothCallbackExecutionScope final
     {
     public:
@@ -4872,11 +5065,6 @@ private:
 
         try
         {
-            if (EnsureTypedSubscription().IsFailed())
-            {
-                return;
-            }
-
             GB_BluetoothEvent bluetoothEvent = BuildBluetoothEvent(deviceEvent);
             if (bluetoothEvent.eventType == GB_BluetoothEventType::Unknown)
             {
@@ -4885,13 +5073,6 @@ private:
 
             GB_Event event(bluetoothEvent.eventName, GB_Variant(bluetoothEvent), u8"GB_SystemBluetoothWatcher");
             event.timestampMilliseconds = bluetoothEvent.timestampMilliseconds;
-            event.SetAttribute("eventType", GB_Variant(static_cast<unsigned int>(bluetoothEvent.eventType)));
-            event.SetAttribute("eventTypeName", GB_Variant(GB_SystemBluetooth::GetEventTypeName(bluetoothEvent.eventType)));
-            event.SetAttribute("sourceName", GB_Variant(bluetoothEvent.sourceName));
-            event.SetAttribute("deviceInstanceId", GB_Variant(bluetoothEvent.deviceInstanceId));
-            event.SetAttribute("deviceInterfacePath", GB_Variant(bluetoothEvent.deviceInterfacePath));
-            event.SetAttribute("interfaceClassGuid", GB_Variant(bluetoothEvent.interfaceClassGuid));
-            event.SetAttribute("nativeAction", GB_Variant(bluetoothEvent.nativeAction));
             (void)eventDispatcher.Post(event);
         }
         catch (...)
@@ -4909,6 +5090,7 @@ private:
     GB_SystemDeviceWatcher deviceWatcher;
     GB_EventDispatcher eventDispatcher;
     GB_EventSubscriptionToken typedSubscriptionToken;
+    std::vector<GB_EventSubscriptionToken> externalSubscriptionTokens;
     GB_SystemBluetoothWatcher::BluetoothEventCallback bluetoothEventCallback;
 };
 
@@ -4942,7 +5124,27 @@ void GB_SystemBluetoothWatcher::SetBluetoothEventCallback(const BluetoothEventCa
     impl->SetBluetoothEventCallback(callback);
 }
 
-GB_EventDispatcher& GB_SystemBluetoothWatcher::GetEventDispatcher()
+GB_SystemResult GB_SystemBluetoothWatcher::Subscribe(const GB_BluetoothEventType eventType, const BluetoothEventCallback& callback, GB_EventSubscriptionToken& subscriptionToken)
 {
-    return impl->GetEventDispatcher();
+    return impl->Subscribe(eventType, callback, subscriptionToken);
+}
+
+GB_SystemResult GB_SystemBluetoothWatcher::SubscribeAll(const BluetoothEventCallback& callback, GB_EventSubscriptionToken& subscriptionToken)
+{
+    return impl->SubscribeAll(callback, subscriptionToken);
+}
+
+GB_SystemResult GB_SystemBluetoothWatcher::Unsubscribe(const GB_EventSubscriptionToken& subscriptionToken)
+{
+    return impl->Unsubscribe(subscriptionToken);
+}
+
+GB_SystemResult GB_SystemBluetoothWatcher::ClearSubscriptions()
+{
+    return impl->ClearSubscriptions();
+}
+
+size_t GB_SystemBluetoothWatcher::GetSubscriptionCount() const
+{
+    return impl->GetSubscriptionCount();
 }

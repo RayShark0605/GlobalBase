@@ -372,6 +372,8 @@ struct GB_BluetoothGattWriteOptions
  * - 会话在 Open() 后持有 BLE 设备接口句柄，并在加载服务缓存时持续持有该设备对应的 GATT 服务接口句柄；
  * - ReadWrite 会话会优先以读写权限打开每个服务接口；不能取得写权限的服务仍会以只读方式加入缓存，只有写入该服务时才会返回权限错误或再次申请写权限；
  * - 服务枚举使用 BLE 设备接口句柄；特征枚举和特征值读写使用对应的 GATT 服务接口句柄，严格遵循 Windows GATT 句柄层级；
+ * - Windows 返回主服务但对应服务接口暂时不可打开或无法验证层级时，会跳过该不可访问服务并保留其它已经严格验证的可用服务；只有一个可用服务都无法建立时才返回失败；
+ * - UUID 比较遵循 Windows IsBthLEUuidMatch 语义，16 位短 UUID 与等价 Bluetooth Base UUID 形式的 128 位 UUID 可正确匹配；
  * - 连续读写同一设备时，可避免每次操作都重新枚举设备/服务接口、重复 CreateFileW 和重建 GATT 层次缓存；
  * - RefreshCache() 用于服务变更、设备重连或系统缓存变化后重新获取服务层次；
  * - 所有公开方法会串行化同一会话上的访问，同一对象可由多个线程调用，但耗时 GATT 操作仍会互斥执行；
@@ -475,7 +477,8 @@ public:
      * 说明：
      * - deviceInterfacePath 必须来自 GetLowEnergyDevices()；
      * - 内部先通过 BLE 设备接口刷新主服务缓存，再枚举并关联 GUID_BLUETOOTH_GATT_SERVICE_DEVICE_INTERFACE；
-     * - 返回的每个服务都会包含可用于后续特征枚举和读写的 serviceInterfacePath。
+     * - 返回的每个服务都已经通过对应服务接口句柄完成层级验证，并包含可用于后续特征枚举和读写的 serviceInterfacePath；
+     * - 个别主服务接口暂时不可访问时会跳过该服务并保留其它可用服务；一个可用服务都无法建立时返回失败。
      */
     static GB_SystemResult GetGattServices(const std::string& deviceInterfacePath, std::vector<GB_BluetoothGattServiceInfo>& services);
 
@@ -487,6 +490,15 @@ public:
 
     /** @brief 按指定写入模式与链路安全选项写入 BLE GATT 特征值；一次性调用使用临时读写会话，value 最大为 512 字节。 */
     static GB_SystemResult WriteGattCharacteristic(const std::string& deviceInterfacePath, const GB_BluetoothGattCharacteristicInfo& characteristic, const std::vector<uint8_t>& value, const GB_BluetoothGattWriteOptions& options = GB_BluetoothGattWriteOptions());
+
+    /**
+     * @brief 按地址查找经典蓝牙设备。
+     *
+     * 说明：
+     * - options 中的 includeAuthenticated / includeRemembered / includeUnknown / includeConnected 仍作为返回类别过滤条件；
+     * - requestFreshInquiry=false 时优先使用 BluetoothGetDeviceInfo 快速读取系统缓存，但不会绕过上述过滤条件；
+     * - found=false 表示未找到符合地址、无线电和返回类别条件的设备，不表示调用失败。
+     */
     static GB_SystemResult GetClassicDeviceByAddress(const std::string& address, GB_BluetoothDeviceInfo& device, bool& found, const GB_BluetoothClassicDeviceQueryOptions& options = GB_BluetoothClassicDeviceQueryOptions());
 
     static GB_SystemResult IsDeviceConnected(const GB_BluetoothDeviceId& deviceId, bool& connected);
@@ -511,9 +523,10 @@ public:
  * 说明：
  * - 当前监听器复用 GB_SystemDeviceWatcher 的 PnP 事件，只转发带有蓝牙语义的设备实例或接口变化；它不表示实时无线链路连接状态；
  * - 回调通过单个 GB_EventDispatcher 异步分发，避免阻塞底层系统设备通知线程，同时避免为同一批蓝牙事件额外维护两条工作线程和两份队列；
- * - GetEventDispatcher() 发布的事件 payload 为 GB_BluetoothEvent，attributes 同时保留常用字段，便于通用事件订阅者使用；内部强类型订阅会在启动和事件投递前自检并在被清除后自动重建；
+ * - SetBluetoothEventCallback() 提供单个强类型回调，Subscribe()/SubscribeAll() 提供可并存的强类型订阅；模块不再暴露可被外部任意启动、停止或清空的原始事件分发器；
  * - Start()/Stop() 使用显式生命周期状态串行化转换；并发启动、启动期间停止或重复等待同一次停止会返回 ResourceBusy，停止失败后可再次调用 Stop() 重试清理；
- * - 从 SetBluetoothEventCallback() 设置的强类型回调内部调用 Stop() 时，Stop() 会返回 InvalidState；通过 GetEventDispatcher() 添加的通用订阅回调同样不得调用 Stop()，因为底层事件分发器不能安全等待自身退出；
+ * - 所有公开回调均经过统一执行作用域保护；从任意蓝牙事件回调内部调用 Stop() 时会返回 InvalidState，避免事件分发线程等待或分离自身；
+ * - ClearSubscriptions() 只清除 Subscribe()/SubscribeAll() 创建的外部订阅，不影响 SetBluetoothEventCallback() 的单回调通道；
  * - 它不替代 BLE AdvertisementWatcher 或 WinRT DeviceWatcher，后续 BLE 广播扫描应作为独立能力补充；
  * - 不应在监听回调执行期间销毁当前监听器；如需销毁，应先让回调返回，再从其它线程或外层控制流释放对象。
  */
@@ -537,8 +550,23 @@ public:
 
     bool IsRunning() const;
 
+    /** @brief 设置或清除单个蓝牙事件回调；传入空回调表示清除。 */
     void SetBluetoothEventCallback(const BluetoothEventCallback& callback);
-    GB_EventDispatcher& GetEventDispatcher();
+
+    /** @brief 订阅指定类型的蓝牙事件；Unknown 和非法枚举值会返回 InvalidArgument。 */
+    GB_SystemResult Subscribe(GB_BluetoothEventType eventType, const BluetoothEventCallback& callback, GB_EventSubscriptionToken& subscriptionToken);
+
+    /** @brief 订阅全部蓝牙事件。 */
+    GB_SystemResult SubscribeAll(const BluetoothEventCallback& callback, GB_EventSubscriptionToken& subscriptionToken);
+
+    /** @brief 取消由当前监听器 Subscribe()/SubscribeAll() 创建的订阅。 */
+    GB_SystemResult Unsubscribe(const GB_EventSubscriptionToken& subscriptionToken);
+
+    /** @brief 清除由 Subscribe()/SubscribeAll() 创建的全部外部订阅，不影响 SetBluetoothEventCallback()。 */
+    GB_SystemResult ClearSubscriptions();
+
+    /** @brief 获取当前外部强类型订阅数量，不包含 SetBluetoothEventCallback() 通道。 */
+    size_t GetSubscriptionCount() const;
 
 private:
     class Impl;
