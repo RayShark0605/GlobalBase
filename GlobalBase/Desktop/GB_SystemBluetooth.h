@@ -60,10 +60,19 @@ enum class GB_BluetoothConnectionStatus : uint16_t
  */
 enum class GB_BluetoothEventType : uint16_t
 {
+    /** @brief 未识别或无法可靠归类的蓝牙 PnP 事件。 */
     Unknown = 0,
+
+    /** @brief 蓝牙设备实例或设备级接口到达/启动。 */
     DeviceAdded = 1,
+
+    /** @brief 蓝牙设备节点、查询移除状态或 GATT 服务接口发生变化。 */
     DeviceUpdated = 2,
+
+    /** @brief 蓝牙设备实例或设备级接口已经移除。 */
     DeviceRemoved = 3,
+
+    /** @brief 本机蓝牙无线电对应的 PnP 状态发生变化。 */
     RadioChanged = 4
 };
 
@@ -144,8 +153,11 @@ struct GB_BluetoothDeviceInfo
     uint32_t serviceClass = 0;
     uint32_t majorDeviceClass = 0;
     uint32_t minorDeviceClass = 0;
-    std::string lastSeenTimeLocal = "";
-    std::string lastUsedTimeLocal = "";
+    /** @brief Windows 原生 stLastSeen 的格式化文本；API 未承诺该 SYSTEMTIME 的时区语义。 */
+    std::string lastSeenTime = "";
+
+    /** @brief Windows 原生 stLastUsed 的格式化文本；API 未承诺该 SYSTEMTIME 的时区语义。 */
+    std::string lastUsedTime = "";
     std::vector<std::string> installedServiceGuids;
     std::string sourceName = "";
 };
@@ -369,7 +381,9 @@ struct GB_BluetoothGattWriteOptions
  * @brief 可复用的 BLE GATT 设备会话。
  *
  * 说明：
+ * - Open() 会先确认 deviceInterfacePath 是当前存在的 GUID_BLUETOOTHLE_DEVICE_INTERFACE 设备接口，再打开并缓存其 PnP 身份信息；
  * - 会话在 Open() 后持有 BLE 设备接口句柄，并在加载服务缓存时持续持有该设备对应的 GATT 服务接口句柄；
+ * - ReadOnly 表示公开接口层禁止写入；个别驱动拒绝 GENERIC_READ 单独打开时，底层可兼容性回退为读写句柄，但仍不会允许调用 WriteCharacteristic()；
  * - ReadWrite 会话会优先以读写权限打开每个服务接口；不能取得写权限的服务仍会以只读方式加入缓存，只有写入该服务时才会返回权限错误或再次申请写权限；
  * - 服务枚举使用 BLE 设备接口句柄；特征枚举和特征值读写使用对应的 GATT 服务接口句柄，严格遵循 Windows GATT 句柄层级；
  * - Windows 返回主服务但对应服务接口暂时不可打开或无法验证层级时，会跳过该不可访问服务并保留其它已经严格验证的可用服务；只有一个可用服务都无法建立时才返回失败；
@@ -503,6 +517,7 @@ public:
 
     static GB_SystemResult IsDeviceConnected(const GB_BluetoothDeviceId& deviceId, bool& connected);
     static GB_SystemResult PairDevice(const GB_BluetoothDeviceId& deviceId, const GB_BluetoothPairingOptions& options = GB_BluetoothPairingOptions());
+    /** @brief 移除经典蓝牙设备的认证关系和缓存服务信息；设备已经不在系统记忆列表中时幂等成功。 */
     static GB_SystemResult RemoveDevice(const GB_BluetoothDeviceId& deviceId);
 
     static bool IsValidAddress(const std::string& address);
