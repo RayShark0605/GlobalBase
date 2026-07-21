@@ -536,7 +536,7 @@ public:
  * @brief 蓝牙相关 PnP 设备变化监听器。
  *
  * 说明：
- * - 当前监听器复用 GB_SystemDeviceWatcher 的 PnP 事件，只转发带有蓝牙语义的设备实例或接口变化；它不表示实时无线链路连接状态；
+ * - 当前监听器复用 GB_SystemDeviceWatcher 的 PnP 事件，识别经典蓝牙设备、BLE 设备、GATT 服务和本机无线电接口变化；它不表示实时无线链路连接状态；
  * - 回调通过单个 GB_EventDispatcher 异步分发，避免阻塞底层系统设备通知线程，同时避免为同一批蓝牙事件额外维护两条工作线程和两份队列；
  * - SetBluetoothEventCallback() 提供单个强类型回调，Subscribe()/SubscribeAll() 提供可并存的强类型订阅；模块不再暴露可被外部任意启动、停止或清空的原始事件分发器；
  * - Start()/Stop() 使用显式生命周期状态串行化转换；并发启动、启动期间停止或重复等待同一次停止会返回 ResourceBusy，停止失败后可再次调用 Stop() 重试清理；
@@ -556,6 +556,9 @@ public:
 
     GB_SystemBluetoothWatcher(const GB_SystemBluetoothWatcher&) = delete;
     GB_SystemBluetoothWatcher& operator=(const GB_SystemBluetoothWatcher&) = delete;
+
+    /** @brief 判断监听器内部状态是否成功创建；资源分配失败时返回 false。 */
+    bool IsValid() const;
 
     /** @brief 启动监听；已经运行时幂等成功，生命周期转换进行中或上次停止未清理完成时返回对应失败结果。 */
     GB_SystemResult Start();
@@ -583,8 +586,21 @@ public:
     /** @brief 获取当前外部强类型订阅数量，不包含 SetBluetoothEventCallback() 通道。 */
     size_t GetSubscriptionCount() const;
 
+    /** @brief 获取尚未分发的蓝牙事件数量。 */
+    size_t GetPendingEventCount() const;
+
+    /** @brief 获取已经完成分发的蓝牙事件数量。 */
+    uint64_t GetDispatchedEventCount() const;
+
+    /** @brief 获取因队列溢出或内部入队失败而丢弃的蓝牙事件数量。 */
+    uint64_t GetDroppedEventCount() const;
+
+    /** @brief 获取用户回调抛出异常的累计次数。 */
+    uint64_t GetCallbackExceptionCount() const;
+
 private:
     class Impl;
+    static std::unique_ptr<Impl> CreateImpl(const GB_SystemBluetoothWatcherOptions& options) noexcept;
     std::unique_ptr<Impl> impl;
 };
 

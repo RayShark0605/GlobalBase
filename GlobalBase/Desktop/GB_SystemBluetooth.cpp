@@ -23,9 +23,12 @@
 #include <bluetoothapis.h>
 #include <bluetoothleapis.h>
 #include <bthledef.h>
+#include <cfgmgr32.h>
+#include <devpkey.h>
 #ifdef _MSC_VER
 #  pragma comment(lib, "Bthprops.lib")
 #  pragma comment(lib, "BluetoothApis.lib")
+#  pragma comment(lib, "Cfgmgr32.lib")
 #endif
 #endif
 
@@ -86,6 +89,7 @@ namespace
         return leftText.size() == rightText.size() && StartsWithAsciiNoCase(leftText, rightText);
     }
 
+    static const char* const GB_BluetoothClassicDeviceInterfaceGuid = "{00F40965-E89D-4487-9890-87C3ABB211F4}";
     static const char* const GB_BluetoothLeDeviceInterfaceGuid = "{781AEE18-7733-4CE4-ADD0-91F41C67B592}";
     static const char* const GB_BluetoothGattServiceDeviceInterfaceGuid = "{6E3BB679-4372-40C8-9EAA-4509DF260CD8}";
     static const char* const GB_BluetoothRadioInterfaceGuid = "{0850302A-B344-4FDA-9BE9-90576B8D46F0}";
@@ -350,6 +354,11 @@ namespace
     static std::string GetBluetoothEventName(const GB_BluetoothEventType eventType)
     {
         return std::string("SystemBluetooth.") + GB_SystemBluetooth::GetEventTypeName(eventType);
+    }
+
+    static GB_SystemResult MakeBluetoothWatcherInitializationFailedResult(const std::string& operationName)
+    {
+        return GB_SystemResult::Failed(GB_SystemErrorCode::ResourceAllocationFailed, operationName, u8"蓝牙监听器内部状态初始化失败，通常是内存或线程同步资源分配失败。");
     }
 
 #if defined(_WIN32)
@@ -2643,6 +2652,46 @@ namespace
         return GB_SystemResult::Succeeded(operationName);
     }
 
+    static bool IsConfigRetDeviceNotFound(const CONFIGRET configResult)
+    {
+        if (configResult == CR_NO_SUCH_DEVNODE)
+        {
+            return true;
+        }
+#if defined(CR_NO_SUCH_DEVINST)
+        if (configResult == CR_NO_SUCH_DEVINST)
+        {
+            return true;
+        }
+#endif
+#if defined(CR_INVALID_DEVNODE)
+        if (configResult == CR_INVALID_DEVNODE)
+        {
+            return true;
+        }
+#endif
+#if defined(CR_INVALID_DEVINST)
+        if (configResult == CR_INVALID_DEVINST)
+        {
+            return true;
+        }
+#endif
+#if defined(CR_INVALID_DEVICE_ID)
+        if (configResult == CR_INVALID_DEVICE_ID)
+        {
+            return true;
+        }
+#endif
+
+        return false;
+    }
+
+    static GB_SystemResult MakeConfigRetFailureResult(const CONFIGRET configResult, const std::string& operationName, const std::string& message)
+    {
+        const DWORD win32Error = ::CM_MapCrToWin32Err(configResult, ERROR_GEN_FAILURE);
+        return GB_SystemResult::FromWin32Error(static_cast<uint32_t>(win32Error), operationName, message);
+    }
+
     static GB_SystemResult EnrichBluetoothInterfaceIdentity(BluetoothInterfaceIdentity& identity, const std::string& operationName)
     {
         if (identity.deviceInstanceId.empty() || (!identity.parentInstanceId.empty() && !identity.containerId.empty()))
@@ -2650,30 +2699,77 @@ namespace
             return GB_SystemResult::Succeeded(operationName);
         }
 
-        GB_SystemDeviceInfo deviceInfo;
-        bool found = false;
-        GB_SystemResult deviceResult = GB_SystemDevice::GetDeviceByInstanceId(identity.deviceInstanceId, deviceInfo, found);
-        if (deviceResult.IsFailed())
+        std::wstring deviceInstanceIdWide;
+        try
         {
-            return deviceResult.WithOperationName(operationName);
+            deviceInstanceIdWide = GB_Utf8ToWString(identity.deviceInstanceId);
         }
-        if (!found)
+        catch (const std::bad_alloc&)
+        {
+            return GB_SystemResult::Failed(GB_SystemErrorCode::ResourceAllocationFailed, operationName, u8"转换蓝牙 PnP 设备实例 ID 时内存不足。");
+        }
+        catch (...)
+        {
+            return GB_SystemResult::Failed(GB_SystemErrorCode::EncodingConversionFailed, operationName, u8"蓝牙 PnP 设备实例 ID 不是合法 UTF-8 文本。");
+        }
+
+        DEVINST deviceInstance = 0;
+        const CONFIGRET locateResult = ::CM_Locate_DevNodeW(&deviceInstance, const_cast<DEVINSTID_W>(deviceInstanceIdWide.c_str()), CM_LOCATE_DEVNODE_NORMAL);
+        if (IsConfigRetDeviceNotFound(locateResult))
         {
             return GB_SystemResult::Succeeded(operationName);
+        }
+        if (locateResult != CR_SUCCESS)
+        {
+            return MakeConfigRetFailureResult(locateResult, operationName, u8"CM_Locate_DevNodeW 定位蓝牙 PnP 设备实例失败。");
         }
 
         try
         {
-            identity.parentInstanceId = deviceInfo.parentInstanceId;
-            identity.containerId = deviceInfo.containerId;
-            if (identity.address.empty() && !TryExtractBluetoothAddressFromText(deviceInfo.instanceId, identity.address))
+            if (identity.parentInstanceId.empty())
             {
-                (void)TryExtractBluetoothAddressFromText(deviceInfo.parentInstanceId, identity.address);
+                DEVINST parentDeviceInstance = 0;
+                const CONFIGRET parentResult = ::CM_Get_Parent(&parentDeviceInstance, deviceInstance, 0);
+                if (parentResult == CR_SUCCESS)
+                {
+                    ULONG parentIdLength = 0;
+                    const CONFIGRET parentSizeResult = ::CM_Get_Device_ID_Size(&parentIdLength, parentDeviceInstance, 0);
+                    if (parentSizeResult == CR_SUCCESS)
+                    {
+                        std::vector<wchar_t> parentIdBuffer(static_cast<size_t>(parentIdLength) + 1u, L'\0');
+                        const CONFIGRET parentIdResult = ::CM_Get_Device_IDW(parentDeviceInstance, parentIdBuffer.data(), static_cast<ULONG>(parentIdBuffer.size()), 0);
+                        if (parentIdResult == CR_SUCCESS)
+                        {
+                            identity.parentInstanceId = WideStringToUtf8Safe(std::wstring(parentIdBuffer.data(), static_cast<size_t>(parentIdLength)));
+                        }
+                    }
+                }
             }
+
+            if (identity.containerId.empty())
+            {
+                GUID containerId = {};
+                DEVPROPTYPE propertyType = 0;
+                ULONG propertySize = static_cast<ULONG>(sizeof(containerId));
+                const CONFIGRET propertyResult = ::CM_Get_DevNode_PropertyW(deviceInstance, &DEVPKEY_Device_ContainerId, &propertyType, reinterpret_cast<PBYTE>(&containerId), &propertySize, 0);
+                if (propertyResult == CR_SUCCESS && propertyType == DEVPROP_TYPE_GUID && propertySize >= sizeof(containerId))
+                {
+                    identity.containerId = GuidToString(containerId);
+                }
+            }
+
+            if (identity.address.empty() && !TryExtractBluetoothAddressFromText(identity.deviceInstanceId, identity.address))
+            {
+                (void)TryExtractBluetoothAddressFromText(identity.parentInstanceId, identity.address);
+            }
+        }
+        catch (const std::bad_alloc&)
+        {
+            return GB_SystemResult::Failed(GB_SystemErrorCode::ResourceAllocationFailed, operationName, u8"保存蓝牙 PnP 设备身份信息时内存不足。");
         }
         catch (...)
         {
-            return GB_SystemResult::Failed(GB_SystemErrorCode::ResourceAllocationFailed, operationName, u8"保存蓝牙 PnP 设备身份信息时内存不足。");
+            return GB_SystemResult::Failed(GB_SystemErrorCode::InternalError, operationName, u8"读取蓝牙 PnP 设备父节点或 ContainerId 时发生内部错误。");
         }
 
         return GB_SystemResult::Succeeded(operationName);
@@ -4836,6 +4932,26 @@ public:
         return externalSubscriptionTokens.size();
     }
 
+    size_t GetPendingEventCount() const
+    {
+        return eventDispatcher.GetPendingEventCount();
+    }
+
+    uint64_t GetDispatchedEventCount() const
+    {
+        return eventDispatcher.GetDispatchedEventCount();
+    }
+
+    uint64_t GetDroppedEventCount() const
+    {
+        return eventDispatcher.GetDroppedEventCount();
+    }
+
+    uint64_t GetCallbackExceptionCount() const
+    {
+        return eventDispatcher.GetCallbackExceptionCount();
+    }
+
 private:
     GB_SystemResult RollbackStartFailure(GB_SystemResult failureResult)
     {
@@ -4968,13 +5084,50 @@ private:
             return false;
         }
 
-        if (StartsWithAsciiNoCase(text, "BTH\\") || StartsWithAsciiNoCase(text, "BTHLE\\") || StartsWithAsciiNoCase(text, "BTHENUM\\") || StartsWithAsciiNoCase(text, "BTHLEDEVICE\\") || StartsWithAsciiNoCase(text, "BTHLEENUM\\") || StartsWithAsciiNoCase(text, "BTHHFENUM\\") || StartsWithAsciiNoCase(text, "BTHMODEM\\") || StartsWithAsciiNoCase(text, "Bluetooth\\") || StartsWithAsciiNoCase(text, "SWD\\RADIO\\Bluetooth"))
+        static const char* const instancePrefixes[] =
         {
-            return true;
+            "BTH\\",
+            "BTHLE\\",
+            "BTHENUM\\",
+            "BTHLEDEVICE\\",
+            "BTHLEENUM\\",
+            "BTHHFENUM\\",
+            "BTHMODEM\\",
+            "Bluetooth\\",
+            "SWD\\RADIO\\Bluetooth"
+        };
+        for (size_t index = 0; index < sizeof(instancePrefixes) / sizeof(instancePrefixes[0]); index++)
+        {
+            if (StartsWithAsciiNoCase(text, instancePrefixes[index]))
+            {
+                return true;
+            }
         }
-        if (ContainsAsciiNoCase(text, "\\BTH\\") || ContainsAsciiNoCase(text, "#BTH#") || ContainsAsciiNoCase(text, "\\BTHLE\\") || ContainsAsciiNoCase(text, "#BTHLE#") || ContainsAsciiNoCase(text, "SWD\\RADIO\\Bluetooth"))
+
+        static const char* const interfaceTokens[] =
         {
-            return true;
+            "\\BTH\\",
+            "#BTH#",
+            "\\BTHLE\\",
+            "#BTHLE#",
+            "\\BTHENUM\\",
+            "#BTHENUM#",
+            "\\BTHLEDEVICE\\",
+            "#BTHLEDEVICE#",
+            "\\BTHLEENUM\\",
+            "#BTHLEENUM#",
+            "\\BTHHFENUM\\",
+            "#BTHHFENUM#",
+            "\\BTHMODEM\\",
+            "#BTHMODEM#",
+            "SWD\\RADIO\\Bluetooth"
+        };
+        for (size_t index = 0; index < sizeof(interfaceTokens) / sizeof(interfaceTokens[0]); index++)
+        {
+            if (ContainsAsciiNoCase(text, interfaceTokens[index]))
+            {
+                return true;
+            }
         }
 
         return false;
@@ -5002,7 +5155,7 @@ private:
 
     static bool IsBluetoothRelatedDeviceEvent(const GB_SystemDeviceEvent& deviceEvent)
     {
-        if (EqualsAsciiNoCase(deviceEvent.interfaceClassGuid, GB_BluetoothLeDeviceInterfaceGuid) || EqualsAsciiNoCase(deviceEvent.interfaceClassGuid, GB_BluetoothGattServiceDeviceInterfaceGuid) || EqualsAsciiNoCase(deviceEvent.interfaceClassGuid, GB_BluetoothRadioInterfaceGuid))
+        if (EqualsAsciiNoCase(deviceEvent.interfaceClassGuid, GB_BluetoothClassicDeviceInterfaceGuid) || EqualsAsciiNoCase(deviceEvent.interfaceClassGuid, GB_BluetoothLeDeviceInterfaceGuid) || EqualsAsciiNoCase(deviceEvent.interfaceClassGuid, GB_BluetoothGattServiceDeviceInterfaceGuid) || EqualsAsciiNoCase(deviceEvent.interfaceClassGuid, GB_BluetoothRadioInterfaceGuid))
         {
             return true;
         }
@@ -5183,57 +5336,99 @@ private:
     GB_SystemBluetoothWatcher::BluetoothEventCallback bluetoothEventCallback;
 };
 
-GB_SystemBluetoothWatcher::GB_SystemBluetoothWatcher() : impl(new Impl(GB_SystemBluetoothWatcherOptions()))
+std::unique_ptr<GB_SystemBluetoothWatcher::Impl> GB_SystemBluetoothWatcher::CreateImpl(const GB_SystemBluetoothWatcherOptions& options) noexcept
+{
+    try
+    {
+        return std::unique_ptr<Impl>(new Impl(options));
+    }
+    catch (...)
+    {
+        return std::unique_ptr<Impl>();
+    }
+}
+
+GB_SystemBluetoothWatcher::GB_SystemBluetoothWatcher() : impl(CreateImpl(GB_SystemBluetoothWatcherOptions()))
 {
 }
 
-GB_SystemBluetoothWatcher::GB_SystemBluetoothWatcher(const GB_SystemBluetoothWatcherOptions& options) : impl(new Impl(options))
+GB_SystemBluetoothWatcher::GB_SystemBluetoothWatcher(const GB_SystemBluetoothWatcherOptions& options) : impl(CreateImpl(options))
 {
 }
 
 GB_SystemBluetoothWatcher::~GB_SystemBluetoothWatcher() noexcept = default;
 
+bool GB_SystemBluetoothWatcher::IsValid() const
+{
+    return impl != nullptr;
+}
+
 GB_SystemResult GB_SystemBluetoothWatcher::Start()
 {
-    return impl->Start();
+    return impl ? impl->Start() : MakeBluetoothWatcherInitializationFailedResult(u8"GB_SystemBluetoothWatcher::Start");
 }
 
 GB_SystemResult GB_SystemBluetoothWatcher::Stop()
 {
-    return impl->Stop();
+    return impl ? impl->Stop() : GB_SystemResult::Succeeded(u8"GB_SystemBluetoothWatcher::Stop", u8"蓝牙监听器内部状态为空，无需停止。");
 }
 
 bool GB_SystemBluetoothWatcher::IsRunning() const
 {
-    return impl->IsRunning();
+    return impl && impl->IsRunning();
 }
 
 void GB_SystemBluetoothWatcher::SetBluetoothEventCallback(const BluetoothEventCallback& callback)
 {
-    impl->SetBluetoothEventCallback(callback);
+    if (impl)
+    {
+        impl->SetBluetoothEventCallback(callback);
+    }
 }
 
 GB_SystemResult GB_SystemBluetoothWatcher::Subscribe(const GB_BluetoothEventType eventType, const BluetoothEventCallback& callback, GB_EventSubscriptionToken& subscriptionToken)
 {
-    return impl->Subscribe(eventType, callback, subscriptionToken);
+    subscriptionToken.Reset();
+    return impl ? impl->Subscribe(eventType, callback, subscriptionToken) : MakeBluetoothWatcherInitializationFailedResult(u8"GB_SystemBluetoothWatcher::Subscribe");
 }
 
 GB_SystemResult GB_SystemBluetoothWatcher::SubscribeAll(const BluetoothEventCallback& callback, GB_EventSubscriptionToken& subscriptionToken)
 {
-    return impl->SubscribeAll(callback, subscriptionToken);
+    subscriptionToken.Reset();
+    return impl ? impl->SubscribeAll(callback, subscriptionToken) : MakeBluetoothWatcherInitializationFailedResult(u8"GB_SystemBluetoothWatcher::SubscribeAll");
 }
 
 GB_SystemResult GB_SystemBluetoothWatcher::Unsubscribe(const GB_EventSubscriptionToken& subscriptionToken)
 {
-    return impl->Unsubscribe(subscriptionToken);
+    return impl ? impl->Unsubscribe(subscriptionToken) : MakeBluetoothWatcherInitializationFailedResult(u8"GB_SystemBluetoothWatcher::Unsubscribe");
 }
 
 GB_SystemResult GB_SystemBluetoothWatcher::ClearSubscriptions()
 {
-    return impl->ClearSubscriptions();
+    return impl ? impl->ClearSubscriptions() : GB_SystemResult::Succeeded(u8"GB_SystemBluetoothWatcher::ClearSubscriptions", u8"蓝牙监听器内部状态为空，没有可清理的订阅。");
 }
 
 size_t GB_SystemBluetoothWatcher::GetSubscriptionCount() const
 {
-    return impl->GetSubscriptionCount();
+    return impl ? impl->GetSubscriptionCount() : 0;
+}
+
+size_t GB_SystemBluetoothWatcher::GetPendingEventCount() const
+{
+    return impl ? impl->GetPendingEventCount() : 0;
+}
+
+uint64_t GB_SystemBluetoothWatcher::GetDispatchedEventCount() const
+{
+    return impl ? impl->GetDispatchedEventCount() : 0;
+}
+
+uint64_t GB_SystemBluetoothWatcher::GetDroppedEventCount() const
+{
+    return impl ? impl->GetDroppedEventCount() : 0;
+}
+
+uint64_t GB_SystemBluetoothWatcher::GetCallbackExceptionCount() const
+{
+    return impl ? impl->GetCallbackExceptionCount() : 0;
 }

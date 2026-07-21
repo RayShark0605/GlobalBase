@@ -1,4 +1,4 @@
-#include "GB_RunTests.h"
+﻿#include "GB_RunTests.h"
 #include "Desktop/GB_SystemBluetooth.h"
 
 #include <atomic>
@@ -150,12 +150,6 @@ namespace
             {
                 callbackCount++;
             });
-
-        GB_EventSubscriptionToken subscriptionToken;
-        const GB_SystemResult subscribeResult = watcher.GetEventDispatcher().SubscribeAll([](const GB_Event&)
-            {
-            }, subscriptionToken);
-        RequireResultSucceeded(subscribeResult, "GB_SystemBluetoothWatcher public SubscribeAll");
 
         GB_SystemResult startResult = watcher.Start();
         RequireResultSucceeded(startResult, "GB_SystemBluetoothWatcher Start first");
