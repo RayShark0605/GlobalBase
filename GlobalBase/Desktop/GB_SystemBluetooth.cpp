@@ -4115,7 +4115,7 @@ GB_SystemResult GB_SystemBluetooth::GetGattServices(const std::string& deviceInt
 GB_SystemResult GB_SystemBluetooth::GetGattCharacteristics(const std::string& deviceInterfacePath, const GB_BluetoothGattServiceInfo& service, std::vector<GB_BluetoothGattCharacteristicInfo>& characteristics)
 {
     characteristics.clear();
-    const std::string targetDeviceInterfacePath = !deviceInterfacePath.empty() ? deviceInterfacePath : service.deviceInterfacePath;
+    const std::string& targetDeviceInterfacePath = !deviceInterfacePath.empty() ? deviceInterfacePath : service.deviceInterfacePath;
     if (!deviceInterfacePath.empty() && !service.deviceInterfacePath.empty() && !EqualsAsciiNoCase(deviceInterfacePath, service.deviceInterfacePath))
     {
         return GB_SystemResult::Failed(GB_SystemErrorCode::InvalidArgument, u8"GB_SystemBluetooth::GetGattCharacteristics", u8"deviceInterfacePath 与 service.deviceInterfacePath 不一致。");
@@ -4134,7 +4134,7 @@ GB_SystemResult GB_SystemBluetooth::GetGattCharacteristics(const std::string& de
 GB_SystemResult GB_SystemBluetooth::ReadGattCharacteristic(const std::string& deviceInterfacePath, const GB_BluetoothGattCharacteristicInfo& characteristic, std::vector<uint8_t>& value, const GB_BluetoothGattReadOptions& options)
 {
     value.clear();
-    const std::string targetDeviceInterfacePath = !deviceInterfacePath.empty() ? deviceInterfacePath : characteristic.deviceInterfacePath;
+    const std::string& targetDeviceInterfacePath = !deviceInterfacePath.empty() ? deviceInterfacePath : characteristic.deviceInterfacePath;
     if (!deviceInterfacePath.empty() && !characteristic.deviceInterfacePath.empty() && !EqualsAsciiNoCase(deviceInterfacePath, characteristic.deviceInterfacePath))
     {
         return GB_SystemResult::Failed(GB_SystemErrorCode::InvalidArgument, u8"GB_SystemBluetooth::ReadGattCharacteristic", u8"deviceInterfacePath 与 characteristic.deviceInterfacePath 不一致。");
@@ -4152,7 +4152,7 @@ GB_SystemResult GB_SystemBluetooth::ReadGattCharacteristic(const std::string& de
 
 GB_SystemResult GB_SystemBluetooth::WriteGattCharacteristic(const std::string& deviceInterfacePath, const GB_BluetoothGattCharacteristicInfo& characteristic, const std::vector<uint8_t>& value, const GB_BluetoothGattWriteOptions& options)
 {
-    const std::string targetDeviceInterfacePath = !deviceInterfacePath.empty() ? deviceInterfacePath : characteristic.deviceInterfacePath;
+    const std::string& targetDeviceInterfacePath = !deviceInterfacePath.empty() ? deviceInterfacePath : characteristic.deviceInterfacePath;
     if (!deviceInterfacePath.empty() && !characteristic.deviceInterfacePath.empty() && !EqualsAsciiNoCase(deviceInterfacePath, characteristic.deviceInterfacePath))
     {
         return GB_SystemResult::Failed(GB_SystemErrorCode::InvalidArgument, u8"GB_SystemBluetooth::WriteGattCharacteristic", u8"deviceInterfacePath 与 characteristic.deviceInterfacePath 不一致。");
@@ -4698,7 +4698,7 @@ private:
     };
 
 public:
-    explicit Impl(const GB_SystemBluetoothWatcherOptions& inputOptions) : options(NormalizeOptions(inputOptions)), acceptingDeviceEvents(false), eventDispatcher(GB_EventDispatcher::MakeQueuedOptions(options.maxDispatchQueueSize, GB_EventQueueOverflowPolicy::DropOldest, u8"GB_SystemBluetoothWatcher"))
+    explicit Impl(const GB_SystemBluetoothWatcherOptions& inputOptions) : options(NormalizeOptions(inputOptions)), acceptingDeviceEvents(false), internalDroppedEventCount(0), eventDispatcher(GB_EventDispatcher::MakeQueuedOptions(options.maxDispatchQueueSize, GB_EventQueueOverflowPolicy::DropOldest, u8"GB_SystemBluetoothWatcher"))
     {
     }
 
@@ -4944,7 +4944,9 @@ public:
 
     uint64_t GetDroppedEventCount() const
     {
-        return eventDispatcher.GetDroppedEventCount();
+        const uint64_t dispatcherDroppedEventCount = eventDispatcher.GetDroppedEventCount();
+        const uint64_t localDroppedEventCount = internalDroppedEventCount.load(std::memory_order_relaxed);
+        return AddSaturating(dispatcherDroppedEventCount, localDroppedEventCount);
     }
 
     uint64_t GetCallbackExceptionCount() const
@@ -5294,6 +5296,25 @@ private:
         return GetCurrentThreadBluetoothCallbackOwner() == this;
     }
 
+    static uint64_t AddSaturating(const uint64_t leftValue, const uint64_t rightValue) noexcept
+    {
+        const uint64_t maxValue = (std::numeric_limits<uint64_t>::max)();
+        return leftValue > maxValue - rightValue ? maxValue : leftValue + rightValue;
+    }
+
+    static void IncrementSaturatingCounter(std::atomic<uint64_t>& counter) noexcept
+    {
+        uint64_t currentValue = counter.load(std::memory_order_relaxed);
+        const uint64_t maxValue = (std::numeric_limits<uint64_t>::max)();
+        while (currentValue != maxValue)
+        {
+            if (counter.compare_exchange_weak(currentValue, currentValue + 1, std::memory_order_relaxed, std::memory_order_relaxed))
+            {
+                return;
+            }
+        }
+    }
+
     void HandleSystemDeviceEvent(const GB_SystemDeviceEvent& deviceEvent) noexcept
     {
         if (!acceptingDeviceEvents.load(std::memory_order_acquire))
@@ -5313,12 +5334,19 @@ private:
                 return;
             }
 
-            GB_Event event(bluetoothEvent.eventName, GB_Variant(bluetoothEvent), u8"GB_SystemBluetoothWatcher");
-            event.timestampMilliseconds = bluetoothEvent.timestampMilliseconds;
-            (void)eventDispatcher.Post(event);
+            const std::string eventName = bluetoothEvent.eventName;
+            const uint64_t timestampMilliseconds = bluetoothEvent.timestampMilliseconds;
+            GB_Event event(eventName, GB_Variant(std::move(bluetoothEvent)), u8"GB_SystemBluetoothWatcher");
+            event.timestampMilliseconds = timestampMilliseconds;
+            const GB_SystemResult postResult = eventDispatcher.Post(event);
+            if (postResult.IsFailed())
+            {
+                IncrementSaturatingCounter(internalDroppedEventCount);
+            }
         }
         catch (...)
         {
+            IncrementSaturatingCounter(internalDroppedEventCount);
         }
     }
 
@@ -5329,6 +5357,7 @@ private:
     mutable std::mutex subscriptionMutex;
     LifecycleState lifecycleState = LifecycleState::Stopped;
     std::atomic<bool> acceptingDeviceEvents;
+    std::atomic<uint64_t> internalDroppedEventCount;
     GB_SystemDeviceWatcher deviceWatcher;
     GB_EventDispatcher eventDispatcher;
     GB_EventSubscriptionToken typedSubscriptionToken;

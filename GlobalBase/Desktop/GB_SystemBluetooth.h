@@ -592,7 +592,7 @@ public:
     /** @brief 获取已经完成分发的蓝牙事件数量。 */
     uint64_t GetDispatchedEventCount() const;
 
-    /** @brief 获取因队列溢出或内部入队失败而丢弃的蓝牙事件数量。 */
+    /** @brief 获取因队列溢出、事件构造失败或内部入队失败而丢弃的蓝牙事件数量。 */
     uint64_t GetDroppedEventCount() const;
 
     /** @brief 获取用户回调抛出异常的累计次数。 */
