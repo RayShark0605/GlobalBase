@@ -388,9 +388,9 @@ struct GB_BluetoothGattWriteOptions
  * - 服务枚举使用 BLE 设备接口句柄；特征枚举和特征值读写使用对应的 GATT 服务接口句柄，严格遵循 Windows GATT 句柄层级；
  * - Windows 返回主服务但对应服务接口暂时不可打开或无法验证层级时，会跳过该不可访问服务并保留其它已经严格验证的可用服务；只有一个可用服务都无法建立时才返回失败；
  * - UUID 比较遵循 Windows IsBthLEUuidMatch 语义，16 位短 UUID 与等价 Bluetooth Base UUID 形式的 128 位 UUID 可正确匹配；
- * - 连续读写同一设备时，可避免每次操作都重新枚举设备/服务接口、重复 CreateFileW 和重建 GATT 层次缓存；
+ * - 连续读写同一设备时，可避免每次操作都重新枚举设备/服务接口、重复 CreateFileW 和重建 GATT 层次缓存；会话使用服务/特征属性句柄索引定位缓存项，避免每次读写线性扫描；
  * - RefreshCache() 用于服务变更、设备重连或系统缓存变化后重新获取服务层次；
- * - 所有公开方法会串行化同一会话上的访问，同一对象可由多个线程调用，但耗时 GATT 操作仍会互斥执行；
+ * - 除移动、析构外，所有公开业务方法会串行化同一会话上的访问，同一对象可由多个线程调用，但耗时 GATT 操作仍会互斥执行；移动或析构时调用方必须保证没有并发访问；
  * - 移动后的源对象为空会话，可再次调用 Open()；
  * - 非 Windows 平台下实际操作返回 UnsupportedPlatform。
  */
@@ -592,7 +592,7 @@ public:
     /** @brief 获取已经完成分发的蓝牙事件数量。 */
     uint64_t GetDispatchedEventCount() const;
 
-    /** @brief 获取因队列溢出、事件构造失败或内部入队失败而丢弃的蓝牙事件数量。 */
+    /** @brief 获取因队列溢出、事件构造失败或分发器内部入队失败而丢弃的蓝牙事件数量；同一事件只统计一次。 */
     uint64_t GetDroppedEventCount() const;
 
     /** @brief 获取用户回调抛出异常的累计次数。 */

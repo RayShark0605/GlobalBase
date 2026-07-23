@@ -12,6 +12,7 @@
 #include <memory>
 #include <mutex>
 #include <new>
+#include <unordered_map>
 #include <unordered_set>
 #include <utility>
 
@@ -2627,8 +2628,10 @@ namespace
         std::string interfacePath;
         std::string deviceInstanceId;
         std::string parentInstanceId;
+        std::vector<std::string> ancestorInstanceIds;
         std::string containerId;
         std::string address;
+        bool pnpMetadataResolved = false;
     };
 
     static GB_SystemResult BuildBluetoothInterfaceIdentity(const GB_SystemDeviceInterfaceInfo& deviceInterface, BluetoothInterfaceIdentity& identity, const std::string& operationName)
@@ -2692,9 +2695,76 @@ namespace
         return GB_SystemResult::FromWin32Error(static_cast<uint32_t>(win32Error), operationName, message);
     }
 
+    static GB_SystemResult GetDeviceInstanceIdFromDevInst(const DEVINST deviceInstance, std::string& deviceInstanceId, const std::string& operationName)
+    {
+        deviceInstanceId.clear();
+
+        ULONG deviceInstanceIdLength = 0;
+        const CONFIGRET sizeResult = ::CM_Get_Device_ID_Size(&deviceInstanceIdLength, deviceInstance, 0);
+        if (sizeResult != CR_SUCCESS)
+        {
+            return MakeConfigRetFailureResult(sizeResult, operationName, u8"CM_Get_Device_ID_Size 查询蓝牙 PnP 设备实例 ID 长度失败。");
+        }
+        if (deviceInstanceIdLength > 32767u)
+        {
+            return GB_SystemResult::Failed(GB_SystemErrorCode::ResourceAllocationFailed, operationName, u8"系统返回的蓝牙 PnP 设备实例 ID 长度异常，已拒绝分配过大缓冲区。");
+        }
+
+        std::vector<wchar_t> deviceInstanceIdBuffer;
+        try
+        {
+            deviceInstanceIdBuffer.assign(static_cast<size_t>(deviceInstanceIdLength) + 1u, L'\0');
+        }
+        catch (...)
+        {
+            return GB_SystemResult::Failed(GB_SystemErrorCode::ResourceAllocationFailed, operationName, u8"分配蓝牙 PnP 设备实例 ID 缓冲区时内存不足。");
+        }
+
+        const CONFIGRET idResult = ::CM_Get_Device_IDW(deviceInstance, deviceInstanceIdBuffer.data(), static_cast<ULONG>(deviceInstanceIdBuffer.size()), 0);
+        if (idResult != CR_SUCCESS)
+        {
+            return MakeConfigRetFailureResult(idResult, operationName, u8"CM_Get_Device_IDW 读取蓝牙 PnP 设备实例 ID 失败。");
+        }
+
+        try
+        {
+            deviceInstanceId = GB_WStringToUtf8(std::wstring(deviceInstanceIdBuffer.data(), static_cast<size_t>(deviceInstanceIdLength)));
+        }
+        catch (const std::bad_alloc&)
+        {
+            deviceInstanceId.clear();
+            return GB_SystemResult::Failed(GB_SystemErrorCode::ResourceAllocationFailed, operationName, u8"转换蓝牙 PnP 设备实例 ID 时内存不足。");
+        }
+        catch (...)
+        {
+            deviceInstanceId.clear();
+            return GB_SystemResult::Failed(GB_SystemErrorCode::EncodingConversionFailed, operationName, u8"蓝牙 PnP 设备实例 ID 转换为 UTF-8 失败。");
+        }
+
+        return GB_SystemResult::Succeeded(operationName);
+    }
+
+    static bool ContainsDeviceInstanceIdNoCase(const std::vector<std::string>& deviceInstanceIds, const std::string& deviceInstanceId)
+    {
+        if (deviceInstanceId.empty())
+        {
+            return false;
+        }
+
+        for (size_t index = 0; index < deviceInstanceIds.size(); index++)
+        {
+            if (EqualsAsciiNoCase(deviceInstanceIds[index], deviceInstanceId))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
     static GB_SystemResult EnrichBluetoothInterfaceIdentity(BluetoothInterfaceIdentity& identity, const std::string& operationName)
     {
-        if (identity.deviceInstanceId.empty() || (!identity.parentInstanceId.empty() && !identity.containerId.empty()))
+        if (identity.pnpMetadataResolved || identity.deviceInstanceId.empty())
         {
             return GB_SystemResult::Succeeded(operationName);
         }
@@ -2724,54 +2794,88 @@ namespace
             return MakeConfigRetFailureResult(locateResult, operationName, u8"CM_Locate_DevNodeW 定位蓝牙 PnP 设备实例失败。");
         }
 
+        std::string parentInstanceId;
+        std::vector<std::string> ancestorInstanceIds;
+        std::string containerId;
+        std::string address;
         try
         {
-            if (identity.parentInstanceId.empty())
+            containerId = identity.containerId;
+            address = identity.address;
+
+            if (containerId.empty())
+            {
+                GUID nativeContainerId = {};
+                DEVPROPTYPE propertyType = 0;
+                ULONG propertySize = static_cast<ULONG>(sizeof(nativeContainerId));
+                const CONFIGRET propertyResult = ::CM_Get_DevNode_PropertyW(deviceInstance, &DEVPKEY_Device_ContainerId, &propertyType, reinterpret_cast<PBYTE>(&nativeContainerId), &propertySize, 0);
+                if (propertyResult == CR_SUCCESS && propertyType == DEVPROP_TYPE_GUID && propertySize >= sizeof(nativeContainerId))
+                {
+                    containerId = GuidToString(nativeContainerId);
+                }
+            }
+
+            const size_t maxAncestorDepth = 32;
+            ancestorInstanceIds.reserve(maxAncestorDepth);
+            DEVINST currentDeviceInstance = deviceInstance;
+            for (size_t ancestorDepth = 0; ancestorDepth < maxAncestorDepth; ancestorDepth++)
             {
                 DEVINST parentDeviceInstance = 0;
-                const CONFIGRET parentResult = ::CM_Get_Parent(&parentDeviceInstance, deviceInstance, 0);
-                if (parentResult == CR_SUCCESS)
+                const CONFIGRET parentResult = ::CM_Get_Parent(&parentDeviceInstance, currentDeviceInstance, 0);
+                if (parentResult != CR_SUCCESS)
                 {
-                    ULONG parentIdLength = 0;
-                    const CONFIGRET parentSizeResult = ::CM_Get_Device_ID_Size(&parentIdLength, parentDeviceInstance, 0);
-                    if (parentSizeResult == CR_SUCCESS)
+                    break;
+                }
+
+                std::string parentDeviceInstanceId;
+                const GB_SystemResult parentIdResult = GetDeviceInstanceIdFromDevInst(parentDeviceInstance, parentDeviceInstanceId, operationName);
+                if (parentIdResult.IsFailed())
+                {
+                    if (parentIdResult.errorCode == GB_SystemErrorCode::ResourceAllocationFailed || parentIdResult.errorCode == GB_SystemErrorCode::EncodingConversionFailed)
                     {
-                        std::vector<wchar_t> parentIdBuffer(static_cast<size_t>(parentIdLength) + 1u, L'\0');
-                        const CONFIGRET parentIdResult = ::CM_Get_Device_IDW(parentDeviceInstance, parentIdBuffer.data(), static_cast<ULONG>(parentIdBuffer.size()), 0);
-                        if (parentIdResult == CR_SUCCESS)
-                        {
-                            identity.parentInstanceId = WideStringToUtf8Safe(std::wstring(parentIdBuffer.data(), static_cast<size_t>(parentIdLength)));
-                        }
+                        return parentIdResult;
+                    }
+
+                    break;
+                }
+                if (parentDeviceInstanceId.empty() || EqualsAsciiNoCase(parentDeviceInstanceId, identity.deviceInstanceId) || ContainsDeviceInstanceIdNoCase(ancestorInstanceIds, parentDeviceInstanceId))
+                {
+                    break;
+                }
+
+                if (parentInstanceId.empty())
+                {
+                    parentInstanceId = parentDeviceInstanceId;
+                }
+                ancestorInstanceIds.push_back(parentDeviceInstanceId);
+                currentDeviceInstance = parentDeviceInstance;
+            }
+
+            if (address.empty() && !TryExtractBluetoothAddressFromText(identity.deviceInstanceId, address))
+            {
+                for (size_t index = 0; index < ancestorInstanceIds.size(); index++)
+                {
+                    if (TryExtractBluetoothAddressFromText(ancestorInstanceIds[index], address))
+                    {
+                        break;
                     }
                 }
-            }
-
-            if (identity.containerId.empty())
-            {
-                GUID containerId = {};
-                DEVPROPTYPE propertyType = 0;
-                ULONG propertySize = static_cast<ULONG>(sizeof(containerId));
-                const CONFIGRET propertyResult = ::CM_Get_DevNode_PropertyW(deviceInstance, &DEVPKEY_Device_ContainerId, &propertyType, reinterpret_cast<PBYTE>(&containerId), &propertySize, 0);
-                if (propertyResult == CR_SUCCESS && propertyType == DEVPROP_TYPE_GUID && propertySize >= sizeof(containerId))
-                {
-                    identity.containerId = GuidToString(containerId);
-                }
-            }
-
-            if (identity.address.empty() && !TryExtractBluetoothAddressFromText(identity.deviceInstanceId, identity.address))
-            {
-                (void)TryExtractBluetoothAddressFromText(identity.parentInstanceId, identity.address);
             }
         }
         catch (const std::bad_alloc&)
         {
-            return GB_SystemResult::Failed(GB_SystemErrorCode::ResourceAllocationFailed, operationName, u8"保存蓝牙 PnP 设备身份信息时内存不足。");
+            return GB_SystemResult::Failed(GB_SystemErrorCode::ResourceAllocationFailed, operationName, u8"保存蓝牙 PnP 设备祖先链或 ContainerId 时内存不足。");
         }
         catch (...)
         {
-            return GB_SystemResult::Failed(GB_SystemErrorCode::InternalError, operationName, u8"读取蓝牙 PnP 设备父节点或 ContainerId 时发生内部错误。");
+            return GB_SystemResult::Failed(GB_SystemErrorCode::InternalError, operationName, u8"读取蓝牙 PnP 设备祖先链或 ContainerId 时发生内部错误。");
         }
 
+        identity.parentInstanceId.swap(parentInstanceId);
+        identity.ancestorInstanceIds.swap(ancestorInstanceIds);
+        identity.containerId.swap(containerId);
+        identity.address.swap(address);
+        identity.pnpMetadataResolved = true;
         return GB_SystemResult::Succeeded(operationName);
     }
 
@@ -2789,7 +2893,11 @@ namespace
         {
             return true;
         }
-        if (!deviceIdentity.deviceInstanceId.empty() && !serviceIdentity.parentInstanceId.empty() && EqualsAsciiNoCase(deviceIdentity.deviceInstanceId, serviceIdentity.parentInstanceId))
+        if (ContainsDeviceInstanceIdNoCase(serviceIdentity.ancestorInstanceIds, deviceIdentity.deviceInstanceId))
+        {
+            return true;
+        }
+        if (ContainsDeviceInstanceIdNoCase(deviceIdentity.ancestorInstanceIds, serviceIdentity.deviceInstanceId))
         {
             return true;
         }
@@ -2828,19 +2936,10 @@ namespace
         return GB_SystemResult::Failed(GB_SystemErrorCode::NotFound, operationName, u8"未在当前存在的 Windows 设备接口中找到指定蓝牙接口路径。");
     }
 
-    static GB_SystemResult GetGattServiceInterfacesForDevice(const BluetoothInterfaceIdentity& inputDeviceIdentity, std::vector<GB_SystemDeviceInterfaceInfo>& serviceInterfaces, const std::string& operationName)
+    static GB_SystemResult GetGattServiceInterfacesForDevice(BluetoothInterfaceIdentity& deviceIdentity, std::vector<GB_SystemDeviceInterfaceInfo>& serviceInterfaces, const std::string& operationName)
     {
         serviceInterfaces.clear();
 
-        BluetoothInterfaceIdentity deviceIdentity;
-        try
-        {
-            deviceIdentity = inputDeviceIdentity;
-        }
-        catch (...)
-        {
-            return GB_SystemResult::Failed(GB_SystemErrorCode::ResourceAllocationFailed, operationName, u8"复制 BLE 设备接口身份信息时内存不足。");
-        }
         if (deviceIdentity.interfacePath.empty())
         {
             return GB_SystemResult::Failed(GB_SystemErrorCode::InvalidState, operationName, u8"BLE GATT 会话缺少经过设备接口枚举验证的目标设备身份信息。");
@@ -2865,7 +2964,7 @@ namespace
             return GB_SystemResult::Failed(GB_SystemErrorCode::ResourceAllocationFailed, operationName, u8"预分配 BLE GATT 服务接口候选缓冲区时内存不足。");
         }
 
-        bool deviceIdentityEnriched = false;
+        bool deviceIdentityEnriched = deviceIdentity.pnpMetadataResolved;
         GB_SystemResult firstIdentityFailure = GB_SystemResult::Succeeded(operationName);
         for (size_t index = 0; index < allServiceInterfaces.size(); index++)
         {
@@ -3227,6 +3326,7 @@ private:
         bool characteristicsLoaded = false;
         std::vector<BTH_LE_GATT_CHARACTERISTIC> nativeCharacteristics;
         std::vector<GB_BluetoothGattCharacteristicInfo> characteristicInfos;
+        std::unordered_map<uint16_t, size_t> characteristicIndexByAttributeHandle;
     };
 
     static GB_SystemResult ProbeGattServiceHierarchy(HANDLE serviceHandle, BTH_LE_GATT_SERVICE& service, bool& compatible, const std::string& operationName)
@@ -3250,19 +3350,6 @@ private:
         }
 
         return MapBluetoothGattHResult(hresult, operationName, u8"验证 BLE GATT 服务接口与主服务层级关系失败。");
-    }
-
-    static bool ContainsCachedService(const std::vector<CachedService>& services, const BTH_LE_GATT_SERVICE& nativeService)
-    {
-        for (size_t index = 0; index < services.size(); index++)
-        {
-            if (services[index].nativeService.AttributeHandle == nativeService.AttributeHandle && AreBthLeUuidsEqual(services[index].nativeService.ServiceUuid, nativeService.ServiceUuid))
-            {
-                return true;
-            }
-        }
-
-        return false;
     }
 
     GB_SystemResult EnsureOpenLocked(const std::string& operationName) const
@@ -3292,8 +3379,27 @@ private:
         if (nativeDeviceServices.empty())
         {
             cachedServices.clear();
+            serviceIndexByAttributeHandle.clear();
             servicesLoaded = true;
             return GB_SystemResult::Succeeded(operationName);
+        }
+
+        std::unordered_set<uint16_t> nativeServiceAttributeHandles;
+        try
+        {
+            nativeServiceAttributeHandles.reserve(nativeDeviceServices.size());
+            for (size_t index = 0; index < nativeDeviceServices.size(); index++)
+            {
+                const uint16_t attributeHandle = static_cast<uint16_t>(nativeDeviceServices[index].AttributeHandle);
+                if (attributeHandle == 0 || !nativeServiceAttributeHandles.insert(attributeHandle).second)
+                {
+                    return GB_SystemResult::Failed(GB_SystemErrorCode::OperationFailed, operationName, u8"Windows 返回了无效或重复的 BLE GATT 主服务属性句柄，原有会话缓存保持不变。");
+                }
+            }
+        }
+        catch (...)
+        {
+            return GB_SystemResult::Failed(GB_SystemErrorCode::ResourceAllocationFailed, operationName, u8"验证 BLE GATT 主服务句柄时内存不足，原有会话缓存保持不变。");
         }
 
         std::vector<GB_SystemDeviceInterfaceInfo> serviceInterfaces;
@@ -3308,13 +3414,15 @@ private:
         }
 
         std::vector<CachedService> newCachedServices;
+        std::unordered_set<uint16_t> matchedServiceAttributeHandles;
         try
         {
             newCachedServices.reserve(nativeDeviceServices.size());
+            matchedServiceAttributeHandles.reserve(nativeDeviceServices.size());
         }
         catch (...)
         {
-            return GB_SystemResult::Failed(GB_SystemErrorCode::ResourceAllocationFailed, operationName, u8"预分配 BLE GATT 服务会话缓存时内存不足。");
+            return GB_SystemResult::Failed(GB_SystemErrorCode::ResourceAllocationFailed, operationName, u8"预分配 BLE GATT 服务会话缓存或匹配索引时内存不足。");
         }
 
         GB_SystemResult firstInterfaceFailure = GB_SystemResult::Succeeded(operationName);
@@ -3340,7 +3448,8 @@ private:
             }
             for (size_t serviceIndex = 0; serviceIndex < nativeDeviceServices.size(); serviceIndex++)
             {
-                if (ContainsCachedService(newCachedServices, nativeDeviceServices[serviceIndex]))
+                const uint16_t serviceAttributeHandle = static_cast<uint16_t>(nativeDeviceServices[serviceIndex].AttributeHandle);
+                if (matchedServiceAttributeHandles.find(serviceAttributeHandle) != matchedServiceAttributeHandles.end())
                 {
                     continue;
                 }
@@ -3368,6 +3477,7 @@ private:
                     cachedService.serviceHandle = std::move(serviceHandle);
                     cachedService.serviceHandleHasWriteAccess = serviceHandleHasWriteAccess;
                     newCachedServices.push_back(std::move(cachedService));
+                    matchedServiceAttributeHandles.insert(serviceAttributeHandle);
                 }
                 catch (...)
                 {
@@ -3404,7 +3514,27 @@ private:
                 }
                 return leftService.serviceInfo.uuid < rightService.serviceInfo.uuid;
             });
+
+        std::unordered_map<uint16_t, size_t> newServiceIndexByAttributeHandle;
+        try
+        {
+            newServiceIndexByAttributeHandle.reserve(newCachedServices.size());
+            for (size_t index = 0; index < newCachedServices.size(); index++)
+            {
+                const uint16_t attributeHandle = static_cast<uint16_t>(newCachedServices[index].nativeService.AttributeHandle);
+                if (attributeHandle == 0 || !newServiceIndexByAttributeHandle.emplace(attributeHandle, index).second)
+                {
+                    return GB_SystemResult::Failed(GB_SystemErrorCode::OperationFailed, operationName, u8"Windows 返回了无效或重复的 BLE GATT 服务属性句柄，原有会话缓存保持不变。");
+                }
+            }
+        }
+        catch (...)
+        {
+            return GB_SystemResult::Failed(GB_SystemErrorCode::ResourceAllocationFailed, operationName, u8"构建 BLE GATT 服务句柄索引时内存不足，原有会话缓存保持不变。");
+        }
+
         cachedServices.swap(newCachedServices);
+        serviceIndexByAttributeHandle.swap(newServiceIndexByAttributeHandle);
         servicesLoaded = true;
         if (skippedServiceCount == 0)
         {
@@ -3475,11 +3605,13 @@ private:
             return ensureResult;
         }
 
-        for (size_t index = 0; index < cachedServices.size(); index++)
+        const std::unordered_map<uint16_t, size_t>::const_iterator serviceIndexIter = serviceIndexByAttributeHandle.find(service.attributeHandle);
+        if (serviceIndexIter != serviceIndexByAttributeHandle.end() && serviceIndexIter->second < cachedServices.size())
         {
-            if (AreDeviceInterfacePathsEqual(cachedServices[index].serviceInfo.serviceInterfacePath, service.serviceInterfacePath) && cachedServices[index].nativeService.AttributeHandle == service.attributeHandle && AreBthLeUuidsEqual(cachedServices[index].nativeService.ServiceUuid, expectedUuid))
+            const CachedService& cachedService = cachedServices[serviceIndexIter->second];
+            if (AreDeviceInterfacePathsEqual(cachedService.serviceInfo.serviceInterfacePath, service.serviceInterfacePath) && cachedService.nativeService.AttributeHandle == service.attributeHandle && AreBthLeUuidsEqual(cachedService.nativeService.ServiceUuid, expectedUuid))
             {
-                serviceIndex = index;
+                serviceIndex = serviceIndexIter->second;
                 return GB_SystemResult::Succeeded(operationName);
             }
         }
@@ -3545,26 +3677,37 @@ private:
         }
 
         std::vector<GB_BluetoothGattCharacteristicInfo> characteristicInfos;
+        std::unordered_map<uint16_t, size_t> characteristicIndexByAttributeHandle;
         try
         {
             characteristicInfos.reserve(nativeCharacteristics.size());
+            characteristicIndexByAttributeHandle.reserve(nativeCharacteristics.size());
             for (size_t index = 0; index < nativeCharacteristics.size(); index++)
             {
-                if (nativeCharacteristics[index].ServiceHandle != cachedService.nativeService.AttributeHandle)
+                const BTH_LE_GATT_CHARACTERISTIC& nativeCharacteristic = nativeCharacteristics[index];
+                if (nativeCharacteristic.ServiceHandle != cachedService.nativeService.AttributeHandle)
                 {
                     return GB_SystemResult::Failed(GB_SystemErrorCode::OperationFailed, operationName, u8"BluetoothGATTGetCharacteristics 返回了不属于目标服务的特征句柄。");
                 }
 
-                characteristicInfos.push_back(ConvertGattCharacteristicInfo(nativeCharacteristics[index], cachedService.serviceInfo, deviceInterfacePath));
+                const uint16_t attributeHandle = static_cast<uint16_t>(nativeCharacteristic.AttributeHandle);
+                const uint16_t characteristicValueHandle = static_cast<uint16_t>(nativeCharacteristic.CharacteristicValueHandle);
+                if (attributeHandle == 0 || characteristicValueHandle == 0 || !characteristicIndexByAttributeHandle.emplace(attributeHandle, index).second)
+                {
+                    return GB_SystemResult::Failed(GB_SystemErrorCode::OperationFailed, operationName, u8"Windows 返回了无效或重复的 BLE GATT 特征属性句柄。");
+                }
+
+                characteristicInfos.push_back(ConvertGattCharacteristicInfo(nativeCharacteristic, cachedService.serviceInfo, deviceInterfacePath));
             }
         }
         catch (...)
         {
-            return GB_SystemResult::Failed(GB_SystemErrorCode::ResourceAllocationFailed, operationName, u8"构建 BLE GATT 特征会话缓存时内存不足。");
+            return GB_SystemResult::Failed(GB_SystemErrorCode::ResourceAllocationFailed, operationName, u8"构建 BLE GATT 特征会话缓存或句柄索引时内存不足。");
         }
 
         cachedService.nativeCharacteristics.swap(nativeCharacteristics);
         cachedService.characteristicInfos.swap(characteristicInfos);
+        cachedService.characteristicIndexByAttributeHandle.swap(characteristicIndexByAttributeHandle);
         cachedService.characteristicsLoaded = true;
         return GB_SystemResult::Succeeded(operationName);
     }
@@ -3611,34 +3754,32 @@ private:
             return ensureResult;
         }
 
-        bool serviceFound = false;
-        for (size_t index = 0; index < cachedServices.size(); index++)
-        {
-            if (AreDeviceInterfacePathsEqual(cachedServices[index].serviceInfo.serviceInterfacePath, characteristic.serviceInterfacePath) && cachedServices[index].nativeService.AttributeHandle == characteristic.serviceAttributeHandle && AreBthLeUuidsEqual(cachedServices[index].nativeService.ServiceUuid, expectedServiceUuid))
-            {
-                serviceIndex = index;
-                serviceFound = true;
-                break;
-            }
-        }
-        if (!serviceFound)
+        const std::unordered_map<uint16_t, size_t>::const_iterator serviceIndexIter = serviceIndexByAttributeHandle.find(characteristic.serviceAttributeHandle);
+        if (serviceIndexIter == serviceIndexByAttributeHandle.end() || serviceIndexIter->second >= cachedServices.size())
         {
             return GB_SystemResult::Failed(GB_SystemErrorCode::NotFound, operationName, u8"未在当前 GATT 会话缓存中找到特征所属服务；请调用 RefreshCache() 后重新枚举。");
         }
 
+        serviceIndex = serviceIndexIter->second;
         CachedService& cachedService = cachedServices[serviceIndex];
+        if (!AreDeviceInterfacePathsEqual(cachedService.serviceInfo.serviceInterfacePath, characteristic.serviceInterfacePath) || cachedService.nativeService.AttributeHandle != characteristic.serviceAttributeHandle || !AreBthLeUuidsEqual(cachedService.nativeService.ServiceUuid, expectedServiceUuid))
+        {
+            return GB_SystemResult::Failed(GB_SystemErrorCode::NotFound, operationName, u8"特征所属服务的接口路径或 UUID 与当前会话缓存不一致；请调用 RefreshCache() 后重新枚举。");
+        }
+
         GB_SystemResult characteristicResult = EnsureCharacteristicsLoadedLocked(cachedService, operationName);
         if (characteristicResult.IsFailed())
         {
             return characteristicResult;
         }
 
-        for (size_t index = 0; index < cachedService.nativeCharacteristics.size(); index++)
+        const std::unordered_map<uint16_t, size_t>::const_iterator characteristicIndexIter = cachedService.characteristicIndexByAttributeHandle.find(characteristic.attributeHandle);
+        if (characteristicIndexIter != cachedService.characteristicIndexByAttributeHandle.end() && characteristicIndexIter->second < cachedService.nativeCharacteristics.size())
         {
-            const BTH_LE_GATT_CHARACTERISTIC& nativeCharacteristic = cachedService.nativeCharacteristics[index];
+            const BTH_LE_GATT_CHARACTERISTIC& nativeCharacteristic = cachedService.nativeCharacteristics[characteristicIndexIter->second];
             if (nativeCharacteristic.ServiceHandle == characteristic.serviceAttributeHandle && nativeCharacteristic.AttributeHandle == characteristic.attributeHandle && nativeCharacteristic.CharacteristicValueHandle == characteristic.characteristicValueHandle && AreBthLeUuidsEqual(nativeCharacteristic.CharacteristicUuid, expectedCharacteristicUuid))
             {
-                characteristicIndex = index;
+                characteristicIndex = characteristicIndexIter->second;
                 return GB_SystemResult::Succeeded(operationName);
             }
         }
@@ -3651,12 +3792,15 @@ private:
     {
 #if defined(_WIN32)
         cachedServices.clear();
+        serviceIndexByAttributeHandle.clear();
         deviceHandle.Reset(INVALID_HANDLE_VALUE);
         deviceIdentity.interfacePath.clear();
         deviceIdentity.deviceInstanceId.clear();
         deviceIdentity.parentInstanceId.clear();
+        deviceIdentity.ancestorInstanceIds.clear();
         deviceIdentity.containerId.clear();
         deviceIdentity.address.clear();
+        deviceIdentity.pnpMetadataResolved = false;
         servicesLoaded = false;
 #endif
         deviceInterfacePath.clear();
@@ -3676,6 +3820,7 @@ private:
     BluetoothInterfaceIdentity deviceIdentity;
     bool servicesLoaded = false;
     std::vector<CachedService> cachedServices;
+    std::unordered_map<uint16_t, size_t> serviceIndexByAttributeHandle;
 #endif
 };
 
@@ -4698,7 +4843,7 @@ private:
     };
 
 public:
-    explicit Impl(const GB_SystemBluetoothWatcherOptions& inputOptions) : options(NormalizeOptions(inputOptions)), acceptingDeviceEvents(false), internalDroppedEventCount(0), eventDispatcher(GB_EventDispatcher::MakeQueuedOptions(options.maxDispatchQueueSize, GB_EventQueueOverflowPolicy::DropOldest, u8"GB_SystemBluetoothWatcher"))
+    explicit Impl(const GB_SystemBluetoothWatcherOptions& inputOptions) : options(NormalizeOptions(inputOptions)), acceptingDeviceEvents(false), sourceDroppedEventCount(0), eventDispatcher(GB_EventDispatcher::MakeQueuedOptions(options.maxDispatchQueueSize, GB_EventQueueOverflowPolicy::DropOldest, u8"GB_SystemBluetoothWatcher"))
     {
     }
 
@@ -4944,9 +5089,10 @@ public:
 
     uint64_t GetDroppedEventCount() const
     {
+        std::lock_guard<std::mutex> postLock(eventPostMutex);
         const uint64_t dispatcherDroppedEventCount = eventDispatcher.GetDroppedEventCount();
-        const uint64_t localDroppedEventCount = internalDroppedEventCount.load(std::memory_order_relaxed);
-        return AddSaturating(dispatcherDroppedEventCount, localDroppedEventCount);
+        const uint64_t sourceDroppedEventCountValue = sourceDroppedEventCount.load(std::memory_order_relaxed);
+        return AddSaturating(dispatcherDroppedEventCount, sourceDroppedEventCountValue);
     }
 
     uint64_t GetCallbackExceptionCount() const
@@ -5338,15 +5484,17 @@ private:
             const uint64_t timestampMilliseconds = bluetoothEvent.timestampMilliseconds;
             GB_Event event(eventName, GB_Variant(std::move(bluetoothEvent)), u8"GB_SystemBluetoothWatcher");
             event.timestampMilliseconds = timestampMilliseconds;
+            std::lock_guard<std::mutex> postLock(eventPostMutex);
+            const uint64_t droppedEventCountBeforePost = eventDispatcher.GetDroppedEventCount();
             const GB_SystemResult postResult = eventDispatcher.Post(event);
-            if (postResult.IsFailed())
+            if (postResult.IsFailed() && eventDispatcher.GetDroppedEventCount() == droppedEventCountBeforePost)
             {
-                IncrementSaturatingCounter(internalDroppedEventCount);
+                IncrementSaturatingCounter(sourceDroppedEventCount);
             }
         }
         catch (...)
         {
-            IncrementSaturatingCounter(internalDroppedEventCount);
+            IncrementSaturatingCounter(sourceDroppedEventCount);
         }
     }
 
@@ -5355,9 +5503,10 @@ private:
     mutable std::mutex stateMutex;
     mutable std::mutex callbackMutex;
     mutable std::mutex subscriptionMutex;
+    mutable std::mutex eventPostMutex;
     LifecycleState lifecycleState = LifecycleState::Stopped;
     std::atomic<bool> acceptingDeviceEvents;
-    std::atomic<uint64_t> internalDroppedEventCount;
+    std::atomic<uint64_t> sourceDroppedEventCount;
     GB_SystemDeviceWatcher deviceWatcher;
     GB_EventDispatcher eventDispatcher;
     GB_EventSubscriptionToken typedSubscriptionToken;
