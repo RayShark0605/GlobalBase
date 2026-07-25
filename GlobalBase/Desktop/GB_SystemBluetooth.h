@@ -168,7 +168,7 @@ struct GB_BluetoothDeviceInfo
  * 说明：
  * - requestFreshInquiry=true 会触发经典蓝牙 Inquiry，可能持续数秒；
  * - inquiryTimeoutMultiplier 单位为 1.28 秒，Windows API 最大有效值为 48；
- * - includeUnknown=true 才返回本机未记住/未配对但 Inquiry 发现的设备；
+ * - includeUnknown=true 才返回既未认证也未记住的设备；该分类与设备当前是否连接相互独立；
  * - radioAddress 非空时只查询指定本机蓝牙无线电；多无线电环境下，同一远端地址可能返回多条不同 radioAddress 的记录。
  */
 struct GB_BluetoothClassicDeviceQueryOptions
@@ -207,8 +207,8 @@ enum class GB_BluetoothAuthenticationRequirement : uint16_t
  * 说明：
  * - pinCodeUtf8 非空时使用 BluetoothAuthenticateDevice 的透明 PIN 配对模式，转换后的 PIN 长度不能超过 16 个 UTF-16 字符；内部使用固定长度敏感缓冲区并在退出时清零；
  * - pinCodeUtf8 为空时使用 BluetoothAuthenticateDeviceEx 发起系统配对流程，可能弹出系统 UI；
- * - authenticationRequirement 只用于 BluetoothAuthenticateDeviceEx；
- * - parentWindowHandle 可传入 HWND 的 void* 表达，使系统配对向导归属于指定窗口；
+ * - authenticationRequirement 只用于 pinCodeUtf8 为空、调用 BluetoothAuthenticateDeviceEx 的系统配对流程；提供 PIN 时该字段会被忽略；
+ * - parentWindowHandle 可传入 HWND 的 void* 表达，使系统配对向导归属于指定窗口；提供 PIN、使用无 UI 配对时该字段会被忽略；
  * - 当前 C++14 实现不承诺超时控制或自定义 SSP 交互。
  */
 struct GB_BluetoothPairingOptions
@@ -386,6 +386,7 @@ struct GB_BluetoothGattWriteOptions
  * - ReadOnly 表示公开接口层禁止写入；个别驱动拒绝 GENERIC_READ 单独打开时，底层可兼容性回退为读写句柄，但仍不会允许调用 WriteCharacteristic()；
  * - ReadWrite 会话会优先以读写权限打开每个服务接口；不能取得写权限的服务仍会以只读方式加入缓存，只有写入该服务时才会返回权限错误或再次申请写权限；
  * - 服务枚举使用 BLE 设备接口句柄；特征枚举和特征值读写使用对应的 GATT 服务接口句柄，严格遵循 Windows GATT 句柄层级；
+ * - GATT 服务接口只接受可通过蓝牙地址、ContainerId、设备实例 ID 或 PnP 祖先链明确归属于目标设备的接口；不会把系统中其它身份不明的服务接口作为回退候选；
  * - Windows 返回主服务但对应服务接口暂时不可打开或无法验证层级时，会跳过该不可访问服务并保留其它已经严格验证的可用服务；只有一个可用服务都无法建立时才返回失败；
  * - UUID 比较遵循 Windows IsBthLEUuidMatch 语义，16 位短 UUID 与等价 Bluetooth Base UUID 形式的 128 位 UUID 可正确匹配；
  * - 连续读写同一设备时，可避免每次操作都重新枚举设备/服务接口、重复 CreateFileW 和重建 GATT 层次缓存；会话使用服务/特征属性句柄索引定位缓存项，避免每次读写线性扫描；
@@ -490,7 +491,7 @@ public:
      *
      * 说明：
      * - deviceInterfacePath 必须来自 GetLowEnergyDevices()；
-     * - 内部先通过 BLE 设备接口刷新主服务缓存，再枚举并关联 GUID_BLUETOOTH_GATT_SERVICE_DEVICE_INTERFACE；
+     * - 内部先通过 BLE 设备接口刷新主服务缓存，再枚举 GUID_BLUETOOTH_GATT_SERVICE_DEVICE_INTERFACE，并仅保留可通过蓝牙地址、ContainerId、设备实例 ID 或 PnP 祖先链明确归属于目标设备的服务接口；
      * - 返回的每个服务都已经通过对应服务接口句柄完成层级验证，并包含可用于后续特征枚举和读写的 serviceInterfacePath；
      * - 个别主服务接口暂时不可访问时会跳过该服务并保留其它可用服务；一个可用服务都无法建立时返回失败。
      */

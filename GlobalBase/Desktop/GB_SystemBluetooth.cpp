@@ -2190,7 +2190,7 @@ namespace
             return true;
         }
 
-        const bool isUnknownDevice = nativeDeviceInfo.fAuthenticated == FALSE && nativeDeviceInfo.fRemembered == FALSE && nativeDeviceInfo.fConnected == FALSE;
+        const bool isUnknownDevice = nativeDeviceInfo.fAuthenticated == FALSE && nativeDeviceInfo.fRemembered == FALSE;
         return isUnknownDevice && options.includeUnknown;
     }
 
@@ -2952,16 +2952,13 @@ namespace
             return interfaceResult.WithOperationName(operationName);
         }
 
-        std::vector<GB_SystemDeviceInterfaceInfo> strongMatches;
-        std::vector<GB_SystemDeviceInterfaceInfo> fallbackCandidates;
         try
         {
-            strongMatches.reserve(allServiceInterfaces.size());
-            fallbackCandidates.reserve(allServiceInterfaces.size());
+            serviceInterfaces.reserve(allServiceInterfaces.size());
         }
         catch (...)
         {
-            return GB_SystemResult::Failed(GB_SystemErrorCode::ResourceAllocationFailed, operationName, u8"预分配 BLE GATT 服务接口候选缓冲区时内存不足。");
+            return GB_SystemResult::Failed(GB_SystemErrorCode::ResourceAllocationFailed, operationName, u8"预分配 BLE GATT 服务接口结果缓冲区时内存不足。");
         }
 
         bool deviceIdentityEnriched = deviceIdentity.pnpMetadataResolved;
@@ -3006,71 +3003,38 @@ namespace
                 strongMatch = AreBluetoothInterfaceIdentitiesStronglyRelated(deviceIdentity, serviceIdentity);
                 addressesConflict = DoBluetoothInterfaceAddressesConflict(deviceIdentity, serviceIdentity);
             }
-            if (addressesConflict)
+            if (addressesConflict || !strongMatch)
             {
                 continue;
             }
 
             try
             {
-                if (strongMatch)
-                {
-                    strongMatches.push_back(allServiceInterfaces[index]);
-                }
-                else
-                {
-                    // PnP 元数据可能不完整。不能仅凭缺失的地址、ContainerId 或父节点关系否定归属，
-                    // 后续会通过 BluetoothGATTGetCharacteristics 的原生服务层级校验排除其它设备的服务接口。
-                    fallbackCandidates.push_back(allServiceInterfaces[index]);
-                }
+                serviceInterfaces.push_back(allServiceInterfaces[index]);
             }
             catch (...)
             {
-                return GB_SystemResult::Failed(GB_SystemErrorCode::ResourceAllocationFailed, operationName, u8"保存 BLE GATT 服务接口候选信息时内存不足。");
+                serviceInterfaces.clear();
+                return GB_SystemResult::Failed(GB_SystemErrorCode::ResourceAllocationFailed, operationName, u8"保存属于目标 BLE 设备的 GATT 服务接口信息时内存不足。");
             }
         }
 
-        const auto sortByInterfacePath = [](const GB_SystemDeviceInterfaceInfo& leftInterface, const GB_SystemDeviceInterfaceInfo& rightInterface)
+        std::sort(serviceInterfaces.begin(), serviceInterfaces.end(), [](const GB_SystemDeviceInterfaceInfo& leftInterface, const GB_SystemDeviceInterfaceInfo& rightInterface)
             {
                 return leftInterface.interfacePath < rightInterface.interfacePath;
-            };
-        std::sort(strongMatches.begin(), strongMatches.end(), sortByInterfacePath);
-        std::sort(fallbackCandidates.begin(), fallbackCandidates.end(), sortByInterfacePath);
+            });
 
-        try
+        if (!serviceInterfaces.empty())
         {
-            serviceInterfaces.reserve(strongMatches.size() + fallbackCandidates.size());
-            serviceInterfaces.insert(serviceInterfaces.end(), strongMatches.begin(), strongMatches.end());
-            serviceInterfaces.insert(serviceInterfaces.end(), fallbackCandidates.begin(), fallbackCandidates.end());
+            return GB_SystemResult::Succeeded(operationName);
         }
-        catch (...)
+        if (firstIdentityFailure.IsFailed())
         {
-            serviceInterfaces.clear();
-            return GB_SystemResult::Failed(GB_SystemErrorCode::ResourceAllocationFailed, operationName, u8"构建 BLE GATT 服务接口候选列表时内存不足。");
-        }
-
-        if (serviceInterfaces.empty() && firstIdentityFailure.IsFailed())
-        {
-            firstIdentityFailure.WithMessage(u8"读取 BLE GATT 服务接口的 PnP 身份信息失败，无法建立可验证的服务接口候选列表。");
+            firstIdentityFailure.WithMessage(u8"读取 BLE 设备或 GATT 服务接口的 PnP 身份信息失败，无法通过蓝牙地址、ContainerId 或 PnP 祖先链安全建立服务归属关系。");
             return firstIdentityFailure;
         }
 
-        if (!fallbackCandidates.empty())
-        {
-            try
-            {
-                std::string message = u8"已优先排列 PnP 身份明确匹配的 GATT 服务接口，并保留 ";
-                message += std::to_string(fallbackCandidates.size());
-                message += u8" 个身份信息不完整的候选接口供原生 GATT 层级校验。";
-                return GB_SystemResult::Succeeded(operationName, message);
-            }
-            catch (...)
-            {
-                return GB_SystemResult::Succeeded(operationName, u8"已保留身份信息不完整的 GATT 服务接口候选项，并将在后续执行原生层级校验。");
-            }
-        }
-
-        return GB_SystemResult::Succeeded(operationName);
+        return GB_SystemResult::Failed(GB_SystemErrorCode::NotFound, operationName, u8"未找到可通过蓝牙地址、ContainerId、设备实例 ID 或 PnP 祖先链明确归属于目标 BLE 设备的 GATT 服务接口；为避免跨设备误匹配，本模块不会把系统中其它身份不明的服务接口作为候选。");
     }
 
 #endif
@@ -4423,9 +4387,9 @@ GB_SystemResult GB_SystemBluetooth::PairDevice(const GB_BluetoothDeviceId& devic
     {
         return resolveResult.WithOperationName(u8"GB_SystemBluetooth::PairDevice");
     }
-    if (!IsValidAuthenticationRequirementValue(static_cast<uint64_t>(options.authenticationRequirement)))
+    if (options.pinCodeUtf8.empty() && !IsValidAuthenticationRequirementValue(static_cast<uint64_t>(options.authenticationRequirement)))
     {
-        return GB_SystemResult::Failed(GB_SystemErrorCode::InvalidArgument, u8"GB_SystemBluetooth::PairDevice", u8"authenticationRequirement 不是有效的 GB_BluetoothAuthenticationRequirement 值。");
+        return GB_SystemResult::Failed(GB_SystemErrorCode::InvalidArgument, u8"GB_SystemBluetooth::PairDevice", u8"未提供 pinCodeUtf8 时，authenticationRequirement 必须是有效的 GB_BluetoothAuthenticationRequirement 值。");
     }
 
     std::string targetRadioAddress;
@@ -4475,9 +4439,9 @@ GB_SystemResult GB_SystemBluetooth::PairDevice(const GB_BluetoothDeviceId& devic
     {
         return GB_SystemResult::Failed(GB_SystemErrorCode::InvalidArgument, u8"GB_SystemBluetooth::PairDevice", u8"不允许系统配对 UI 时必须提供 pinCodeUtf8。");
     }
-    if (options.parentWindowHandle != nullptr && ::IsWindow(static_cast<HWND>(options.parentWindowHandle)) == FALSE)
+    if (pinCodeLength == 0 && options.parentWindowHandle != nullptr && ::IsWindow(static_cast<HWND>(options.parentWindowHandle)) == FALSE)
     {
-        return GB_SystemResult::Failed(GB_SystemErrorCode::InvalidArgument, u8"GB_SystemBluetooth::PairDevice", u8"parentWindowHandle 不是有效 HWND。");
+        return GB_SystemResult::Failed(GB_SystemErrorCode::InvalidArgument, u8"GB_SystemBluetooth::PairDevice", u8"使用系统配对 UI 时，parentWindowHandle 必须是有效 HWND。");
     }
 
     const std::lock_guard<std::mutex> deviceMutationLock(GetClassicBluetoothDeviceMutationMutex(address));
