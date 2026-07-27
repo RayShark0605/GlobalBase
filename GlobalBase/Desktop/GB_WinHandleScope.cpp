@@ -221,17 +221,6 @@ namespace
         return TryGetCloseHandleFlags(handle, flags);
     }
 
-    static bool IsProtectedCloseHandleValue(const void* handle)
-    {
-        DWORD flags = 0;
-        if (!TryGetCloseHandleFlags(handle, flags))
-        {
-            return false;
-        }
-
-        return (flags & HANDLE_FLAG_PROTECT_FROM_CLOSE) != 0;
-    }
-
     static GB_SystemResult CloseRawHandle(void* handle, void* contextHandle, const GB_WinHandleCloseMethod closeMethod, const std::string& resourceName)
     {
         switch (closeMethod)
@@ -524,7 +513,12 @@ GB_WinHandleScope& GB_WinHandleScope::operator=(GB_WinHandleScope&& other)
         return *this;
     }
 
-    CloseSilently();
+    const GB_SystemResult closeResult = Close();
+    if (closeResult.IsFailed())
+    {
+        return *this;
+    }
+
     MoveFrom(other);
     return *this;
 }
@@ -728,6 +722,36 @@ GB_WinHandleScope::NativeHandle GB_WinHandleScope::Detach()
 
 GB_SystemResult GB_WinHandleScope::Reset(NativeHandle newHandle, const GB_WinHandleCloseMethod newCloseMethod, NativeHandle newContextHandle, const std::string& newResourceName)
 {
+    const std::string operationName = u8"GB_WinHandleScope::Reset";
+    if (!IsValidCloseMethodValue(static_cast<uint64_t>(newCloseMethod)))
+    {
+        return GB_SystemResult::Failed(GB_SystemErrorCode::InvalidArgument, operationName, u8"新的 Windows 句柄关闭方式无效；当前资源保持不变。");
+    }
+
+    std::string preparedResourceName;
+    GB_SystemResult resetSucceededResult;
+    try
+    {
+        preparedResourceName = newResourceName;
+        resetSucceededResult = GB_SystemResult::Succeeded(operationName, u8"已释放原资源并接管新资源。");
+    }
+    catch (...)
+    {
+        return GB_SystemResult::Failed(GB_SystemErrorCode::ResourceAllocationFailed, operationName, u8"准备新的 Windows 资源元数据时内存不足；当前资源保持不变。");
+    }
+
+    if (newHandle == handle && !IsNullHandle(handle))
+    {
+        if (newCloseMethod != closeMethod || newContextHandle != contextHandle)
+        {
+            return GB_SystemResult::Failed(GB_SystemErrorCode::InvalidArgument, operationName, u8"不能通过 Reset() 为同一个原生句柄直接更换关闭方式或上下文句柄；请先调用 Detach() 明确转移所有权。");
+        }
+
+        resourceName.swap(preparedResourceName);
+        lastCloseResult = std::move(resetSucceededResult);
+        return lastCloseResult;
+    }
+
     const GB_SystemResult closeResult = Close();
     if (closeResult.IsFailed())
     {
@@ -737,9 +761,9 @@ GB_SystemResult GB_WinHandleScope::Reset(NativeHandle newHandle, const GB_WinHan
     handle = newHandle;
     contextHandle = newContextHandle;
     closeMethod = newCloseMethod;
-    resourceName = newResourceName;
-    lastCloseResult = closeResult;
-    return closeResult;
+    resourceName.swap(preparedResourceName);
+    lastCloseResult = std::move(resetSucceededResult);
+    return lastCloseResult;
 }
 
 void GB_WinHandleScope::Swap(GB_WinHandleScope& other)
@@ -846,19 +870,9 @@ bool GB_WinHandleScope::IsClosableHandleForCloseMethod(NativeHandle handle, cons
         return false;
     }
 
-    if (normalizedCloseMethod == GB_WinHandleCloseMethod::CloseHandle)
+    if (normalizedCloseMethod == GB_WinHandleCloseMethod::CloseHandle && IsPseudoCloseHandleValue(handle))
     {
-#if defined(_WIN32)
-        if (IsPseudoCloseHandleValue(handle) || IsProtectedCloseHandleValue(handle))
-        {
-            return false;
-        }
-#else
-        if (IsPseudoCloseHandleValue(handle))
-        {
-            return false;
-        }
-#endif
+        return false;
     }
 
     if (normalizedCloseMethod == GB_WinHandleCloseMethod::RegCloseKey && IsPredefinedRegistryKey(handle))
@@ -1041,11 +1055,16 @@ void GB_WinHandleScope::ClearHandleState() noexcept
 
 void GB_WinHandleScope::MoveFrom(GB_WinHandleScope& other)
 {
+    const std::string transferredResourceName = other.resourceName;
+    const GB_SystemResult transferredLastCloseResult = other.lastCloseResult;
+    GB_SystemResult movedFromResult = GB_SystemResult::Succeeded(u8"GB_WinHandleScope::MoveFrom");
+
+    resourceName = transferredResourceName;
+    lastCloseResult = transferredLastCloseResult;
+    other.lastCloseResult = std::move(movedFromResult);
+
     handle = other.handle;
     contextHandle = other.contextHandle;
     closeMethod = other.closeMethod;
-    resourceName = std::move(other.resourceName);
-    lastCloseResult = other.lastCloseResult;
     other.ClearHandleState();
-    other.lastCloseResult = GB_SystemResult::Succeeded(u8"GB_WinHandleScope::MoveFrom");
 }

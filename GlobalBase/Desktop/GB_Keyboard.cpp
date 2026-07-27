@@ -377,40 +377,53 @@ namespace
             return input;
         }
 
-        static bool TrySendInputEvents(const std::vector<INPUT>& inputs)
+        static bool TrySendInputEventsWithRetry(const INPUT* inputs, const size_t inputCount, const int maxAttemptCount = 2, const int retryDelayMs = 1)
         {
-            if (inputs.empty())
+            if (inputCount == 0)
             {
                 return true;
             }
 
-            if (inputs.size() > static_cast<size_t>(std::numeric_limits<UINT>::max()))
+            if (inputs == nullptr || inputCount > static_cast<size_t>(std::numeric_limits<UINT>::max()))
             {
                 return false;
             }
 
-            const UINT inputCount = static_cast<UINT>(inputs.size());
-            const UINT sentInputCount = ::SendInput(inputCount, const_cast<INPUT*>(inputs.data()), sizeof(INPUT));
-            return sentInputCount == inputCount;
+            const int attemptCount = std::max(maxAttemptCount, 1);
+            size_t firstUnsentInputIndex = 0;
+            int noProgressAttemptCount = 0;
+            while (firstUnsentInputIndex < inputCount)
+            {
+                const size_t remainingInputCount = inputCount - firstUnsentInputIndex;
+                const UINT remainingInputCountValue = static_cast<UINT>(remainingInputCount);
+                const UINT sentInputCount = ::SendInput(remainingInputCountValue, const_cast<INPUT*>(inputs + firstUnsentInputIndex), sizeof(INPUT));
+                if (sentInputCount > remainingInputCountValue)
+                {
+                    return false;
+                }
+
+                if (sentInputCount != 0)
+                {
+                    firstUnsentInputIndex += static_cast<size_t>(sentInputCount);
+                    noProgressAttemptCount = 0;
+                    continue;
+                }
+
+                noProgressAttemptCount++;
+                if (noProgressAttemptCount >= attemptCount)
+                {
+                    return false;
+                }
+
+                SleepForDelayMs(retryDelayMs);
+            }
+
+            return true;
         }
 
         static bool TrySendInputEventsWithRetry(const std::vector<INPUT>& inputs, const int maxAttemptCount = 2, const int retryDelayMs = 1)
         {
-            const int attemptCount = std::max(maxAttemptCount, 1);
-            for (int attemptIndex = 0; attemptIndex < attemptCount; attemptIndex++)
-            {
-                if (TrySendInputEvents(inputs))
-                {
-                    return true;
-                }
-
-                if (attemptIndex + 1 < attemptCount)
-                {
-                    SleepForDelayMs(retryDelayMs);
-                }
-            }
-
-            return false;
+            return TrySendInputEventsWithRetry(inputs.data(), inputs.size(), maxAttemptCount, retryDelayMs);
         }
 
         static INPUT MakeKeyboardInputByMode(const GB_VirtualKey virtualKey, GB_KeyboardInputMode inputMode, const bool isKeyUp)
@@ -437,9 +450,8 @@ namespace
                 return false;
             }
 
-            std::vector<INPUT> inputs;
-            inputs.push_back(MakeKeyboardInputByMode(virtualKey, inputMode, isKeyUp));
-            return TrySendInputEventsWithRetry(inputs);
+            INPUT input = MakeKeyboardInputByMode(virtualKey, inputMode, isKeyUp);
+            return TrySendInputEventsWithRetry(&input, 1);
         }
 
         static bool IsSameModifierFamily(const GB_VirtualKey leftKey, const GB_VirtualKey rightKey)
@@ -529,25 +541,24 @@ namespace
             const int clampedDownUpIntervalMs = ClampNonNegativeDelayMs(downUpIntervalMs);
             if (clampedDownUpIntervalMs <= 0)
             {
-                std::vector<INPUT> inputs;
-                inputs.reserve(2);
-                inputs.push_back(MakeKeyboardInputByUnicode(unicodeChar, false));
-                inputs.push_back(MakeKeyboardInputByUnicode(unicodeChar, true));
-                return TrySendInputEventsWithRetry(inputs);
+                const std::array<INPUT, 2> inputs =
+                {
+                    MakeKeyboardInputByUnicode(unicodeChar, false),
+                    MakeKeyboardInputByUnicode(unicodeChar, true)
+                };
+                return TrySendInputEventsWithRetry(inputs.data(), inputs.size());
             }
 
-            std::vector<INPUT> downInputs;
-            downInputs.push_back(MakeKeyboardInputByUnicode(unicodeChar, false));
-            if (!TrySendInputEventsWithRetry(downInputs))
+            INPUT downInput = MakeKeyboardInputByUnicode(unicodeChar, false);
+            if (!TrySendInputEventsWithRetry(&downInput, 1))
             {
                 return false;
             }
 
             SleepForDelayMs(clampedDownUpIntervalMs);
 
-            std::vector<INPUT> upInputs;
-            upInputs.push_back(MakeKeyboardInputByUnicode(unicodeChar, true));
-            return TrySendInputEventsWithRetry(upInputs);
+            INPUT upInput = MakeKeyboardInputByUnicode(unicodeChar, true);
+            return TrySendInputEventsWithRetry(&upInput, 1);
         }
 
         static bool TryInputEnterKey(const GB_TextInputOptions& options, const int downUpIntervalMs)
@@ -873,24 +884,61 @@ namespace
 
             bool StartWorker()
             {
-                std::lock_guard<std::mutex> lifecycleLock(lifecycleMutex);
-                if (workerThread.joinable())
+                std::thread completedWorkerThread;
                 {
-                    return true;
+                    std::unique_lock<std::mutex> lifecycleLock(lifecycleMutex);
+                    if (workerRunning)
+                    {
+                        if (!stopWorker.load())
+                        {
+                            return true;
+                        }
+
+                        if (workerThreadId == std::this_thread::get_id())
+                        {
+                            return false;
+                        }
+
+                        lifecycleConditionVariable.wait(lifecycleLock, [this]()
+                            {
+                                return !workerRunning;
+                            });
+                    }
+
+                    if (workerThread.joinable())
+                    {
+                        if (workerThread.get_id() == std::this_thread::get_id())
+                        {
+                            return false;
+                        }
+
+                        completedWorkerThread = std::move(workerThread);
+                    }
                 }
 
+                if (completedWorkerThread.joinable())
+                {
+                    completedWorkerThread.join();
+                }
+
+                std::lock_guard<std::mutex> lifecycleLock(lifecycleMutex);
                 stopWorker.store(false);
                 try
                 {
-                    const auto self = shared_from_this();
+                    const std::shared_ptr<GlobalKeyboardListenerState> self = shared_from_this();
+                    workerRunning = true;
                     workerThread = std::thread([self]()
                         {
                             self->WorkerThreadMain();
                         });
+                    workerThreadId = workerThread.get_id();
                 }
                 catch (...)
                 {
+                    workerRunning = false;
+                    workerThreadId = std::thread::id();
                     stopWorker.store(true);
+                    lifecycleConditionVariable.notify_all();
                     return false;
                 }
 
@@ -899,27 +947,44 @@ namespace
 
             void StopWorker()
             {
-                std::unique_lock<std::mutex> lifecycleLock(lifecycleMutex);
-                if (!workerThread.joinable())
+                std::thread workerThreadToJoin;
                 {
-                    return;
+                    std::unique_lock<std::mutex> lifecycleLock(lifecycleMutex);
+                    if (!workerRunning && !workerThread.joinable())
+                    {
+                        return;
+                    }
+
+                    stopWorker.store(true);
+                    {
+                        std::lock_guard<std::mutex> queueLock(queueMutex);
+                        eventQueue.clear();
+                    }
+                    queueConditionVariable.notify_all();
+
+                    if (workerRunning && workerThreadId == std::this_thread::get_id())
+                    {
+                        if (workerThread.joinable())
+                        {
+                            workerThread.detach();
+                        }
+                        return;
+                    }
+
+                    if (workerThread.joinable())
+                    {
+                        workerThreadToJoin = std::move(workerThread);
+                    }
+                    else
+                    {
+                        lifecycleConditionVariable.wait(lifecycleLock, [this]()
+                            {
+                                return !workerRunning;
+                            });
+                        return;
+                    }
                 }
 
-                stopWorker.store(true);
-                {
-                    std::lock_guard<std::mutex> queueLock(queueMutex);
-                    eventQueue.clear();
-                }
-                queueConditionVariable.notify_all();
-
-                if (workerThread.get_id() == std::this_thread::get_id())
-                {
-                    workerThread.detach();
-                    return;
-                }
-
-                std::thread workerThreadToJoin = std::move(workerThread);
-                lifecycleLock.unlock();
                 workerThreadToJoin.join();
             }
 
@@ -999,6 +1064,13 @@ namespace
 
                     DispatchOneEvent(keyboardEvent);
                 }
+
+                {
+                    std::lock_guard<std::mutex> lifecycleLock(lifecycleMutex);
+                    workerRunning = false;
+                    workerThreadId = std::thread::id();
+                }
+                lifecycleConditionVariable.notify_all();
             }
 
             static void InvokeCallbackSafely(const GB_GlobalKeyboardEventCallback& callback, const GB_GlobalKeyboardEvent& keyboardEvent)
@@ -1057,7 +1129,10 @@ namespace
             std::condition_variable queueConditionVariable;
             std::deque<GB_GlobalKeyboardEvent> eventQueue;
             std::mutex lifecycleMutex;
+            std::condition_variable lifecycleConditionVariable;
             std::thread workerThread;
+            std::thread::id workerThreadId;
+            bool workerRunning = false;
         };
 
         class GlobalKeyboardRawInputManager
@@ -1065,12 +1140,13 @@ namespace
         public:
             static GlobalKeyboardRawInputManager& GetInstance()
             {
-                static GlobalKeyboardRawInputManager instance;
-                return instance;
+                static GlobalKeyboardRawInputManager* globalKeyboardRawInputManager = new GlobalKeyboardRawInputManager();
+                return *globalKeyboardRawInputManager;
             }
 
             bool RegisterListener(const std::shared_ptr<GlobalKeyboardListenerState>& listenerState, uint64_t& listenerId)
             {
+                listenerId = 0;
                 if (!listenerState)
                 {
                     return false;
@@ -1088,12 +1164,35 @@ namespace
                     return false;
                 }
 
-                listenerId = nextListenerId++;
-                if (listenerId == 0)
+                uint64_t newListenerId = 0;
+                const size_t maximumAttemptCount = listeners.size() < (std::numeric_limits<size_t>::max)() - 2 ? listeners.size() + 2 : listeners.size();
+                for (size_t attemptIndex = 0; attemptIndex < maximumAttemptCount; attemptIndex++)
                 {
-                    listenerId = nextListenerId++;
+                    newListenerId = nextListenerId++;
+                    if (newListenerId != 0 && listeners.find(newListenerId) == listeners.end())
+                    {
+                        break;
+                    }
+                    newListenerId = 0;
                 }
-                listeners[listenerId] = listenerState;
+
+                if (newListenerId == 0)
+                {
+                    StopMessageThreadIfIdle(managerLock);
+                    return false;
+                }
+
+                try
+                {
+                    listeners.emplace(newListenerId, listenerState);
+                }
+                catch (...)
+                {
+                    StopMessageThreadIfIdle(managerLock);
+                    return false;
+                }
+
+                listenerId = newListenerId;
                 return true;
             }
 
@@ -1135,7 +1234,14 @@ namespace
 
             static LRESULT CALLBACK StaticWindowProc(HWND windowHandle, UINT message, WPARAM wParam, LPARAM lParam)
             {
-                return GetInstance().WindowProc(windowHandle, message, wParam, lParam);
+                try
+                {
+                    return GetInstance().WindowProc(windowHandle, message, wParam, lParam);
+                }
+                catch (...)
+                {
+                    return ::DefWindowProcW(windowHandle, message, wParam, lParam);
+                }
             }
 
             LRESULT WindowProc(HWND windowHandle, UINT message, WPARAM wParam, LPARAM lParam)
@@ -1680,27 +1786,48 @@ bool GB_Keyboard::PressKeyCombination(const std::vector<GB_VirtualKey>& virtualK
     }
 
     std::vector<GB_VirtualKey> temporarilyReleasedModifierKeys;
-    if (options.temporarilyReleaseActiveModifierKeys)
+    std::vector<INPUT> releaseModifierInputs;
+    std::vector<INPUT> restoreModifierInputs;
+    std::vector<GB_VirtualKey> pressedKeys;
+    try
     {
-        temporarilyReleasedModifierKeys = internal::GetCurrentlyPressedModifierKeysNotInCombination(virtualKeys);
-        if (!temporarilyReleasedModifierKeys.empty())
+        if (options.temporarilyReleaseActiveModifierKeys)
         {
-            std::vector<INPUT> releaseModifierInputs;
+            temporarilyReleasedModifierKeys = internal::GetCurrentlyPressedModifierKeysNotInCombination(virtualKeys);
             releaseModifierInputs.reserve(temporarilyReleasedModifierKeys.size());
+            if (options.restoreReleasedModifierKeys)
+            {
+                restoreModifierInputs.reserve(temporarilyReleasedModifierKeys.size());
+            }
             for (const GB_VirtualKey modifierKey : temporarilyReleasedModifierKeys)
             {
                 internal::AppendKeyInputs(releaseModifierInputs, modifierKey, inputMode, true);
+                if (options.restoreReleasedModifierKeys)
+                {
+                    internal::AppendKeyInputs(restoreModifierInputs, modifierKey, inputMode, false);
+                }
             }
-            if (!internal::TrySendInputEventsWithRetry(releaseModifierInputs))
-            {
-                return false;
-            }
-            SleepForDelayMs(1);
         }
+        pressedKeys.reserve(virtualKeys.size());
+    }
+    catch (...)
+    {
+        return false;
     }
 
-    std::vector<GB_VirtualKey> pressedKeys;
-    pressedKeys.reserve(virtualKeys.size());
+    if (!releaseModifierInputs.empty())
+    {
+        if (!internal::TrySendInputEventsWithRetry(releaseModifierInputs))
+        {
+            if (!restoreModifierInputs.empty())
+            {
+                (void)internal::TrySendInputEventsWithRetry(restoreModifierInputs);
+            }
+            return false;
+        }
+        SleepForDelayMs(1);
+    }
+
     bool succeeded = true;
     for (const GB_VirtualKey virtualKey : virtualKeys)
     {
@@ -1719,7 +1846,7 @@ bool GB_Keyboard::PressKeyCombination(const std::vector<GB_VirtualKey>& virtualK
         SleepForDelayMs(options.holdIntervalMs);
     }
 
-    for (auto reverseIter = pressedKeys.rbegin(); reverseIter != pressedKeys.rend(); ++reverseIter)
+    for (auto reverseIter = pressedKeys.rbegin(); reverseIter != pressedKeys.rend(); reverseIter++)
     {
         if (!ReleaseKey(*reverseIter, inputMode))
         {
@@ -1732,18 +1859,9 @@ bool GB_Keyboard::PressKeyCombination(const std::vector<GB_VirtualKey>& virtualK
         }
     }
 
-    if (options.temporarilyReleaseActiveModifierKeys && options.restoreReleasedModifierKeys && !temporarilyReleasedModifierKeys.empty())
+    if (!restoreModifierInputs.empty() && !internal::TrySendInputEventsWithRetry(restoreModifierInputs))
     {
-        std::vector<INPUT> restoreModifierInputs;
-        restoreModifierInputs.reserve(temporarilyReleasedModifierKeys.size());
-        for (const GB_VirtualKey modifierKey : temporarilyReleasedModifierKeys)
-        {
-            internal::AppendKeyInputs(restoreModifierInputs, modifierKey, inputMode, false);
-        }
-        if (!internal::TrySendInputEventsWithRetry(restoreModifierInputs))
-        {
-            succeeded = false;
-        }
+        succeeded = false;
     }
 
     return succeeded;

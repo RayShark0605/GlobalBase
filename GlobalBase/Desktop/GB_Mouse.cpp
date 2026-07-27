@@ -250,14 +250,15 @@ namespace
                 return false;
             }
 
-            constexpr double minValue = static_cast<double>(std::numeric_limits<int64_t>::min());
-            constexpr double maxValue = static_cast<double>(std::numeric_limits<int64_t>::max());
-            if (value < minValue || value > maxValue)
+            const long double roundedLongDoubleValue = std::round(static_cast<long double>(value));
+            const long double minValue = static_cast<long double>(std::numeric_limits<int64_t>::min());
+            const long double maxValue = static_cast<long double>(std::numeric_limits<int64_t>::max());
+            if (roundedLongDoubleValue < minValue || roundedLongDoubleValue > maxValue)
             {
                 return false;
             }
 
-            roundedValue = static_cast<int64_t>(std::llround(value));
+            roundedValue = static_cast<int64_t>(roundedLongDoubleValue);
             return true;
         }
 
@@ -271,6 +272,21 @@ namespace
             }
 
             longValue = static_cast<LONG>(value);
+            return true;
+        }
+
+
+        static bool TryGetAbsoluteLongAsPositiveInt(const LONG value, int& positiveValue)
+        {
+            positiveValue = 0;
+            const int64_t signedValue = static_cast<int64_t>(value);
+            const int64_t absoluteValue = signedValue < 0 ? -signedValue : signedValue;
+            if (absoluteValue <= 0 || absoluteValue > static_cast<int64_t>(std::numeric_limits<int>::max()))
+            {
+                return false;
+            }
+
+            positiveValue = static_cast<int>(absoluteValue);
             return true;
         }
 
@@ -492,8 +508,7 @@ namespace
                 }
 
                 cursorWidth = bitmapInfo.bmWidth;
-                cursorHeight = std::abs(bitmapInfo.bmHeight);
-                if (!(cursorWidth > 0 && cursorHeight > 0))
+                if (cursorWidth <= 0 || !TryGetAbsoluteLongAsPositiveInt(bitmapInfo.bmHeight, cursorHeight))
                 {
                     CleanupIconInfoBitmaps(iconInfo);
                     return false;
@@ -514,8 +529,8 @@ namespace
                 return false;
             }
 
-            const int maskBitmapHeight = std::abs(bitmapInfo.bmHeight);
-            if (bitmapInfo.bmWidth <= 0 || maskBitmapHeight <= 0 || (maskBitmapHeight % 2) != 0)
+            int maskBitmapHeight = 0;
+            if (bitmapInfo.bmWidth <= 0 || !TryGetAbsoluteLongAsPositiveInt(bitmapInfo.bmHeight, maskBitmapHeight) || (maskBitmapHeight % 2) != 0)
             {
                 CleanupIconInfoBitmaps(iconInfo);
                 return false;
@@ -835,7 +850,8 @@ namespace
                 return false;
             }
 
-            if (rowStrideBytes == 0 || bitmapBits.size() < rowStrideBytes * static_cast<size_t>(bitmapHeight))
+            const size_t bitmapHeightValue = static_cast<size_t>(bitmapHeight);
+            if (rowStrideBytes == 0 || rowStrideBytes > (std::numeric_limits<size_t>::max)() / bitmapHeightValue || bitmapBits.size() < rowStrideBytes * bitmapHeightValue)
             {
                 return false;
             }
@@ -1022,6 +1038,11 @@ namespace
 
             if (brightnessSampleCount == 0 && backgroundImage != nullptr && !backgroundImage->IsEmpty())
             {
+                if (backgroundImage->GetWidth() > static_cast<size_t>(std::numeric_limits<int>::max()) || backgroundImage->GetHeight() > static_cast<size_t>(std::numeric_limits<int>::max()))
+                {
+                    return false;
+                }
+
                 const int backgroundWidth = static_cast<int>(backgroundImage->GetWidth());
                 const int backgroundHeight = static_cast<int>(backgroundImage->GetHeight());
                 for (int rowIndex = 0; rowIndex < backgroundHeight; rowIndex++)
@@ -1871,6 +1892,8 @@ namespace
         {
             const double samplingIntervalMs = GetPositiveOptionOrDefault(moveOptions.samplingIntervalMs, 4.0);
             const double maxStepPixelDistance = GetPositiveOptionOrDefault(moveOptions.maxStepPixelDistance, 8.0);
+            const int64_t maxReasonableStepCount = 100000;
+            const double maxReasonableStepCountAsDouble = static_cast<double>(maxReasonableStepCount);
 
             int64_t stepCountByDuration = 1;
             int64_t stepCountByDistance = 1;
@@ -1880,7 +1903,7 @@ namespace
                 const double rawStepCountByDuration = std::ceil(durationMs / samplingIntervalMs);
                 if (std::isfinite(rawStepCountByDuration) && rawStepCountByDuration > 1.0)
                 {
-                    stepCountByDuration = static_cast<int64_t>(std::min(rawStepCountByDuration, static_cast<double>(std::numeric_limits<int64_t>::max())));
+                    stepCountByDuration = static_cast<int64_t>(std::min(rawStepCountByDuration, maxReasonableStepCountAsDouble));
                 }
             }
 
@@ -1889,11 +1912,10 @@ namespace
                 const double rawStepCountByDistance = std::ceil(distancePixel / maxStepPixelDistance);
                 if (std::isfinite(rawStepCountByDistance) && rawStepCountByDistance > 1.0)
                 {
-                    stepCountByDistance = static_cast<int64_t>(std::min(rawStepCountByDistance, static_cast<double>(std::numeric_limits<int64_t>::max())));
+                    stepCountByDistance = static_cast<int64_t>(std::min(rawStepCountByDistance, maxReasonableStepCountAsDouble));
                 }
             }
 
-            const int64_t maxReasonableStepCount = 100000;
             const int64_t stepCount = std::max<int64_t>(1, std::min<int64_t>(maxReasonableStepCount, std::max(stepCountByDuration, stepCountByDistance)));
             return static_cast<int>(stepCount);
         }
@@ -2921,25 +2943,62 @@ namespace
 
             bool StartWorker()
             {
-                std::lock_guard<std::mutex> lifecycleLock(lifecycleMutex);
-                if (workerThread.joinable())
+                std::thread completedWorkerThread;
                 {
-                    return true;
+                    std::unique_lock<std::mutex> lifecycleLock(lifecycleMutex);
+                    if (workerRunning)
+                    {
+                        if (!stopWorker.load())
+                        {
+                            return true;
+                        }
+
+                        if (workerThreadId == std::this_thread::get_id())
+                        {
+                            return false;
+                        }
+
+                        lifecycleConditionVariable.wait(lifecycleLock, [this]()
+                            {
+                                return !workerRunning;
+                            });
+                    }
+
+                    if (workerThread.joinable())
+                    {
+                        if (workerThread.get_id() == std::this_thread::get_id())
+                        {
+                            return false;
+                        }
+
+                        completedWorkerThread = std::move(workerThread);
+                    }
                 }
 
+                if (completedWorkerThread.joinable())
+                {
+                    completedWorkerThread.join();
+                }
+
+                std::lock_guard<std::mutex> lifecycleLock(lifecycleMutex);
                 stopWorker.store(false);
                 lastMoveEnqueueTickMs.store(0);
                 try
                 {
-                    const auto self = shared_from_this();
+                    const std::shared_ptr<GlobalMouseListenerState> self = shared_from_this();
+                    workerRunning = true;
                     workerThread = std::thread([self]()
                         {
                             self->WorkerThreadMain();
                         });
+                    workerThreadId = workerThread.get_id();
                 }
                 catch (...)
                 {
+                    workerRunning = false;
+                    workerThreadId = std::thread::id();
                     stopWorker.store(true);
+                    lifecycleConditionVariable.notify_all();
                     return false;
                 }
 
@@ -2948,27 +3007,44 @@ namespace
 
             void StopWorker()
             {
-                std::unique_lock<std::mutex> lifecycleLock(lifecycleMutex);
-                if (!workerThread.joinable())
+                std::thread workerThreadToJoin;
                 {
-                    return;
+                    std::unique_lock<std::mutex> lifecycleLock(lifecycleMutex);
+                    if (!workerRunning && !workerThread.joinable())
+                    {
+                        return;
+                    }
+
+                    stopWorker.store(true);
+                    {
+                        std::lock_guard<std::mutex> queueLock(queueMutex);
+                        eventQueue.clear();
+                    }
+                    queueConditionVariable.notify_all();
+
+                    if (workerRunning && workerThreadId == std::this_thread::get_id())
+                    {
+                        if (workerThread.joinable())
+                        {
+                            workerThread.detach();
+                        }
+                        return;
+                    }
+
+                    if (workerThread.joinable())
+                    {
+                        workerThreadToJoin = std::move(workerThread);
+                    }
+                    else
+                    {
+                        lifecycleConditionVariable.wait(lifecycleLock, [this]()
+                            {
+                                return !workerRunning;
+                            });
+                        return;
+                    }
                 }
 
-                stopWorker.store(true);
-                {
-                    std::lock_guard<std::mutex> queueLock(queueMutex);
-                    eventQueue.clear();
-                }
-                queueConditionVariable.notify_all();
-
-                if (workerThread.get_id() == std::this_thread::get_id())
-                {
-                    workerThread.detach();
-                    return;
-                }
-
-                std::thread workerThreadToJoin = std::move(workerThread);
-                lifecycleLock.unlock();
                 workerThreadToJoin.join();
             }
 
@@ -3207,6 +3283,13 @@ namespace
                     {
                     }
                 }
+
+                {
+                    std::lock_guard<std::mutex> lifecycleLock(lifecycleMutex);
+                    workerRunning = false;
+                    workerThreadId = std::thread::id();
+                }
+                lifecycleConditionVariable.notify_all();
             }
 
         private:
@@ -3229,7 +3312,10 @@ namespace
             std::deque<GB_GlobalMouseEvent> eventQueue;
 
             std::mutex lifecycleMutex;
+            std::condition_variable lifecycleConditionVariable;
             std::thread workerThread;
+            std::thread::id workerThreadId;
+            bool workerRunning = false;
         };
 
         class GlobalMouseRawInputManager
@@ -3243,6 +3329,7 @@ namespace
 
             bool RegisterListener(const std::shared_ptr<GlobalMouseListenerState>& listenerState, uint64_t& listenerId)
             {
+                listenerId = 0;
                 if (!listenerState)
                 {
                     return false;
@@ -3254,13 +3341,41 @@ namespace
                     return false;
                 }
 
+                RemoveExpiredListenersLocked();
                 if (!EnsureMessageThreadStarted(managerLock))
                 {
                     return false;
                 }
 
-                listenerId = nextListenerId++;
-                listeners[listenerId] = listenerState;
+                uint64_t newListenerId = 0;
+                const size_t maximumAttemptCount = listeners.size() < (std::numeric_limits<size_t>::max)() - 2 ? listeners.size() + 2 : listeners.size();
+                for (size_t attemptIndex = 0; attemptIndex < maximumAttemptCount; attemptIndex++)
+                {
+                    newListenerId = nextListenerId++;
+                    if (newListenerId != 0 && listeners.find(newListenerId) == listeners.end())
+                    {
+                        break;
+                    }
+                    newListenerId = 0;
+                }
+
+                if (newListenerId == 0)
+                {
+                    StopMessageThreadIfIdle(managerLock);
+                    return false;
+                }
+
+                try
+                {
+                    listeners.emplace(newListenerId, listenerState);
+                }
+                catch (...)
+                {
+                    StopMessageThreadIfIdle(managerLock);
+                    return false;
+                }
+
+                listenerId = newListenerId;
                 return true;
             }
 
@@ -3446,7 +3561,14 @@ namespace
 
             static LRESULT CALLBACK StaticWindowProc(HWND windowHandle, UINT message, WPARAM wParam, LPARAM lParam)
             {
-                return GetInstance().WindowProc(windowHandle, message, wParam, lParam);
+                try
+                {
+                    return GetInstance().WindowProc(windowHandle, message, wParam, lParam);
+                }
+                catch (...)
+                {
+                    return ::DefWindowProcW(windowHandle, message, wParam, lParam);
+                }
             }
 
             LRESULT WindowProc(HWND windowHandle, UINT message, WPARAM wParam, LPARAM lParam)

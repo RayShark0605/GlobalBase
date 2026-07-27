@@ -125,7 +125,8 @@ struct GB_EventDispatcherOptions
  * - 执行回调前会复制当前订阅列表，因此回调内部可以安全调用 Subscribe()/Unsubscribe()；
  * - 回调抛出的异常会被捕获并计数，若设置了异常处理器则传递给处理器；
  * - 异步模式使用单分发线程串行执行回调，保证同一个分发器内事件处理顺序稳定；
- * - 本类析构时会停止异步线程并丢弃尚未处理的排队事件，避免析构阶段继续扩大回调范围。
+ * - 本类析构时会停止异步线程并丢弃尚未处理的排队事件，避免析构阶段继续扩大回调范围；
+ * - 可在回调内调用 Stop() 请求停止，但不得在该回调返回前销毁当前分发器对象；外部线程应在对象析构前再次调用 Stop() 或等待回调返回。
  */
 class GLOBALBASE_PORT GB_EventDispatcher final
 {
@@ -149,7 +150,17 @@ public:
     uint64_t GetDispatcherId() const;
 
     GB_SystemResult Start();
+
+    /**
+     * @brief 停止接收新事件并停止异步分发线程。
+     *
+     * 说明：
+     * - 从普通外部线程调用时，会等待异步工作线程以及已经开始的同步分发回调完成；
+     * - 从当前分发器的事件回调内调用时只请求停止，不等待当前回调自身，避免自等待死锁；
+     * - Stop() 返回后，调用方仍不应让其他线程继续并发调用 Dispatch()/Post()/Publish()。
+     */
     GB_SystemResult Stop(GB_EventDispatcherStopMode stopMode = GB_EventDispatcherStopMode::Drain);
+
     GB_SystemResult WaitIdle();
     bool WaitIdleFor(uint64_t timeoutMilliseconds);
     bool IsRunning() const;
@@ -225,7 +236,6 @@ private:
     bool isStopping = false;
     bool isWorkerStarted = false;
     bool isWorkerJoining = false;
-    bool workerDetachedBySelfStop = false;
     size_t activeDispatchCount = 0;
 
     uint64_t nextSubscriptionId = 1;

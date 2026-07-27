@@ -556,15 +556,20 @@ void GB_ComScope::ClearInitializationState() noexcept
 
 void GB_ComScope::MoveFrom(GB_ComScope& other)
 {
+    const GB_SystemResult transferredInitializeResult = other.initializeResult;
+    const GB_SystemResult transferredLastUninitializeResult = other.lastUninitializeResult;
+    GB_SystemResult movedFromInitializeResult = GB_SystemResult::Succeeded(u8"GB_ComScope::MoveFrom", u8"COM 初始化配平责任已经转移。普通移动对象不调用 CoUninitialize。");
+    GB_SystemResult movedFromUninitializeResult = GB_SystemResult::Succeeded(u8"GB_ComScope::MoveFrom");
+
+    initializeResult = transferredInitializeResult;
+    lastUninitializeResult = transferredLastUninitializeResult;
+    other.initializeResult = std::move(movedFromInitializeResult);
+    other.lastUninitializeResult = std::move(movedFromUninitializeResult);
+
     initialized = other.initialized;
     alreadyInitializedOnThread = other.alreadyInitializedOnThread;
     initializeOptions = other.initializeOptions;
     ownerThreadId = other.ownerThreadId;
     initializeHResult = other.initializeHResult;
-    initializeResult = other.initializeResult;
-    lastUninitializeResult = other.lastUninitializeResult;
-
     other.ClearInitializationState();
-    other.initializeResult = GB_SystemResult::Succeeded(u8"GB_ComScope::MoveFrom", u8"COM 初始化配平责任已经转移。普通移动对象不调用 CoUninitialize。");
-    other.lastUninitializeResult = GB_SystemResult::Succeeded(u8"GB_ComScope::MoveFrom");
 }

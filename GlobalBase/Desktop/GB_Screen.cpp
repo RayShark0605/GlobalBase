@@ -4,6 +4,7 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <cwctype>
 #include <cstring>
 #include <cstdint>
@@ -396,14 +397,20 @@ namespace internal
             return std::wstring();
         }
 
-        const int requiredLength = ::MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, text.data(), static_cast<int>(text.size()), nullptr, 0);
+        if (text.size() > static_cast<size_t>(std::numeric_limits<int>::max()))
+        {
+            return std::wstring();
+        }
+
+        const int textLength = static_cast<int>(text.size());
+        const int requiredLength = ::MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, text.data(), textLength, nullptr, 0);
         if (requiredLength <= 0)
         {
             return std::wstring();
         }
 
         std::wstring result(static_cast<size_t>(requiredLength), L'\0');
-        const int convertedLength = ::MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, text.data(), static_cast<int>(text.size()), &result[0], requiredLength);
+        const int convertedLength = ::MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, text.data(), textLength, &result[0], requiredLength);
         if (convertedLength != requiredLength)
         {
             return std::wstring();
@@ -419,14 +426,20 @@ namespace internal
             return std::string();
         }
 
-        const int requiredLength = ::WideCharToMultiByte(CP_UTF8, 0, text.data(), static_cast<int>(text.size()), nullptr, 0, nullptr, nullptr);
+        if (text.size() > static_cast<size_t>(std::numeric_limits<int>::max()))
+        {
+            return std::string();
+        }
+
+        const int textLength = static_cast<int>(text.size());
+        const int requiredLength = ::WideCharToMultiByte(CP_UTF8, 0, text.data(), textLength, nullptr, 0, nullptr, nullptr);
         if (requiredLength <= 0)
         {
             return std::string();
         }
 
         std::string result(static_cast<size_t>(requiredLength), '\0');
-        const int convertedLength = ::WideCharToMultiByte(CP_UTF8, 0, text.data(), static_cast<int>(text.size()), &result[0], requiredLength, nullptr, nullptr);
+        const int convertedLength = ::WideCharToMultiByte(CP_UTF8, 0, text.data(), textLength, &result[0], requiredLength, nullptr, nullptr);
         if (convertedLength != requiredLength)
         {
             return std::string();
@@ -639,31 +652,38 @@ namespace internal
             return TRUE;
         }
 
-        MONITORINFOEXW monitorInfo = {};
-        monitorInfo.cbSize = sizeof(monitorInfo);
-        if (!::GetMonitorInfoW(monitorHandle, &monitorInfo))
+        std::map<std::wstring, RuntimeMonitorInfo>* runtimeMonitorMap = reinterpret_cast<std::map<std::wstring, RuntimeMonitorInfo>*>(userData);
+        try
         {
+            MONITORINFOEXW monitorInfo = {};
+            monitorInfo.cbSize = sizeof(monitorInfo);
+            if (!::GetMonitorInfoW(monitorHandle, &monitorInfo))
+            {
+                return TRUE;
+            }
+
+            UINT effectiveDpiX = 96;
+            UINT effectiveDpiY = 96;
+            UINT rawDpiX = 0;
+            UINT rawDpiY = 0;
+            FillFallbackMonitorDpi(monitorHandle, effectiveDpiX, effectiveDpiY, rawDpiX, rawDpiY);
+
+            RuntimeMonitorInfo runtimeMonitorInfo;
+            runtimeMonitorInfo.monitorHandle = monitorHandle;
+            runtimeMonitorInfo.monitorRect = monitorInfo.rcMonitor;
+            runtimeMonitorInfo.isPrimary = (monitorInfo.dwFlags & MONITORINFOF_PRIMARY) != 0;
+            runtimeMonitorInfo.effectiveDpiX = effectiveDpiX;
+            runtimeMonitorInfo.effectiveDpiY = effectiveDpiY;
+            runtimeMonitorInfo.rawDpiX = rawDpiX;
+            runtimeMonitorInfo.rawDpiY = rawDpiY;
+            (*runtimeMonitorMap)[monitorInfo.szDevice] = runtimeMonitorInfo;
             return TRUE;
         }
-
-        UINT effectiveDpiX = 96;
-        UINT effectiveDpiY = 96;
-        UINT rawDpiX = 0;
-        UINT rawDpiY = 0;
-        FillFallbackMonitorDpi(monitorHandle, effectiveDpiX, effectiveDpiY, rawDpiX, rawDpiY);
-
-        RuntimeMonitorInfo runtimeMonitorInfo;
-        runtimeMonitorInfo.monitorHandle = monitorHandle;
-        runtimeMonitorInfo.monitorRect = monitorInfo.rcMonitor;
-        runtimeMonitorInfo.isPrimary = (monitorInfo.dwFlags & MONITORINFOF_PRIMARY) != 0;
-        runtimeMonitorInfo.effectiveDpiX = effectiveDpiX;
-        runtimeMonitorInfo.effectiveDpiY = effectiveDpiY;
-        runtimeMonitorInfo.rawDpiX = rawDpiX;
-        runtimeMonitorInfo.rawDpiY = rawDpiY;
-
-        std::map<std::wstring, RuntimeMonitorInfo>* runtimeMonitorMap = reinterpret_cast<std::map<std::wstring, RuntimeMonitorInfo>*>(userData);
-        (*runtimeMonitorMap)[monitorInfo.szDevice] = runtimeMonitorInfo;
-        return TRUE;
+        catch (...)
+        {
+            runtimeMonitorMap->clear();
+            return FALSE;
+        }
     }
 
     static std::map<std::wstring, RuntimeMonitorInfo> CollectRuntimeMonitors()
@@ -923,7 +943,7 @@ namespace internal
         return ParseEdid(edidBytes, edidInfo);
     }
 
-    static std::unordered_map<std::wstring, EdidInfo> CollectEdidInfoByMonitorDevicePath()
+    static std::unordered_map<std::wstring, EdidInfo> CollectEdidInfoByMonitorDevicePathUncached()
     {
         std::unordered_map<std::wstring, EdidInfo> edidInfoMap;
 
@@ -976,6 +996,37 @@ namespace internal
             }
 
             edidInfoMap[normalizedDevicePath] = edidInfo;
+        }
+
+        return edidInfoMap;
+    }
+
+    static std::unordered_map<std::wstring, EdidInfo> CollectEdidInfoByMonitorDevicePath()
+    {
+        struct EdidCache
+        {
+            std::mutex mutex;
+            std::unordered_map<std::wstring, EdidInfo> edidInfoMap;
+            std::chrono::steady_clock::time_point updateTime;
+            bool initialized = false;
+        };
+
+        static EdidCache edidCache;
+        const std::chrono::steady_clock::time_point currentTime = std::chrono::steady_clock::now();
+        {
+            std::lock_guard<std::mutex> lock(edidCache.mutex);
+            if (edidCache.initialized && currentTime - edidCache.updateTime < std::chrono::seconds(5))
+            {
+                return edidCache.edidInfoMap;
+            }
+        }
+
+        std::unordered_map<std::wstring, EdidInfo> edidInfoMap = CollectEdidInfoByMonitorDevicePathUncached();
+        {
+            std::lock_guard<std::mutex> lock(edidCache.mutex);
+            edidCache.edidInfoMap = edidInfoMap;
+            edidCache.updateTime = currentTime;
+            edidCache.initialized = true;
         }
 
         return edidInfoMap;
@@ -1212,6 +1263,37 @@ namespace internal
         return true;
     }
 
+    static bool TryGetPositiveRectSize(const RECT& rectangle, int& width, int& height)
+    {
+        width = 0;
+        height = 0;
+
+        const int64_t widthValue = static_cast<int64_t>(rectangle.right) - static_cast<int64_t>(rectangle.left);
+        const int64_t heightValue = static_cast<int64_t>(rectangle.bottom) - static_cast<int64_t>(rectangle.top);
+        if (widthValue <= 0 || heightValue <= 0 || widthValue > static_cast<int64_t>(std::numeric_limits<int>::max()) || heightValue > static_cast<int64_t>(std::numeric_limits<int>::max()))
+        {
+            return false;
+        }
+
+        width = static_cast<int>(widthValue);
+        height = static_cast<int>(heightValue);
+        return true;
+    }
+
+    static bool TryGetAbsoluteLongAsPositiveInt(const LONG value, int& positiveValue)
+    {
+        positiveValue = 0;
+        const int64_t signedValue = static_cast<int64_t>(value);
+        const int64_t absoluteValue = signedValue < 0 ? -signedValue : signedValue;
+        if (absoluteValue <= 0 || absoluteValue > static_cast<int64_t>(std::numeric_limits<int>::max()))
+        {
+            return false;
+        }
+
+        positiveValue = static_cast<int>(absoluteValue);
+        return true;
+    }
+
     static void FillScaleFactors(GB_ScreenInfo& screenInfo)
     {
         screenInfo.scaleFactorX = screenInfo.effectiveDpiX > 0.0 ? screenInfo.effectiveDpiX / 96.0 : 1.0;
@@ -1236,8 +1318,7 @@ namespace internal
         GB_ScreenInfo screenInfo;
         screenInfo.gdiDeviceName = WideStringToUtf8(gdiDeviceName);
         screenInfo.virtualScreenRectangle = GB_Rectangle(static_cast<double>(runtimeMonitorInfo.monitorRect.left), static_cast<double>(runtimeMonitorInfo.monitorRect.top), static_cast<double>(runtimeMonitorInfo.monitorRect.right), static_cast<double>(runtimeMonitorInfo.monitorRect.bottom));
-        screenInfo.currentPixelWidth = runtimeMonitorInfo.monitorRect.right - runtimeMonitorInfo.monitorRect.left;
-        screenInfo.currentPixelHeight = runtimeMonitorInfo.monitorRect.bottom - runtimeMonitorInfo.monitorRect.top;
+        (void)TryGetPositiveRectSize(runtimeMonitorInfo.monitorRect, screenInfo.currentPixelWidth, screenInfo.currentPixelHeight);
         screenInfo.preferredPixelWidth = screenInfo.currentPixelWidth;
         screenInfo.preferredPixelHeight = screenInfo.currentPixelHeight;
         screenInfo.effectiveDpiX = static_cast<double>(runtimeMonitorInfo.effectiveDpiX);
@@ -1281,7 +1362,7 @@ namespace internal
             return GB_Rectangle::Invalid;
         }
 
-        return GB_Rectangle(static_cast<double>(virtualLeft), static_cast<double>(virtualTop), static_cast<double>(virtualLeft + virtualWidth), static_cast<double>(virtualTop + virtualHeight));
+        return GB_Rectangle(static_cast<double>(virtualLeft), static_cast<double>(virtualTop), static_cast<double>(virtualLeft) + static_cast<double>(virtualWidth), static_cast<double>(virtualTop) + static_cast<double>(virtualHeight));
     }
 
     static bool IntersectCaptureRectangle(const GB_Rectangle& requestedRectangle, RECT& clippedRectangle)
@@ -1338,9 +1419,9 @@ namespace internal
 
     static bool CaptureRectangleToImage(const RECT& captureRectangle, GB_Image& screenImage)
     {
-        const int captureWidth = captureRectangle.right - captureRectangle.left;
-        const int captureHeight = captureRectangle.bottom - captureRectangle.top;
-        if (captureWidth <= 0 || captureHeight <= 0)
+        int captureWidth = 0;
+        int captureHeight = 0;
+        if (!TryGetPositiveRectSize(captureRectangle, captureWidth, captureHeight))
         {
             return false;
         }
@@ -1489,8 +1570,7 @@ namespace internal
             }
 
             cursorWidth = bitmapInfo.bmWidth;
-            cursorHeight = std::abs(bitmapInfo.bmHeight);
-            if (cursorWidth <= 0 || cursorHeight <= 0)
+            if (cursorWidth <= 0 || !TryGetAbsoluteLongAsPositiveInt(bitmapInfo.bmHeight, cursorHeight))
             {
                 ClearIconInfoBitmaps(iconInfo);
                 return false;
@@ -1511,8 +1591,8 @@ namespace internal
             return false;
         }
 
-        const int maskBitmapHeight = std::abs(bitmapInfo.bmHeight);
-        if (bitmapInfo.bmWidth <= 0 || maskBitmapHeight <= 0 || (maskBitmapHeight % 2) != 0)
+        int maskBitmapHeight = 0;
+        if (bitmapInfo.bmWidth <= 0 || !TryGetAbsoluteLongAsPositiveInt(bitmapInfo.bmHeight, maskBitmapHeight) || (maskBitmapHeight % 2) != 0)
         {
             ClearIconInfoBitmaps(iconInfo);
             return false;
@@ -2120,46 +2200,45 @@ namespace internal
             return false;
         }
 
-        const GB_Image* sourceImage = &image;
-        GB_Image convertedImage;
-        if (image.GetDepth() != GB_ImageDepth::UInt8)
+        GB_Image bgraImage = image.ConvertToBgra8();
+        if (bgraImage.IsEmpty() || bgraImage.GetDepth() != GB_ImageDepth::UInt8 || bgraImage.GetChannels() != 4)
         {
-            convertedImage = image.ConvertTo(GB_ImageDepth::UInt8);
-            if (convertedImage.IsEmpty())
-            {
-                return false;
-            }
-            sourceImage = &convertedImage;
+            return false;
         }
 
-        const size_t imageWidth = sourceImage->GetWidth();
-        const size_t imageHeight = sourceImage->GetHeight();
+        const size_t imageWidth = bgraImage.GetWidth();
+        const size_t imageHeight = bgraImage.GetHeight();
         if (imageWidth == 0 || imageHeight == 0 || imageWidth > static_cast<size_t>(std::numeric_limits<int>::max()) || imageHeight > static_cast<size_t>(std::numeric_limits<int>::max()))
         {
             return false;
         }
 
-        straightBgraImage.create(static_cast<int>(imageHeight), static_cast<int>(imageWidth), CV_8UC4);
-        for (size_t rowIndex = 0; rowIndex < imageHeight; rowIndex++)
+        if (imageWidth > (std::numeric_limits<size_t>::max)() / 4u)
         {
-            cv::Vec4b* targetRow = straightBgraImage.ptr<cv::Vec4b>(static_cast<int>(rowIndex));
-            for (size_t colIndex = 0; colIndex < imageWidth; colIndex++)
-            {
-                GB_ColorRGBA pixelColor;
-                if (!sourceImage->GetPixelColor(rowIndex, colIndex, pixelColor))
-                {
-                    straightBgraImage.release();
-                    return false;
-                }
-
-                targetRow[colIndex][0] = pixelColor.b;
-                targetRow[colIndex][1] = pixelColor.g;
-                targetRow[colIndex][2] = pixelColor.r;
-                targetRow[colIndex][3] = pixelColor.a;
-            }
+            return false;
         }
 
-        return !straightBgraImage.empty();
+        const size_t rowByteCount = imageWidth * 4u;
+        straightBgraImage.create(static_cast<int>(imageHeight), static_cast<int>(imageWidth), CV_8UC4);
+        if (straightBgraImage.empty())
+        {
+            return false;
+        }
+
+        for (size_t rowIndex = 0; rowIndex < imageHeight; rowIndex++)
+        {
+            const unsigned char* sourceRowData = bgraImage.GetRowData(rowIndex);
+            unsigned char* targetRowData = straightBgraImage.ptr<unsigned char>(static_cast<int>(rowIndex));
+            if (sourceRowData == nullptr || targetRowData == nullptr)
+            {
+                straightBgraImage.release();
+                return false;
+            }
+
+            std::memcpy(targetRowData, sourceRowData, rowByteCount);
+        }
+
+        return true;
     }
 
     static bool TryGetImageTargetRectangleInCanvas(const GB_Rectangle& screenRectangle, const int virtualScreenLeft, const int virtualScreenTop, cv::Rect& targetRectangle)
@@ -2275,10 +2354,18 @@ namespace internal
             return false;
         }
 
-        virtualScreenRect.left = left;
-        virtualScreenRect.top = top;
-        virtualScreenRect.right = left + width;
-        virtualScreenRect.bottom = top + height;
+        const int64_t right = static_cast<int64_t>(left) + static_cast<int64_t>(width);
+        const int64_t bottom = static_cast<int64_t>(top) + static_cast<int64_t>(height);
+        if (right > static_cast<int64_t>(std::numeric_limits<LONG>::max()) || bottom > static_cast<int64_t>(std::numeric_limits<LONG>::max()))
+        {
+            virtualScreenRect = { 0, 0, 0, 0 };
+            return false;
+        }
+
+        virtualScreenRect.left = static_cast<LONG>(left);
+        virtualScreenRect.top = static_cast<LONG>(top);
+        virtualScreenRect.right = static_cast<LONG>(right);
+        virtualScreenRect.bottom = static_cast<LONG>(bottom);
         return true;
     }
 
@@ -2541,9 +2628,9 @@ namespace internal
                 return;
             }
 
-            const int virtualScreenWidth = virtualScreenRect.right - virtualScreenRect.left;
-            const int virtualScreenHeight = virtualScreenRect.bottom - virtualScreenRect.top;
-            if (virtualScreenWidth <= 0 || virtualScreenHeight <= 0)
+            int virtualScreenWidth = 0;
+            int virtualScreenHeight = 0;
+            if (!TryGetPositiveRectSize(virtualScreenRect, virtualScreenWidth, virtualScreenHeight))
             {
                 ::ShowWindow(currentWindowHandle, SW_HIDE);
                 return;
@@ -2628,6 +2715,7 @@ namespace internal
         static const UINT kRefreshTimerMilliseconds = 50;
 
         std::mutex mutex;
+        std::condition_variable windowThreadCondition;
         std::map<uint64_t, ScreenPainterObjectState> paintObjects;
         std::atomic<uint64_t> nextUid{ 1 };
         std::thread windowThread;
@@ -2635,6 +2723,8 @@ namespace internal
         DWORD windowThreadId = 0;
         bool windowThreadStopping = false;
         bool windowThreadFinished = true;
+        bool windowThreadStartupCompleted = true;
+        bool windowThreadStartupSucceeded = false;
 
         uint64_t AllocateUid()
         {
@@ -2648,11 +2738,22 @@ namespace internal
 
         bool AddPaintObject(const GB_ScreenPaintObject& paintObject, const long long displayDurationMilliseconds)
         {
+            try
             {
-                std::lock_guard<std::mutex> lockGuard(mutex);
+                std::unique_lock<std::mutex> lock(mutex);
                 RemoveFinishedWindowThreadLocked();
                 if (!StartWindowThreadLocked())
                 {
+                    return false;
+                }
+
+                windowThreadCondition.wait(lock, [this]()
+                    {
+                        return windowThreadStartupCompleted;
+                    });
+                if (!windowThreadStartupSucceeded)
+                {
+                    RemoveFinishedWindowThreadLocked();
                     return false;
                 }
 
@@ -2660,6 +2761,11 @@ namespace internal
                 objectState.paintObject = paintObject;
                 objectState.expireTime = BuildExpireTime(displayDurationMilliseconds);
                 paintObjects[paintObject.uid] = objectState;
+                lock.unlock();
+            }
+            catch (...)
+            {
+                return false;
             }
 
             RequestRefresh();
@@ -2681,12 +2787,16 @@ namespace internal
             try
             {
                 windowThreadFinished = false;
+                windowThreadStartupCompleted = false;
+                windowThreadStartupSucceeded = false;
                 windowThread = std::thread(&ScreenPainterManager::WindowThreadMain, this);
             }
             catch (...)
             {
                 windowThreadId = 0;
                 windowThreadFinished = true;
+                windowThreadStartupCompleted = true;
+                windowThreadStartupSucceeded = false;
                 return false;
             }
 
@@ -2712,11 +2822,12 @@ namespace internal
                 currentWindowThreadId = windowThreadId;
             }
 
+            bool stopMessagePosted = false;
             if (currentWindowHandle != nullptr)
             {
-                (void)::PostMessageW(currentWindowHandle, WM_CLOSE, 0, 0);
+                stopMessagePosted = ::PostMessageW(currentWindowHandle, WM_CLOSE, 0, 0) != FALSE;
             }
-            else if (currentWindowThreadId != 0)
+            if (!stopMessagePosted && currentWindowThreadId != 0)
             {
                 (void)::PostThreadMessageW(currentWindowThreadId, WM_QUIT, 0, 0);
             }
@@ -2732,6 +2843,8 @@ namespace internal
                 windowThreadId = 0;
                 windowThreadStopping = false;
                 windowThreadFinished = true;
+                windowThreadStartupCompleted = true;
+                windowThreadStartupSucceeded = false;
             }
         }
 
@@ -2879,135 +2992,192 @@ namespace internal
 
         static LRESULT CALLBACK WindowProc(HWND windowHandle, UINT message, WPARAM wParam, LPARAM lParam)
         {
-            ScreenPainterManager* manager = reinterpret_cast<ScreenPainterManager*>(::GetWindowLongPtrW(windowHandle, GWLP_USERDATA));
-            if (message == WM_NCCREATE)
+            try
             {
-                CREATESTRUCTW* createStruct = reinterpret_cast<CREATESTRUCTW*>(lParam);
-                manager = reinterpret_cast<ScreenPainterManager*>(createStruct->lpCreateParams);
-                (void)::SetWindowLongPtrW(windowHandle, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(manager));
-            }
-
-            if (manager == nullptr)
-            {
-                return ::DefWindowProcW(windowHandle, message, wParam, lParam);
-            }
-
-            switch (message)
-            {
-            case kRefreshMessage:
-                manager->RenderWindow();
-                return 0;
-
-            case WM_TIMER:
-                if (wParam == kRefreshTimerId)
+                ScreenPainterManager* manager = reinterpret_cast<ScreenPainterManager*>(::GetWindowLongPtrW(windowHandle, GWLP_USERDATA));
+                if (message == WM_NCCREATE)
                 {
-                    manager->OnTimer();
-                    return 0;
+                    CREATESTRUCTW* createStruct = reinterpret_cast<CREATESTRUCTW*>(lParam);
+                    manager = createStruct == nullptr ? nullptr : reinterpret_cast<ScreenPainterManager*>(createStruct->lpCreateParams);
+                    (void)::SetWindowLongPtrW(windowHandle, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(manager));
                 }
-                break;
 
-            case WM_DISPLAYCHANGE:
-            case WM_SETTINGCHANGE:
-            case WM_DPICHANGED:
-                manager->RenderWindow();
-                return 0;
+                if (manager == nullptr)
+                {
+                    return ::DefWindowProcW(windowHandle, message, wParam, lParam);
+                }
 
-            case WM_CLOSE:
-                ::DestroyWindow(windowHandle);
-                return 0;
+                switch (message)
+                {
+                case kRefreshMessage:
+                    manager->RenderWindow();
+                    return 0;
 
-            case WM_DESTROY:
-                ::PostQuitMessage(0);
-                return 0;
+                case WM_TIMER:
+                    if (wParam == kRefreshTimerId)
+                    {
+                        manager->OnTimer();
+                        return 0;
+                    }
+                    break;
 
-            default:
-                break;
+                case WM_DISPLAYCHANGE:
+                case WM_SETTINGCHANGE:
+                case WM_DPICHANGED:
+                    manager->RenderWindow();
+                    return 0;
+
+                case WM_CLOSE:
+                    ::DestroyWindow(windowHandle);
+                    return 0;
+
+                case WM_DESTROY:
+                    ::PostQuitMessage(0);
+                    return 0;
+
+                default:
+                    break;
+                }
+            }
+            catch (...)
+            {
             }
 
             return ::DefWindowProcW(windowHandle, message, wParam, lParam);
         }
 
-        void WindowThreadMain()
+        void WindowThreadMain() noexcept
         {
-            DpiAwarenessScope dpiAwarenessScope;
-
-            MSG initialMessage = {};
-            (void)::PeekMessageW(&initialMessage, nullptr, WM_USER, WM_USER, PM_NOREMOVE);
+            HWND createdWindowHandle = nullptr;
+            try
             {
-                std::lock_guard<std::mutex> lockGuard(mutex);
-                windowThreadId = ::GetCurrentThreadId();
-                if (windowThreadStopping)
+                DpiAwarenessScope dpiAwarenessScope;
+
+                MSG initialMessage = {};
+                (void)::PeekMessageW(&initialMessage, nullptr, WM_USER, WM_USER, PM_NOREMOVE);
                 {
+                    std::lock_guard<std::mutex> lockGuard(mutex);
+                    windowThreadId = ::GetCurrentThreadId();
+                    if (windowThreadStopping)
+                    {
+                        windowThreadId = 0;
+                        windowThreadFinished = true;
+                        windowThreadStartupCompleted = true;
+                        windowThreadStartupSucceeded = false;
+                        windowThreadCondition.notify_all();
+                        return;
+                    }
+                }
+
+                const wchar_t* className = L"GB_ScreenPainterLayeredWindow";
+                WNDCLASSEXW windowClass = {};
+                windowClass.cbSize = sizeof(windowClass);
+                windowClass.style = CS_HREDRAW | CS_VREDRAW;
+                windowClass.lpfnWndProc = &ScreenPainterManager::WindowProc;
+                windowClass.hInstance = ::GetModuleHandleW(nullptr);
+                windowClass.hCursor = nullptr;
+                windowClass.hbrBackground = nullptr;
+                windowClass.lpszClassName = className;
+                const ATOM classAtom = ::RegisterClassExW(&windowClass);
+                if (classAtom == 0 && ::GetLastError() != ERROR_CLASS_ALREADY_EXISTS)
+                {
+                    std::lock_guard<std::mutex> lockGuard(mutex);
                     windowThreadId = 0;
                     windowThreadFinished = true;
+                    windowThreadStartupCompleted = true;
+                    windowThreadStartupSucceeded = false;
+                    windowThreadCondition.notify_all();
                     return;
                 }
+
+                RECT virtualScreenRect = { 0, 0, 1, 1 };
+                if (!TryGetCurrentVirtualScreenRectForPainter(virtualScreenRect))
+                {
+                    virtualScreenRect = { 0, 0, 1, 1 };
+                }
+
+                int virtualScreenWidth = 0;
+                int virtualScreenHeight = 0;
+                if (!TryGetPositiveRectSize(virtualScreenRect, virtualScreenWidth, virtualScreenHeight))
+                {
+                    virtualScreenRect = { 0, 0, 1, 1 };
+                    virtualScreenWidth = 1;
+                    virtualScreenHeight = 1;
+                }
+
+                const DWORD exStyle = WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE;
+                createdWindowHandle = ::CreateWindowExW(exStyle, className, L"GB_ScreenPainter", WS_POPUP, virtualScreenRect.left, virtualScreenRect.top, virtualScreenWidth, virtualScreenHeight, nullptr, nullptr, ::GetModuleHandleW(nullptr), this);
+                if (createdWindowHandle == nullptr)
+                {
+                    std::lock_guard<std::mutex> lockGuard(mutex);
+                    windowHandle = nullptr;
+                    windowThreadId = 0;
+                    windowThreadFinished = true;
+                    windowThreadStartupCompleted = true;
+                    windowThreadStartupSucceeded = false;
+                    windowThreadCondition.notify_all();
+                    return;
+                }
+
+                {
+                    std::lock_guard<std::mutex> lockGuard(mutex);
+                    if (windowThreadStopping)
+                    {
+                        windowThreadId = 0;
+                        windowThreadFinished = true;
+                        windowThreadStartupCompleted = true;
+                        windowThreadStartupSucceeded = false;
+                        windowThreadCondition.notify_all();
+                        (void)::DestroyWindow(createdWindowHandle);
+                        createdWindowHandle = nullptr;
+                        return;
+                    }
+
+                    windowHandle = createdWindowHandle;
+                    windowThreadStartupCompleted = true;
+                    windowThreadStartupSucceeded = true;
+                    windowThreadCondition.notify_all();
+                }
+
+                (void)::SetTimer(createdWindowHandle, kRefreshTimerId, kRefreshTimerMilliseconds, nullptr);
+                (void)::SetWindowPos(createdWindowHandle, HWND_TOPMOST, virtualScreenRect.left, virtualScreenRect.top, virtualScreenWidth, virtualScreenHeight, SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_SHOWWINDOW);
+                ::ShowWindow(createdWindowHandle, SW_SHOWNOACTIVATE);
+                RenderWindow();
+
+                MSG message = {};
+                while (::GetMessageW(&message, nullptr, 0, 0) > 0)
+                {
+                    ::TranslateMessage(&message);
+                    ::DispatchMessageW(&message);
+                }
+
+                if (createdWindowHandle != nullptr && ::IsWindow(createdWindowHandle) != FALSE)
+                {
+                    (void)::DestroyWindow(createdWindowHandle);
+                }
+                createdWindowHandle = nullptr;
             }
-
-            const wchar_t* className = L"GB_ScreenPainterLayeredWindow";
-            WNDCLASSEXW windowClass = {};
-            windowClass.cbSize = sizeof(windowClass);
-            windowClass.style = CS_HREDRAW | CS_VREDRAW;
-            windowClass.lpfnWndProc = &ScreenPainterManager::WindowProc;
-            windowClass.hInstance = ::GetModuleHandleW(nullptr);
-            windowClass.hCursor = nullptr;
-            windowClass.hbrBackground = nullptr;
-            windowClass.lpszClassName = className;
-            (void)::RegisterClassExW(&windowClass);
-
-            RECT virtualScreenRect = { 0, 0, 1, 1 };
-            if (!TryGetCurrentVirtualScreenRectForPainter(virtualScreenRect))
+            catch (...)
             {
-                virtualScreenRect.right = virtualScreenRect.left + 1;
-                virtualScreenRect.bottom = virtualScreenRect.top + 1;
+                if (createdWindowHandle != nullptr && ::IsWindow(createdWindowHandle) != FALSE)
+                {
+                    (void)::DestroyWindow(createdWindowHandle);
+                }
+                createdWindowHandle = nullptr;
             }
 
-            const DWORD exStyle = WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE;
-            const HWND createdWindowHandle = ::CreateWindowExW(exStyle, className, L"GB_ScreenPainter", WS_POPUP, virtualScreenRect.left, virtualScreenRect.top, virtualScreenRect.right - virtualScreenRect.left, virtualScreenRect.bottom - virtualScreenRect.top, nullptr, nullptr, ::GetModuleHandleW(nullptr), this);
-            if (createdWindowHandle == nullptr)
             {
                 std::lock_guard<std::mutex> lockGuard(mutex);
                 windowHandle = nullptr;
-                windowThreadFinished = true;
-                return;
-            }
-
-            {
-                std::lock_guard<std::mutex> lockGuard(mutex);
-                if (windowThreadStopping)
-                {
-                    windowHandle = nullptr;
-                    windowThreadId = 0;
-                    windowThreadFinished = true;
-                    ::DestroyWindow(createdWindowHandle);
-                    return;
-                }
-
-                windowHandle = createdWindowHandle;
-            }
-
-            (void)::SetTimer(createdWindowHandle, kRefreshTimerId, kRefreshTimerMilliseconds, nullptr);
-            (void)::SetWindowPos(createdWindowHandle, HWND_TOPMOST, virtualScreenRect.left, virtualScreenRect.top, virtualScreenRect.right - virtualScreenRect.left, virtualScreenRect.bottom - virtualScreenRect.top, SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_SHOWWINDOW);
-            ::ShowWindow(createdWindowHandle, SW_SHOWNOACTIVATE);
-            RenderWindow();
-
-            MSG message = {};
-            while (::GetMessageW(&message, nullptr, 0, 0) > 0)
-            {
-                ::TranslateMessage(&message);
-                ::DispatchMessageW(&message);
-            }
-
-            (void)::KillTimer(createdWindowHandle, kRefreshTimerId);
-            {
-                std::lock_guard<std::mutex> lockGuard(mutex);
-                if (windowHandle == createdWindowHandle)
-                {
-                    windowHandle = nullptr;
-                }
                 windowThreadId = 0;
                 windowThreadFinished = true;
+                if (!windowThreadStartupCompleted)
+                {
+                    windowThreadStartupCompleted = true;
+                    windowThreadStartupSucceeded = false;
+                }
             }
+            windowThreadCondition.notify_all();
         }
     };
 
@@ -3067,13 +3237,16 @@ std::vector<GB_ScreenInfo> GB_Screen::GetAllScreens()
                 screenInfo.rawDpiX = static_cast<double>(runtimeMonitorInfo.rawDpiX);
                 screenInfo.rawDpiY = static_cast<double>(runtimeMonitorInfo.rawDpiY);
 
+                int runtimeMonitorWidth = 0;
+                int runtimeMonitorHeight = 0;
+                (void)internal::TryGetPositiveRectSize(runtimeMonitorInfo.monitorRect, runtimeMonitorWidth, runtimeMonitorHeight);
                 if (screenInfo.currentPixelWidth <= 0)
                 {
-                    screenInfo.currentPixelWidth = runtimeMonitorInfo.monitorRect.right - runtimeMonitorInfo.monitorRect.left;
+                    screenInfo.currentPixelWidth = runtimeMonitorWidth;
                 }
                 if (screenInfo.currentPixelHeight <= 0)
                 {
-                    screenInfo.currentPixelHeight = runtimeMonitorInfo.monitorRect.bottom - runtimeMonitorInfo.monitorRect.top;
+                    screenInfo.currentPixelHeight = runtimeMonitorHeight;
                 }
             }
             else

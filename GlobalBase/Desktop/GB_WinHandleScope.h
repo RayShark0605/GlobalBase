@@ -133,7 +133,9 @@ public:
     GB_WinHandleScope(GB_WinHandleScope&& other);
 
     /**
-     * @brief 移动赋值，先释放当前资源，再接管 @p other 的资源。
+     * @brief 移动赋值，先显式关闭当前资源，再接管 @p other 的资源。
+     *
+     * 说明：如果当前资源关闭失败，则保留当前对象与 @p other 的原状态，不执行所有权转移。
      */
     GB_WinHandleScope& operator=(GB_WinHandleScope&& other);
 
@@ -289,7 +291,12 @@ public:
     /**
      * @brief 重置为新句柄，并释放原有资源。
      *
-     * @return 原有资源的关闭结果；若原本没有资源，则返回成功。
+     * 说明：
+     * - 会在释放原资源前校验新的关闭方式并准备资源名，失败时原资源保持不变；
+     * - 传入与当前相同的非空句柄时，只允许保持原关闭方式和上下文句柄，并仅更新资源名；
+     * - 如需为同一原生句柄改变所有权策略，应先调用 Detach()，再由新的作用域明确接管。
+     *
+     * @return 重置结果；原资源关闭失败时保留原资源并返回关闭失败结果。
      */
     GB_SystemResult Reset(NativeHandle newHandle = nullptr, GB_WinHandleCloseMethod newCloseMethod = GB_WinHandleCloseMethod::None, NativeHandle newContextHandle = nullptr, const std::string& newResourceName = std::string());
 

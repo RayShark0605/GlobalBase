@@ -81,6 +81,11 @@ namespace
         return leftText.size() == rightText.size() && StartsWithAsciiNoCase(leftText, rightText);
     }
 
+    static char ToLowerAsciiCharacter(const char character)
+    {
+        return character >= 'A' && character <= 'Z' ? static_cast<char>(character - 'A' + 'a') : character;
+    }
+
     static bool ContainsAsciiNoCase(const std::string& text, const std::string& needle)
     {
         if (needle.empty())
@@ -88,9 +93,16 @@ namespace
             return true;
         }
 
-        const std::string lowerText = ToLowerAscii(text);
-        const std::string lowerNeedle = ToLowerAscii(needle);
-        return lowerText.find(lowerNeedle) != std::string::npos;
+        if (needle.size() > text.size())
+        {
+            return false;
+        }
+
+        const std::string::const_iterator foundIter = std::search(text.begin(), text.end(), needle.begin(), needle.end(), [](const char leftCharacter, const char rightCharacter)
+            {
+                return ToLowerAsciiCharacter(leftCharacter) == ToLowerAsciiCharacter(rightCharacter);
+            });
+        return foundIter != text.end();
     }
 
     static bool EqualsAnyAsciiNoCase(const std::string& text, const char* const* candidates, const size_t candidateCount)
@@ -1956,7 +1968,7 @@ GB_SystemResult GB_SystemDevice::GetDeviceInterfacesByClassGuid(const std::strin
 class GB_SystemDeviceWatcher::Impl
 {
 public:
-    Impl() : typedDispatcher(GB_EventDispatcher::MakeQueuedOptions(1024, GB_EventQueueOverflowPolicy::DropOldest, u8"GB_SystemDeviceWatcher.Typed")), publicDispatcher(GB_EventDispatcher::MakeQueuedOptions(1024, GB_EventQueueOverflowPolicy::DropOldest, u8"GB_SystemDeviceWatcher.Public")), acceptingNativeNotifications(false), activeNativeNotificationCount(0)
+    Impl() : acceptingNativeNotifications(false), activeNativeNotificationCount(0), typedDispatcher(GB_EventDispatcher::MakeQueuedOptions(1024, GB_EventQueueOverflowPolicy::DropOldest, u8"GB_SystemDeviceWatcher.Typed")), publicDispatcher(GB_EventDispatcher::MakeQueuedOptions(1024, GB_EventQueueOverflowPolicy::DropOldest, u8"GB_SystemDeviceWatcher.Public"))
     {
         (void)typedDispatcher.SubscribeAll([this](const GB_Event& event)
             {
@@ -2148,7 +2160,6 @@ private:
     {
         if (activeNativeNotificationCount.fetch_sub(1, std::memory_order_acq_rel) == 1)
         {
-            std::lock_guard<std::mutex> lock(notificationMutex);
             notificationCondition.notify_all();
         }
     }
@@ -2479,7 +2490,41 @@ private:
         deviceNotifyHandles.clear();
     }
 
-    void WindowThreadMain()
+    void WindowThreadMain() noexcept
+    {
+        try
+        {
+            WindowThreadMainImpl();
+        }
+        catch (...)
+        {
+            HWND currentWindowHandle = nullptr;
+            {
+                std::lock_guard<std::mutex> lock(stateMutex);
+                currentWindowHandle = windowHandle;
+                windowHandle = nullptr;
+                windowThreadId = 0;
+                if (!startCompleted)
+                {
+                    startResult.errorCode = GB_SystemErrorCode::InternalError;
+                    startResult.errorSource = GB_NativeErrorSource::None;
+                    startResult.nativeErrorCode = 0;
+                    startResult.hresult = GB_SystemResult::ErrorCodeToHResult(GB_SystemErrorCode::InternalError);
+                    startResult.nativeMessage.clear();
+                    startCompleted = true;
+                }
+            }
+
+            UnregisterFallbackNotifications();
+            if (currentWindowHandle != nullptr && ::IsWindow(currentWindowHandle) != FALSE)
+            {
+                (void)::DestroyWindow(currentWindowHandle);
+            }
+            startCondition.notify_all();
+        }
+    }
+
+    void WindowThreadMainImpl()
     {
         {
             std::lock_guard<std::mutex> lock(stateMutex);
@@ -2561,24 +2606,30 @@ private:
 
     static LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam)
     {
-        Impl* impl = nullptr;
-        if (message == WM_NCCREATE)
+        try
         {
-            CREATESTRUCTW* createStruct = reinterpret_cast<CREATESTRUCTW*>(lParam);
-            impl = createStruct == nullptr ? nullptr : static_cast<Impl*>(createStruct->lpCreateParams);
+            Impl* impl = nullptr;
+            if (message == WM_NCCREATE)
+            {
+                CREATESTRUCTW* createStruct = reinterpret_cast<CREATESTRUCTW*>(lParam);
+                impl = createStruct == nullptr ? nullptr : static_cast<Impl*>(createStruct->lpCreateParams);
+                if (impl != nullptr)
+                {
+                    ::SetWindowLongPtrW(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(impl));
+                }
+            }
+            else
+            {
+                impl = reinterpret_cast<Impl*>(::GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+            }
+
             if (impl != nullptr)
             {
-                ::SetWindowLongPtrW(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(impl));
+                return impl->HandleWindowMessage(hwnd, message, wParam, lParam);
             }
         }
-        else
+        catch (...)
         {
-            impl = reinterpret_cast<Impl*>(::GetWindowLongPtrW(hwnd, GWLP_USERDATA));
-        }
-
-        if (impl != nullptr)
-        {
-            return impl->HandleWindowMessage(hwnd, message, wParam, lParam);
         }
 
         return ::DefWindowProcW(hwnd, message, wParam, lParam);

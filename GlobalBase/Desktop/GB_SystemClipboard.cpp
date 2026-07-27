@@ -2027,13 +2027,17 @@ GB_SystemResult GB_SystemClipboard::SetImage(const GB_Image& image, const GB_Sys
     }
     dibV5Handle.Detach();
 
+    GB_SystemResult compatibilityDibResult = GB_SystemResult::Succeeded(GB_ClipboardOperationSetImage);
     if (options.publishCompatibilityDib)
     {
         if (::SetClipboardData(CF_DIB, dibHandle.Get()) == nullptr)
         {
-            return GB_SystemResult::FromLastWin32Error(GB_ClipboardOperationSetImage, "写入 CF_DIB 兼容格式失败。");
+            compatibilityDibResult = GB_SystemResult::FromLastWin32Error(GB_ClipboardOperationSetImage, "CF_DIBV5 已成功写入，但额外发布 CF_DIB 兼容格式失败。");
         }
-        dibHandle.Detach();
+        else
+        {
+            dibHandle.Detach();
+        }
     }
 
     result = clipboardScope.Close(GB_ClipboardOperationSetImage);
@@ -2042,6 +2046,12 @@ GB_SystemResult GB_SystemClipboard::SetImage(const GB_Image& image, const GB_Sys
         return result;
     }
     RememberSelfWriteSequence();
+
+    if (compatibilityDibResult.IsFailed())
+    {
+        return GB_SystemResult::Succeeded(GB_ClipboardOperationSetImage, std::string("CF_DIBV5 已成功写入剪贴板；可选的 CF_DIB 兼容格式发布失败，不影响主要写入结果。 ") + compatibilityDibResult.ToString());
+    }
+
     return GB_SystemResult::Succeeded(GB_ClipboardOperationSetImage);
 #else
     (void)image;
@@ -2526,7 +2536,43 @@ private:
         createCondition.notify_all();
     }
 
-    void ThreadMain()
+    void ThreadMain() noexcept
+    {
+        try
+        {
+            ThreadMainImpl();
+        }
+        catch (...)
+        {
+            HWND currentWindowHandle = nullptr;
+            {
+                std::lock_guard<std::mutex> lock(stateMutex);
+                currentWindowHandle = windowHandle;
+                windowHandle = nullptr;
+                running = false;
+                threadId = 0;
+                createSucceeded = false;
+                if (!createCompleted)
+                {
+                    createResult.errorCode = GB_SystemErrorCode::InternalError;
+                    createResult.errorSource = GB_NativeErrorSource::None;
+                    createResult.nativeErrorCode = 0;
+                    createResult.hresult = GB_SystemResult::ErrorCodeToHResult(GB_SystemErrorCode::InternalError);
+                    createResult.nativeMessage.clear();
+                    createCompleted = true;
+                }
+            }
+
+            if (currentWindowHandle != nullptr && ::IsWindow(currentWindowHandle) != FALSE)
+            {
+                (void)::RemoveClipboardFormatListener(currentWindowHandle);
+                (void)::DestroyWindow(currentWindowHandle);
+            }
+            createCondition.notify_all();
+        }
+    }
+
+    void ThreadMainImpl()
     {
         SetThreadId(::GetCurrentThreadId());
 
@@ -2577,22 +2623,28 @@ private:
         threadId = 0;
     }
 
-    void QueueClipboardUpdate()
+    void QueueClipboardUpdate() noexcept
     {
-        GB_SystemClipboardEvent clipboardEvent;
-        clipboardEvent.sequenceNumber = ReadClipboardSequenceNumberRaw();
-        clipboardEvent.timestampMilliseconds = GB_EventDispatcher::GetCurrentTimestampMilliseconds();
-        clipboardEvent.isSelfWrite = IsSelfWriteSequence(clipboardEvent.sequenceNumber);
-
+        try
         {
-            std::lock_guard<std::mutex> lock(eventQueueMutex);
-            if (options.maxQueueSize != 0 && pendingClipboardEvents.size() >= options.maxQueueSize)
+            GB_SystemClipboardEvent clipboardEvent;
+            clipboardEvent.sequenceNumber = ReadClipboardSequenceNumberRaw();
+            clipboardEvent.timestampMilliseconds = GB_EventDispatcher::GetCurrentTimestampMilliseconds();
+            clipboardEvent.isSelfWrite = IsSelfWriteSequence(clipboardEvent.sequenceNumber);
+
             {
-                pendingClipboardEvents.pop_front();
+                std::lock_guard<std::mutex> lock(eventQueueMutex);
+                if (options.maxQueueSize != 0 && pendingClipboardEvents.size() >= options.maxQueueSize)
+                {
+                    pendingClipboardEvents.pop_front();
+                }
+                pendingClipboardEvents.push_back(std::move(clipboardEvent));
             }
-            pendingClipboardEvents.push_back(std::move(clipboardEvent));
+            eventQueueCondition.notify_one();
         }
-        eventQueueCondition.notify_one();
+        catch (...)
+        {
+        }
     }
 
     GB_SystemResult JoinPreviousThreadsBeforeStart()
@@ -2655,8 +2707,14 @@ private:
                 pendingClipboardEvents.pop_front();
             }
 
-            CompleteClipboardEvent(clipboardEvent);
-            DispatchClipboardEvent(clipboardEvent);
+            try
+            {
+                CompleteClipboardEvent(clipboardEvent);
+                DispatchClipboardEvent(clipboardEvent);
+            }
+            catch (...)
+            {
+            }
         }
     }
 
@@ -2698,10 +2756,18 @@ private:
             }
         }
 
+        {
+            std::lock_guard<std::mutex> lock(eventQueueMutex);
+            if (eventWorkerStopRequested)
+            {
+                return;
+            }
+        }
+
         GB_Event event(clipboardEvent.eventName);
         event.sourceName = "GB_SystemClipboardWatcher";
         event.timestampMilliseconds = clipboardEvent.timestampMilliseconds;
-        eventDispatcher.Post(event);
+        (void)eventDispatcher.Post(event);
     }
 #endif
 

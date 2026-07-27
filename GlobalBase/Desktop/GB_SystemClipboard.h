@@ -408,7 +408,7 @@ public:
      *
      * @remarks
      * - 默认发布保留 alpha 的 CF_DIBV5。
-     * - publishCompatibilityDib=true 时额外发布不携带 alpha 语义的 CF_DIB 兼容格式，以提高旧程序互操作性。
+     * - publishCompatibilityDib=true 时额外发布不携带 alpha 语义的 CF_DIB 兼容格式，以提高旧程序互操作性；若主要 CF_DIBV5 已成功而该可选兼容格式失败，接口仍返回成功并在 message 中记录降级信息。
      * - 成功写入后会记录当前剪贴板序列号，GB_SystemClipboardWatcher 可据此标记 isSelfWrite。
      */
     static GB_SystemResult SetImage(const GB_Image& image, const GB_SystemClipboardImageWriteOptions& options = GB_SystemClipboardImageWriteOptions());

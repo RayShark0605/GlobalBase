@@ -147,6 +147,32 @@ namespace
         return privilegeInfo;
     }
 
+    static void SetPrivilegeInfoNativeState(GB_PrivilegeInfo& privilegeInfo, const uint32_t luidLowPart, const int32_t luidHighPart, const uint32_t attributes, const bool exists) noexcept
+    {
+        privilegeInfo.luidLowPart = luidLowPart;
+        privilegeInfo.luidHighPart = luidHighPart;
+        privilegeInfo.attributes = attributes;
+        privilegeInfo.exists = exists;
+        privilegeInfo.enabled = (attributes & GB_SePrivilegeEnabled) != 0;
+        privilegeInfo.enabledByDefault = (attributes & GB_SePrivilegeEnabledByDefault) != 0;
+        privilegeInfo.removed = (attributes & GB_SePrivilegeRemoved) != 0;
+        privilegeInfo.usedForAccess = (attributes & GB_SePrivilegeUsedForAccess) != 0;
+    }
+
+    static void SwapPrivilegeInfo(GB_PrivilegeInfo& leftInfo, GB_PrivilegeInfo& rightInfo) noexcept
+    {
+        using std::swap;
+        leftInfo.privilegeName.swap(rightInfo.privilegeName);
+        swap(leftInfo.luidLowPart, rightInfo.luidLowPart);
+        swap(leftInfo.luidHighPart, rightInfo.luidHighPart);
+        swap(leftInfo.attributes, rightInfo.attributes);
+        swap(leftInfo.exists, rightInfo.exists);
+        swap(leftInfo.enabled, rightInfo.enabled);
+        swap(leftInfo.enabledByDefault, rightInfo.enabledByDefault);
+        swap(leftInfo.removed, rightInfo.removed);
+        swap(leftInfo.usedForAccess, rightInfo.usedForAccess);
+    }
+
     static std::string BuildAdjustDetailMessage(const GB_PrivilegeScopeOptions& options, const GB_PrivilegeTokenTarget openedTokenTarget, const bool stateChanged, const GB_PrivilegeInfo& previousPrivilegeInfo, const GB_PrivilegeInfo& adjustedPrivilegeInfo)
     {
         std::ostringstream stream;
@@ -435,15 +461,15 @@ namespace
         }
 
         GB_WinHandleScope tokenHandleScope = GB_WinHandleScope::FromKernelHandle(tokenHandle, u8"AccessToken");
-        tokenHandle = nullptr;
-
         GB_SystemResult closeResult = tokenHandleScope.Close();
         if (closeResult.IsFailed())
         {
+            tokenHandle = tokenHandleScope.Detach();
             closeResult.WithOperationName(ResolveOperationName(operationName, u8"GB_PrivilegeScope::CloseTokenHandle"));
             return closeResult;
         }
 
+        tokenHandle = nullptr;
         return GB_SystemResult::Succeeded(ResolveOperationName(operationName, u8"GB_PrivilegeScope::CloseTokenHandle"), u8"已关闭访问令牌句柄。");
     }
 
@@ -632,6 +658,21 @@ GB_SystemResult GB_PrivilegeScope::Adjust(const GB_PrivilegeScopeOptions& adjust
         return adjustResult;
     }
 
+    GB_PrivilegeScopeOptions committedOptions;
+    GB_PrivilegeInfo committedPreviousPrivilegeInfo;
+    GB_PrivilegeInfo committedAdjustedPrivilegeInfo;
+    try
+    {
+        committedOptions = adjustOptions;
+        committedPreviousPrivilegeInfo = beforeInfo;
+        committedAdjustedPrivilegeInfo = beforeInfo;
+    }
+    catch (...)
+    {
+        ClearPrivilegeState();
+        return GB_SystemResult::Failed(GB_SystemErrorCode::ResourceAllocationFailed, ResolveOperationName(operationName, u8"GB_PrivilegeScope::Adjust"), u8"准备权限恢复元数据时内存不足，尚未执行权限调整。");
+    }
+
     TOKEN_PRIVILEGES previousState = {};
     DWORD previousStateLength = 0;
     const DWORD targetAttributes = static_cast<DWORD>(BuildPrivilegeAttributes(adjustOptions.action));
@@ -642,37 +683,67 @@ GB_SystemResult GB_PrivilegeScope::Adjust(const GB_PrivilegeScopeOptions& adjust
         return adjustResult;
     }
 
-    GB_PrivilegeInfo authoritativePreviousInfo = beforeInfo;
     if (previousState.PrivilegeCount > 0)
     {
-        authoritativePreviousInfo = MakePrivilegeInfoFromLuidAndAttributes(adjustOptions.privilegeName, previousState.Privileges[0].Luid, previousState.Privileges[0].Attributes, true);
+        SetPrivilegeInfoNativeState(committedPreviousPrivilegeInfo, static_cast<uint32_t>(previousState.Privileges[0].Luid.LowPart), static_cast<int32_t>(previousState.Privileges[0].Luid.HighPart), static_cast<uint32_t>(previousState.Privileges[0].Attributes), true);
     }
 
-    GB_PrivilegeInfo afterInfo;
-    const GB_SystemResult afterQueryResult = QueryPrivilegeInfoFromToken(rawTokenHandle, adjustOptions.privilegeName, privilegeLuid, afterInfo, ResolveOperationName(operationName, u8"GetTokenInformation"));
-    if (afterQueryResult.IsFailed())
-    {
-        if (previousState.PrivilegeCount > 0)
-        {
-            (void)RestorePrivilegeOnToken(rawTokenHandle, authoritativePreviousInfo, u8"GB_PrivilegeScope::Adjust.RollbackAfterQueryFailed");
-        }
+    SetPrivilegeInfoNativeState(committedAdjustedPrivilegeInfo, static_cast<uint32_t>(privilegeLuid.LowPart), static_cast<int32_t>(privilegeLuid.HighPart), static_cast<uint32_t>(targetAttributes), true);
 
-        ClearPrivilegeState();
-        adjustResult = afterQueryResult;
-        return adjustResult;
+    GB_SystemResult afterQueryResult;
+    bool hasAfterQueryResult = false;
+    bool afterStateVerified = false;
+    try
+    {
+        GB_PrivilegeInfo queriedAfterInfo;
+        afterQueryResult = QueryPrivilegeInfoFromToken(rawTokenHandle, adjustOptions.privilegeName, privilegeLuid, queriedAfterInfo, ResolveOperationName(operationName, u8"GetTokenInformation"));
+        hasAfterQueryResult = true;
+        if (afterQueryResult.IsSucceeded())
+        {
+            SwapPrivilegeInfo(committedAdjustedPrivilegeInfo, queriedAfterInfo);
+            afterStateVerified = true;
+        }
+    }
+    catch (...)
+    {
+        hasAfterQueryResult = false;
+        afterStateVerified = false;
     }
 
     tokenHandle = tokenHandleScope.Detach();
     adjusted = true;
     stateChanged = previousState.PrivilegeCount > 0;
-    restoreOnDestruct = adjustOptions.restoreOnDestruct;
-    options = adjustOptions;
+    restoreOnDestruct = committedOptions.restoreOnDestruct;
+    options.privilegeName.swap(committedOptions.privilegeName);
+    options.action = committedOptions.action;
+    options.tokenTarget = committedOptions.tokenTarget;
+    options.openThreadAsSelf = committedOptions.openThreadAsSelf;
+    options.restoreOnDestruct = committedOptions.restoreOnDestruct;
     openedTokenTarget = actualOpenedTokenTarget;
     requestedAttributes = static_cast<uint32_t>(targetAttributes);
-    previousPrivilegeInfo = authoritativePreviousInfo;
-    adjustedPrivilegeInfo = afterInfo;
-    adjustResult = GB_SystemResult::Succeeded(ResolveOperationName(operationName, u8"GB_PrivilegeScope::Adjust"), BuildAdjustDetailMessage(options, openedTokenTarget, stateChanged, previousPrivilegeInfo, adjustedPrivilegeInfo));
-    lastRestoreResult = GB_SystemResult::Succeeded(u8"GB_PrivilegeScope::Adjust");
+    SwapPrivilegeInfo(previousPrivilegeInfo, committedPreviousPrivilegeInfo);
+    SwapPrivilegeInfo(adjustedPrivilegeInfo, committedAdjustedPrivilegeInfo);
+
+    try
+    {
+        std::string detailMessage = BuildAdjustDetailMessage(options, openedTokenTarget, stateChanged, previousPrivilegeInfo, adjustedPrivilegeInfo);
+        if (!afterStateVerified)
+        {
+            detailMessage += u8" 调整后的权限状态复查失败或状态结果处理时内存不足，但 AdjustTokenPrivileges 已经成功；当前作用域继续持有令牌和旧状态，以确保 Restore() 或析构仍可恢复权限。";
+            if (hasAfterQueryResult)
+            {
+                detailMessage += u8" verifyError=";
+                detailMessage += afterQueryResult.ToString();
+            }
+        }
+        adjustResult = GB_SystemResult::Succeeded(ResolveOperationName(operationName, u8"GB_PrivilegeScope::Adjust"), detailMessage);
+        lastRestoreResult = GB_SystemResult::Succeeded(u8"GB_PrivilegeScope::Adjust");
+    }
+    catch (...)
+    {
+        // adjustResult 仍保留 AdjustTokenPrivileges 的成功结果；恢复责任已经完整提交给当前对象。
+    }
+
     return adjustResult;
 #else
     adjustResult = MakeUnsupportedPlatformResult(ResolveOperationName(operationName, u8"GB_PrivilegeScope::Adjust"));
@@ -724,15 +795,13 @@ GB_SystemResult GB_PrivilegeScope::Restore()
     {
 #if defined(_WIN32)
         const GB_SystemResult closeResult = CloseTokenHandleWithResult(tokenHandle, u8"GB_PrivilegeScope::Restore.CloseToken");
-#endif
-        ClearPrivilegeState();
-#if defined(_WIN32)
         if (closeResult.IsFailed())
         {
             lastRestoreResult = closeResult;
             return lastRestoreResult;
         }
 #endif
+        ClearPrivilegeState();
         lastRestoreResult = MakeRestoreSkippedResult();
         return lastRestoreResult;
     }
@@ -741,15 +810,13 @@ GB_SystemResult GB_PrivilegeScope::Restore()
     {
 #if defined(_WIN32)
         const GB_SystemResult closeResult = CloseTokenHandleWithResult(tokenHandle, u8"GB_PrivilegeScope::Restore.CloseToken");
-#endif
-        ClearPrivilegeState();
-#if defined(_WIN32)
         if (closeResult.IsFailed())
         {
             lastRestoreResult = closeResult;
             return lastRestoreResult;
         }
 #endif
+        ClearPrivilegeState();
         lastRestoreResult = MakeNoStateChangedRestoreResult();
         return lastRestoreResult;
     }
@@ -767,10 +834,11 @@ GB_SystemResult GB_PrivilegeScope::Restore()
         return lastRestoreResult;
     }
 
+    stateChanged = false;
+    adjustedPrivilegeInfo = previousPrivilegeInfo;
     const GB_SystemResult closeResult = CloseTokenHandleWithResult(tokenHandle, u8"GB_PrivilegeScope::Restore.CloseToken");
     if (closeResult.IsFailed())
     {
-        ClearPrivilegeState();
         lastRestoreResult = closeResult;
         return lastRestoreResult;
     }
@@ -795,16 +863,14 @@ GB_SystemResult GB_PrivilegeScope::Detach()
 
 #if defined(_WIN32)
     const GB_SystemResult closeResult = CloseTokenHandleWithResult(tokenHandle, u8"GB_PrivilegeScope::Detach.CloseToken");
-#endif
-
-    ClearPrivilegeState();
-#if defined(_WIN32)
     if (closeResult.IsFailed())
     {
         lastRestoreResult = closeResult;
         return lastRestoreResult;
     }
 #endif
+
+    ClearPrivilegeState();
     lastRestoreResult = MakeDetachSucceededResult();
     return lastRestoreResult;
 }
@@ -1394,20 +1460,27 @@ void GB_PrivilegeScope::ClearPrivilegeState() noexcept
 
 void GB_PrivilegeScope::MoveFrom(GB_PrivilegeScope& other)
 {
+    const GB_PrivilegeScopeOptions transferredOptions = other.options;
+    const GB_PrivilegeInfo transferredPreviousPrivilegeInfo = other.previousPrivilegeInfo;
+    const GB_PrivilegeInfo transferredAdjustedPrivilegeInfo = other.adjustedPrivilegeInfo;
+    const GB_SystemResult transferredAdjustResult = other.adjustResult;
+    const GB_SystemResult transferredLastRestoreResult = other.lastRestoreResult;
+    GB_SystemResult movedFromAdjustResult = GB_SystemResult::Succeeded(u8"GB_PrivilegeScope::MoveFrom", u8"权限恢复责任已经转移。普通移动对象不恢复权限。");
+    GB_SystemResult movedFromRestoreResult = GB_SystemResult::Succeeded(u8"GB_PrivilegeScope::MoveFrom");
+
+    options = transferredOptions;
+    previousPrivilegeInfo = transferredPreviousPrivilegeInfo;
+    adjustedPrivilegeInfo = transferredAdjustedPrivilegeInfo;
+    adjustResult = transferredAdjustResult;
+    lastRestoreResult = transferredLastRestoreResult;
+    other.adjustResult = std::move(movedFromAdjustResult);
+    other.lastRestoreResult = std::move(movedFromRestoreResult);
+
     tokenHandle = other.tokenHandle;
     adjusted = other.adjusted;
     stateChanged = other.stateChanged;
     restoreOnDestruct = other.restoreOnDestruct;
-    options = other.options;
     openedTokenTarget = other.openedTokenTarget;
     requestedAttributes = other.requestedAttributes;
-    previousPrivilegeInfo = other.previousPrivilegeInfo;
-    adjustedPrivilegeInfo = other.adjustedPrivilegeInfo;
-    adjustResult = other.adjustResult;
-    lastRestoreResult = other.lastRestoreResult;
-
-    other.tokenHandle = nullptr;
     other.ClearPrivilegeState();
-    other.adjustResult = GB_SystemResult::Succeeded(u8"GB_PrivilegeScope::MoveFrom", u8"权限恢复责任已经转移。普通移动对象不恢复权限。");
-    other.lastRestoreResult = GB_SystemResult::Succeeded(u8"GB_PrivilegeScope::MoveFrom");
 }

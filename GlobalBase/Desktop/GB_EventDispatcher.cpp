@@ -101,6 +101,49 @@ namespace
         return GB_SystemResult::Failed(GB_SystemErrorCode::InternalError, operationName, u8"事件分发内部状态处理失败。");
     }
 
+    struct DispatchThreadFrame
+    {
+        const GB_EventDispatcher* dispatcher = nullptr;
+        DispatchThreadFrame* previousFrame = nullptr;
+    };
+
+    static thread_local DispatchThreadFrame* currentDispatchThreadFrame = nullptr;
+
+    class DispatchThreadScope final
+    {
+    public:
+        explicit DispatchThreadScope(const GB_EventDispatcher* dispatcher) noexcept
+        {
+            frame.dispatcher = dispatcher;
+            frame.previousFrame = currentDispatchThreadFrame;
+            currentDispatchThreadFrame = &frame;
+        }
+
+        ~DispatchThreadScope() noexcept
+        {
+            currentDispatchThreadFrame = frame.previousFrame;
+        }
+
+        DispatchThreadScope(const DispatchThreadScope&) = delete;
+        DispatchThreadScope& operator=(const DispatchThreadScope&) = delete;
+
+    private:
+        DispatchThreadFrame frame;
+    };
+
+    static bool IsDispatchingOnCurrentThread(const GB_EventDispatcher* dispatcher) noexcept
+    {
+        for (const DispatchThreadFrame* frame = currentDispatchThreadFrame; frame != nullptr; frame = frame->previousFrame)
+        {
+            if (frame->dispatcher == dispatcher)
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
 }
 
 GB_Event::GB_Event()
@@ -254,13 +297,19 @@ uint64_t GB_EventDispatcher::GetDispatcherId() const
 
 GB_SystemResult GB_EventDispatcher::Start()
 {
-    std::lock_guard<std::mutex> operationLock(operationMutex);
+    std::unique_lock<std::mutex> operationLock(operationMutex);
+    std::thread completedWorkerThread;
 
     {
         std::lock_guard<std::mutex> lock(stateMutex);
-        if (isWorkerStarted || isWorkerJoining)
+        if (isWorkerJoining)
         {
-            if (isStopping || isWorkerJoining)
+            return GB_SystemResult::Failed(GB_SystemErrorCode::InvalidState, u8"GB_EventDispatcher::Start", u8"事件分发线程正在由其他线程回收，不能并发启动。");
+        }
+
+        if (isWorkerStarted)
+        {
+            if (isStopping)
             {
                 return GB_SystemResult::Failed(GB_SystemErrorCode::InvalidState, u8"GB_EventDispatcher::Start", u8"事件分发线程正在停止，不能在停止完成前重新启动。");
             }
@@ -269,10 +318,29 @@ GB_SystemResult GB_EventDispatcher::Start()
             return GB_SystemResult::Succeeded(u8"GB_EventDispatcher::Start", u8"事件分发线程已经启动。");
         }
 
+        if (workerThread.joinable())
+        {
+            if (workerThread.get_id() == std::this_thread::get_id())
+            {
+                return GB_SystemResult::Failed(GB_SystemErrorCode::InvalidState, u8"GB_EventDispatcher::Start", u8"不能在尚未退出的事件分发线程内部重新启动分发器。");
+            }
+
+            completedWorkerThread = std::move(workerThread);
+            isWorkerJoining = true;
+        }
+    }
+
+    if (completedWorkerThread.joinable())
+    {
+        completedWorkerThread.join();
+        std::lock_guard<std::mutex> lock(stateMutex);
+        isWorkerJoining = false;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(stateMutex);
         isAcceptingEvents = true;
         isStopping = false;
-        isWorkerJoining = false;
-        workerDetachedBySelfStop = false;
 
         try
         {
@@ -282,13 +350,13 @@ GB_SystemResult GB_EventDispatcher::Start()
         catch (const std::bad_alloc&)
         {
             isAcceptingEvents = false;
-            isStopping = true;
+            isStopping = false;
             return MakeAllocationFailedResult(u8"GB_EventDispatcher::Start");
         }
         catch (...)
         {
             isAcceptingEvents = false;
-            isStopping = true;
+            isStopping = false;
             return MakeInternalFailedResult(u8"GB_EventDispatcher::Start");
         }
     }
@@ -304,10 +372,10 @@ GB_SystemResult GB_EventDispatcher::Stop(const GB_EventDispatcherStopMode stopMo
         return GB_SystemResult::Failed(GB_SystemErrorCode::InvalidArgument, u8"GB_EventDispatcher::Stop", u8"停止模式不是有效的 GB_EventDispatcherStopMode 值。");
     }
 
+    const bool calledFromDispatcherCallback = IsDispatchingOnCurrentThread(this);
     std::unique_lock<std::mutex> operationLock(operationMutex);
     std::thread localWorkerThread;
     bool calledFromWorkerThread = false;
-    bool shouldJoinWorkerThread = false;
 
     {
         std::lock_guard<std::mutex> lock(stateMutex);
@@ -320,29 +388,18 @@ GB_SystemResult GB_EventDispatcher::Stop(const GB_EventDispatcherStopMode stopMo
             eventQueue.clear();
         }
 
-        if (isWorkerStarted && workerThread.joinable())
+        if (workerThread.joinable())
         {
             calledFromWorkerThread = workerThread.get_id() == std::this_thread::get_id();
             if (!calledFromWorkerThread)
             {
                 localWorkerThread = std::move(workerThread);
                 isWorkerJoining = true;
-                shouldJoinWorkerThread = true;
-            }
-            else
-            {
-                workerThread.detach();
-                isWorkerJoining = true;
-                workerDetachedBySelfStop = true;
             }
         }
-        else
+        else if (!isWorkerStarted)
         {
-            if (!isWorkerJoining)
-            {
-                isWorkerStarted = false;
-                workerDetachedBySelfStop = false;
-            }
+            isStopping = false;
         }
     }
 
@@ -353,31 +410,38 @@ GB_SystemResult GB_EventDispatcher::Stop(const GB_EventDispatcherStopMode stopMo
     if (localWorkerThread.joinable())
     {
         localWorkerThread.join();
-    }
-
-    if (shouldJoinWorkerThread)
-    {
         std::lock_guard<std::mutex> lock(stateMutex);
         isWorkerStarted = false;
         isWorkerJoining = false;
-        workerDetachedBySelfStop = false;
+        isStopping = false;
     }
 
-    if (calledFromWorkerThread)
+    if (!calledFromDispatcherCallback)
     {
-        return GB_SystemResult::Succeeded(u8"GB_EventDispatcher::Stop", u8"已在事件分发线程内请求停止；线程将在当前回调返回后退出。");
+        std::unique_lock<std::mutex> lock(stateMutex);
+        idleCond.wait(lock, [this]()
+            {
+                return IsIdleLocked();
+            });
     }
 
-    return GB_SystemResult::Succeeded(u8"GB_EventDispatcher::Stop", u8"已停止事件分发线程。");
+    if (calledFromDispatcherCallback)
+    {
+        const std::string message = calledFromWorkerThread ? u8"已在事件分发线程内请求停止；线程将在当前回调返回后退出，并由后续 Start()、Stop() 或析构过程回收。" : u8"已在同步事件回调内请求停止；当前回调返回后分发器才会完全空闲。";
+        return GB_SystemResult::Succeeded(u8"GB_EventDispatcher::Stop", message);
+    }
+
+    return GB_SystemResult::Succeeded(u8"GB_EventDispatcher::Stop", u8"已停止事件分发线程，并等待当前已经开始的同步分发回调完成。");
 }
 
 GB_SystemResult GB_EventDispatcher::WaitIdle()
 {
-    std::unique_lock<std::mutex> lock(stateMutex);
-    if (isWorkerStarted && workerThread.joinable() && workerThread.get_id() == std::this_thread::get_id())
+    if (IsDispatchingOnCurrentThread(this))
     {
-        return GB_SystemResult::Failed(GB_SystemErrorCode::InvalidState, u8"GB_EventDispatcher::WaitIdle", u8"不能在事件分发线程回调内等待自身空闲。");
+        return GB_SystemResult::Failed(GB_SystemErrorCode::InvalidState, u8"GB_EventDispatcher::WaitIdle", u8"不能在当前分发器的事件回调内等待自身空闲，否则会形成自等待死锁。");
     }
+
+    std::unique_lock<std::mutex> lock(stateMutex);
 
     idleCond.wait(lock, [this]()
         {
@@ -389,11 +453,12 @@ GB_SystemResult GB_EventDispatcher::WaitIdle()
 
 bool GB_EventDispatcher::WaitIdleFor(const uint64_t timeoutMilliseconds)
 {
-    std::unique_lock<std::mutex> lock(stateMutex);
-    if (isWorkerStarted && workerThread.joinable() && workerThread.get_id() == std::this_thread::get_id())
+    if (IsDispatchingOnCurrentThread(this))
     {
         return false;
     }
+
+    std::unique_lock<std::mutex> lock(stateMutex);
 
     const std::chrono::steady_clock::time_point deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeoutMilliseconds);
     return idleCond.wait_until(lock, deadline, [this]()
@@ -825,9 +890,10 @@ GB_SystemResult GB_EventDispatcher::DispatchPreparedEvent(const GB_Event& event,
         return MakeInternalFailedResult(operationName);
     }
 
+    const DispatchThreadScope dispatchThreadScope(this);
     for (size_t index = 0; index < subscriptionSnapshots.size(); index++)
     {
-        const SubscriptionSnapshot subscriptionSnapshot = subscriptionSnapshots[index];
+        const SubscriptionSnapshot& subscriptionSnapshot = subscriptionSnapshots[index];
         if (!subscriptionSnapshot.callback)
         {
             continue;
@@ -905,13 +971,8 @@ void GB_EventDispatcher::WorkerLoop()
 
     {
         std::lock_guard<std::mutex> lock(stateMutex);
-        if (workerDetachedBySelfStop)
-        {
-            isWorkerStarted = false;
-            isWorkerJoining = false;
-            isStopping = false;
-            workerDetachedBySelfStop = false;
-        }
+        isWorkerStarted = false;
+        isStopping = false;
     }
 
     idleCond.notify_all();
