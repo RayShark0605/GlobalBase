@@ -40,7 +40,7 @@ enum class GB_SystemNetworkInterfaceType : uint16_t
     Tunnel = 4,    ///< 隧道接口，例如 VPN、IPv6 隧道等。
     Ppp = 5,       ///< PPP 点对点接口。
     Cellular = 6,  ///< 蜂窝网络接口。
-    Bluetooth = 7, ///< 蓝牙网络接口。
+    Bluetooth = 7, ///< 蓝牙网络接口；优先依据 MIB_IF_ROW2::PhysicalMediumType 识别。
     Virtual = 8    ///< 虚拟接口，例如虚拟交换机、虚拟机网卡、TAP/TUN 设备等。
 };
 

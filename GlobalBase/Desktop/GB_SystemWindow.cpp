@@ -2160,10 +2160,6 @@ private:
 
     GB_SystemResult ValidateOptions()
     {
-        if (options.maxPendingNativeEvents == 0 || options.maxDispatchQueueSize == 0)
-        {
-            return GB_SystemResult::Failed(GB_SystemErrorCode::InvalidArgument, GB_WindowOperationWatcherStart, "窗口监听器队列容量必须大于 0。");
-        }
         if (!GB_IsUtf8(options.filter.titleContains) || !GB_IsUtf8(options.filter.classNameContains))
         {
             return GB_SystemResult::Failed(GB_SystemErrorCode::InvalidArgument, GB_WindowOperationWatcherStart, "窗口事件过滤条件包含非法 UTF-8 字符串。");
@@ -2438,7 +2434,7 @@ private:
                         break;
                     }
                 }
-                if (pendingNativeEvents.size() >= options.maxPendingNativeEvents)
+                if (options.maxPendingNativeEvents != 0 && pendingNativeEvents.size() >= options.maxPendingNativeEvents)
                 {
                     pendingNativeEvents.pop_front();
                     droppedNativeEventCount.fetch_add(1, std::memory_order_acq_rel);

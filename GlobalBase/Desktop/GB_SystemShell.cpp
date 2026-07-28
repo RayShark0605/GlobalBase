@@ -2,7 +2,6 @@
 #include "GB_WindowsCommandLineInternal.h"
 
 #include <algorithm>
-#include <cctype>
 #include <limits>
 #include <new>
 #include <stdexcept>
@@ -42,18 +41,31 @@ namespace
         return text.find('\0') != std::string::npos;
     }
 
+    static bool IsAsciiAlpha(const char character)
+    {
+        return (character >= 'A' && character <= 'Z') || (character >= 'a' && character <= 'z');
+    }
+
+    static bool IsAsciiDigit(const char character)
+    {
+        return character >= '0' && character <= '9';
+    }
+
     static std::string ToAsciiLower(std::string text)
     {
         for (char& character : text)
         {
-            character = static_cast<char>(std::tolower(static_cast<unsigned char>(character)));
+            if (character >= 'A' && character <= 'Z')
+            {
+                character = static_cast<char>(character - 'A' + 'a');
+            }
         }
         return text;
     }
 
     static bool IsWindowsDrivePathLike(const std::string& text)
     {
-        return text.size() >= 2 && std::isalpha(static_cast<unsigned char>(text[0])) && text[1] == ':';
+        return text.size() >= 2 && IsAsciiAlpha(text[0]) && text[1] == ':';
     }
 
     static bool IsExplicitFileSystemPathLike(const std::string& text)
@@ -61,14 +73,13 @@ namespace
         return IsWindowsDrivePathLike(text) || text.find('\\') != std::string::npos || text.find('/') != std::string::npos;
     }
 
-    static bool IsValidUriSchemeCharacter(char character, bool isFirstCharacter)
+    static bool IsValidUriSchemeCharacter(const char character, const bool isFirstCharacter)
     {
-        const unsigned char value = static_cast<unsigned char>(character);
         if (isFirstCharacter)
         {
-            return std::isalpha(value) != 0;
+            return IsAsciiAlpha(character);
         }
-        return std::isalnum(value) != 0 || character == '+' || character == '-' || character == '.';
+        return IsAsciiAlpha(character) || IsAsciiDigit(character) || character == '+' || character == '-' || character == '.';
     }
 
     static bool TryGetUriScheme(const std::string& target, std::string& scheme)
@@ -122,18 +133,69 @@ namespace
 
     static bool IsHttpOrHttpsUrlShapeValid(const std::string& uri, const std::string& scheme)
     {
-        const std::string prefix = scheme + "://";
-        if (uri.size() <= prefix.size())
-        {
-            return false;
-        }
-        if (uri.compare(0, prefix.size(), prefix) != 0)
+        const size_t schemeEndIndex = scheme.size();
+        if (uri.size() <= schemeEndIndex + 3 || uri[schemeEndIndex] != ':' || uri[schemeEndIndex + 1] != '/' || uri[schemeEndIndex + 2] != '/')
         {
             return false;
         }
 
-        const char firstAuthorityCharacter = uri[prefix.size()];
-        return firstAuthorityCharacter != '/' && firstAuthorityCharacter != '?' && firstAuthorityCharacter != '#';
+        const size_t authorityBeginIndex = schemeEndIndex + 3;
+        const size_t authorityEndIndex = uri.find_first_of("/?#", authorityBeginIndex);
+        const size_t effectiveAuthorityEndIndex = authorityEndIndex == std::string::npos ? uri.size() : authorityEndIndex;
+        if (effectiveAuthorityEndIndex <= authorityBeginIndex)
+        {
+            return false;
+        }
+
+        const size_t userInfoEndIndex = uri.rfind('@', effectiveAuthorityEndIndex - 1);
+        const size_t hostBeginIndex = userInfoEndIndex == std::string::npos || userInfoEndIndex < authorityBeginIndex ? authorityBeginIndex : userInfoEndIndex + 1;
+        if (hostBeginIndex >= effectiveAuthorityEndIndex)
+        {
+            return false;
+        }
+
+        if (uri[hostBeginIndex] == '[')
+        {
+            const size_t closingBracketIndex = uri.find(']', hostBeginIndex + 1);
+            if (closingBracketIndex == std::string::npos || closingBracketIndex >= effectiveAuthorityEndIndex || closingBracketIndex == hostBeginIndex + 1)
+            {
+                return false;
+            }
+            if (closingBracketIndex + 1 == effectiveAuthorityEndIndex)
+            {
+                return true;
+            }
+            if (uri[closingBracketIndex + 1] != ':')
+            {
+                return false;
+            }
+            for (size_t portIndex = closingBracketIndex + 2; portIndex < effectiveAuthorityEndIndex; portIndex++)
+            {
+                if (uri[portIndex] < '0' || uri[portIndex] > '9')
+                {
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        const size_t firstColonIndex = uri.find(':', hostBeginIndex);
+        if (firstColonIndex == std::string::npos || firstColonIndex >= effectiveAuthorityEndIndex)
+        {
+            return effectiveAuthorityEndIndex > hostBeginIndex;
+        }
+        if (firstColonIndex == hostBeginIndex || uri.find(':', firstColonIndex + 1) < effectiveAuthorityEndIndex)
+        {
+            return false;
+        }
+        for (size_t portIndex = firstColonIndex + 1; portIndex < effectiveAuthorityEndIndex; portIndex++)
+        {
+            if (uri[portIndex] < '0' || uri[portIndex] > '9')
+            {
+                return false;
+            }
+        }
+        return true;
     }
 
     static GB_SystemResult ValidateUriTarget(const std::string& uri, bool allowMsSettings, const std::string& operationName)
@@ -172,23 +234,30 @@ namespace
 #ifdef _WIN32
     static const size_t GB_MaxWindowsCommandLineCharacters = 32767;
 
-    static bool Utf8ToWide(const std::string& textUtf8, std::wstring& textWide)
+    enum class Utf8ToWideStatus
+    {
+        Succeeded,
+        InvalidEncoding,
+        AllocationFailed
+    };
+
+    static Utf8ToWideStatus Utf8ToWide(const std::string& textUtf8, std::wstring& textWide)
     {
         textWide.clear();
         if (textUtf8.empty())
         {
-            return true;
+            return Utf8ToWideStatus::Succeeded;
         }
         if (textUtf8.size() > static_cast<size_t>(std::numeric_limits<int>::max()))
         {
-            return false;
+            return Utf8ToWideStatus::InvalidEncoding;
         }
 
         const int inputLength = static_cast<int>(textUtf8.size());
         const int requiredLength = ::MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, textUtf8.data(), inputLength, nullptr, 0);
         if (requiredLength <= 0)
         {
-            return false;
+            return Utf8ToWideStatus::InvalidEncoding;
         }
 
         try
@@ -198,15 +267,15 @@ namespace
         catch (const std::bad_alloc&)
         {
             textWide.clear();
-            return false;
+            return Utf8ToWideStatus::AllocationFailed;
         }
         const int convertedLength = ::MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, textUtf8.data(), inputLength, &textWide[0], requiredLength);
         if (convertedLength != requiredLength)
         {
             textWide.clear();
-            return false;
+            return Utf8ToWideStatus::InvalidEncoding;
         }
-        return true;
+        return Utf8ToWideStatus::Succeeded;
     }
 
     static GB_SystemResult Utf8ToWideResult(const std::string& textUtf8, std::wstring& textWide, const std::string& operationName, const std::string& fieldName)
@@ -215,7 +284,13 @@ namespace
         {
             return GB_SystemResult::Failed(GB_SystemErrorCode::InvalidArgument, operationName, fieldName + " 不能包含嵌入式 NUL 字符。");
         }
-        if (!Utf8ToWide(textUtf8, textWide))
+
+        const Utf8ToWideStatus conversionStatus = Utf8ToWide(textUtf8, textWide);
+        if (conversionStatus == Utf8ToWideStatus::AllocationFailed)
+        {
+            return GB_SystemResult::Failed(GB_SystemErrorCode::ResourceAllocationFailed, operationName, "转换" + fieldName + "时内存分配失败。");
+        }
+        if (conversionStatus != Utf8ToWideStatus::Succeeded)
         {
             return GB_SystemResult::Failed(GB_SystemErrorCode::EncodingConversionFailed, operationName, fieldName + " 不是有效 UTF-8 字符串。");
         }

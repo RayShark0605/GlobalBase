@@ -117,7 +117,7 @@ struct GB_WindowInfo
     bool isTopMost = false;                     ///< 窗口是否具有 WS_EX_TOPMOST 扩展样式。
     bool isForeground = false;                  ///< 窗口当前是否为前台窗口。
     bool isToolWindow = false;                  ///< 窗口是否具有 WS_EX_TOOLWINDOW 扩展样式。
-    bool isAppWindow = false;                   ///< 窗口是否具有 WS_EX_APPWINDOW 扩展样式。
+    bool isAppWindow = false;                   ///< 是否按模块启发式被识别为应用窗口：显式 WS_EX_APPWINDOW，或无 owner、非工具窗口且非子窗口。
     bool isCloaked = false;                     ///< DWM cloaked 状态；例如 UWP/虚拟桌面隐藏窗口可能为 true。
     bool isChildWindow = false;                 ///< 窗口是否具有 WS_CHILD 样式。
 };

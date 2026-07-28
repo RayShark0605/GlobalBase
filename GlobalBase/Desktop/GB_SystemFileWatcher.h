@@ -667,7 +667,8 @@ public:
      *
      * @details
      * 稳定状态指文件存在，并且大小与最后写入时间在 stableWindowMilliseconds 内保持不变；
-     * 如果 requireReadable 为 true，还要求文件能以共享读写删除方式打开。
+     * 如果 requireReadable 为 true，还要求文件能以共享读写删除方式打开；
+     * 目标暂时不存在时会继续等待，目标是目录或属性查询因权限、路径格式等非“不存在”原因失败时会立即返回错误。
      */
     static GB_SystemResult WaitForFileStable(const std::string& path, const GB_SystemFileStableWaitOptions& options = GB_SystemFileStableWaitOptions());
 

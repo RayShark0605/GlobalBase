@@ -495,10 +495,31 @@ namespace
         return IsUsableUnicastAddress(address);
     }
 
-    uint64_t MakeIpInterfaceMetricKey(const ADDRESS_FAMILY family, const uint64_t interfaceLuid)
+    struct IpInterfaceMetricKey
     {
-        return (static_cast<uint64_t>(family) << 48) ^ (interfaceLuid & 0x0000FFFFFFFFFFFFull);
-    }
+        IpInterfaceMetricKey(const ADDRESS_FAMILY inputFamily, const uint64_t inputInterfaceLuid)
+            : family(inputFamily), interfaceLuid(inputInterfaceLuid)
+        {
+        }
+
+        bool operator==(const IpInterfaceMetricKey& other) const
+        {
+            return family == other.family && interfaceLuid == other.interfaceLuid;
+        }
+
+        ADDRESS_FAMILY family;
+        uint64_t interfaceLuid;
+    };
+
+    struct IpInterfaceMetricKeyHasher
+    {
+        size_t operator()(const IpInterfaceMetricKey& key) const noexcept
+        {
+            const size_t familyHash = std::hash<unsigned int>()(static_cast<unsigned int>(key.family));
+            const size_t luidHash = std::hash<uint64_t>()(key.interfaceLuid);
+            return luidHash ^ (familyHash + static_cast<size_t>(0x9E3779B9u) + (luidHash << 6) + (luidHash >> 2));
+        }
+    };
 
     std::string BytesToHex(const unsigned char* bytes, const size_t byteCount, const char separator)
     {
@@ -615,6 +636,27 @@ namespace
             return GB_SystemNetworkInterfaceType::Cellular;
         default:
             return looksVirtual ? GB_SystemNetworkInterfaceType::Virtual : GB_SystemNetworkInterfaceType::Unknown;
+        }
+    }
+
+    GB_SystemNetworkInterfaceType RefineInterfaceTypeByPhysicalMedium(const GB_SystemNetworkInterfaceType interfaceType, const NDIS_PHYSICAL_MEDIUM physicalMediumType, const bool looksVirtual)
+    {
+        if (looksVirtual || interfaceType == GB_SystemNetworkInterfaceType::Loopback || interfaceType == GB_SystemNetworkInterfaceType::Tunnel)
+        {
+            return interfaceType;
+        }
+
+        switch (physicalMediumType)
+        {
+        case NdisPhysicalMediumBluetooth:
+            return GB_SystemNetworkInterfaceType::Bluetooth;
+        case NdisPhysicalMediumWirelessLan:
+        case NdisPhysicalMediumNative802_11:
+            return GB_SystemNetworkInterfaceType::Wifi;
+        case NdisPhysicalMediumWirelessWan:
+            return GB_SystemNetworkInterfaceType::Cellular;
+        default:
+            return interfaceType;
         }
     }
 
@@ -803,6 +845,7 @@ namespace
             interfaceRow.InterfaceLuid = adapter->Luid;
             if (::GetIfEntry2(&interfaceRow) == NO_ERROR)
             {
+                info.interfaceType = RefineInterfaceTypeByPhysicalMedium(info.interfaceType, interfaceRow.PhysicalMediumType, info.isVirtual);
                 info.mtu = interfaceRow.Mtu;
                 info.transmitLinkSpeedBitsPerSecond = interfaceRow.TransmitLinkSpeed;
                 info.receiveLinkSpeedBitsPerSecond = interfaceRow.ReceiveLinkSpeed;
@@ -879,7 +922,7 @@ namespace
         {
             MibTableScope routeTableScope;
             routeTableScope.Reset(routeTable);
-            std::unordered_map<uint64_t, uint32_t> interfaceMetricByKey;
+            std::unordered_map<IpInterfaceMetricKey, uint32_t, IpInterfaceMetricKeyHasher> interfaceMetricByKey;
             interfaceMetricByKey.reserve(interfaces.size() * 2);
             for (ULONG routeIndex = 0; routeIndex < routeTable->NumEntries; routeIndex++)
             {
@@ -897,8 +940,8 @@ namespace
                 {
                     continue;
                 }
-                const uint64_t metricKey = MakeIpInterfaceMetricKey(route.DestinationPrefix.Prefix.si_family, route.InterfaceLuid.Value);
-                std::unordered_map<uint64_t, uint32_t>::const_iterator metricIter = interfaceMetricByKey.find(metricKey);
+                const IpInterfaceMetricKey metricKey(route.DestinationPrefix.Prefix.si_family, route.InterfaceLuid.Value);
+                std::unordered_map<IpInterfaceMetricKey, uint32_t, IpInterfaceMetricKeyHasher>::const_iterator metricIter = interfaceMetricByKey.find(metricKey);
                 if (metricIter == interfaceMetricByKey.end())
                 {
                     MIB_IPINTERFACE_ROW ipInterface = {};

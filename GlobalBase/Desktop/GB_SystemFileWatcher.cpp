@@ -3744,9 +3744,23 @@ GB_SystemResult GB_SystemFileWatcher::WaitForFileStable(const std::string& path,
             return GB_SystemResult::Failed(GB_SystemErrorCode::Cancelled, GB_SystemFileOperationWaitStable, u8"等待文件稳定操作已取消。");
         }
 
-        WIN32_FILE_ATTRIBUTE_DATA attributeData;
-        const bool exists = ::GetFileAttributesExW(MakeExtendedPath(normalizedPath).c_str(), GetFileExInfoStandard, &attributeData) != FALSE && (attributeData.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) == 0;
-        if (exists)
+        WIN32_FILE_ATTRIBUTE_DATA attributeData = {};
+        ::SetLastError(ERROR_SUCCESS);
+        const BOOL attributeResult = ::GetFileAttributesExW(MakeExtendedPath(normalizedPath).c_str(), GetFileExInfoStandard, &attributeData);
+        if (attributeResult == FALSE)
+        {
+            const DWORD errorCode = ::GetLastError();
+            if (errorCode != ERROR_FILE_NOT_FOUND && errorCode != ERROR_PATH_NOT_FOUND)
+            {
+                return GB_SystemResult::FromWin32Error(errorCode, GB_SystemFileOperationWaitStable, u8"读取待稳定文件属性失败。");
+            }
+            hasPreviousState = false;
+        }
+        else if ((attributeData.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0)
+        {
+            return GB_SystemResult::Failed(GB_SystemErrorCode::InvalidArgument, GB_SystemFileOperationWaitStable, u8"等待稳定的目标必须是文件，不能是目录。");
+        }
+        else
         {
             const uint64_t currentSize = (static_cast<uint64_t>(attributeData.nFileSizeHigh) << 32) | attributeData.nFileSizeLow;
             const uint64_t currentLastWriteTime = FileTimeToUInt64(attributeData.ftLastWriteTime);
@@ -3762,10 +3776,6 @@ GB_SystemResult GB_SystemFileWatcher::WaitForFileStable(const std::string& path,
             {
                 return GB_SystemResult::Succeeded(GB_SystemFileOperationWaitStable);
             }
-        }
-        else
-        {
-            hasPreviousState = false;
         }
 
         if (options.timeoutMilliseconds >= 0)

@@ -144,14 +144,13 @@ struct GB_ProcessFieldError
  * @brief 进程信息快照。
  *
  * @remarks
- * - 为兼容旧 GB_Process API，原有字段保持原顺序，新增字段只追加在结构体末尾；
  * - 所有 std::string 均约定为 UTF-8；
  * - 单个字段失败不会使整个进程从枚举结果中消失，失败信息记录在 fieldErrors。
  */
 struct GB_ProcessInfo
 {
-    int processId = 0;                              ///< 进程 ID。
-    int parentProcessId = 0;                        ///< 父进程 ID 快照。
+    uint32_t processId = 0;                         ///< 进程 ID，对应 Windows DWORD。
+    uint32_t parentProcessId = 0;                   ///< 父进程 ID 快照，对应 Windows DWORD。
     std::string processNameUtf8 = "";               ///< 进程可执行文件名。
     std::string executablePathUtf8 = "";            ///< 可执行文件完整路径。
     bool hasExecutablePath = false;                 ///< executablePathUtf8 是否有效。
@@ -270,7 +269,7 @@ struct GB_ProcessWaitOptions
 {
     int64_t timeoutMilliseconds = 5000;         ///< 最大等待时间；-1 表示无限等待，0 表示只检查一次。
     uint32_t pollIntervalMilliseconds = 50;     ///< 轮询间隔；必须大于 0。
-    const std::atomic<bool>* cancellationFlag = nullptr; ///< 外部取消标志；不转移所有权。
+    const std::atomic<bool>* cancellationFlag = nullptr; ///< 外部取消标志；不转移所有权。WaitForInputIdle 只能在原生调用前后检查该标志。
 };
 
 /** @brief 进程查询选项。 */
@@ -384,7 +383,14 @@ public:
     /** @brief 等待进程退出并返回退出码。 */
     GB_SystemResult WaitForExit(uint32_t& exitCode, const GB_ProcessWaitOptions& waitOptions = GB_ProcessWaitOptions());
 
-    /** @brief 等待 GUI 进程首次进入输入空闲状态。 */
+    /**
+     * @brief 等待 GUI 进程首次进入输入空闲状态。
+     *
+     * @remarks
+     * - Windows 对同一进程只执行一次有效的 WaitForInputIdle 等待，内部必须使用单次原生调用，不能通过短超时重复轮询；
+     * - cancellationFlag 只能在原生调用前后检查，不能中断进行中的原生等待；
+     * - timeoutMilliseconds=-1 时不允许同时提供 cancellationFlag，以避免产生无法取消的无限等待。
+     */
     GB_SystemResult WaitForInputIdle(const GB_ProcessWaitOptions& waitOptions = GB_ProcessWaitOptions());
 
     /** @brief 等待该进程出现可见的顶层应用主窗口；隐藏辅助窗口和工具窗口不计入。 */

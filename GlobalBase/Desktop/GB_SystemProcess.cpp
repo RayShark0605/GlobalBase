@@ -747,8 +747,8 @@ namespace
     void FillProcessInfoFromEntry(const PROCESSENTRY32W& processEntry, const GB_ProcessQueryOptions& queryOptions, GB_ProcessInfo& processInfo)
     {
         processInfo = GB_ProcessInfo();
-        processInfo.processId = static_cast<int>(processEntry.th32ProcessID);
-        processInfo.parentProcessId = static_cast<int>(processEntry.th32ParentProcessID);
+        processInfo.processId = static_cast<uint32_t>(processEntry.th32ProcessID);
+        processInfo.parentProcessId = static_cast<uint32_t>(processEntry.th32ParentProcessID);
         processInfo.threadCount = static_cast<unsigned int>(processEntry.cntThreads);
         processInfo.identity.processId = processEntry.th32ProcessID;
         processInfo.isCurrentProcess = processEntry.th32ProcessID == ::GetCurrentProcessId();
@@ -1094,7 +1094,7 @@ namespace
 
     GB_SystemResult ValidateTerminationSafety(const GB_ProcessInfo& processInfo, const std::string& operationName)
     {
-        if (processInfo.processId <= 0 || static_cast<uint32_t>(processInfo.processId) == ::GetCurrentProcessId())
+        if (processInfo.processId == 0 || processInfo.processId == ::GetCurrentProcessId())
         {
             return GB_SystemResult::Failed(GB_SystemErrorCode::PermissionDenied, operationName, "默认安全策略禁止终止当前进程或无效进程。");
         }
@@ -2024,36 +2024,31 @@ GB_SystemResult GB_ProcessInstance::WaitForInputIdle(const GB_ProcessWaitOptions
     {
         return validationResult;
     }
-    const std::chrono::steady_clock::time_point startTime = std::chrono::steady_clock::now();
-    while (true)
+    if (waitOptions.timeoutMilliseconds < 0 && waitOptions.cancellationFlag != nullptr)
     {
-        if (IsCancellationRequested(waitOptions))
-        {
-            return GB_SystemResult::Failed(GB_SystemErrorCode::Cancelled, "GB_ProcessInstance::WaitForInputIdle", "等待输入空闲已取消。");
-        }
-        DWORD waitMilliseconds = waitOptions.timeoutMilliseconds == 0 ? 0 : waitOptions.pollIntervalMilliseconds;
-        if (waitOptions.timeoutMilliseconds > 0)
-        {
-            const uint64_t elapsedMilliseconds = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - startTime).count());
-            if (elapsedMilliseconds >= static_cast<uint64_t>(waitOptions.timeoutMilliseconds))
-            {
-                return GB_SystemResult::Failed(GB_SystemErrorCode::Timeout, "GB_ProcessInstance::WaitForInputIdle", "等待进程输入空闲超时。");
-            }
-            waitMilliseconds = static_cast<DWORD>((std::min)(static_cast<uint64_t>(waitOptions.pollIntervalMilliseconds), static_cast<uint64_t>(waitOptions.timeoutMilliseconds) - elapsedMilliseconds));
-        }
-        if (waitOptions.cancellationFlag != nullptr)
-        {
-            waitMilliseconds = (std::min)(waitMilliseconds, static_cast<DWORD>(50));
-        }
-        const DWORD waitResult = ::WaitForInputIdle(implementation->processHandle.GetHandleAs<HANDLE>(), waitMilliseconds);
-        if (waitResult == 0)
-        {
-            return GB_SystemResult::Succeeded("GB_ProcessInstance::WaitForInputIdle");
-        }
-        if (waitResult == WAIT_FAILED)
-        {
-            return GB_SystemResult::FromLastWin32Error("GB_ProcessInstance::WaitForInputIdle", "WaitForInputIdle 调用失败；目标可能不是 GUI 进程。");
-        }
+        return GB_SystemResult::Failed(GB_SystemErrorCode::InvalidArgument, "GB_ProcessInstance::WaitForInputIdle", "WaitForInputIdle 的无限等待不能与 cancellationFlag 同时使用，因为 Windows 原生等待无法被该标志中断。");
+    }
+    if (IsCancellationRequested(waitOptions))
+    {
+        return GB_SystemResult::Failed(GB_SystemErrorCode::Cancelled, "GB_ProcessInstance::WaitForInputIdle", "等待输入空闲前已收到取消请求。");
+    }
+
+    const DWORD waitMilliseconds = waitOptions.timeoutMilliseconds < 0 ? INFINITE : static_cast<DWORD>(waitOptions.timeoutMilliseconds);
+    const DWORD waitResult = ::WaitForInputIdle(implementation->processHandle.GetHandleAs<HANDLE>(), waitMilliseconds);
+    if (waitResult == 0)
+    {
+        return GB_SystemResult::Succeeded("GB_ProcessInstance::WaitForInputIdle");
+    }
+    if (waitResult == WAIT_FAILED)
+    {
+        return GB_SystemResult::FromLastWin32Error("GB_ProcessInstance::WaitForInputIdle", "WaitForInputIdle 调用失败；目标可能不是 GUI 进程。");
+    }
+    if (IsCancellationRequested(waitOptions))
+    {
+        return GB_SystemResult::Failed(GB_SystemErrorCode::Cancelled, "GB_ProcessInstance::WaitForInputIdle", "等待输入空闲期间收到取消请求。");
+    }
+    if (waitResult == WAIT_TIMEOUT)
+    {
         bool running = false;
         GB_SystemResult runningResult = IsRunning(running);
         if (runningResult.IsFailed())
@@ -2064,11 +2059,10 @@ GB_SystemResult GB_ProcessInstance::WaitForInputIdle(const GB_ProcessWaitOptions
         {
             return GB_SystemResult::Failed(GB_SystemErrorCode::NotFound, "GB_ProcessInstance::WaitForInputIdle", "进程在进入输入空闲前已经退出。");
         }
-        if (waitOptions.timeoutMilliseconds == 0)
-        {
-            return GB_SystemResult::Failed(GB_SystemErrorCode::Timeout, "GB_ProcessInstance::WaitForInputIdle", "进程尚未进入输入空闲状态。");
-        }
+        return GB_SystemResult::Failed(GB_SystemErrorCode::Timeout, "GB_ProcessInstance::WaitForInputIdle", "等待进程首次进入输入空闲状态超时。");
     }
+
+    return GB_SystemResult::Failed(GB_SystemErrorCode::NativeApiFailed, "GB_ProcessInstance::WaitForInputIdle", "WaitForInputIdle 返回了未定义的等待结果：" + std::to_string(waitResult) + "。");
 #else
     (void)waitOptions;
     return MakeUnsupportedPlatformResult("GB_ProcessInstance::WaitForInputIdle");
@@ -3040,7 +3034,7 @@ GB_SystemResult GB_SystemProcess::FindProcesses(const GB_ProcessFindOptions& fin
             {
                 return;
             }
-            if (findOptions.parentProcessId != 0 && static_cast<uint32_t>(processInfo.parentProcessId) != findOptions.parentProcessId)
+            if (findOptions.parentProcessId != 0 && processInfo.parentProcessId != findOptions.parentProcessId)
             {
                 return;
             }
@@ -3413,7 +3407,7 @@ GB_SystemResult GB_SystemProcess::TerminateProcessTreeSnapshot(const GB_ProcessI
         const GB_ProcessInfo& processInfo = allProcesses[processIndex];
         if (processInfo.identity.IsStrong())
         {
-            childrenByParent.emplace(static_cast<uint32_t>(processInfo.parentProcessId), processInfo.identity);
+            childrenByParent.emplace(processInfo.parentProcessId, processInfo.identity);
         }
     }
 
