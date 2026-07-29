@@ -231,7 +231,7 @@ public:
  * - 当编译环境或运行时不支持 CM_Register_Notification 时，自动退回 RegisterDeviceNotification + 隐藏消息窗口；
  * - 系统回调线程只做轻量事件构造和投递，用户回调通过 GB_EventDispatcher 异步分发；
  * - GetEventDispatcher() 暴露通用事件出口，SetDeviceEventCallback() 暴露强类型回调；
- * - Start()/Stop() 可重复调用，析构时会自动停止监听。
+ * - Start()/Stop() 可重复调用，析构时会自动停止监听；回调内调用 Stop() 时不会等待当前回调自身。
  */
 class GLOBALBASE_PORT GB_SystemDeviceWatcher final
 {

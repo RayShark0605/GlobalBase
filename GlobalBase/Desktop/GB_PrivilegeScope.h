@@ -273,8 +273,8 @@ public:
     /** @brief 移动构造，转移权限恢复责任。 */
     GB_PrivilegeScope(GB_PrivilegeScope&& other);
 
-    /** @brief 移动赋值，先恢复当前权限作用域，再接管 @p other 的恢复责任。 */
-    GB_PrivilegeScope& operator=(GB_PrivilegeScope&& other);
+    /** @brief 禁止移动赋值，避免旧权限状态恢复失败时无法向调用方报告错误。 */
+    GB_PrivilegeScope& operator=(GB_PrivilegeScope&& other) = delete;
 
     /** @brief 创建默认启用权限选项。 */
     static GB_PrivilegeScopeOptions MakeEnableOptions(const std::string& privilegeName, GB_PrivilegeTokenTarget tokenTarget = GB_PrivilegeTokenTarget::CurrentProcess, bool restoreOnDestruct = true);

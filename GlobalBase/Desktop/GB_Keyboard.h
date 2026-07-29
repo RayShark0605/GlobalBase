@@ -537,7 +537,7 @@ public:
     /**
      * @brief 输入一个 Unicode 字符。
      *
-     * @param unicodeChar Unicode 字符。Windows 下按 UTF-16 code unit 发送。
+     * @param unicodeChar Unicode 字符。Windows 下按 UTF-16 code unit 发送；NUL 字符不允许发送。
      * @param downUpIntervalMs 按下与抬起之间的间隔耗时，单位为毫秒。
      * @return true=成功；false=失败。
      */
@@ -552,6 +552,7 @@ public:
      *
      * 说明：
      * - 内部会按 virtualKeys 顺序依次按下，再按反向顺序依次抬起；
+     * - virtualKeys 中不允许出现重复虚拟键码，避免同一按键被重复按下后无法正确配平；
      * - 若中途失败，会尽量释放已经按下的键，避免按键逻辑状态残留。
      */
     static bool PressKeyCombination(const std::vector<GB_VirtualKey>& virtualKeys, const GB_KeyCombinationOptions& options = GB_KeyCombinationOptions());
@@ -747,7 +748,7 @@ public:
     /**
      * @brief 输入一段宽字符文本。
      *
-     * @param text 文本内容。
+     * @param text 文本内容；不允许包含嵌入式 NUL。
      * @param options 文本输入模拟选项。
      * @return true=成功；false=失败。
      */
@@ -756,7 +757,7 @@ public:
     /**
      * @brief 输入一段 UTF-8 文本。
      *
-     * @param utf8Text UTF-8 文本内容。
+     * @param utf8Text UTF-8 文本内容；必须是有效 UTF-8，且不允许包含嵌入式 NUL。
      * @param options 文本输入模拟选项。
      * @return true=成功；false=失败。
      */
@@ -798,7 +799,7 @@ public:
  * - 监听器只采集事件，不拦截、不吞掉、不修改系统键盘输入；
  * - 对外回调采用异步触发：底层消息线程只负责快速采集与入队，真正的用户回调在监听器自己的工作线程中执行；
  * - 该类本身不是单例，但底层 Raw Input 监听源会在进程内自动共享；
- * - Win32 对同一进程内同一 Raw Input 设备类别通常只保留最后一次注册的目标窗口，因此宿主程序若也直接注册键盘 Raw Input，应统一协调注册入口。
+ * - Windows 对同一进程内同一 Raw Input 设备类别只保留最后一次注册的目标窗口；本类只能协调 GlobalBase 内部监听器，无法避免与宿主程序或其他第三方库直接注册键盘 Raw Input 时互相覆盖，因此宿主必须统一 Raw Input 注册入口。
  */
 class GLOBALBASE_PORT GB_GlobalKeyboardListener
 {

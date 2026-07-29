@@ -115,6 +115,20 @@ namespace
         return static_cast<uint64_t>(reinterpret_cast<uintptr_t>(tokenHandle));
     }
 
+    static void SwapPrivilegeInfo(GB_PrivilegeInfo& leftInfo, GB_PrivilegeInfo& rightInfo) noexcept
+    {
+        using std::swap;
+        leftInfo.privilegeName.swap(rightInfo.privilegeName);
+        swap(leftInfo.luidLowPart, rightInfo.luidLowPart);
+        swap(leftInfo.luidHighPart, rightInfo.luidHighPart);
+        swap(leftInfo.attributes, rightInfo.attributes);
+        swap(leftInfo.exists, rightInfo.exists);
+        swap(leftInfo.enabled, rightInfo.enabled);
+        swap(leftInfo.enabledByDefault, rightInfo.enabledByDefault);
+        swap(leftInfo.removed, rightInfo.removed);
+        swap(leftInfo.usedForAccess, rightInfo.usedForAccess);
+    }
+
 #if defined(_WIN32)
     static GB_SystemResult MakePrivilegeNotPresentResult(const std::string& privilegeName, const std::string& operationName)
     {
@@ -157,20 +171,6 @@ namespace
         privilegeInfo.enabledByDefault = (attributes & GB_SePrivilegeEnabledByDefault) != 0;
         privilegeInfo.removed = (attributes & GB_SePrivilegeRemoved) != 0;
         privilegeInfo.usedForAccess = (attributes & GB_SePrivilegeUsedForAccess) != 0;
-    }
-
-    static void SwapPrivilegeInfo(GB_PrivilegeInfo& leftInfo, GB_PrivilegeInfo& rightInfo) noexcept
-    {
-        using std::swap;
-        leftInfo.privilegeName.swap(rightInfo.privilegeName);
-        swap(leftInfo.luidLowPart, rightInfo.luidLowPart);
-        swap(leftInfo.luidHighPart, rightInfo.luidHighPart);
-        swap(leftInfo.attributes, rightInfo.attributes);
-        swap(leftInfo.exists, rightInfo.exists);
-        swap(leftInfo.enabled, rightInfo.enabled);
-        swap(leftInfo.enabledByDefault, rightInfo.enabledByDefault);
-        swap(leftInfo.removed, rightInfo.removed);
-        swap(leftInfo.usedForAccess, rightInfo.usedForAccess);
     }
 
     static std::string BuildAdjustDetailMessage(const GB_PrivilegeScopeOptions& options, const GB_PrivilegeTokenTarget openedTokenTarget, const bool stateChanged, const GB_PrivilegeInfo& previousPrivilegeInfo, const GB_PrivilegeInfo& adjustedPrivilegeInfo)
@@ -544,23 +544,6 @@ GB_PrivilegeScope::GB_PrivilegeScope(GB_PrivilegeScope&& other)
     MoveFrom(other);
 }
 
-GB_PrivilegeScope& GB_PrivilegeScope::operator=(GB_PrivilegeScope&& other)
-{
-    if (this == &other)
-    {
-        return *this;
-    }
-
-    const GB_SystemResult restoreResult = Restore();
-    if (restoreResult.IsFailed())
-    {
-        return *this;
-    }
-
-    MoveFrom(other);
-    return *this;
-}
-
 GB_PrivilegeScopeOptions GB_PrivilegeScope::MakeEnableOptions(const std::string& privilegeName, const GB_PrivilegeTokenTarget tokenTarget, const bool restoreOnDestruct)
 {
     GB_PrivilegeScopeOptions options;
@@ -835,7 +818,7 @@ GB_SystemResult GB_PrivilegeScope::Restore()
     }
 
     stateChanged = false;
-    adjustedPrivilegeInfo = previousPrivilegeInfo;
+    SetPrivilegeInfoNativeState(adjustedPrivilegeInfo, previousPrivilegeInfo.luidLowPart, previousPrivilegeInfo.luidHighPart, previousPrivilegeInfo.attributes, previousPrivilegeInfo.exists);
     const GB_SystemResult closeResult = CloseTokenHandleWithResult(tokenHandle, u8"GB_PrivilegeScope::Restore.CloseToken");
     if (closeResult.IsFailed())
     {
@@ -1451,30 +1434,46 @@ void GB_PrivilegeScope::ClearPrivilegeState() noexcept
     adjusted = false;
     stateChanged = false;
     restoreOnDestruct = true;
-    options = GB_PrivilegeScopeOptions();
+    options.privilegeName.clear();
+    options.action = GB_PrivilegeAction::Enable;
+    options.tokenTarget = GB_PrivilegeTokenTarget::CurrentProcess;
+    options.openThreadAsSelf = true;
+    options.restoreOnDestruct = true;
     openedTokenTarget = GB_PrivilegeTokenTarget::CurrentProcess;
     requestedAttributes = 0;
-    previousPrivilegeInfo = GB_PrivilegeInfo();
-    adjustedPrivilegeInfo = GB_PrivilegeInfo();
+    previousPrivilegeInfo.privilegeName.clear();
+    previousPrivilegeInfo.luidLowPart = 0;
+    previousPrivilegeInfo.luidHighPart = 0;
+    previousPrivilegeInfo.attributes = 0;
+    previousPrivilegeInfo.exists = false;
+    previousPrivilegeInfo.enabled = false;
+    previousPrivilegeInfo.enabledByDefault = false;
+    previousPrivilegeInfo.removed = false;
+    previousPrivilegeInfo.usedForAccess = false;
+    adjustedPrivilegeInfo.privilegeName.clear();
+    adjustedPrivilegeInfo.luidLowPart = 0;
+    adjustedPrivilegeInfo.luidHighPart = 0;
+    adjustedPrivilegeInfo.attributes = 0;
+    adjustedPrivilegeInfo.exists = false;
+    adjustedPrivilegeInfo.enabled = false;
+    adjustedPrivilegeInfo.enabledByDefault = false;
+    adjustedPrivilegeInfo.removed = false;
+    adjustedPrivilegeInfo.usedForAccess = false;
 }
 
 void GB_PrivilegeScope::MoveFrom(GB_PrivilegeScope& other)
 {
-    const GB_PrivilegeScopeOptions transferredOptions = other.options;
-    const GB_PrivilegeInfo transferredPreviousPrivilegeInfo = other.previousPrivilegeInfo;
-    const GB_PrivilegeInfo transferredAdjustedPrivilegeInfo = other.adjustedPrivilegeInfo;
-    const GB_SystemResult transferredAdjustResult = other.adjustResult;
-    const GB_SystemResult transferredLastRestoreResult = other.lastRestoreResult;
-    GB_SystemResult movedFromAdjustResult = GB_SystemResult::Succeeded(u8"GB_PrivilegeScope::MoveFrom", u8"权限恢复责任已经转移。普通移动对象不恢复权限。");
-    GB_SystemResult movedFromRestoreResult = GB_SystemResult::Succeeded(u8"GB_PrivilegeScope::MoveFrom");
+    using std::swap;
 
-    options = transferredOptions;
-    previousPrivilegeInfo = transferredPreviousPrivilegeInfo;
-    adjustedPrivilegeInfo = transferredAdjustedPrivilegeInfo;
-    adjustResult = transferredAdjustResult;
-    lastRestoreResult = transferredLastRestoreResult;
-    other.adjustResult = std::move(movedFromAdjustResult);
-    other.lastRestoreResult = std::move(movedFromRestoreResult);
+    options.privilegeName.swap(other.options.privilegeName);
+    swap(options.action, other.options.action);
+    swap(options.tokenTarget, other.options.tokenTarget);
+    swap(options.openThreadAsSelf, other.options.openThreadAsSelf);
+    swap(options.restoreOnDestruct, other.options.restoreOnDestruct);
+    SwapPrivilegeInfo(previousPrivilegeInfo, other.previousPrivilegeInfo);
+    SwapPrivilegeInfo(adjustedPrivilegeInfo, other.adjustedPrivilegeInfo);
+    swap(adjustResult, other.adjustResult);
+    swap(lastRestoreResult, other.lastRestoreResult);
 
     tokenHandle = other.tokenHandle;
     adjusted = other.adjusted;

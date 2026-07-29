@@ -1984,23 +1984,12 @@ namespace
             const double durationMs = ResolveMoveDurationMs(distancePixel, moveOptions);
             const int stepCount = ResolveMoveStepCount(distancePixel, durationMs, moveOptions);
 
-            struct MoveStepSample
-            {
-                POINT cursorPoint = {};
-                double linearProgress = 0.0;
-            };
-
-            std::vector<MoveStepSample> moveStepSamples;
-            try
-            {
-                moveStepSamples.reserve(static_cast<size_t>(stepCount));
-            }
-            catch (...)
-            {
-                return false;
-            }
-
+            POINT pendingPoint = {};
+            double pendingLinearProgress = 0.0;
+            bool hasPendingPoint = false;
             int preferredScreenIndex = startScreenIndex;
+            const std::chrono::steady_clock::time_point moveStartTime = std::chrono::steady_clock::now();
+
             for (int stepIndex = 1; stepIndex <= stepCount; stepIndex++)
             {
                 const double linearProgress = static_cast<double>(stepIndex) / static_cast<double>(stepCount);
@@ -2014,34 +2003,34 @@ namespace
                 }
 
                 preferredScreenIndex = sampledScreenIndex;
-
-                if (!moveStepSamples.empty() && moveStepSamples.back().cursorPoint.x == sampledPoint.x && moveStepSamples.back().cursorPoint.y == sampledPoint.y)
+                if (hasPendingPoint && pendingPoint.x == sampledPoint.x && pendingPoint.y == sampledPoint.y)
                 {
-                    moveStepSamples.back().linearProgress = linearProgress;
+                    pendingLinearProgress = linearProgress;
                     continue;
                 }
 
-                MoveStepSample sample;
-                sample.cursorPoint = sampledPoint;
-                sample.linearProgress = linearProgress;
-                moveStepSamples.push_back(sample);
+                if (hasPendingPoint)
+                {
+                    if (!TrySetCurrentPhysicalCursorPosition(pendingPoint))
+                    {
+                        return false;
+                    }
+
+                    if (durationMs > 0.0)
+                    {
+                        const std::chrono::steady_clock::time_point expectedTime = moveStartTime + std::chrono::duration_cast<std::chrono::steady_clock::duration>(std::chrono::duration<double, std::milli>(durationMs * pendingLinearProgress));
+                        std::this_thread::sleep_until(expectedTime);
+                    }
+                }
+
+                pendingPoint = sampledPoint;
+                pendingLinearProgress = linearProgress;
+                hasPendingPoint = true;
             }
 
-            const auto moveStartTime = std::chrono::steady_clock::now();
-            for (size_t stepIndex = 0; stepIndex < moveStepSamples.size(); stepIndex++)
+            if (hasPendingPoint && !TrySetCurrentPhysicalCursorPosition(pendingPoint))
             {
-                if (!TrySetCurrentPhysicalCursorPosition(moveStepSamples[stepIndex].cursorPoint))
-                {
-                    return false;
-                }
-
-                if (stepIndex + 1 >= moveStepSamples.size() || !(durationMs > 0.0))
-                {
-                    continue;
-                }
-
-                const auto expectedTime = moveStartTime + std::chrono::duration_cast<std::chrono::steady_clock::duration>(std::chrono::duration<double, std::milli>(durationMs * moveStepSamples[stepIndex].linearProgress));
-                std::this_thread::sleep_until(expectedTime);
+                return false;
             }
 
             if (!TrySetCurrentPhysicalCursorPosition(effectiveTargetPoint))
@@ -2246,6 +2235,7 @@ bool GB_Mouse::GetCursorImage(GB_Image& cursorImage, GB_Point2d& hotSpot, const 
     }
 
 #if !defined(_WIN32)
+    (void)fallbackCaptureRadius;
     cursorImage.Clear();
     return false;
 #else
@@ -2943,66 +2933,68 @@ namespace
 
             bool StartWorker()
             {
-                std::thread completedWorkerThread;
+                for (;;)
                 {
-                    std::unique_lock<std::mutex> lifecycleLock(lifecycleMutex);
-                    if (workerRunning)
+                    std::thread completedWorkerThread;
                     {
-                        if (!stopWorker.load())
+                        std::unique_lock<std::mutex> lifecycleLock(lifecycleMutex);
+                        if (workerRunning)
                         {
+                            if (!stopWorker.load())
+                            {
+                                return true;
+                            }
+
+                            if (workerThreadId == std::this_thread::get_id())
+                            {
+                                return false;
+                            }
+
+                            lifecycleConditionVariable.wait(lifecycleLock, [this]()
+                                {
+                                    return !workerRunning;
+                                });
+                            continue;
+                        }
+
+                        if (workerThread.joinable())
+                        {
+                            if (workerThread.get_id() == std::this_thread::get_id())
+                            {
+                                return false;
+                            }
+
+                            completedWorkerThread = std::move(workerThread);
+                        }
+                        else
+                        {
+                            stopWorker.store(false);
+                            lastMoveEnqueueTickMs.store(0);
+                            try
+                            {
+                                const std::shared_ptr<GlobalMouseListenerState> self = shared_from_this();
+                                workerRunning = true;
+                                workerThread = std::thread([self]()
+                                    {
+                                        self->WorkerThreadMain();
+                                    });
+                                workerThreadId = workerThread.get_id();
+                            }
+                            catch (...)
+                            {
+                                workerRunning = false;
+                                workerThreadId = std::thread::id();
+                                stopWorker.store(true);
+                                lifecycleConditionVariable.notify_all();
+                                return false;
+                            }
+
                             return true;
                         }
-
-                        if (workerThreadId == std::this_thread::get_id())
-                        {
-                            return false;
-                        }
-
-                        lifecycleConditionVariable.wait(lifecycleLock, [this]()
-                            {
-                                return !workerRunning;
-                            });
                     }
 
-                    if (workerThread.joinable())
-                    {
-                        if (workerThread.get_id() == std::this_thread::get_id())
-                        {
-                            return false;
-                        }
-
-                        completedWorkerThread = std::move(workerThread);
-                    }
-                }
-
-                if (completedWorkerThread.joinable())
-                {
                     completedWorkerThread.join();
                 }
-
-                std::lock_guard<std::mutex> lifecycleLock(lifecycleMutex);
-                stopWorker.store(false);
-                lastMoveEnqueueTickMs.store(0);
-                try
-                {
-                    const std::shared_ptr<GlobalMouseListenerState> self = shared_from_this();
-                    workerRunning = true;
-                    workerThread = std::thread([self]()
-                        {
-                            self->WorkerThreadMain();
-                        });
-                    workerThreadId = workerThread.get_id();
-                }
-                catch (...)
-                {
-                    workerRunning = false;
-                    workerThreadId = std::thread::id();
-                    stopWorker.store(true);
-                    lifecycleConditionVariable.notify_all();
-                    return false;
-                }
-
-                return true;
             }
 
             void StopWorker()
@@ -3072,7 +3064,7 @@ namespace
                     if (moveMinTriggerIntervalMs > 0)
                     {
                         const uint64_t lastMoveTickMs = lastMoveEnqueueTickMs.load();
-                        if (lastMoveTickMs > 0 && mouseEvent.receiveTickCountMs < lastMoveTickMs + moveMinTriggerIntervalMs)
+                        if (lastMoveTickMs > 0 && mouseEvent.receiveTickCountMs >= lastMoveTickMs && mouseEvent.receiveTickCountMs - lastMoveTickMs < static_cast<uint64_t>(moveMinTriggerIntervalMs))
                         {
                             return false;
                         }
@@ -3118,7 +3110,14 @@ namespace
                         }
                     }
 
-                    eventQueue.push_back(mouseEvent);
+                    try
+                    {
+                        eventQueue.push_back(mouseEvent);
+                    }
+                    catch (...)
+                    {
+                        return false;
+                    }
                 }
 
                 if (IsMoveEventType(mouseEvent.eventType))
@@ -3153,7 +3152,7 @@ namespace
                     return true;
                 }
 
-                if (lastInvokeTickMs > 0 && currentTickMs < lastInvokeTickMs + minTriggerIntervalMs)
+                if (lastInvokeTickMs > 0 && currentTickMs >= lastInvokeTickMs && currentTickMs - lastInvokeTickMs < static_cast<uint64_t>(minTriggerIntervalMs))
                 {
                     return false;
                 }
@@ -3615,19 +3614,25 @@ namespace
                     return;
                 }
 
-                std::unique_ptr<uint8_t[]> rawInputBuffer(new (std::nothrow) uint8_t[rawInputSize]);
-                if (!rawInputBuffer)
+                try
+                {
+                    if (rawInputBuffer.size() < rawInputSize)
+                    {
+                        rawInputBuffer.resize(rawInputSize);
+                    }
+                }
+                catch (...)
                 {
                     return;
                 }
 
                 UINT copiedByteCount = rawInputSize;
-                if (::GetRawInputData(reinterpret_cast<HRAWINPUT>(lParam), RID_INPUT, rawInputBuffer.get(), &copiedByteCount, sizeof(RAWINPUTHEADER)) == static_cast<UINT>(-1) || copiedByteCount < sizeof(RAWINPUTHEADER))
+                if (::GetRawInputData(reinterpret_cast<HRAWINPUT>(lParam), RID_INPUT, rawInputBuffer.data(), &copiedByteCount, sizeof(RAWINPUTHEADER)) == static_cast<UINT>(-1) || copiedByteCount < sizeof(RAWINPUTHEADER))
                 {
                     return;
                 }
 
-                const RAWINPUT* rawInput = reinterpret_cast<const RAWINPUT*>(rawInputBuffer.get());
+                const RAWINPUT* rawInput = reinterpret_cast<const RAWINPUT*>(rawInputBuffer.data());
                 if (rawInput == nullptr || rawInput->header.dwType != RIM_TYPEMOUSE)
                 {
                     return;
@@ -3649,6 +3654,11 @@ namespace
 
             bool EnsureMessageThreadStarted(std::unique_lock<std::mutex>& managerLock)
             {
+                if (shuttingDown)
+                {
+                    return false;
+                }
+
                 while (messageThreadStopInProgress)
                 {
                     messageThreadReadyConditionVariable.wait(managerLock);
@@ -3660,11 +3670,26 @@ namespace
                     {
                         messageThreadReadyConditionVariable.wait(managerLock);
                     }
-                    return rawInputRegisteredSuccessfully;
+
+                    if (messageThreadRunning && rawInputRegisteredSuccessfully)
+                    {
+                        return true;
+                    }
+
+                    std::thread completedMessageThread = std::move(messageThread);
+                    managerLock.unlock();
+                    completedMessageThread.join();
+                    managerLock.lock();
+                    rawInputWindowHandle = nullptr;
+                    rawInputThreadId = 0;
+                    messageThreadStartupResolved = false;
+                    rawInputRegisteredSuccessfully = false;
+                    messageThreadRunning = false;
                 }
 
                 messageThreadStartupResolved = false;
                 rawInputRegisteredSuccessfully = false;
+                messageThreadRunning = false;
                 rawInputThreadId = 0;
                 rawInputWindowHandle = nullptr;
                 try
@@ -3681,7 +3706,7 @@ namespace
                     messageThreadReadyConditionVariable.wait(managerLock);
                 }
 
-                if (!rawInputRegisteredSuccessfully)
+                if (!messageThreadRunning || !rawInputRegisteredSuccessfully)
                 {
                     std::thread messageThreadToJoin = std::move(messageThread);
                     managerLock.unlock();
@@ -3694,9 +3719,11 @@ namespace
                     rawInputThreadId = 0;
                     messageThreadStartupResolved = false;
                     rawInputRegisteredSuccessfully = false;
+                    messageThreadRunning = false;
+                    return false;
                 }
 
-                return rawInputRegisteredSuccessfully;
+                return true;
             }
 
             void MessageThreadMain()
@@ -3731,6 +3758,7 @@ namespace
                     rawInputThreadId = currentThreadId;
                     rawInputWindowHandle = windowHandle;
                     rawInputRegisteredSuccessfully = registerSucceeded;
+                    messageThreadRunning = registerSucceeded;
                     messageThreadStartupResolved = true;
                 }
                 messageThreadReadyConditionVariable.notify_all();
@@ -3769,6 +3797,9 @@ namespace
                 {
                     rawInputThreadId = 0;
                 }
+                rawInputRegisteredSuccessfully = false;
+                messageThreadRunning = false;
+                messageThreadReadyConditionVariable.notify_all();
             }
 
             void RemoveExpiredListenersLocked()
@@ -3815,6 +3846,7 @@ namespace
                 rawInputThreadId = 0;
                 messageThreadStartupResolved = false;
                 rawInputRegisteredSuccessfully = false;
+                messageThreadRunning = false;
                 messageThreadStopInProgress = false;
                 messageThreadReadyConditionVariable.notify_all();
             }
@@ -3824,11 +3856,13 @@ namespace
             std::condition_variable messageThreadReadyConditionVariable;
             std::unordered_map<uint64_t, std::weak_ptr<GlobalMouseListenerState>> listeners;
             std::thread messageThread;
+            std::vector<uint8_t> rawInputBuffer;
             HWND rawInputWindowHandle = nullptr;
             DWORD rawInputThreadId = 0;
             uint64_t nextListenerId = 1;
             bool messageThreadStartupResolved = false;
             bool rawInputRegisteredSuccessfully = false;
+            bool messageThreadRunning = false;
             bool messageThreadStopInProgress = false;
             bool shuttingDown = false;
         };

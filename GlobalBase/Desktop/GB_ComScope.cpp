@@ -1,7 +1,6 @@
 ﻿#include "GB_ComScope.h"
 
 #include <sstream>
-#include <utility>
 
 #if defined(_WIN32)
 #  ifndef NOMINMAX
@@ -181,39 +180,6 @@ GB_ComScope::~GB_ComScope() noexcept
     CloseSilently();
 }
 
-GB_ComScope::GB_ComScope(GB_ComScope&& other)
-    : GB_ComScope()
-{
-    MoveFrom(other);
-}
-
-GB_ComScope& GB_ComScope::operator=(GB_ComScope&& other)
-{
-    if (this == &other)
-    {
-        return *this;
-    }
-
-    const GB_SystemResult uninitializeResult = Uninitialize();
-    if (uninitializeResult.IsFailed())
-    {
-        return *this;
-    }
-
-    MoveFrom(other);
-    return *this;
-}
-
-GB_ComScope GB_ComScope::InitializeSta(const std::string& operationName, const bool disableOle1Dde)
-{
-    return GB_ComScope(MakeStaOptions(disableOle1Dde), ResolveOperationName(operationName, u8"GB_ComScope::InitializeSta"));
-}
-
-GB_ComScope GB_ComScope::InitializeMta(const std::string& operationName, const bool disableOle1Dde)
-{
-    return GB_ComScope(MakeMtaOptions(disableOle1Dde), ResolveOperationName(operationName, u8"GB_ComScope::InitializeMta"));
-}
-
 GB_ComInitializeOptions GB_ComScope::MakeStaOptions(const bool disableOle1Dde, const bool speedOverMemory)
 {
     GB_ComInitializeOptions options;
@@ -251,6 +217,7 @@ GB_SystemResult GB_ComScope::Initialize(const GB_ComInitializeOptions& options, 
         return initializeResult;
     }
 
+    ClearInitializationState();
     if (!IsValidInitializeOptions(options))
     {
         initializeResult = MakeInvalidOptionsResult(options, operationName);
@@ -407,18 +374,6 @@ GB_SystemResult GB_ComScope::GetLastUninitializeResult() const
     return lastUninitializeResult;
 }
 
-void GB_ComScope::Swap(GB_ComScope& other)
-{
-    using std::swap;
-    swap(initialized, other.initialized);
-    swap(alreadyInitializedOnThread, other.alreadyInitializedOnThread);
-    swap(initializeOptions, other.initializeOptions);
-    swap(ownerThreadId, other.ownerThreadId);
-    swap(initializeHResult, other.initializeHResult);
-    swap(initializeResult, other.initializeResult);
-    swap(lastUninitializeResult, other.lastUninitializeResult);
-}
-
 bool GB_ComScope::IsValidApartmentModelValue(const uint64_t apartmentModelValue)
 {
     switch (apartmentModelValue)
@@ -554,22 +509,3 @@ void GB_ComScope::ClearInitializationState() noexcept
     initializeHResult = 0;
 }
 
-void GB_ComScope::MoveFrom(GB_ComScope& other)
-{
-    const GB_SystemResult transferredInitializeResult = other.initializeResult;
-    const GB_SystemResult transferredLastUninitializeResult = other.lastUninitializeResult;
-    GB_SystemResult movedFromInitializeResult = GB_SystemResult::Succeeded(u8"GB_ComScope::MoveFrom", u8"COM 初始化配平责任已经转移。普通移动对象不调用 CoUninitialize。");
-    GB_SystemResult movedFromUninitializeResult = GB_SystemResult::Succeeded(u8"GB_ComScope::MoveFrom");
-
-    initializeResult = transferredInitializeResult;
-    lastUninitializeResult = transferredLastUninitializeResult;
-    other.initializeResult = std::move(movedFromInitializeResult);
-    other.lastUninitializeResult = std::move(movedFromUninitializeResult);
-
-    initialized = other.initialized;
-    alreadyInitializedOnThread = other.alreadyInitializedOnThread;
-    initializeOptions = other.initializeOptions;
-    ownerThreadId = other.ownerThreadId;
-    initializeHResult = other.initializeHResult;
-    other.ClearInitializationState();
-}

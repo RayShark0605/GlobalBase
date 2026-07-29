@@ -1341,15 +1341,15 @@ GB_SystemErrorCode GB_SystemError::GuessErrorCodeFromCRuntimeErrorCode(const int
 #endif
 #if defined(EBUSY)
     case EBUSY:
-        return GB_SystemErrorCode::InvalidState;
+        return GB_SystemErrorCode::ResourceBusy;
 #endif
 #if defined(EAGAIN) && (!defined(EBUSY) || EAGAIN != EBUSY)
     case EAGAIN:
-        return GB_SystemErrorCode::InvalidState;
+        return GB_SystemErrorCode::ResourceBusy;
 #endif
 #if defined(EWOULDBLOCK) && (!defined(EAGAIN) || EWOULDBLOCK != EAGAIN) && (!defined(EBUSY) || EWOULDBLOCK != EBUSY)
     case EWOULDBLOCK:
-        return GB_SystemErrorCode::InvalidState;
+        return GB_SystemErrorCode::ResourceBusy;
 #endif
     default:
         break;

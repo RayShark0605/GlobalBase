@@ -460,8 +460,22 @@ bool GB_EventDispatcher::WaitIdleFor(const uint64_t timeoutMilliseconds)
 
     std::unique_lock<std::mutex> lock(stateMutex);
 
-    const std::chrono::steady_clock::time_point deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeoutMilliseconds);
-    return idleCond.wait_until(lock, deadline, [this]()
+    const uint64_t maximumWaitChunkMilliseconds = 24ull * 60ull * 60ull * 1000ull;
+    uint64_t remainingMilliseconds = timeoutMilliseconds;
+    while (remainingMilliseconds > maximumWaitChunkMilliseconds)
+    {
+        if (idleCond.wait_for(lock, std::chrono::hours(24), [this]()
+            {
+                return IsIdleLocked();
+            }))
+        {
+            return true;
+        }
+
+        remainingMilliseconds -= maximumWaitChunkMilliseconds;
+    }
+
+    return idleCond.wait_for(lock, std::chrono::milliseconds(remainingMilliseconds), [this]()
         {
             return IsIdleLocked();
         });
@@ -864,6 +878,11 @@ GB_SystemResult GB_EventDispatcher::DispatchPreparedEvent(const GB_Event& event,
     try
     {
         std::lock_guard<std::mutex> lock(stateMutex);
+        if (countActiveDispatch && !isAcceptingEvents)
+        {
+            return GB_SystemResult::Failed(GB_SystemErrorCode::Cancelled, operationName, u8"事件分发器当前不接收新事件。");
+        }
+
         if (countActiveDispatch)
         {
             activeDispatchCount++;

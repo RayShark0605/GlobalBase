@@ -670,6 +670,11 @@ namespace
             for (size_t charIndex = 0; charIndex < text.size(); charIndex++)
             {
                 const wchar_t unicodeChar = text[charIndex];
+                if (unicodeChar == L'\0')
+                {
+                    return false;
+                }
+
                 bool succeeded = false;
                 if (unicodeChar == L'\r' || unicodeChar == L'\n')
                 {
@@ -678,6 +683,10 @@ namespace
                     {
                         charIndex++;
                     }
+                }
+                else if (unicodeChar == L'\t')
+                {
+                    succeeded = GB_Keyboard::ClickKey(GB_VirtualKey::Tab, downUpIntervalMs, options.inputMode == GB_KeyboardInputMode::ScanCode ? GB_KeyboardInputMode::ScanCode : GB_KeyboardInputMode::VirtualKey);
                 }
                 else if (options.inputMode == GB_KeyboardInputMode::Unicode)
                 {
@@ -884,65 +893,67 @@ namespace
 
             bool StartWorker()
             {
-                std::thread completedWorkerThread;
+                for (;;)
                 {
-                    std::unique_lock<std::mutex> lifecycleLock(lifecycleMutex);
-                    if (workerRunning)
+                    std::thread completedWorkerThread;
                     {
-                        if (!stopWorker.load())
+                        std::unique_lock<std::mutex> lifecycleLock(lifecycleMutex);
+                        if (workerRunning)
                         {
+                            if (!stopWorker.load())
+                            {
+                                return true;
+                            }
+
+                            if (workerThreadId == std::this_thread::get_id())
+                            {
+                                return false;
+                            }
+
+                            lifecycleConditionVariable.wait(lifecycleLock, [this]()
+                                {
+                                    return !workerRunning;
+                                });
+                            continue;
+                        }
+
+                        if (workerThread.joinable())
+                        {
+                            if (workerThread.get_id() == std::this_thread::get_id())
+                            {
+                                return false;
+                            }
+
+                            completedWorkerThread = std::move(workerThread);
+                        }
+                        else
+                        {
+                            stopWorker.store(false);
+                            try
+                            {
+                                const std::shared_ptr<GlobalKeyboardListenerState> self = shared_from_this();
+                                workerRunning = true;
+                                workerThread = std::thread([self]()
+                                    {
+                                        self->WorkerThreadMain();
+                                    });
+                                workerThreadId = workerThread.get_id();
+                            }
+                            catch (...)
+                            {
+                                workerRunning = false;
+                                workerThreadId = std::thread::id();
+                                stopWorker.store(true);
+                                lifecycleConditionVariable.notify_all();
+                                return false;
+                            }
+
                             return true;
                         }
-
-                        if (workerThreadId == std::this_thread::get_id())
-                        {
-                            return false;
-                        }
-
-                        lifecycleConditionVariable.wait(lifecycleLock, [this]()
-                            {
-                                return !workerRunning;
-                            });
                     }
 
-                    if (workerThread.joinable())
-                    {
-                        if (workerThread.get_id() == std::this_thread::get_id())
-                        {
-                            return false;
-                        }
-
-                        completedWorkerThread = std::move(workerThread);
-                    }
-                }
-
-                if (completedWorkerThread.joinable())
-                {
                     completedWorkerThread.join();
                 }
-
-                std::lock_guard<std::mutex> lifecycleLock(lifecycleMutex);
-                stopWorker.store(false);
-                try
-                {
-                    const std::shared_ptr<GlobalKeyboardListenerState> self = shared_from_this();
-                    workerRunning = true;
-                    workerThread = std::thread([self]()
-                        {
-                            self->WorkerThreadMain();
-                        });
-                    workerThreadId = workerThread.get_id();
-                }
-                catch (...)
-                {
-                    workerRunning = false;
-                    workerThreadId = std::thread::id();
-                    stopWorker.store(true);
-                    lifecycleConditionVariable.notify_all();
-                    return false;
-                }
-
-                return true;
             }
 
             void StopWorker()
@@ -1023,7 +1034,14 @@ namespace
                         eventQueue.pop_front();
                     }
 
-                    eventQueue.push_back(keyboardEvent);
+                    try
+                    {
+                        eventQueue.push_back(keyboardEvent);
+                    }
+                    catch (...)
+                    {
+                        return false;
+                    }
                 }
 
                 queueConditionVariable.notify_one();
@@ -1442,11 +1460,26 @@ namespace
                     {
                         messageThreadReadyConditionVariable.wait(managerLock);
                     }
-                    return rawInputRegisteredSuccessfully;
+
+                    if (messageThreadRunning && rawInputRegisteredSuccessfully)
+                    {
+                        return true;
+                    }
+
+                    std::thread completedMessageThread = std::move(messageThread);
+                    managerLock.unlock();
+                    completedMessageThread.join();
+                    managerLock.lock();
+                    rawInputWindowHandle = nullptr;
+                    rawInputThreadId = 0;
+                    messageThreadStartupResolved = false;
+                    rawInputRegisteredSuccessfully = false;
+                    messageThreadRunning = false;
                 }
 
                 messageThreadStartupResolved = false;
                 rawInputRegisteredSuccessfully = false;
+                messageThreadRunning = false;
                 rawInputThreadId = 0;
                 rawInputWindowHandle = nullptr;
                 for (auto& keyDownStateValue : keyDownState)
@@ -1468,7 +1501,7 @@ namespace
                     messageThreadReadyConditionVariable.wait(managerLock);
                 }
 
-                if (!rawInputRegisteredSuccessfully)
+                if (!messageThreadRunning || !rawInputRegisteredSuccessfully)
                 {
                     std::thread messageThreadToJoin = std::move(messageThread);
                     managerLock.unlock();
@@ -1481,9 +1514,11 @@ namespace
                     rawInputThreadId = 0;
                     messageThreadStartupResolved = false;
                     rawInputRegisteredSuccessfully = false;
+                    messageThreadRunning = false;
+                    return false;
                 }
 
-                return rawInputRegisteredSuccessfully;
+                return true;
             }
 
             void MessageThreadMain()
@@ -1518,6 +1553,7 @@ namespace
                     rawInputThreadId = currentThreadId;
                     rawInputWindowHandle = windowHandle;
                     rawInputRegisteredSuccessfully = registerSucceeded;
+                    messageThreadRunning = registerSucceeded;
                     messageThreadStartupResolved = true;
                 }
                 messageThreadReadyConditionVariable.notify_all();
@@ -1557,6 +1593,9 @@ namespace
                 {
                     rawInputThreadId = 0;
                 }
+                rawInputRegisteredSuccessfully = false;
+                messageThreadRunning = false;
+                messageThreadReadyConditionVariable.notify_all();
             }
 
             void RemoveExpiredListenersLocked()
@@ -1604,6 +1643,7 @@ namespace
                 rawInputThreadId = 0;
                 messageThreadStartupResolved = false;
                 rawInputRegisteredSuccessfully = false;
+                messageThreadRunning = false;
                 messageThreadStopInProgress = false;
                 messageThreadReadyConditionVariable.notify_all();
             }
@@ -1618,6 +1658,7 @@ namespace
             uint64_t nextListenerId = 1;
             bool messageThreadStartupResolved = false;
             bool rawInputRegisteredSuccessfully = false;
+            bool messageThreadRunning = false;
             bool messageThreadStopInProgress = false;
             bool shuttingDown = false;
             std::vector<uint8_t> rawInputBuffer;
@@ -1698,9 +1739,8 @@ bool GB_Keyboard::PressScanCode(const uint16_t scanCode, const bool isExtendedKe
         return false;
     }
 
-    std::vector<INPUT> inputs;
-    inputs.push_back(internal::MakeKeyboardInputByScanCode(scanCode, isExtendedKey, false));
-    return internal::TrySendInputEventsWithRetry(inputs);
+    const INPUT input = internal::MakeKeyboardInputByScanCode(scanCode, isExtendedKey, false);
+    return internal::TrySendInputEventsWithRetry(&input, 1);
 #else
     (void)scanCode;
     (void)isExtendedKey;
@@ -1716,9 +1756,8 @@ bool GB_Keyboard::ReleaseScanCode(const uint16_t scanCode, const bool isExtended
         return false;
     }
 
-    std::vector<INPUT> inputs;
-    inputs.push_back(internal::MakeKeyboardInputByScanCode(scanCode, isExtendedKey, true));
-    return internal::TrySendInputEventsWithRetry(inputs);
+    const INPUT input = internal::MakeKeyboardInputByScanCode(scanCode, isExtendedKey, true);
+    return internal::TrySendInputEventsWithRetry(&input, 1);
 #else
     (void)scanCode;
     (void)isExtendedKey;
@@ -1755,6 +1794,11 @@ bool GB_Keyboard::ClickScanCode(const uint16_t scanCode, const bool isExtendedKe
 bool GB_Keyboard::InputUnicodeCharacter(const wchar_t unicodeChar, const int downUpIntervalMs)
 {
 #if defined(_WIN32)
+    if (unicodeChar == L'\0')
+    {
+        return false;
+    }
+
     return internal::TryInputUnicodeCharacter(unicodeChar, downUpIntervalMs);
 #else
     (void)unicodeChar;
@@ -1777,12 +1821,16 @@ bool GB_Keyboard::PressKeyCombination(const std::vector<GB_VirtualKey>& virtualK
         inputMode = GB_KeyboardInputMode::VirtualKey;
     }
 
+    std::array<bool, 256> usedVirtualKeyCodes = {};
     for (const GB_VirtualKey virtualKey : virtualKeys)
     {
-        if (!internal::IsValidVirtualKeyCode(internal::ToVirtualKeyCode(virtualKey)))
+        const uint16_t virtualKeyCode = internal::ToVirtualKeyCode(virtualKey);
+        if (!internal::IsValidVirtualKeyCode(virtualKeyCode) || usedVirtualKeyCodes[virtualKeyCode])
         {
             return false;
         }
+
+        usedVirtualKeyCodes[virtualKeyCode] = true;
     }
 
     std::vector<GB_VirtualKey> temporarilyReleasedModifierKeys;

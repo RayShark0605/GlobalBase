@@ -1143,7 +1143,7 @@ namespace
         {
             *overallConnectivityInfo = NlmOverallConnectivityInfo();
         }
-        GB_ComScope comScope = GB_ComScope::InitializeMta("GB_SystemNetwork::EnumerateConnectedNetworks");
+        GB_ComScope comScope(GB_ComApartmentModel::MultiThreaded, "GB_SystemNetwork::EnumerateConnectedNetworks");
         if (!IsComUsable(comScope))
         {
             return comScope.GetInitializeResult();
@@ -1165,7 +1165,7 @@ namespace
     GB_SystemResult GetNetworkCostInternal(GB_SystemNetworkCostInfo& costInfo)
     {
         costInfo = GB_SystemNetworkCostInfo();
-        GB_ComScope comScope = GB_ComScope::InitializeMta("GB_SystemNetwork::GetNetworkCost");
+        GB_ComScope comScope(GB_ComApartmentModel::MultiThreaded, "GB_SystemNetwork::GetNetworkCost");
         if (!IsComUsable(comScope))
         {
             return comScope.GetInitializeResult();
@@ -1188,7 +1188,7 @@ namespace
         hasCostInfo = false;
         connectedNetworksSucceeded = false;
 
-        GB_ComScope comScope = GB_ComScope::InitializeMta("GB_SystemNetwork::RefreshSnapshot");
+        GB_ComScope comScope(GB_ComApartmentModel::MultiThreaded, "GB_SystemNetwork::RefreshSnapshot");
         if (!IsComUsable(comScope))
         {
             AppendDiagnostic(diagnosticMessage, "NLM 查询失败：" + comScope.GetInitializeResult().GetDisplayMessage());
@@ -1224,7 +1224,7 @@ namespace
     GB_SystemResult QueryInternetAccessByNlm(bool& hasInternetAccess)
     {
         hasInternetAccess = false;
-        GB_ComScope comScope = GB_ComScope::InitializeMta("GB_SystemNetwork::HasInternetAccess");
+        GB_ComScope comScope(GB_ComApartmentModel::MultiThreaded, "GB_SystemNetwork::HasInternetAccess");
         if (!IsComUsable(comScope))
         {
             return comScope.GetInitializeResult().WithOperationName("GB_SystemNetwork::HasInternetAccess");

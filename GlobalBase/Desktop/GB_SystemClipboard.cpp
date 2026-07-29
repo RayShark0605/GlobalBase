@@ -1109,9 +1109,9 @@ namespace
             const bool isBgraBitFieldsDib = (header->biCompression == BI_BITFIELDS || header->biCompression == BI_ALPHABITFIELDS) && redMask == 0x00FF0000U && greenMask == 0x0000FF00U && blueMask == 0x000000FFU && (alphaMask == 0xFF000000U || alphaMask == 0x00000000U);
             if (isDefaultBgraRgbDib || isBgraBitFieldsDib)
             {
-                const bool readSourceAlpha = isDefaultBgraRgbDib || alphaMask == 0xFF000000U;
-                const bool forceOpaqueAlpha = !isDefaultBgraRgbDib && alphaMask == 0x00000000U;
-                const bool setOpaqueWhenAllAlphaZero = isDefaultBgraRgbDib;
+                const bool readSourceAlpha = !isDefaultBgraRgbDib && alphaMask == 0xFF000000U;
+                const bool forceOpaqueAlpha = isDefaultBgraRgbDib || alphaMask == 0x00000000U;
+                const bool setOpaqueWhenAllAlphaZero = false;
                 if (!CopyBgra32DibFast(bytes, pixelOffset, rowStrideBytes, width, height, topDown, readSourceAlpha, forceOpaqueAlpha, setOpaqueWhenAllAlphaZero, decodedImage))
                 {
                     return false;
@@ -2336,6 +2336,7 @@ public:
     GB_SystemResult Start()
     {
 #ifdef _WIN32
+        std::lock_guard<std::mutex> operationLock(operationMutex);
         if (options.includeFormats)
         {
             const GB_SystemResult validationResult = ValidateClipboardAccessOptions(options.formatAccessOptions, GB_ClipboardOperationWatcherStart);
@@ -2369,8 +2370,6 @@ public:
         createSucceeded = false;
         createCompleted = false;
         createResult = GB_SystemResult::Succeeded(GB_ClipboardOperationWatcherStart);
-        stopRequested = false;
-
         {
             std::lock_guard<std::mutex> queueLock(eventQueueMutex);
             eventWorkerStopRequested = false;
@@ -2426,6 +2425,7 @@ public:
     GB_SystemResult Stop()
     {
 #ifdef _WIN32
+        std::lock_guard<std::mutex> operationLock(operationMutex);
         {
             std::lock_guard<std::mutex> lock(stateMutex);
             if (!running && !watcherThread.joinable() && !eventWorkerThread.joinable())
@@ -2434,7 +2434,6 @@ public:
                 return GB_SystemResult::Succeeded(GB_ClipboardOperationWatcherStop);
             }
 
-            stopRequested = true;
             bool stopMessagePosted = false;
             if (windowHandle != nullptr)
             {
@@ -2776,6 +2775,7 @@ private:
     GB_EventDispatcher eventDispatcher;
     ClipboardEventCallback callback;
     mutable std::mutex callbackMutex;
+    std::mutex operationMutex;
     mutable std::mutex stateMutex;
     std::condition_variable createCondition;
     std::thread watcherThread;
@@ -2784,7 +2784,6 @@ private:
     std::condition_variable eventQueueCondition;
     std::deque<GB_SystemClipboardEvent> pendingClipboardEvents;
     bool running = false;
-    bool stopRequested = false;
     bool createSucceeded = false;
     bool createCompleted = false;
     bool eventWorkerStopRequested = false;

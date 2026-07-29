@@ -395,7 +395,8 @@ public:
      * @remarks
      * - 按系统枚举顺序优先解析真实发布的图片格式，并回退到可用的 CF_DIBV5 / CF_DIB / CF_BITMAP。
      * - 当前实现支持常见 1/4/8/16/24/32 位 DIB、位掩码 DIB、DIBV5 以及 CF_BITMAP 解码路径。
-     * - 解析成功后输出通常为 8 位 BGRA 四通道图像；透明度缺失或全 0 alpha 的部分传统 DIB 会按不透明处理。
+     * - 32 位 BI_RGB 的高字节按 Win32 规范视为未使用并统一输出为不透明；只有显式 alpha 掩码的位图格式才保留透明度。
+     * - 解析成功后输出通常为 8 位 BGRA 四通道图像。
      */
     static GB_SystemResult GetImage(GB_Image& image, const GB_SystemClipboardImageReadOptions& options = GB_SystemClipboardImageReadOptions());
 
@@ -505,7 +506,7 @@ struct GB_SystemClipboardWatcherOptions
  * @remarks
  * - 监听线程只创建隐藏消息窗口并接收 WM_CLIPBOARDUPDATE。
  * - 监听线程只负责接收系统消息，格式枚举、强类型回调和通用事件投递会转交内部工作线程处理。
- * - Start()/Stop() 可重复调用，析构时自动停止。
+ * - Start()/Stop() 可重复调用，并在同一实例内串行化生命周期操作；析构时自动停止。
  * - 回调中可以调用 Stop()，但不应在回调返回前销毁监听器实例。
  * - 若在回调线程内调用 Stop()，内部事件线程会在回调返回后退出，后续从其他线程再次调用 Stop()/Start() 会完成线程回收。
  * - 回调中应避免执行长时间阻塞操作。

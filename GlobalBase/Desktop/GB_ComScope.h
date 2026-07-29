@@ -87,7 +87,7 @@ struct GB_ComSecurityOptions
  * - CoInitializeEx 返回 S_OK 或 S_FALSE 时均表示初始化成功，本类都会在析构或 Uninitialize() 中调用 CoUninitialize；
  * - CoInitializeEx 返回 RPC_E_CHANGED_MODE 等失败 HRESULT 时，本类不会调用 CoUninitialize；
  * - COM 初始化和反初始化必须发生在同一线程，本类会记录初始化线程 ID，并拒绝在非初始化线程调用 CoUninitialize；
- * - 允许移动对象，但移动后仍必须在原初始化线程析构或显式 Uninitialize()，否则无法安全执行 CoUninitialize；
+ * - 本类不可复制、不可移动，避免 COM 初始化配平责任被转移到其他线程；
  * - 所有 std::string 均约定为 UTF-8 编码。
  */
 class GLOBALBASE_PORT GB_ComScope final
@@ -115,22 +115,8 @@ public:
 
     GB_ComScope(const GB_ComScope&) = delete;
     GB_ComScope& operator=(const GB_ComScope&) = delete;
-
-    /**
-     * @brief 移动构造，转移当前 COM 初始化配平责任。
-     */
-    GB_ComScope(GB_ComScope&& other);
-
-    /**
-     * @brief 移动赋值，先反初始化当前作用域，再接管 @p other 的配平责任。
-     */
-    GB_ComScope& operator=(GB_ComScope&& other);
-
-    /** @brief 创建并初始化 STA COM 作用域。 */
-    static GB_ComScope InitializeSta(const std::string& operationName = std::string(), bool disableOle1Dde = true);
-
-    /** @brief 创建并初始化 MTA COM 作用域。 */
-    static GB_ComScope InitializeMta(const std::string& operationName = std::string(), bool disableOle1Dde = false);
+    GB_ComScope(GB_ComScope&&) = delete;
+    GB_ComScope& operator=(GB_ComScope&&) = delete;
 
     /** @brief 创建 STA 初始化选项。 */
     static GB_ComInitializeOptions MakeStaOptions(bool disableOle1Dde = true, bool speedOverMemory = false);
@@ -216,9 +202,6 @@ public:
     /** @brief 获取上一次 Uninitialize() / Detach() 的结果。 */
     GB_SystemResult GetLastUninitializeResult() const;
 
-    /** @brief 交换两个作用域对象。 */
-    void Swap(GB_ComScope& other);
-
     /** @brief 判断指定 COM 单元模型数值是否有效。 */
     static bool IsValidApartmentModelValue(uint64_t apartmentModelValue);
 
@@ -251,7 +234,6 @@ public:
 private:
     void CloseSilently() noexcept;
     void ClearInitializationState() noexcept;
-    void MoveFrom(GB_ComScope& other);
 
 private:
     bool initialized = false;

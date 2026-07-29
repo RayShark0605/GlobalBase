@@ -1993,6 +1993,10 @@ public:
             {
                 return GB_SystemResult::Succeeded(u8"GB_SystemDeviceWatcher::Start", u8"系统设备监听器已经启动。");
             }
+            if (stopping)
+            {
+                return GB_SystemResult::Failed(GB_SystemErrorCode::InvalidState, u8"GB_SystemDeviceWatcher::Start", u8"系统设备监听器正在停止，不能并发重新启动。");
+            }
         }
 
         GB_SystemResult result = typedDispatcher.Start();
@@ -2044,7 +2048,7 @@ public:
 #if !defined(_WIN32)
         return GB_SystemResult::Succeeded(u8"GB_SystemDeviceWatcher::Stop", u8"当前平台没有需要停止的 Windows 设备监听。");
 #else
-        std::lock_guard<std::mutex> operationLock(operationMutex);
+        std::unique_lock<std::mutex> operationLock(operationMutex);
 
 #if GB_SYSTEMDEVICE_HAS_CM_NOTIFICATION
         std::vector<HCMNOTIFICATION> localCmNotificationHandles;
@@ -2055,6 +2059,10 @@ public:
 
         {
             std::lock_guard<std::mutex> lock(stateMutex);
+            if (stopping)
+            {
+                return GB_SystemResult::Succeeded(u8"GB_SystemDeviceWatcher::Stop", u8"系统设备监听器正在停止。");
+            }
             if (!running && !windowThread.joinable()
 #if GB_SYSTEMDEVICE_HAS_CM_NOTIFICATION
                 && cmNotificationHandles.empty()
@@ -2064,6 +2072,7 @@ public:
                 return GB_SystemResult::Succeeded(u8"GB_SystemDeviceWatcher::Stop", u8"系统设备监听器未启动。");
             }
 
+            stopping = true;
             DisableNativeNotifications();
             running = false;
             localWindowHandle = windowHandle;
@@ -2105,8 +2114,25 @@ public:
             startCompleted = false;
         }
 
-        (void)publicDispatcher.Stop(GB_EventDispatcherStopMode::Drain);
-        (void)typedDispatcher.Stop(GB_EventDispatcherStopMode::Drain);
+        operationLock.unlock();
+        GB_SystemResult publicStopResult = publicDispatcher.Stop(GB_EventDispatcherStopMode::Drain);
+        GB_SystemResult typedStopResult = typedDispatcher.Stop(GB_EventDispatcherStopMode::Drain);
+        operationLock.lock();
+
+        {
+            std::lock_guard<std::mutex> lock(stateMutex);
+            stopping = false;
+        }
+
+        if (publicStopResult.IsFailed())
+        {
+            return publicStopResult.WithOperationName(u8"GB_SystemDeviceWatcher::Stop");
+        }
+        if (typedStopResult.IsFailed())
+        {
+            return typedStopResult.WithOperationName(u8"GB_SystemDeviceWatcher::Stop");
+        }
+
         return GB_SystemResult::Succeeded(u8"GB_SystemDeviceWatcher::Stop", u8"系统设备监听器已停止。");
 #endif
     }
@@ -2749,6 +2775,7 @@ private:
     std::atomic<size_t> activeNativeNotificationCount;
     std::thread windowThread;
     bool running = false;
+    bool stopping = false;
     bool startCompleted = false;
     bool useCmNotification = false;
     GB_SystemResult startResult;
