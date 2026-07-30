@@ -4,21 +4,21 @@
 #include <utility>
 
 #if defined(_WIN32)
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
-#ifndef WIN32_LEAN_AND_MEAN
-#define WIN32_LEAN_AND_MEAN
-#endif
-#include <windows.h>
-#include <objbase.h>
+#  ifndef NOMINMAX
+#    define NOMINMAX
+#  endif
+#  ifndef WIN32_LEAN_AND_MEAN
+#    define WIN32_LEAN_AND_MEAN
+#  endif
+#  include <windows.h>
+#  include <objbase.h>
 
-#ifdef _MSC_VER
-#  pragma comment(lib, "Advapi32.lib")
-#  pragma comment(lib, "Gdi32.lib")
-#  pragma comment(lib, "User32.lib")
-#  pragma comment(lib, "Ole32.lib")
-#endif
+#  ifdef _MSC_VER
+#    pragma comment(lib, "Advapi32.lib")
+#    pragma comment(lib, "Gdi32.lib")
+#    pragma comment(lib, "User32.lib")
+#    pragma comment(lib, "Ole32.lib")
+#  endif
 #endif
 
 namespace
@@ -78,21 +78,18 @@ namespace
         return GB_SystemResult::Failed(GB_SystemErrorCode::NativeApiFailed, BuildCloseOperationName(closeMethod), BuildCloseDetailMessage(closeMethod, resourceName, detail));
     }
 
-#endif
-
-#if defined(_WIN32)
     static GB_SystemResult MakeCloseFailedResultFromLastError(const GB_WinHandleCloseMethod closeMethod, const std::string& resourceName, const std::string& detail)
     {
-        const DWORD lastError = ::GetLastError();
-        if (lastError != ERROR_SUCCESS)
+        const DWORD lastErrorCode = ::GetLastError();
+        if (lastErrorCode != ERROR_SUCCESS)
         {
-            return GB_SystemResult::FromWin32Error(static_cast<uint32_t>(lastError), BuildCloseOperationName(closeMethod), BuildCloseDetailMessage(closeMethod, resourceName, detail));
+            return GB_SystemResult::FromWin32Error(static_cast<uint32_t>(lastErrorCode), BuildCloseOperationName(closeMethod), BuildCloseDetailMessage(closeMethod, resourceName, detail));
         }
 
         return MakeCloseFailedResultWithoutNativeCode(closeMethod, resourceName, detail);
     }
 
-    class Win32LastErrorValueScope
+    class Win32LastErrorValueScope final
     {
     public:
         Win32LastErrorValueScope() noexcept
@@ -116,66 +113,66 @@ namespace
     {
         const HKEY registryKey = reinterpret_cast<HKEY>(const_cast<void*>(handle));
 
-#if defined(HKEY_CLASSES_ROOT)
+#  if defined(HKEY_CLASSES_ROOT)
         if (registryKey == HKEY_CLASSES_ROOT)
         {
             return true;
         }
-#endif
-#if defined(HKEY_CURRENT_USER)
+#  endif
+#  if defined(HKEY_CURRENT_USER)
         if (registryKey == HKEY_CURRENT_USER)
         {
             return true;
         }
-#endif
-#if defined(HKEY_LOCAL_MACHINE)
+#  endif
+#  if defined(HKEY_LOCAL_MACHINE)
         if (registryKey == HKEY_LOCAL_MACHINE)
         {
             return true;
         }
-#endif
-#if defined(HKEY_USERS)
+#  endif
+#  if defined(HKEY_USERS)
         if (registryKey == HKEY_USERS)
         {
             return true;
         }
-#endif
-#if defined(HKEY_PERFORMANCE_DATA)
+#  endif
+#  if defined(HKEY_PERFORMANCE_DATA)
         if (registryKey == HKEY_PERFORMANCE_DATA)
         {
             return true;
         }
-#endif
-#if defined(HKEY_PERFORMANCE_TEXT)
+#  endif
+#  if defined(HKEY_PERFORMANCE_TEXT)
         if (registryKey == HKEY_PERFORMANCE_TEXT)
         {
             return true;
         }
-#endif
-#if defined(HKEY_PERFORMANCE_NLSTEXT)
+#  endif
+#  if defined(HKEY_PERFORMANCE_NLSTEXT)
         if (registryKey == HKEY_PERFORMANCE_NLSTEXT)
         {
             return true;
         }
-#endif
-#if defined(HKEY_CURRENT_CONFIG)
+#  endif
+#  if defined(HKEY_CURRENT_CONFIG)
         if (registryKey == HKEY_CURRENT_CONFIG)
         {
             return true;
         }
-#endif
-#if defined(HKEY_DYN_DATA)
+#  endif
+#  if defined(HKEY_DYN_DATA)
         if (registryKey == HKEY_DYN_DATA)
         {
             return true;
         }
-#endif
-#if defined(HKEY_CURRENT_USER_LOCAL_SETTINGS)
+#  endif
+#  if defined(HKEY_CURRENT_USER_LOCAL_SETTINGS)
         if (registryKey == HKEY_CURRENT_USER_LOCAL_SETTINGS)
         {
             return true;
         }
-#endif
+#  endif
 
         return false;
     }
@@ -183,42 +180,13 @@ namespace
     static bool IsPseudoCloseHandleValue(const void* handle)
     {
         const HANDLE nativeHandle = static_cast<HANDLE>(const_cast<void*>(handle));
-
-        if (nativeHandle == ::GetCurrentProcess())
-        {
-            return true;
-        }
-
-        if (nativeHandle == ::GetCurrentThread())
+        if (nativeHandle == ::GetCurrentProcess() || nativeHandle == ::GetCurrentThread())
         {
             return true;
         }
 
         const intptr_t handleValue = reinterpret_cast<intptr_t>(handle);
-        if (handleValue == static_cast<intptr_t>(-4) || handleValue == static_cast<intptr_t>(-5) || handleValue == static_cast<intptr_t>(-6))
-        {
-            return true;
-        }
-
-        return false;
-    }
-
-    static bool TryGetCloseHandleFlags(const void* handle, DWORD& flags)
-    {
-        const Win32LastErrorValueScope lastErrorValueScope;
-        flags = 0;
-        return ::GetHandleInformation(static_cast<HANDLE>(const_cast<void*>(handle)), &flags) != FALSE;
-    }
-
-    static bool IsValidCloseHandleValue(const void* handle)
-    {
-        if (IsPseudoCloseHandleValue(handle))
-        {
-            return false;
-        }
-
-        DWORD flags = 0;
-        return TryGetCloseHandleFlags(handle, flags);
+        return handleValue == static_cast<intptr_t>(-4) || handleValue == static_cast<intptr_t>(-5) || handleValue == static_cast<intptr_t>(-6);
     }
 
     static GB_SystemResult CloseRawHandle(void* handle, void* contextHandle, const GB_WinHandleCloseMethod closeMethod, const std::string& resourceName)
@@ -303,7 +271,7 @@ namespace
         {
             ::SetLastError(ERROR_SUCCESS);
             const int closeResult = ::ReleaseDC(static_cast<HWND>(contextHandle), static_cast<HDC>(handle));
-            return closeResult != 0 ? MakeCloseSucceededResult(closeMethod, resourceName, std::string()) : MakeCloseFailedResultFromLastError(closeMethod, resourceName, u8"ReleaseDC 调用失败。请确认该 HDC 来自 GetDC 或 GetWindowDC，并且由同一线程释放。");
+            return closeResult != 0 ? MakeCloseSucceededResult(closeMethod, resourceName, std::string()) : MakeCloseFailedResultFromLastError(closeMethod, resourceName, u8"ReleaseDC 调用失败。请确认该 HDC 来自 GetDC 或 GetWindowDC，并且在原线程释放。");
         }
 
         case GB_WinHandleCloseMethod::DestroyWindow:
@@ -356,10 +324,8 @@ namespace
         }
 
         case GB_WinHandleCloseMethod::CoTaskMemFree:
-        {
             ::CoTaskMemFree(handle);
             return MakeCloseSucceededResult(closeMethod, resourceName, std::string());
-        }
 
         case GB_WinHandleCloseMethod::None:
             return MakeCloseSucceededResult(closeMethod, resourceName, std::string());
@@ -458,24 +424,13 @@ namespace
             return;
         }
     }
-
 #else
-    static bool IsPredefinedRegistryKey(const void*)
-    {
-        return false;
-    }
-
-    static bool IsPseudoCloseHandleValue(const void*)
-    {
-        return false;
-    }
-
     static GB_SystemResult CloseRawHandle(void*, void*, const GB_WinHandleCloseMethod closeMethod, const std::string& resourceName)
     {
         return GB_SystemResult::Failed(GB_SystemErrorCode::UnsupportedPlatform, BuildCloseOperationName(closeMethod), BuildCloseDetailMessage(closeMethod, resourceName, u8"当前平台不支持 Windows 原生句柄释放。"));
     }
 
-    static void CloseRawHandleSilently(void*, void*, const GB_WinHandleCloseMethod) noexcept
+    static void CloseRawHandleSilently(void*, void*, GB_WinHandleCloseMethod) noexcept
     {
     }
 #endif
@@ -677,7 +632,7 @@ GB_SystemResult GB_WinHandleScope::Close()
     const GB_WinHandleCloseMethod currentCloseMethod = closeMethod;
     if (!IsValidCloseMethodValue(static_cast<uint64_t>(currentCloseMethod)))
     {
-        lastCloseResult = GB_SystemResult::Failed(GB_SystemErrorCode::InvalidArgument, u8"GB_WinHandleScope::Close", u8"未知的 Windows 句柄关闭方式，未执行关闭；当前对象继续保留原句柄，避免错误清空导致资源泄漏。请调用 Detach() 后由外部接管。");
+        lastCloseResult = GB_SystemResult::Failed(GB_SystemErrorCode::InvalidArgument, u8"GB_WinHandleScope::Close", u8"未知的 Windows 句柄关闭方式；当前对象保持原状态，请调用 Detach() 后由外部明确接管。");
         return lastCloseResult;
     }
 
@@ -688,21 +643,21 @@ GB_SystemResult GB_WinHandleScope::Close()
         return lastCloseResult;
     }
 
-    if (!IsValidHandleForCloseMethod(handle, closeMethod))
+    if (!IsValidHandleForCloseMethod(handle, currentCloseMethod))
     {
         ClearHandleState();
-        lastCloseResult = GB_SystemResult::Succeeded(BuildCloseOperationName(currentCloseMethod), u8"句柄值无效，未执行关闭。此情况通常来自返回 INVALID_HANDLE_VALUE 的 Windows API 失败分支。");
+        lastCloseResult = GB_SystemResult::Succeeded(BuildCloseOperationName(currentCloseMethod), u8"句柄值无效或属于不可关闭的伪句柄，未执行关闭。此路径适用于 INVALID_HANDLE_VALUE 等 Windows API 失败返回值。");
         return lastCloseResult;
     }
 
-    if (!IsClosableHandleForCloseMethod(handle, closeMethod))
+    if (!IsClosableHandleForCloseMethod(handle, currentCloseMethod))
     {
         ClearHandleState();
-        lastCloseResult = GB_SystemResult::Succeeded(BuildCloseOperationName(currentCloseMethod), u8"当前对象不拥有该句柄，未执行关闭。");
+        lastCloseResult = GB_SystemResult::Succeeded(BuildCloseOperationName(currentCloseMethod), u8"当前对象不拥有该资源，未执行关闭。");
         return lastCloseResult;
     }
 
-    const GB_SystemResult closeResult = CloseRawHandle(handle, contextHandle, closeMethod, resourceName);
+    const GB_SystemResult closeResult = CloseRawHandle(handle, contextHandle, currentCloseMethod, resourceName);
     lastCloseResult = closeResult;
     if (closeResult.IsSucceeded())
     {
@@ -744,7 +699,7 @@ GB_SystemResult GB_WinHandleScope::Reset(NativeHandle newHandle, const GB_WinHan
     {
         if (newCloseMethod != closeMethod || newContextHandle != contextHandle)
         {
-            return GB_SystemResult::Failed(GB_SystemErrorCode::InvalidArgument, operationName, u8"不能通过 Reset() 为同一个原生句柄直接更换关闭方式或上下文句柄；请先调用 Detach() 明确转移所有权。");
+            return GB_SystemResult::Failed(GB_SystemErrorCode::InvalidArgument, operationName, u8"不能通过 Reset() 为同一个原生句柄直接改变关闭方式或上下文句柄；请先调用 Detach() 明确转移所有权。");
         }
 
         resourceName.swap(preparedResourceName);
@@ -816,9 +771,9 @@ bool GB_WinHandleScope::IsValidCloseMethodValue(const uint64_t closeMethodValue)
     case static_cast<uint64_t>(GB_WinHandleCloseMethod::DestroyIcon):
     case static_cast<uint64_t>(GB_WinHandleCloseMethod::DestroyCursor):
     case static_cast<uint64_t>(GB_WinHandleCloseMethod::UnhookWindowsHookEx):
-    case static_cast<uint64_t>(GB_WinHandleCloseMethod::UnhookWinEvent):
     case static_cast<uint64_t>(GB_WinHandleCloseMethod::UnmapViewOfFile):
     case static_cast<uint64_t>(GB_WinHandleCloseMethod::CoTaskMemFree):
+    case static_cast<uint64_t>(GB_WinHandleCloseMethod::UnhookWinEvent):
         return true;
 
     default:
@@ -835,20 +790,13 @@ bool GB_WinHandleScope::IsValidHandleForCloseMethod(NativeHandle handle, const G
         return false;
     }
 
-    const uint64_t closeMethodValue = static_cast<uint64_t>(closeMethod);
-    if (!IsValidCloseMethodValue(closeMethodValue))
+    if (!IsValidCloseMethodValue(static_cast<uint64_t>(closeMethod)))
     {
         return false;
     }
 
-    const GB_WinHandleCloseMethod normalizedCloseMethod = closeMethod;
-    if (normalizedCloseMethod == GB_WinHandleCloseMethod::None)
-    {
-        return true;
-    }
-
 #if defined(_WIN32)
-    if (normalizedCloseMethod == GB_WinHandleCloseMethod::CloseHandle && !IsValidCloseHandleValue(handle))
+    if (closeMethod == GB_WinHandleCloseMethod::CloseHandle && IsPseudoCloseHandleValue(handle))
     {
         return false;
     }
@@ -870,6 +818,7 @@ bool GB_WinHandleScope::IsClosableHandleForCloseMethod(NativeHandle handle, cons
         return false;
     }
 
+#if defined(_WIN32)
     if (normalizedCloseMethod == GB_WinHandleCloseMethod::CloseHandle && IsPseudoCloseHandleValue(handle))
     {
         return false;
@@ -879,6 +828,7 @@ bool GB_WinHandleScope::IsClosableHandleForCloseMethod(NativeHandle handle, cons
     {
         return false;
     }
+#endif
 
     return true;
 }
@@ -894,64 +844,44 @@ std::string GB_WinHandleScope::GetCloseMethodName(const GB_WinHandleCloseMethod 
     {
     case GB_WinHandleCloseMethod::None:
         return u8"None";
-
     case GB_WinHandleCloseMethod::CloseHandle:
         return u8"CloseHandle";
-
     case GB_WinHandleCloseMethod::FindClose:
         return u8"FindClose";
-
     case GB_WinHandleCloseMethod::FindCloseChangeNotification:
         return u8"FindCloseChangeNotification";
-
     case GB_WinHandleCloseMethod::CloseServiceHandle:
         return u8"CloseServiceHandle";
-
     case GB_WinHandleCloseMethod::RegCloseKey:
         return u8"RegCloseKey";
-
     case GB_WinHandleCloseMethod::FreeLibrary:
         return u8"FreeLibrary";
-
     case GB_WinHandleCloseMethod::LocalFree:
         return u8"LocalFree";
-
     case GB_WinHandleCloseMethod::GlobalFree:
         return u8"GlobalFree";
-
     case GB_WinHandleCloseMethod::DeleteObject:
         return u8"DeleteObject";
-
     case GB_WinHandleCloseMethod::DeleteDC:
         return u8"DeleteDC";
-
     case GB_WinHandleCloseMethod::ReleaseDC:
         return u8"ReleaseDC";
-
     case GB_WinHandleCloseMethod::DestroyWindow:
         return u8"DestroyWindow";
-
     case GB_WinHandleCloseMethod::DestroyMenu:
         return u8"DestroyMenu";
-
     case GB_WinHandleCloseMethod::DestroyIcon:
         return u8"DestroyIcon";
-
     case GB_WinHandleCloseMethod::DestroyCursor:
         return u8"DestroyCursor";
-
     case GB_WinHandleCloseMethod::UnhookWindowsHookEx:
         return u8"UnhookWindowsHookEx";
-
-    case GB_WinHandleCloseMethod::UnhookWinEvent:
-        return u8"UnhookWinEvent";
-
     case GB_WinHandleCloseMethod::UnmapViewOfFile:
         return u8"UnmapViewOfFile";
-
     case GB_WinHandleCloseMethod::CoTaskMemFree:
         return u8"CoTaskMemFree";
-
+    case GB_WinHandleCloseMethod::UnhookWinEvent:
+        return u8"UnhookWinEvent";
     default:
         break;
     }
@@ -970,64 +900,44 @@ std::string GB_WinHandleScope::GetCloseMethodDescription(const GB_WinHandleClose
     {
     case GB_WinHandleCloseMethod::None:
         return u8"不拥有资源，不自动关闭。";
-
     case GB_WinHandleCloseMethod::CloseHandle:
         return u8"使用 CloseHandle 关闭内核对象句柄。";
-
     case GB_WinHandleCloseMethod::FindClose:
         return u8"使用 FindClose 关闭文件搜索句柄。";
-
     case GB_WinHandleCloseMethod::FindCloseChangeNotification:
         return u8"使用 FindCloseChangeNotification 关闭文件系统变更通知句柄。";
-
     case GB_WinHandleCloseMethod::CloseServiceHandle:
         return u8"使用 CloseServiceHandle 关闭服务管理句柄。";
-
     case GB_WinHandleCloseMethod::RegCloseKey:
         return u8"使用 RegCloseKey 关闭注册表键句柄。";
-
     case GB_WinHandleCloseMethod::FreeLibrary:
         return u8"使用 FreeLibrary 释放动态库模块句柄。";
-
     case GB_WinHandleCloseMethod::LocalFree:
         return u8"使用 LocalFree 释放本地内存句柄。";
-
     case GB_WinHandleCloseMethod::GlobalFree:
         return u8"使用 GlobalFree 释放全局内存句柄。";
-
     case GB_WinHandleCloseMethod::DeleteObject:
         return u8"使用 DeleteObject 删除 GDI 对象。";
-
     case GB_WinHandleCloseMethod::DeleteDC:
         return u8"使用 DeleteDC 删除自建设备上下文。";
-
     case GB_WinHandleCloseMethod::ReleaseDC:
-        return u8"使用 ReleaseDC 释放 GetDC 或 GetWindowDC 获取的窗口设备上下文。";
-
+        return u8"使用 ReleaseDC 释放 GetDC 或 GetWindowDC 获取的设备上下文。";
     case GB_WinHandleCloseMethod::DestroyWindow:
         return u8"使用 DestroyWindow 销毁窗口。";
-
     case GB_WinHandleCloseMethod::DestroyMenu:
         return u8"使用 DestroyMenu 销毁菜单。";
-
     case GB_WinHandleCloseMethod::DestroyIcon:
         return u8"使用 DestroyIcon 销毁图标。";
-
     case GB_WinHandleCloseMethod::DestroyCursor:
         return u8"使用 DestroyCursor 销毁光标。";
-
     case GB_WinHandleCloseMethod::UnhookWindowsHookEx:
         return u8"使用 UnhookWindowsHookEx 卸载 Windows Hook。";
-
-    case GB_WinHandleCloseMethod::UnhookWinEvent:
-        return u8"使用 UnhookWinEvent 卸载辅助功能 WinEvent Hook。";
-
     case GB_WinHandleCloseMethod::UnmapViewOfFile:
         return u8"使用 UnmapViewOfFile 解除文件映射视图。";
-
     case GB_WinHandleCloseMethod::CoTaskMemFree:
         return u8"使用 CoTaskMemFree 释放 COM 任务内存。";
-
+    case GB_WinHandleCloseMethod::UnhookWinEvent:
+        return u8"使用 UnhookWinEvent 卸载辅助功能 WinEvent Hook。";
     default:
         break;
     }

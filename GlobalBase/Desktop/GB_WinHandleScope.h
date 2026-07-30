@@ -94,6 +94,7 @@ enum class GB_WinHandleCloseMethod : uint16_t
  * - Close() 会返回 GB_SystemResult；关闭成功、无需关闭或句柄本身无效时清空当前对象，关闭失败时保留句柄以便调用方诊断或重试；
  * - 本类不可复制，只能移动，保证同一资源在任意时刻最多只有一个所有者；
  * - 本类不会强行接管伪句柄、INVALID_HANDLE_VALUE、预定义注册表根键等不应关闭的句柄；
+ * - CloseHandle 路径不会调用 GetHandleInformation 预探测句柄，因为该 API 不支持全部可由 CloseHandle 关闭的对象类型，并且预探测无法消除句柄关闭前的竞态；
  * - std::string 均约定为 UTF-8 编码；
  * - 该类不保证线程安全，同一个实例不应被多个线程并发读写。
  */
@@ -104,9 +105,7 @@ public:
     using NativeHandle = void*;
 
 public:
-    /**
-     * @brief 构造空句柄对象。
-     */
+    /** @brief 构造空句柄对象。 */
     GB_WinHandleScope();
 
     /**
@@ -119,17 +118,13 @@ public:
      */
     GB_WinHandleScope(NativeHandle handle, GB_WinHandleCloseMethod closeMethod, NativeHandle contextHandle = nullptr, const std::string& resourceName = std::string());
 
-    /**
-     * @brief 析构并自动释放当前拥有的资源。
-     */
+    /** @brief 析构并自动释放当前拥有的资源。 */
     ~GB_WinHandleScope() noexcept;
 
     GB_WinHandleScope(const GB_WinHandleScope&) = delete;
     GB_WinHandleScope& operator=(const GB_WinHandleScope&) = delete;
 
-    /**
-     * @brief 移动构造，转移句柄所有权。
-     */
+    /** @brief 移动构造，转移句柄所有权。 */
     GB_WinHandleScope(GB_WinHandleScope&& other);
 
     /**
@@ -205,9 +200,7 @@ public:
     /** @brief 创建使用 CoTaskMemFree 释放的 COM 任务内存对象。 */
     static GB_WinHandleScope FromComTaskMemory(NativeHandle handle, const std::string& resourceName = std::string());
 
-    /**
-     * @brief 判断当前是否为空句柄。
-     */
+    /** @brief 判断当前是否为空句柄。 */
     bool IsEmpty() const;
 
     /**
@@ -216,52 +209,37 @@ public:
      * 说明：
      * - 空句柄和 INVALID_HANDLE_VALUE 返回 false；
      * - 借用句柄 closeMethod=None 只表示不拥有资源，不表示可以把失败 API 返回值视为有效句柄；
-     * - 预定义注册表根键是有效句柄值，但不是本类应关闭的自有资源。
+     * - 预定义注册表根键是有效句柄值，但不是本类应关闭的自有资源；
+     * - 本函数只校验句柄值和关闭策略，不探测句柄是否仍然打开；句柄生命周期仍由所有权约定保证。
      */
     bool IsValid() const;
 
-    /**
-     * @brief 判断当前对象是否拥有需要自动释放的资源。
-     */
+    /** @brief 判断当前对象是否拥有需要自动释放的资源。 */
     bool HasOwnership() const;
 
-    /**
-     * @brief 显式 bool 转换。true 表示当前句柄值有效。
-     */
+    /** @brief 显式 bool 转换。true 表示当前句柄值有效。 */
     explicit operator bool() const;
 
-    /**
-     * @brief 获取原生句柄。
-     */
+    /** @brief 获取原生句柄。 */
     NativeHandle GetHandle() const;
 
-    /**
-     * @brief 按指定类型获取原生句柄。
-     */
+    /** @brief 按指定类型获取原生句柄。 */
     template<typename HandleType>
     HandleType GetHandleAs() const
     {
         return reinterpret_cast<HandleType>(handle);
     }
 
-    /**
-     * @brief 获取上下文句柄。
-     */
+    /** @brief 获取上下文句柄。 */
     NativeHandle GetContextHandle() const;
 
-    /**
-     * @brief 获取关闭方式。
-     */
+    /** @brief 获取关闭方式。 */
     GB_WinHandleCloseMethod GetCloseMethod() const;
 
-    /**
-     * @brief 获取资源名或业务名。
-     */
+    /** @brief 获取资源名或业务名。 */
     std::string GetResourceName() const;
 
-    /**
-     * @brief 获取上一次 Close() 的结果。
-     */
+    /** @brief 获取上一次 Close() 的结果。 */
     GB_SystemResult GetLastCloseResult() const;
 
     /**
@@ -274,14 +252,10 @@ public:
      */
     GB_SystemResult Close();
 
-    /**
-     * @brief 释放所有权并返回原生句柄，不执行关闭。
-     */
+    /** @brief 释放所有权并返回原生句柄，不执行关闭。 */
     NativeHandle Detach();
 
-    /**
-     * @brief 释放所有权并按指定类型返回原生句柄，不执行关闭。
-     */
+    /** @brief 释放所有权并按指定类型返回原生句柄，不执行关闭。 */
     template<typename HandleType>
     HandleType DetachAs()
     {
@@ -300,53 +274,31 @@ public:
      */
     GB_SystemResult Reset(NativeHandle newHandle = nullptr, GB_WinHandleCloseMethod newCloseMethod = GB_WinHandleCloseMethod::None, NativeHandle newContextHandle = nullptr, const std::string& newResourceName = std::string());
 
-    /**
-     * @brief 交换两个对象。
-     */
+    /** @brief 交换两个对象。 */
     void Swap(GB_WinHandleScope& other);
 
-    /**
-     * @brief 获取 INVALID_HANDLE_VALUE 等价值。
-     */
+    /** @brief 获取 INVALID_HANDLE_VALUE 等价值。 */
     static NativeHandle GetInvalidHandleValue();
 
-    /**
-     * @brief 判断指定句柄是否为空。
-     */
+    /** @brief 判断指定句柄是否为空。 */
     static bool IsNullHandle(NativeHandle handle);
 
-    /**
-     * @brief 判断指定句柄是否等于 INVALID_HANDLE_VALUE。
-     */
+    /** @brief 判断指定句柄是否等于 INVALID_HANDLE_VALUE。 */
     static bool IsInvalidHandleValue(NativeHandle handle);
 
-    /**
-     * @brief 判断指定关闭方式是否为当前已定义的有效值。
-     */
+    /** @brief 判断指定关闭方式是否为当前已定义的有效值。 */
     static bool IsValidCloseMethodValue(uint64_t closeMethodValue);
 
-    /**
-     * @brief 判断指定句柄在指定关闭方式下是否为有效句柄值。
-     */
+    /** @brief 判断指定句柄在指定关闭方式下是否为有效句柄值。 */
     static bool IsValidHandleForCloseMethod(NativeHandle handle, GB_WinHandleCloseMethod closeMethod);
 
-    /**
-     * @brief 判断指定句柄在指定关闭方式下是否应由本类关闭。
-     */
+    /** @brief 判断指定句柄在指定关闭方式下是否应由本类关闭。 */
     static bool IsClosableHandleForCloseMethod(NativeHandle handle, GB_WinHandleCloseMethod closeMethod);
 
-    /**
-     * @brief 获取关闭方式英文名称。
-     *
-     * @return UTF-8 编码文本。
-     */
+    /** @brief 获取关闭方式英文名称。返回 UTF-8 编码文本。 */
     static std::string GetCloseMethodName(GB_WinHandleCloseMethod closeMethod);
 
-    /**
-     * @brief 获取关闭方式中文描述。
-     *
-     * @return UTF-8 编码文本。
-     */
+    /** @brief 获取关闭方式中文描述。返回 UTF-8 编码文本。 */
     static std::string GetCloseMethodDescription(GB_WinHandleCloseMethod closeMethod);
 
 private:
