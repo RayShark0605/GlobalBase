@@ -924,18 +924,25 @@ GB_SystemResult GB_EventDispatcher::DispatchPreparedEvent(const GB_Event& event,
         }
         catch (...)
         {
+            const std::exception_ptr callbackException = std::current_exception();
             ExceptionHandler localExceptionHandler;
             {
                 std::lock_guard<std::mutex> lock(stateMutex);
                 callbackExceptionCount++;
-                localExceptionHandler = exceptionHandler;
+                try
+                {
+                    localExceptionHandler = exceptionHandler;
+                }
+                catch (...)
+                {
+                }
             }
 
             if (localExceptionHandler)
             {
                 try
                 {
-                    localExceptionHandler(event, subscriptionSnapshot.subscriptionToken, std::current_exception());
+                    localExceptionHandler(event, subscriptionSnapshot.subscriptionToken, callbackException);
                 }
                 catch (...)
                 {
@@ -984,7 +991,13 @@ void GB_EventDispatcher::WorkerLoop()
             activeDispatchCount++;
         }
 
-        DispatchPreparedEvent(event, false);
+        try
+        {
+            (void)DispatchPreparedEvent(event, false);
+        }
+        catch (...)
+        {
+        }
         FinishActiveDispatch();
     }
 
