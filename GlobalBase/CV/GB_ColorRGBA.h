@@ -89,17 +89,17 @@ public:
     /**
      * @brief 获取原始字节指针，顺序固定为 RGBA。
      */
-    constexpr uint8_t* Data() noexcept
+    uint8_t* Data() noexcept
     {
-        return &r;
+        return reinterpret_cast<uint8_t*>(this);
     }
 
     /**
      * @brief 获取原始字节只读指针，顺序固定为 RGBA。
      */
-    constexpr const uint8_t* Data() const noexcept
+    const uint8_t* Data() const noexcept
     {
-        return &r;
+        return reinterpret_cast<const uint8_t*>(this);
     }
 
     /**
@@ -109,7 +109,7 @@ public:
     constexpr uint8_t& operator[](size_t channelIndex) noexcept
     {
         assert(channelIndex < 4);
-        return Data()[channelIndex];
+        return channelIndex == 0 ? r : (channelIndex == 1 ? g : (channelIndex == 2 ? b : a));
     }
 
     /**
@@ -119,7 +119,7 @@ public:
     constexpr const uint8_t& operator[](size_t channelIndex) const noexcept
     {
         assert(channelIndex < 4);
-        return Data()[channelIndex];
+        return channelIndex == 0 ? r : (channelIndex == 1 ? g : (channelIndex == 2 ? b : a));
     }
 
     /**
@@ -162,6 +162,7 @@ public:
 
     /**
      * @brief 从归一化 RGBA 构造。
+     * @note NaN 与负无穷按 0 处理，正无穷按 1 处理。
      */
     static constexpr GB_ColorRGBA FromFloatArray(const std::array<float, 4>& rgbaArray) noexcept
     {
@@ -170,6 +171,7 @@ public:
 
     /**
      * @brief 从归一化 RGBA 构造。
+     * @note NaN 与负无穷按 0 处理，正无穷按 1 处理。
      */
     static constexpr GB_ColorRGBA FromFloat(float red, float green, float blue, float alpha = 1.0f) noexcept
     {
@@ -355,6 +357,7 @@ public:
 
     /**
      * @brief 应用额外不透明度，只调整 Alpha，不修改 RGB。
+     * @note NaN 与负无穷按 0 处理，正无穷按饱和值处理。
      */
     constexpr GB_ColorRGBA ApplyOpacity(float opacity) const noexcept
     {
@@ -364,7 +367,7 @@ public:
     /**
      * @brief 线性插值。
      *
-     * @param t 插值因子，超出 [0, 1] 会被钳制。
+     * @param t 插值因子，超出 [0, 1] 会被钳制；NaN 按 0 处理。
      */
     static constexpr GB_ColorRGBA Lerp(const GB_ColorRGBA& firstColor, const GB_ColorRGBA& secondColor, float t) noexcept
     {
@@ -378,6 +381,8 @@ public:
 
     /**
      * @brief 标准 source-over Alpha 混合（非预乘输入，非预乘输出）。
+     *
+     * 计算过程只在最终输出处进行一次四舍五入，避免分阶段除以 255 造成双重舍入误差。
      *
      * @param sourceColor 源颜色（覆盖层）。
      * @param destinationColor 目标颜色（背景层）。
@@ -397,23 +402,21 @@ public:
         const int sourceAlpha = static_cast<int>(sourceColor.a);
         const int destinationAlpha = static_cast<int>(destinationColor.a);
         const int invSourceAlpha = 255 - sourceAlpha;
-
-        const int outAlpha = sourceAlpha + RoundDiv255(destinationAlpha * invSourceAlpha);
-        if (outAlpha <= 0)
+        const int alphaNumerator = sourceAlpha * 255 + destinationAlpha * invSourceAlpha;
+        if (alphaNumerator <= 0)
         {
             return GB_ColorRGBA(0, 0, 0, 0);
         }
 
-        const int redPremultiplied = static_cast<int>(sourceColor.r) * sourceAlpha + RoundDiv255(static_cast<int>(destinationColor.r) * destinationAlpha * invSourceAlpha);
-
-        const int greenPremultiplied = static_cast<int>(sourceColor.g) * sourceAlpha + RoundDiv255(static_cast<int>(destinationColor.g) * destinationAlpha * invSourceAlpha);
-
-        const int bluePremultiplied = static_cast<int>(sourceColor.b) * sourceAlpha + RoundDiv255(static_cast<int>(destinationColor.b) * destinationAlpha * invSourceAlpha);
+        const int outAlpha = RoundDiv255(alphaNumerator);
+        const int redNumerator = static_cast<int>(sourceColor.r) * sourceAlpha * 255 + static_cast<int>(destinationColor.r) * destinationAlpha * invSourceAlpha;
+        const int greenNumerator = static_cast<int>(sourceColor.g) * sourceAlpha * 255 + static_cast<int>(destinationColor.g) * destinationAlpha * invSourceAlpha;
+        const int blueNumerator = static_cast<int>(sourceColor.b) * sourceAlpha * 255 + static_cast<int>(destinationColor.b) * destinationAlpha * invSourceAlpha;
 
         return GB_ColorRGBA(
-            ClampToByte((redPremultiplied + outAlpha / 2) / outAlpha),
-            ClampToByte((greenPremultiplied + outAlpha / 2) / outAlpha),
-            ClampToByte((bluePremultiplied + outAlpha / 2) / outAlpha),
+            ClampToByte(DivideRounded(redNumerator, alphaNumerator)),
+            ClampToByte(DivideRounded(greenNumerator, alphaNumerator)),
+            ClampToByte(DivideRounded(blueNumerator, alphaNumerator)),
             static_cast<uint8_t>(outAlpha));
     }
 
@@ -534,6 +537,7 @@ public:
 
     /**
      * @brief 按标量缩放 RGBA 四个分量。
+     * @note NaN 与负无穷按 0 处理，正无穷按饱和值处理。
      */
     constexpr GB_ColorRGBA operator*(float scalar) const noexcept
     {
@@ -588,12 +592,13 @@ private:
 
     static constexpr float ClampUnitFloat(float value) noexcept
     {
-        return value <= 0.0f ? 0.0f : (value >= 1.0f ? 1.0f : value);
+        return !(value > 0.0f) ? 0.0f : (value >= 1.0f ? 1.0f : value);
     }
 
     static constexpr uint8_t ClampUnitFloatToByte(float value) noexcept
     {
-        return ClampToByte(static_cast<int>(ClampUnitFloat(value) * 255.0f + 0.5f));
+        const float clampedValue = ClampUnitFloat(value);
+        return clampedValue >= 1.0f ? 255 : static_cast<uint8_t>(clampedValue * 255.0f + 0.5f);
     }
 
     static constexpr uint8_t SaturatingAdd(uint8_t firstValue, uint8_t secondValue) noexcept
@@ -611,6 +616,11 @@ private:
         return (value + 127) / 255;
     }
 
+    static constexpr int DivideRounded(int numerator, int denominator) noexcept
+    {
+        return (numerator + denominator / 2) / denominator;
+    }
+
     static constexpr uint8_t MultiplyChannel(uint8_t firstValue, uint8_t secondValue) noexcept
     {
         return static_cast<uint8_t>(RoundDiv255(static_cast<int>(firstValue) * static_cast<int>(secondValue)));
@@ -618,12 +628,18 @@ private:
 
     static constexpr uint8_t MultiplyByScalar(uint8_t channelValue, float scalar) noexcept
     {
-        if (scalar <= 0.0f)
+        if (channelValue == 0 || !(scalar > 0.0f))
         {
             return 0;
         }
 
-        return ClampToByte(static_cast<int>(static_cast<float>(channelValue) * scalar + 0.5f));
+        const float saturationScalar = 255.0f / static_cast<float>(channelValue);
+        if (scalar >= saturationScalar)
+        {
+            return 255;
+        }
+
+        return static_cast<uint8_t>(static_cast<float>(channelValue) * scalar + 0.5f);
     }
 
     static constexpr uint8_t LerpChannel(uint8_t firstValue, uint8_t secondValue, float t) noexcept
@@ -640,6 +656,7 @@ inline constexpr GB_ColorRGBA operator*(float scalar, const GB_ColorRGBA& color)
     return color * scalar;
 }
 
+static_assert(std::is_same<uint8_t, unsigned char>::value, "GB_ColorRGBA requires uint8_t to be unsigned char for raw byte access.");
 static_assert(sizeof(GB_ColorRGBA) == 4, "GB_ColorRGBA must be exactly 4 bytes.");
 static_assert(alignof(GB_ColorRGBA) == 1, "GB_ColorRGBA alignment must be 1.");
 static_assert(offsetof(GB_ColorRGBA, r) == 0, "GB_ColorRGBA::r offset must be 0.");
@@ -648,7 +665,6 @@ static_assert(offsetof(GB_ColorRGBA, b) == 2, "GB_ColorRGBA::b offset must be 2.
 static_assert(offsetof(GB_ColorRGBA, a) == 3, "GB_ColorRGBA::a offset must be 3.");
 static_assert(std::is_standard_layout<GB_ColorRGBA>::value, "GB_ColorRGBA must be a standard-layout type.");
 static_assert(std::is_trivially_copyable<GB_ColorRGBA>::value, "GB_ColorRGBA must be trivially copyable.");
-
 
 /**
  * @brief HSV 颜色（浮点表示）。
