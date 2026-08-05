@@ -67,7 +67,7 @@ namespace
 
     static inline float ClampUnitFloat(float value) noexcept
     {
-        return value <= 0.0f ? 0.0f : (value >= 1.0f ? 1.0f : value);
+        return !(value > 0.0f) ? 0.0f : (value >= 1.0f ? 1.0f : value);
     }
 
     static inline float WrapHue360(float hue) noexcept
@@ -400,7 +400,6 @@ GB_ColorRGBA GB_ColorRGBA::FromHsl(const GB_ColorHSL& hslColor) noexcept
     }
 
     const float qValue = lightness < 0.5f ? lightness * (1.0f + saturation) : lightness + saturation - lightness * saturation;
-
     const float pValue = 2.0f * lightness - qValue;
 
     return GB_ColorRGBA::FromFloat(HueToRgb(pValue, qValue, hue + 1.0f / 3.0f), HueToRgb(pValue, qValue, hue), HueToRgb(pValue, qValue, hue - 1.0f / 3.0f), alpha);
@@ -415,7 +414,6 @@ GB_ColorRGBA GB_ColorRGBA::FromLinearRgba(const GB_ColorLinearRGBA& linearColor)
 {
     return GB_ColorRGBA::FromFloat(LinearToSrgb(linearColor.r), LinearToSrgb(linearColor.g), LinearToSrgb(linearColor.b), ClampUnitFloat(linearColor.a));
 }
-
 
 const std::string& GB_ColorRGBA::GetClassType() const
 {
@@ -513,9 +511,9 @@ bool GB_ColorRGBA::Deserialize(const std::string& data)
 bool GB_ColorRGBA::Deserialize(const GB_ByteBuffer& data)
 {
     constexpr static uint16_t expectedPayloadVersion = 1;
-    constexpr static size_t minSize = 20;
+    constexpr static size_t expectedSize = 20;
 
-    if (data.size() < minSize)
+    if (data.size() != expectedSize)
     {
         return false;
     }
@@ -534,19 +532,19 @@ bool GB_ColorRGBA::Deserialize(const GB_ByteBuffer& data)
         return false;
     }
 
-    if (magic != GB_ClassMagicNumber || typeId != GetClassTypeId() || payloadVersion != expectedPayloadVersion)
+    if (magic != GB_ClassMagicNumber || typeId != GetClassTypeId() || payloadVersion != expectedPayloadVersion || reserved != 0 || offset + 4 != data.size())
     {
         return false;
     }
 
-    if (offset + 4 > data.size())
-    {
-        return false;
-    }
+    const uint8_t parsedRed = data[offset];
+    const uint8_t parsedGreen = data[offset + 1];
+    const uint8_t parsedBlue = data[offset + 2];
+    const uint8_t parsedAlpha = data[offset + 3];
 
-    r = data[offset];
-    g = data[offset + 1];
-    b = data[offset + 2];
-    a = data[offset + 3];
+    r = parsedRed;
+    g = parsedGreen;
+    b = parsedBlue;
+    a = parsedAlpha;
     return true;
 }
