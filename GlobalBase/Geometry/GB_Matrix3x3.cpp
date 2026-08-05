@@ -1,99 +1,283 @@
-﻿#include "GB_Matrix3x3.h"
+#include "GB_Matrix3x3.h"
 #include "GB_Vector2d.h"
 #include "GB_Point2d.h"
 #include "../GB_IO.h"
+
+#include <algorithm>
 #include <cassert>
+#include <cmath>
+#include <cstdint>
 #include <iomanip>
+#include <limits>
 #include <locale>
 #include <sstream>
-#include <algorithm>
+#include <utility>
 
 namespace
 {
-    static inline double Sqr(double value)
+    struct Linear2x2Info
     {
-        return value * value;
-    }
+        double globalScale = 0.0;
+        double normalizedLengthX = 0.0;
+        double normalizedLengthY = 0.0;
+        double unitX0 = 0.0;
+        double unitY0 = 0.0;
+        double unitX1 = 0.0;
+        double unitY1 = 0.0;
+    };
 
     static inline bool IsFinite(double value)
     {
         return std::isfinite(value) != 0;
     }
 
-    struct Linear2x2Info
+    static bool TryGetAbsoluteTolerance(double tolerance, double& absoluteTolerance)
     {
-        double c0Len2 = GB_QuietNan;
-        double c1Len2 = GB_QuietNan;
-        double dot = GB_QuietNan;
-    };
+        if (std::isnan(tolerance))
+        {
+            absoluteTolerance = 0.0;
+            return false;
+        }
 
-    static inline bool TryGetLinear2x2Info(const GB_Matrix3x3& mat, double absTol, Linear2x2Info& info)
+        absoluteTolerance = std::abs(tolerance);
+        return true;
+    }
+
+    static bool IsExactlyAffine2d(const GB_Matrix3x3& matrix)
     {
-        if (!mat.IsValid())
+        return matrix.m[2][0] == 0.0 && matrix.m[2][1] == 0.0 && matrix.m[2][2] == 1.0;
+    }
+
+    static bool TryGetLinear2x2Info(const GB_Matrix3x3& matrix, Linear2x2Info& info)
+    {
+        if (!matrix.IsValid())
         {
             return false;
         }
 
-        const double c0x = mat.m[0][0];
-        const double c0y = mat.m[1][0];
-        const double c1x = mat.m[0][1];
-        const double c1y = mat.m[1][1];
-
-        info.c0Len2 = c0x * c0x + c0y * c0y;
-        info.c1Len2 = c1x * c1x + c1y * c1y;
-        info.dot = c0x * c1x + c0y * c1y;
-
-        const double minLen2 = absTol * absTol;
-        if (!IsFinite(info.c0Len2) || !IsFinite(info.c1Len2) || !IsFinite(info.dot))
+        const double globalScale = std::max(std::max(std::abs(matrix.m[0][0]), std::abs(matrix.m[1][0])), std::max(std::abs(matrix.m[0][1]), std::abs(matrix.m[1][1])));
+        if (globalScale == 0.0)
         {
             return false;
         }
 
-        if (info.c0Len2 <= minLen2 || info.c1Len2 <= minLen2)
+        const double normalizedX0 = matrix.m[0][0] / globalScale;
+        const double normalizedY0 = matrix.m[1][0] / globalScale;
+        const double normalizedX1 = matrix.m[0][1] / globalScale;
+        const double normalizedY1 = matrix.m[1][1] / globalScale;
+        const double normalizedLengthX = std::hypot(normalizedX0, normalizedY0);
+        const double normalizedLengthY = std::hypot(normalizedX1, normalizedY1);
+        if (!IsFinite(normalizedLengthX) || !IsFinite(normalizedLengthY) || normalizedLengthX == 0.0 || normalizedLengthY == 0.0)
         {
+            return false;
+        }
+
+        info.globalScale = globalScale;
+        info.normalizedLengthX = normalizedLengthX;
+        info.normalizedLengthY = normalizedLengthY;
+        info.unitX0 = normalizedX0 / normalizedLengthX;
+        info.unitY0 = normalizedY0 / normalizedLengthX;
+        info.unitX1 = normalizedX1 / normalizedLengthY;
+        info.unitY1 = normalizedY1 / normalizedLengthY;
+        return true;
+    }
+
+    static bool IsScaledOrthogonalByInfo(const Linear2x2Info& info, double absoluteTolerance)
+    {
+        const double normalizedDot = info.unitX0 * info.unitX1 + info.unitY0 * info.unitY1;
+        return std::abs(normalizedDot) <= absoluteTolerance;
+    }
+
+    static bool IsUniformScaleByInfo(const Linear2x2Info& info, double absoluteTolerance)
+    {
+        const double maxNormalizedLength = std::max(info.normalizedLengthX, info.normalizedLengthY);
+        return std::abs(info.normalizedLengthX - info.normalizedLengthY) <= absoluteTolerance * maxNormalizedLength;
+    }
+
+    static bool TryGetScaleFactorsByInfo(const Linear2x2Info& info, double& scaleX, double& scaleY)
+    {
+        scaleX = info.globalScale * info.normalizedLengthX;
+        scaleY = info.globalScale * info.normalizedLengthY;
+        if (!IsFinite(scaleX) || !IsFinite(scaleY))
+        {
+            scaleX = GB_QuietNan;
+            scaleY = GB_QuietNan;
             return false;
         }
 
         return true;
     }
 
-    static inline bool IsScaledOrthogonalByInfo(const Linear2x2Info& info, double absTol)
+    static bool TryInvertGeneralMatrix(const GB_Matrix3x3& sourceMatrix, double tolerance, GB_Matrix3x3& inverseMatrix)
     {
-        // dot^2 <= (tol^2) * |c0|^2 * |c1|^2
-        const double lhs = info.dot * info.dot;
-        const double rhs = (absTol * absTol) * info.c0Len2 * info.c1Len2;
-
-        if (!IsFinite(lhs) || !IsFinite(rhs))
+        double absoluteTolerance = 0.0;
+        if (!sourceMatrix.IsValid() || !TryGetAbsoluteTolerance(tolerance, absoluteTolerance))
         {
             return false;
         }
 
-        return lhs <= rhs;
+        double augmentedMatrix[3][6];
+        double rowScales[3];
+        for (size_t rowIndex = 0; rowIndex < 3; rowIndex++)
+        {
+            rowScales[rowIndex] = 0.0;
+            for (size_t colIndex = 0; colIndex < 3; colIndex++)
+            {
+                augmentedMatrix[rowIndex][colIndex] = sourceMatrix.m[rowIndex][colIndex];
+                rowScales[rowIndex] = std::max(rowScales[rowIndex], std::abs(sourceMatrix.m[rowIndex][colIndex]));
+                augmentedMatrix[rowIndex][colIndex + 3] = rowIndex == colIndex ? 1.0 : 0.0;
+            }
+
+            if (rowScales[rowIndex] == 0.0)
+            {
+                return false;
+            }
+        }
+
+        for (size_t pivotColumn = 0; pivotColumn < 3; pivotColumn++)
+        {
+            size_t pivotRow = pivotColumn;
+            double bestScaledPivot = 0.0;
+            for (size_t candidateRow = pivotColumn; candidateRow < 3; candidateRow++)
+            {
+                const double scaledPivot = std::abs(augmentedMatrix[candidateRow][pivotColumn]) / rowScales[candidateRow];
+                if (scaledPivot > bestScaledPivot)
+                {
+                    bestScaledPivot = scaledPivot;
+                    pivotRow = candidateRow;
+                }
+            }
+
+            if (!IsFinite(bestScaledPivot) || bestScaledPivot <= absoluteTolerance)
+            {
+                return false;
+            }
+
+            if (pivotRow != pivotColumn)
+            {
+                for (size_t colIndex = 0; colIndex < 6; colIndex++)
+                {
+                    std::swap(augmentedMatrix[pivotRow][colIndex], augmentedMatrix[pivotColumn][colIndex]);
+                }
+                std::swap(rowScales[pivotRow], rowScales[pivotColumn]);
+            }
+
+            const double pivotValue = augmentedMatrix[pivotColumn][pivotColumn];
+            if (!IsFinite(pivotValue) || pivotValue == 0.0)
+            {
+                return false;
+            }
+
+            for (size_t colIndex = 0; colIndex < 6; colIndex++)
+            {
+                augmentedMatrix[pivotColumn][colIndex] /= pivotValue;
+                if (!IsFinite(augmentedMatrix[pivotColumn][colIndex]))
+                {
+                    return false;
+                }
+            }
+
+            for (size_t rowIndex = 0; rowIndex < 3; rowIndex++)
+            {
+                if (rowIndex == pivotColumn)
+                {
+                    continue;
+                }
+
+                const double eliminationFactor = augmentedMatrix[rowIndex][pivotColumn];
+                if (eliminationFactor == 0.0)
+                {
+                    continue;
+                }
+
+                for (size_t colIndex = 0; colIndex < 6; colIndex++)
+                {
+                    augmentedMatrix[rowIndex][colIndex] -= eliminationFactor * augmentedMatrix[pivotColumn][colIndex];
+                    if (!IsFinite(augmentedMatrix[rowIndex][colIndex]))
+                    {
+                        return false;
+                    }
+                }
+            }
+        }
+
+        GB_Matrix3x3 result;
+        for (size_t rowIndex = 0; rowIndex < 3; rowIndex++)
+        {
+            for (size_t colIndex = 0; colIndex < 3; colIndex++)
+            {
+                result.m[rowIndex][colIndex] = augmentedMatrix[rowIndex][colIndex + 3];
+            }
+        }
+
+        if (!result.IsValid())
+        {
+            return false;
+        }
+
+        inverseMatrix = result;
+        return true;
     }
 
-    static inline bool TryGetScaleByLen2(double c0Len2, double c1Len2, double& scaleX, double& scaleY)
+    template<typename ElementType>
+    static bool HasUnsupportedPartialOverlap(const ElementType* inputElements, ElementType* outputElements, size_t numElements)
     {
-        scaleX = std::sqrt(c0Len2);
-        scaleY = std::sqrt(c1Len2);
-        return IsFinite(scaleX) && IsFinite(scaleY);
+        if (numElements == 0 || inputElements == outputElements)
+        {
+            return false;
+        }
+
+        if (numElements > std::numeric_limits<size_t>::max() / sizeof(ElementType))
+        {
+            return true;
+        }
+
+        const size_t byteSize = numElements * sizeof(ElementType);
+        const uintptr_t inputBegin = reinterpret_cast<uintptr_t>(inputElements);
+        const uintptr_t outputBegin = reinterpret_cast<uintptr_t>(outputElements);
+        if (inputBegin > std::numeric_limits<uintptr_t>::max() - byteSize || outputBegin > std::numeric_limits<uintptr_t>::max() - byteSize)
+        {
+            return true;
+        }
+
+        const uintptr_t inputEnd = inputBegin + byteSize;
+        const uintptr_t outputEnd = outputBegin + byteSize;
+        return inputBegin < outputEnd && outputBegin < inputEnd;
+    }
+
+    static GB_Point2d TransformPointAffineUnchecked(const GB_Matrix3x3& matrix, const GB_Point2d& point)
+    {
+        if (!point.IsValid())
+        {
+            return GB_Point2d();
+        }
+
+        const double transformedX = std::fma(matrix.m[0][0], point.x, std::fma(matrix.m[0][1], point.y, matrix.m[0][2]));
+        const double transformedY = std::fma(matrix.m[1][0], point.x, std::fma(matrix.m[1][1], point.y, matrix.m[1][2]));
+        const GB_Point2d result(transformedX, transformedY);
+        return result.IsValid() ? result : GB_Point2d();
+    }
+
+    static GB_Vector2d TransformVectorUnchecked(const GB_Matrix3x3& matrix, const GB_Vector2d& vector)
+    {
+        if (!vector.IsValid())
+        {
+            return GB_Vector2d();
+        }
+
+        const double transformedX = std::fma(matrix.m[0][0], vector.x, matrix.m[0][1] * vector.y);
+        const double transformedY = std::fma(matrix.m[1][0], vector.x, matrix.m[1][1] * vector.y);
+        const GB_Vector2d result(transformedX, transformedY);
+        return result.IsValid() ? result : GB_Vector2d();
     }
 }
 
 const GB_Matrix3x3 GB_Matrix3x3::Zero(0, 0, 0, 0, 0, 0, 0, 0, 0);
-
 const GB_Matrix3x3 GB_Matrix3x3::Identity(1, 0, 0, 0, 1, 0, 0, 0, 1);
 
 GB_Matrix3x3::GB_Matrix3x3()
 {
-    m[0][0] = GB_QuietNan;
-    m[0][1] = GB_QuietNan;
-    m[0][2] = GB_QuietNan;
-    m[1][0] = GB_QuietNan;
-    m[1][1] = GB_QuietNan;
-    m[1][2] = GB_QuietNan;
-    m[2][0] = GB_QuietNan;
-    m[2][1] = GB_QuietNan;
-    m[2][2] = GB_QuietNan;
+    Set(GB_QuietNan, GB_QuietNan, GB_QuietNan, GB_QuietNan, GB_QuietNan, GB_QuietNan, GB_QuietNan, GB_QuietNan, GB_QuietNan);
 }
 
 GB_Matrix3x3::GB_Matrix3x3(double m00, double m01, double m02, double m10, double m11, double m12, double m20, double m21, double m22)
@@ -122,11 +306,9 @@ void GB_Matrix3x3::Set(double m00, double m01, double m02, double m10, double m1
     m[0][0] = m00;
     m[0][1] = m01;
     m[0][2] = m02;
-
     m[1][0] = m10;
     m[1][1] = m11;
     m[1][2] = m12;
-
     m[2][0] = m20;
     m[2][1] = m21;
     m[2][2] = m22;
@@ -160,24 +342,32 @@ void GB_Matrix3x3::SetToZero()
 
 bool GB_Matrix3x3::IsValid() const
 {
-    return IsFinite(m[0][0]) && IsFinite(m[0][1]) && IsFinite(m[0][2]) &&
-        IsFinite(m[1][0]) && IsFinite(m[1][1]) && IsFinite(m[1][2]) &&
-        IsFinite(m[2][0]) && IsFinite(m[2][1]) && IsFinite(m[2][2]);
-}
-
-bool GB_Matrix3x3::IsZero(double tolerance) const
-{
-    if (!IsValid())
-    {
-        return false;
-    }
-
-    const double absTol = std::abs(tolerance);
     for (size_t rowIndex = 0; rowIndex < 3; rowIndex++)
     {
         for (size_t colIndex = 0; colIndex < 3; colIndex++)
         {
-            if (std::abs(m[rowIndex][colIndex]) > absTol)
+            if (!IsFinite(m[rowIndex][colIndex]))
+            {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+bool GB_Matrix3x3::IsZero(double tolerance) const
+{
+    double absoluteTolerance = 0.0;
+    if (!IsValid() || !TryGetAbsoluteTolerance(tolerance, absoluteTolerance))
+    {
+        return false;
+    }
+
+    for (size_t rowIndex = 0; rowIndex < 3; rowIndex++)
+    {
+        for (size_t colIndex = 0; colIndex < 3; colIndex++)
+        {
+            if (std::abs(m[rowIndex][colIndex]) > absoluteTolerance)
             {
                 return false;
             }
@@ -188,18 +378,18 @@ bool GB_Matrix3x3::IsZero(double tolerance) const
 
 bool GB_Matrix3x3::IsIdentity(double tolerance) const
 {
-    if (!IsValid())
+    double absoluteTolerance = 0.0;
+    if (!IsValid() || !TryGetAbsoluteTolerance(tolerance, absoluteTolerance))
     {
         return false;
     }
 
-    const double absTol = std::abs(tolerance);
     for (size_t rowIndex = 0; rowIndex < 3; rowIndex++)
     {
         for (size_t colIndex = 0; colIndex < 3; colIndex++)
         {
-            const double expected = (rowIndex == colIndex) ? 1 : 0;
-            if (std::abs(m[rowIndex][colIndex] - expected) > absTol)
+            const double expectedValue = rowIndex == colIndex ? 1.0 : 0.0;
+            if (std::abs(m[rowIndex][colIndex] - expectedValue) > absoluteTolerance)
             {
                 return false;
             }
@@ -210,17 +400,17 @@ bool GB_Matrix3x3::IsIdentity(double tolerance) const
 
 bool GB_Matrix3x3::IsNearEqual(const GB_Matrix3x3& other, double tolerance) const
 {
-    if (!IsValid() || !other.IsValid())
+    double absoluteTolerance = 0.0;
+    if (!IsValid() || !other.IsValid() || !TryGetAbsoluteTolerance(tolerance, absoluteTolerance))
     {
         return false;
     }
 
-    const double absTol = std::abs(tolerance);
     for (size_t rowIndex = 0; rowIndex < 3; rowIndex++)
     {
         for (size_t colIndex = 0; colIndex < 3; colIndex++)
         {
-            if (std::abs(m[rowIndex][colIndex] - other.m[rowIndex][colIndex]) > absTol)
+            if (std::abs(m[rowIndex][colIndex] - other.m[rowIndex][colIndex]) > absoluteTolerance)
             {
                 return false;
             }
@@ -231,13 +421,13 @@ bool GB_Matrix3x3::IsNearEqual(const GB_Matrix3x3& other, double tolerance) cons
 
 bool GB_Matrix3x3::IsAffine2d(double tolerance) const
 {
-    if (!IsValid())
+    double absoluteTolerance = 0.0;
+    if (!IsValid() || !TryGetAbsoluteTolerance(tolerance, absoluteTolerance))
     {
         return false;
     }
 
-    const double absTol = std::abs(tolerance);
-    return std::abs(m[2][0]) <= absTol && std::abs(m[2][1]) <= absTol && std::abs(m[2][2] - 1) <= absTol;
+    return std::abs(m[2][0]) <= absoluteTolerance && std::abs(m[2][1]) <= absoluteTolerance && std::abs(m[2][2] - 1.0) <= absoluteTolerance;
 }
 
 GB_Matrix3x3 GB_Matrix3x3::operator+(const GB_Matrix3x3& other) const
@@ -268,21 +458,14 @@ GB_Matrix3x3 GB_Matrix3x3::operator-(const GB_Matrix3x3& other) const
 
 GB_Matrix3x3 GB_Matrix3x3::operator*(const GB_Matrix3x3& other) const
 {
-    GB_Matrix3x3 result = Zero;
-
+    GB_Matrix3x3 result;
     for (size_t rowIndex = 0; rowIndex < 3; rowIndex++)
     {
         for (size_t colIndex = 0; colIndex < 3; colIndex++)
         {
-            double sum = 0;
-            for (size_t k = 0; k < 3; k++)
-            {
-                sum += m[rowIndex][k] * other.m[k][colIndex];
-            }
-            result.m[rowIndex][colIndex] = sum;
+            result.m[rowIndex][colIndex] = std::fma(m[rowIndex][0], other.m[0][colIndex], std::fma(m[rowIndex][1], other.m[1][colIndex], m[rowIndex][2] * other.m[2][colIndex]));
         }
     }
-
     return result;
 }
 
@@ -312,7 +495,7 @@ GB_Matrix3x3& GB_Matrix3x3::operator-=(const GB_Matrix3x3& other)
 
 GB_Matrix3x3& GB_Matrix3x3::operator*=(const GB_Matrix3x3& other)
 {
-    *this = (*this) * other;
+    *this = *this * other;
     return *this;
 }
 
@@ -373,56 +556,40 @@ const double* GB_Matrix3x3::Data() const
 
 GB_Matrix3x3 GB_Matrix3x3::LeftMultiplied(const GB_Matrix3x3& left) const
 {
-    return left * (*this);
+    return left * *this;
 }
 
 void GB_Matrix3x3::LeftMultiply(const GB_Matrix3x3& left)
 {
-    *this = left * (*this);
+    *this = left * *this;
 }
 
 GB_Matrix3x3 GB_Matrix3x3::RightMultiplied(const GB_Matrix3x3& right) const
 {
-    return (*this) * right;
+    return *this * right;
 }
 
 void GB_Matrix3x3::RightMultiply(const GB_Matrix3x3& right)
 {
-    *this = (*this) * right;
+    *this = *this * right;
 }
 
 GB_Matrix3x3 GB_Matrix3x3::Transposed() const
 {
-    GB_Matrix3x3 result;
-    for (size_t rowIndex = 0; rowIndex < 3; rowIndex++)
-    {
-        for (size_t colIndex = 0; colIndex < 3; colIndex++)
-        {
-            result.m[rowIndex][colIndex] = m[colIndex][rowIndex];
-        }
-    }
-    return result;
+    return GB_Matrix3x3(m[0][0], m[1][0], m[2][0], m[0][1], m[1][1], m[2][1], m[0][2], m[1][2], m[2][2]);
 }
 
 void GB_Matrix3x3::Transpose()
 {
-    *this = Transposed();
+    std::swap(m[0][1], m[1][0]);
+    std::swap(m[0][2], m[2][0]);
+    std::swap(m[1][2], m[2][1]);
 }
 
 bool GB_Matrix3x3::CanInvert(double tolerance) const
 {
-    if (!IsValid())
-    {
-        return false;
-    }
-
-    const double absTol = std::abs(tolerance);
-    const double det = IsAffine2d(absTol) ? Det2x2() : Det();
-    if (!std::isfinite(det))
-    {
-        return false;
-    }
-    return std::abs(det) > absTol;
+    GB_Matrix3x3 inverseMatrix;
+    return TryInvertGeneralMatrix(*this, tolerance, inverseMatrix);
 }
 
 GB_Matrix3x3 GB_Matrix3x3::Inverted(double tolerance) const
@@ -443,56 +610,43 @@ bool GB_Matrix3x3::Invert(double tolerance)
         return false;
     }
 
-    if (TryInvertAffine2d(tolerance))
+    if (IsExactlyAffine2d(*this) && TryInvertAffine2d(tolerance))
     {
         return true;
     }
 
-    const double det = Det();
-    if (!IsFinite(det) || std::abs(det) <= std::abs(tolerance))
+    GB_Matrix3x3 inverseMatrix;
+    if (!TryInvertGeneralMatrix(*this, tolerance, inverseMatrix))
     {
         *this = GB_Matrix3x3();
         return false;
     }
 
-    const double invDet = 1.0 / det;
-
-    // 伴随矩阵（余子式矩阵转置）
-    GB_Matrix3x3 adj;
-
-    adj.m[0][0] = (m[1][1] * m[2][2] - m[1][2] * m[2][1]);
-    adj.m[0][1] = -(m[0][1] * m[2][2] - m[0][2] * m[2][1]);
-    adj.m[0][2] = (m[0][1] * m[1][2] - m[0][2] * m[1][1]);
-
-    adj.m[1][0] = -(m[1][0] * m[2][2] - m[1][2] * m[2][0]);
-    adj.m[1][1] = (m[0][0] * m[2][2] - m[0][2] * m[2][0]);
-    adj.m[1][2] = -(m[0][0] * m[1][2] - m[0][2] * m[1][0]);
-
-    adj.m[2][0] = (m[1][0] * m[2][1] - m[1][1] * m[2][0]);
-    adj.m[2][1] = -(m[0][0] * m[2][1] - m[0][1] * m[2][0]);
-    adj.m[2][2] = (m[0][0] * m[1][1] - m[0][1] * m[1][0]);
-
-    for (size_t rowIndex = 0; rowIndex < 3; rowIndex++)
-    {
-        for (size_t colIndex = 0; colIndex < 3; colIndex++)
-        {
-            m[rowIndex][colIndex] = adj.m[rowIndex][colIndex] * invDet;
-        }
-    }
-
+    *this = inverseMatrix;
     return true;
 }
 
 double GB_Matrix3x3::Det() const
 {
-    return m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1]) 
-        - m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0]) 
-        + m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0]);
+    if (!IsValid())
+    {
+        return GB_QuietNan;
+    }
+
+    const double firstMinor = std::fma(m[1][1], m[2][2], -m[1][2] * m[2][1]);
+    const double secondMinor = std::fma(m[1][0], m[2][2], -m[1][2] * m[2][0]);
+    const double thirdMinor = std::fma(m[1][0], m[2][1], -m[1][1] * m[2][0]);
+    return std::fma(m[0][0], firstMinor, std::fma(-m[0][1], secondMinor, m[0][2] * thirdMinor));
 }
 
 double GB_Matrix3x3::Det2x2() const
 {
-    return m[0][0] * m[1][1] - m[0][1] * m[1][0];
+    if (!IsValid())
+    {
+        return GB_QuietNan;
+    }
+
+    return std::fma(m[0][0], m[1][1], -m[0][1] * m[1][0]);
 }
 
 void GB_Matrix3x3::SetTranslation(double translateX, double translateY)
@@ -503,8 +657,7 @@ void GB_Matrix3x3::SetTranslation(double translateX, double translateY)
 
 void GB_Matrix3x3::SetTranslation(const GB_Vector2d& translation)
 {
-    m[0][2] = translation.x;
-    m[1][2] = translation.y;
+    SetTranslation(translation.x, translation.y);
 }
 
 GB_Vector2d GB_Matrix3x3::GetTranslation() const
@@ -514,84 +667,41 @@ GB_Vector2d GB_Matrix3x3::GetTranslation() const
 
 void GB_Matrix3x3::ClearTranslation()
 {
-    m[0][2] = 0;
-    m[1][2] = 0;
+    m[0][2] = 0.0;
+    m[1][2] = 0.0;
 }
 
 bool GB_Matrix3x3::IsScaledOrthogonal(double tolerance) const
 {
-    const double absTol = std::abs(tolerance);
-
+    double absoluteTolerance = 0.0;
     Linear2x2Info info;
-    if (!TryGetLinear2x2Info(*this, absTol, info))
-    {
-        return false;
-    }
-
-    return IsScaledOrthogonalByInfo(info, absTol);
+    return TryGetAbsoluteTolerance(tolerance, absoluteTolerance) && TryGetLinear2x2Info(*this, info) && IsScaledOrthogonalByInfo(info, absoluteTolerance);
 }
 
 bool GB_Matrix3x3::IsUniformScaledOrthogonal(double tolerance) const
 {
-    const double absTol = std::abs(tolerance);
-
+    double absoluteTolerance = 0.0;
     Linear2x2Info info;
-    if (!TryGetLinear2x2Info(*this, absTol, info))
-    {
-        return false;
-    }
-
-    if (!IsScaledOrthogonalByInfo(info, absTol))
-    {
-        return false;
-    }
-
-    double scaleX = GB_QuietNan;
-    double scaleY = GB_QuietNan;
-    if (!TryGetScaleByLen2(info.c0Len2, info.c1Len2, scaleX, scaleY))
-    {
-        return false;
-    }
-
-    const double maxLen = std::max(scaleX, scaleY);
-    return std::abs(scaleX - scaleY) <= absTol * maxLen;
+    return TryGetAbsoluteTolerance(tolerance, absoluteTolerance) && TryGetLinear2x2Info(*this, info) && IsScaledOrthogonalByInfo(info, absoluteTolerance) && IsUniformScaleByInfo(info, absoluteTolerance);
 }
 
 bool GB_Matrix3x3::IsOrthogonal(double tolerance) const
 {
-    const double absTol = std::abs(tolerance);
-
+    double absoluteTolerance = 0.0;
     Linear2x2Info info;
-    if (!TryGetLinear2x2Info(*this, absTol, info))
-    {
-        return false;
-    }
-
-    if (!IsScaledOrthogonalByInfo(info, absTol))
+    if (!TryGetAbsoluteTolerance(tolerance, absoluteTolerance) || !TryGetLinear2x2Info(*this, info) || !IsScaledOrthogonalByInfo(info, absoluteTolerance))
     {
         return false;
     }
 
     double scaleX = GB_QuietNan;
     double scaleY = GB_QuietNan;
-    if (!TryGetScaleByLen2(info.c0Len2, info.c1Len2, scaleX, scaleY))
+    if (!TryGetScaleFactorsByInfo(info, scaleX, scaleY))
     {
         return false;
     }
 
-    const double maxLen = std::max(scaleX, scaleY);
-    if (std::abs(scaleX - scaleY) > absTol * maxLen)
-    {
-        return false;
-    }
-
-    const double scale = 0.5 * (scaleX + scaleY);
-    if (!IsFinite(scale))
-    {
-        return false;
-    }
-
-    return std::abs(scale - 1.0) <= absTol;
+    return std::abs(scaleX - 1.0) <= absoluteTolerance && std::abs(scaleY - 1.0) <= absoluteTolerance;
 }
 
 bool GB_Matrix3x3::IsRigid(double tolerance) const
@@ -601,7 +711,7 @@ bool GB_Matrix3x3::IsRigid(double tolerance) const
 
 bool GB_Matrix3x3::IsConformal(double tolerance) const
 {
-    return IsUniformScaledOrthogonal(tolerance);
+    return IsAffine2d(tolerance) && IsUniformScaledOrthogonal(tolerance);
 }
 
 double GB_Matrix3x3::GetRotationAngle(double tolerance) const
@@ -611,21 +721,14 @@ double GB_Matrix3x3::GetRotationAngle(double tolerance) const
         return GB_QuietNan;
     }
 
-    const double scale = GetUniformScaleFactor(tolerance);
-    if (!IsFinite(scale) || GB_IsZero(scale, std::abs(tolerance)))
+    Linear2x2Info info;
+    if (!TryGetLinear2x2Info(*this, info))
     {
         return GB_QuietNan;
     }
 
-    const double c0x = m[0][0] / scale;
-    const double c0y = m[1][0] / scale;
-    if (!IsFinite(c0x) || !IsFinite(c0y))
-    {
-        return GB_QuietNan;
-    }
-
-    double angle = std::atan2(c0y, c0x);
-    if (angle < 0)
+    double angle = std::atan2(info.unitY0, info.unitX0);
+    if (angle < 0.0)
     {
         angle += GB_2Pi;
     }
@@ -634,99 +737,59 @@ double GB_Matrix3x3::GetRotationAngle(double tolerance) const
 
 bool GB_Matrix3x3::TryGetScaleFactors(double& scaleX, double& scaleY, double tolerance) const
 {
-    if (!IsValid())
+    double absoluteTolerance = 0.0;
+    Linear2x2Info info;
+    if (!TryGetAbsoluteTolerance(tolerance, absoluteTolerance) || !TryGetLinear2x2Info(*this, info))
     {
         scaleX = GB_QuietNan;
         scaleY = GB_QuietNan;
         return false;
     }
 
-    const double c0x = m[0][0];
-    const double c0y = m[1][0];
-    const double c1x = m[0][1];
-    const double c1y = m[1][1];
-
-    const double c0Len2 = c0x * c0x + c0y * c0y;
-    const double c1Len2 = c1x * c1x + c1y * c1y;
-
-    const double absTol = std::abs(tolerance);
-    const double minLen2 = absTol * absTol;
-
-    if (!IsFinite(c0Len2) || !IsFinite(c1Len2) || c0Len2 <= minLen2 || c1Len2 <= minLen2)
-    {
-        scaleX = GB_QuietNan;
-        scaleY = GB_QuietNan;
-        return false;
-    }
-
-    scaleX = std::sqrt(c0Len2);
-    scaleY = std::sqrt(c1Len2);
-    return IsFinite(scaleX) && IsFinite(scaleY);
+    return TryGetScaleFactorsByInfo(info, scaleX, scaleY);
 }
 
 double GB_Matrix3x3::GetUniformScaleFactor(double tolerance) const
 {
-    const double absTol = std::abs(tolerance);
-
+    double absoluteTolerance = 0.0;
     Linear2x2Info info;
-    if (!TryGetLinear2x2Info(*this, absTol, info))
-    {
-        return GB_QuietNan;
-    }
-
-    if (!IsScaledOrthogonalByInfo(info, absTol))
+    if (!TryGetAbsoluteTolerance(tolerance, absoluteTolerance) || !TryGetLinear2x2Info(*this, info) || !IsScaledOrthogonalByInfo(info, absoluteTolerance) || !IsUniformScaleByInfo(info, absoluteTolerance))
     {
         return GB_QuietNan;
     }
 
     double scaleX = GB_QuietNan;
     double scaleY = GB_QuietNan;
-    if (!TryGetScaleByLen2(info.c0Len2, info.c1Len2, scaleX, scaleY))
+    if (!TryGetScaleFactorsByInfo(info, scaleX, scaleY))
     {
         return GB_QuietNan;
     }
 
-    const double maxLen = std::max(scaleX, scaleY);
-    if (std::abs(scaleX - scaleY) > absTol * maxLen)
-    {
-        return GB_QuietNan;
-    }
-
-    return 0.5 * (scaleX + scaleY);
+    return scaleX * 0.5 + scaleY * 0.5;
 }
 
 GB_Point2d GB_Matrix3x3::TransformPoint(const GB_Point2d& point) const
 {
     if (!IsValid() || !point.IsValid())
     {
-        return GB_Point2d(GB_QuietNan, GB_QuietNan);
+        return GB_Point2d();
     }
 
-    const double x = point.x;
-    const double y = point.y;
-
-    // 仿射快路径：w 恒为 1，无需算 wPrime/除法
-    if (std::abs(m[2][0]) <= GB_Epsilon &&
-        std::abs(m[2][1]) <= GB_Epsilon &&
-        std::abs(m[2][2] - 1) <= GB_Epsilon)
+    if (IsExactlyAffine2d(*this))
     {
-        const double xPrime = m[0][0] * x + m[0][1] * y + m[0][2];
-        const double yPrime = m[1][0] * x + m[1][1] * y + m[1][2];
-        return GB_Point2d(xPrime, yPrime);
+        return TransformPointAffineUnchecked(*this, point);
     }
 
-    // 通用路径（透视/投影）
-    const double xPrime = m[0][0] * x + m[0][1] * y + m[0][2];
-    const double yPrime = m[1][0] * x + m[1][1] * y + m[1][2];
-    const double wPrime = m[2][0] * x + m[2][1] * y + m[2][2];
-
-    if (!IsFinite(wPrime) || std::abs(wPrime) <= GB_Epsilon)
+    const double numeratorX = std::fma(m[0][0], point.x, std::fma(m[0][1], point.y, m[0][2]));
+    const double numeratorY = std::fma(m[1][0], point.x, std::fma(m[1][1], point.y, m[1][2]));
+    const double homogeneousW = std::fma(m[2][0], point.x, std::fma(m[2][1], point.y, m[2][2]));
+    if (!IsFinite(numeratorX) || !IsFinite(numeratorY) || !IsFinite(homogeneousW) || homogeneousW == 0.0)
     {
-        return GB_Point2d(GB_QuietNan, GB_QuietNan);
+        return GB_Point2d();
     }
 
-    const double invW = 1.0 / wPrime;
-    return GB_Point2d(xPrime * invW, yPrime * invW);
+    const GB_Point2d result(numeratorX / homogeneousW, numeratorY / homogeneousW);
+    return result.IsValid() ? result : GB_Point2d();
 }
 
 bool GB_Matrix3x3::TransformPoints(const GB_Point2d* inputPoints, GB_Point2d* outputPoints, size_t numPoints, bool useOpenMP) const
@@ -736,115 +799,48 @@ bool GB_Matrix3x3::TransformPoints(const GB_Point2d* inputPoints, GB_Point2d* ou
         return true;
     }
 
-    if (!IsValid() || inputPoints == nullptr || outputPoints == nullptr)
+    if (!IsValid() || inputPoints == nullptr || outputPoints == nullptr || HasUnsupportedPartialOverlap(inputPoints, outputPoints, numPoints))
     {
         return false;
     }
 
-    const double m00 = m[0][0];
-    const double m01 = m[0][1];
-    const double m02 = m[0][2];
-    const double m10 = m[1][0];
-    const double m11 = m[1][1];
-    const double m12 = m[1][2];
-
-    const bool isAffine = IsAffine2d();
-
-    if (isAffine)
+    const bool useParallelLoop = useOpenMP && numPoints <= static_cast<size_t>(std::numeric_limits<long long>::max());
+    if (IsExactlyAffine2d(*this))
     {
-        if (useOpenMP)
+        if (useParallelLoop)
         {
 #pragma omp parallel for schedule(static)
-            for (long long i = 0; i < static_cast<long long>(numPoints); i++)
+            for (long long pointIndex = 0; pointIndex < static_cast<long long>(numPoints); pointIndex++)
             {
-                const double x = inputPoints[i].x;
-                const double y = inputPoints[i].y;
-
-                const double xPrime = m00 * x + m01 * y + m02;
-                const double yPrime = m10 * x + m11 * y + m12;
-
-                outputPoints[i] = GB_Point2d(xPrime, yPrime);
+                outputPoints[pointIndex] = TransformPointAffineUnchecked(*this, inputPoints[pointIndex]);
             }
-            return true;
         }
         else
         {
-            for (size_t i = 0; i < numPoints; i++)
+            for (size_t pointIndex = 0; pointIndex < numPoints; pointIndex++)
             {
-                const double x = inputPoints[i].x;
-                const double y = inputPoints[i].y;
-
-                const double xPrime = m00 * x + m01 * y + m02;
-                const double yPrime = m10 * x + m11 * y + m12;
-
-                outputPoints[i] = GB_Point2d(xPrime, yPrime);
+                outputPoints[pointIndex] = TransformPointAffineUnchecked(*this, inputPoints[pointIndex]);
             }
-            return true;
-        }
-    }
-
-    // 一般 3×3（可能含透视）：逐点计算 w，并进行齐次除法
-    const double m20 = m[2][0];
-    const double m21 = m[2][1];
-    const double m22 = m[2][2];
-    if (useOpenMP)
-    {
-#pragma omp parallel for schedule(static)
-        for (long long i = 0; i < static_cast<long long>(numPoints); i++)
-        {
-            const double x = inputPoints[i].x;
-            const double y = inputPoints[i].y;
-
-            const double xPrime = m00 * x + m01 * y + m02;
-            const double yPrime = m10 * x + m11 * y + m12;
-            const double wPrime = m20 * x + m21 * y + m22;
-
-            if (!IsFinite(wPrime) || std::abs(wPrime) <= GB_Epsilon)
-            {
-                outputPoints[i] = GB_Point2d(GB_QuietNan, GB_QuietNan);
-                continue;
-            }
-
-            if (std::abs(wPrime - 1) <= GB_Epsilon)
-            {
-                outputPoints[i] = GB_Point2d(xPrime, yPrime);
-                continue;
-            }
-
-            const double invW = 1.0 / wPrime;
-            outputPoints[i] = GB_Point2d(xPrime * invW, yPrime * invW);
         }
         return true;
+    }
+
+    if (useParallelLoop)
+    {
+#pragma omp parallel for schedule(static)
+        for (long long pointIndex = 0; pointIndex < static_cast<long long>(numPoints); pointIndex++)
+        {
+            outputPoints[pointIndex] = TransformPoint(inputPoints[pointIndex]);
+        }
     }
     else
     {
-        for (size_t i = 0; i < numPoints; i++)
+        for (size_t pointIndex = 0; pointIndex < numPoints; pointIndex++)
         {
-            const double x = inputPoints[i].x;
-            const double y = inputPoints[i].y;
-
-            const double xPrime = m00 * x + m01 * y + m02;
-            const double yPrime = m10 * x + m11 * y + m12;
-            const double wPrime = m20 * x + m21 * y + m22;
-
-            if (!IsFinite(wPrime) || std::abs(wPrime) <= GB_Epsilon)
-            {
-                outputPoints[i] = GB_Point2d(GB_QuietNan, GB_QuietNan);
-                continue;
-            }
-
-            if (std::abs(wPrime - 1) <= GB_Epsilon)
-            {
-                outputPoints[i] = GB_Point2d(xPrime, yPrime);
-                continue;
-            }
-
-            const double invW = 1.0 / wPrime;
-            outputPoints[i] = GB_Point2d(xPrime * invW, yPrime * invW);
+            outputPoints[pointIndex] = TransformPoint(inputPoints[pointIndex]);
         }
-
-        return true;
     }
+    return true;
 }
 
 bool GB_Matrix3x3::TransformPoints(const std::vector<GB_Point2d>& inputPoints, std::vector<GB_Point2d>& outputPoints, bool useOpenMP) const
@@ -854,15 +850,26 @@ bool GB_Matrix3x3::TransformPoints(const std::vector<GB_Point2d>& inputPoints, s
         return TransformPoints(outputPoints, useOpenMP);
     }
 
-    const size_t numPoints = inputPoints.size();
-    if (numPoints == 0)
+    if (inputPoints.empty())
     {
         outputPoints.clear();
         return true;
     }
 
-    outputPoints.resize(numPoints);
-    return TransformPoints(inputPoints.data(), outputPoints.data(), numPoints, useOpenMP);
+    try
+    {
+        std::vector<GB_Point2d> transformedPoints(inputPoints.size());
+        if (!TransformPoints(inputPoints.data(), transformedPoints.data(), inputPoints.size(), useOpenMP))
+        {
+            return false;
+        }
+        outputPoints.swap(transformedPoints);
+        return true;
+    }
+    catch (...)
+    {
+        return false;
+    }
 }
 
 bool GB_Matrix3x3::TransformPoints(GB_Point2d* points, size_t numPoints, bool useOpenMP) const
@@ -872,26 +879,17 @@ bool GB_Matrix3x3::TransformPoints(GB_Point2d* points, size_t numPoints, bool us
 
 bool GB_Matrix3x3::TransformPoints(std::vector<GB_Point2d>& points, bool useOpenMP) const
 {
-    const size_t numPoints = points.size();
-    if (numPoints == 0)
-    {
-        return true;
-    }
-
-    return TransformPoints(points.data(), points.data(), numPoints, useOpenMP);
+    return points.empty() || TransformPoints(points.data(), points.data(), points.size(), useOpenMP);
 }
 
 GB_Vector2d GB_Matrix3x3::TransformVector(const GB_Vector2d& vec) const
 {
-    if (!IsValid() || !vec.IsValid())
+    if (!IsValid())
     {
-        return GB_Vector2d(GB_QuietNan, GB_QuietNan);
+        return GB_Vector2d();
     }
 
-    const double x = vec.x;
-    const double y = vec.y;
-
-    return GB_Vector2d(m[0][0] * x + m[0][1] * y, m[1][0] * x + m[1][1] * y);
+    return TransformVectorUnchecked(*this, vec);
 }
 
 bool GB_Matrix3x3::TransformVectors(const GB_Vector2d* inputVectors, GB_Vector2d* outputVectors, size_t numVectors, bool useOpenMP) const
@@ -901,38 +899,28 @@ bool GB_Matrix3x3::TransformVectors(const GB_Vector2d* inputVectors, GB_Vector2d
         return true;
     }
 
-    if (!IsValid() || inputVectors == nullptr || outputVectors == nullptr)
+    if (!IsValid() || inputVectors == nullptr || outputVectors == nullptr || HasUnsupportedPartialOverlap(inputVectors, outputVectors, numVectors))
     {
         return false;
     }
 
-    const double m00 = m[0][0];
-    const double m01 = m[0][1];
-    const double m10 = m[1][0];
-    const double m11 = m[1][1];
-
-    if (useOpenMP)
+    const bool useParallelLoop = useOpenMP && numVectors <= static_cast<size_t>(std::numeric_limits<long long>::max());
+    if (useParallelLoop)
     {
 #pragma omp parallel for schedule(static)
-        for (long long i = 0; i < static_cast<long long>(numVectors); i++)
+        for (long long vectorIndex = 0; vectorIndex < static_cast<long long>(numVectors); vectorIndex++)
         {
-            const double x = inputVectors[i].x;
-            const double y = inputVectors[i].y;
-            outputVectors[i] = GB_Vector2d(m00 * x + m01 * y, m10 * x + m11 * y);
+            outputVectors[vectorIndex] = TransformVectorUnchecked(*this, inputVectors[vectorIndex]);
         }
-        return true;
     }
     else
     {
-        for (size_t i = 0; i < numVectors; i++)
+        for (size_t vectorIndex = 0; vectorIndex < numVectors; vectorIndex++)
         {
-            const double x = inputVectors[i].x;
-            const double y = inputVectors[i].y;
-            outputVectors[i] = GB_Vector2d(m00 * x + m01 * y, m10 * x + m11 * y);
+            outputVectors[vectorIndex] = TransformVectorUnchecked(*this, inputVectors[vectorIndex]);
         }
-
-        return true;
     }
+    return true;
 }
 
 bool GB_Matrix3x3::TransformVectors(const std::vector<GB_Vector2d>& inputVectors, std::vector<GB_Vector2d>& outputVectors, bool useOpenMP) const
@@ -942,15 +930,26 @@ bool GB_Matrix3x3::TransformVectors(const std::vector<GB_Vector2d>& inputVectors
         return TransformVectors(outputVectors, useOpenMP);
     }
 
-    const size_t numVectors = inputVectors.size();
-    if (numVectors == 0)
+    if (inputVectors.empty())
     {
         outputVectors.clear();
         return true;
     }
 
-    outputVectors.resize(numVectors);
-    return TransformVectors(inputVectors.data(), outputVectors.data(), numVectors, useOpenMP);
+    try
+    {
+        std::vector<GB_Vector2d> transformedVectors(inputVectors.size());
+        if (!TransformVectors(inputVectors.data(), transformedVectors.data(), inputVectors.size(), useOpenMP))
+        {
+            return false;
+        }
+        outputVectors.swap(transformedVectors);
+        return true;
+    }
+    catch (...)
+    {
+        return false;
+    }
 }
 
 bool GB_Matrix3x3::TransformVectors(GB_Vector2d* vectors, size_t numVectors, bool useOpenMP) const
@@ -960,29 +959,22 @@ bool GB_Matrix3x3::TransformVectors(GB_Vector2d* vectors, size_t numVectors, boo
 
 bool GB_Matrix3x3::TransformVectors(std::vector<GB_Vector2d>& vectors, bool useOpenMP) const
 {
-    const size_t numVectors = vectors.size();
-    if (numVectors == 0)
-    {
-        return true;
-    }
-
-    return TransformVectors(vectors.data(), vectors.data(), numVectors, useOpenMP);
+    return vectors.empty() || TransformVectors(vectors.data(), vectors.data(), vectors.size(), useOpenMP);
 }
 
 GB_Matrix3x3 GB_Matrix3x3::CreateFromTranslation(double translateX, double translateY)
 {
-    GB_Matrix3x3 mat = Identity;
-    mat.m[0][2] = translateX;
-    mat.m[1][2] = translateY;
-    return mat;
+    if (!IsFinite(translateX) || !IsFinite(translateY))
+    {
+        return GB_Matrix3x3();
+    }
+
+    return GB_Matrix3x3(1, 0, translateX, 0, 1, translateY, 0, 0, 1);
 }
 
 GB_Matrix3x3 GB_Matrix3x3::CreateFromTranslation(const GB_Vector2d& translation)
 {
-    GB_Matrix3x3 mat = Identity;
-    mat.m[0][2] = translation.x;
-    mat.m[1][2] = translation.y;
-    return mat;
+    return CreateFromTranslation(translation.x, translation.y);
 }
 
 GB_Matrix3x3 GB_Matrix3x3::CreateFromRotation(double angle)
@@ -992,10 +984,9 @@ GB_Matrix3x3 GB_Matrix3x3::CreateFromRotation(double angle)
         return GB_Matrix3x3();
     }
 
-    const double c = std::cos(angle);
-    const double s = std::sin(angle);
-
-    return GB_Matrix3x3(c, -s, 0, s, c, 0, 0, 0, 1);
+    const double cosAngle = std::cos(angle);
+    const double sinAngle = std::sin(angle);
+    return GB_Matrix3x3(cosAngle, -sinAngle, 0, sinAngle, cosAngle, 0, 0, 0, 1);
 }
 
 GB_Matrix3x3 GB_Matrix3x3::CreateFromScaling(double scaleX, double scaleY)
@@ -1010,12 +1001,7 @@ GB_Matrix3x3 GB_Matrix3x3::CreateFromScaling(double scaleX, double scaleY)
 
 GB_Matrix3x3 GB_Matrix3x3::CreateFromUniformScaling(double scale)
 {
-    if (!IsFinite(scale))
-    {
-        return GB_Matrix3x3();
-    }
-
-    return GB_Matrix3x3(scale, 0, 0, 0, scale, 0, 0, 0, 1);
+    return CreateFromScaling(scale, scale);
 }
 
 GB_Matrix3x3 GB_Matrix3x3::CreateShear(double shearX, double shearY)
@@ -1030,14 +1016,13 @@ GB_Matrix3x3 GB_Matrix3x3::CreateShear(double shearX, double shearY)
 
 std::string GB_Matrix3x3::SerializeToString() const
 {
-    std::ostringstream oss;
-    oss.imbue(std::locale::classic());
-    oss << "(" << GetClassType() << " " << std::setprecision(17)
+    std::ostringstream stream;
+    stream.imbue(std::locale::classic());
+    stream << "(" << GetClassType() << " " << std::setprecision(17)
         << m[0][0] << "," << m[0][1] << "," << m[0][2] << ","
         << m[1][0] << "," << m[1][1] << "," << m[1][2] << ","
-        << m[2][0] << "," << m[2][1] << "," << m[2][2]
-        << ")";
-    return oss.str();
+        << m[2][0] << "," << m[2][1] << "," << m[2][2] << ")";
+    return stream.str();
 }
 
 GB_ByteBuffer GB_Matrix3x3::SerializeToBinary() const
@@ -1045,13 +1030,11 @@ GB_ByteBuffer GB_Matrix3x3::SerializeToBinary() const
     constexpr static uint16_t payloadVersion = 1;
 
     GB_ByteBuffer buffer;
-    buffer.reserve(96);
-
+    buffer.reserve(88);
     GB_ByteBufferIO::AppendUInt32LE(buffer, GB_ClassMagicNumber);
     GB_ByteBufferIO::AppendUInt64LE(buffer, GetClassTypeId());
     GB_ByteBufferIO::AppendUInt16LE(buffer, payloadVersion);
     GB_ByteBufferIO::AppendUInt16LE(buffer, 0);
-
     for (size_t rowIndex = 0; rowIndex < 3; rowIndex++)
     {
         for (size_t colIndex = 0; colIndex < 3; colIndex++)
@@ -1059,61 +1042,40 @@ GB_ByteBuffer GB_Matrix3x3::SerializeToBinary() const
             GB_ByteBufferIO::AppendDoubleLE(buffer, m[rowIndex][colIndex]);
         }
     }
-
     return buffer;
 }
 
 bool GB_Matrix3x3::Deserialize(const std::string& data)
 {
-    std::istringstream iss(data);
-    iss.imbue(std::locale::classic());
+    std::istringstream stream(data);
+    stream.imbue(std::locale::classic());
 
-    char leftParen = 0;
+    char leftParenthesis = 0;
     std::string type;
-    double values[9];
-    for (int i = 0; i < 9; i++)
+    double values[9] = { GB_QuietNan, GB_QuietNan, GB_QuietNan, GB_QuietNan, GB_QuietNan, GB_QuietNan, GB_QuietNan, GB_QuietNan, GB_QuietNan };
+    if (!(stream >> leftParenthesis >> type) || leftParenthesis != '(' || type != GetClassType())
     {
-        values[i] = GB_QuietNan;
-    }
-
-    if (!(iss >> leftParen >> type))
-    {
-        *this = GB_Matrix3x3();
         return false;
     }
 
-    if (leftParen != '(' || type != GetClassType())
+    for (size_t valueIndex = 0; valueIndex < 9; valueIndex++)
     {
-        *this = GB_Matrix3x3();
-        return false;
-    }
-
-    for (int i = 0; i < 9; i++)
-    {
-        if (!(iss >> values[i]))
+        if (!(stream >> values[valueIndex]))
         {
-            *this = GB_Matrix3x3();
             return false;
         }
 
-        if (i < 8)
+        char separator = 0;
+        if (!(stream >> separator) || separator != (valueIndex < 8 ? ',' : ')'))
         {
-            char comma = 0;
-            if (!(iss >> comma) || comma != ',')
-            {
-                *this = GB_Matrix3x3();
-                return false;
-            }
+            return false;
         }
-        else
-        {
-            char rightParen = 0;
-            if (!(iss >> rightParen) || rightParen != ')')
-            {
-                *this = GB_Matrix3x3();
-                return false;
-            }
-        }
+    }
+
+    stream >> std::ws;
+    if (!stream.eof())
+    {
+        return false;
     }
 
     Set(values[0], values[1], values[2], values[3], values[4], values[5], values[6], values[7], values[8]);
@@ -1123,11 +1085,10 @@ bool GB_Matrix3x3::Deserialize(const std::string& data)
 bool GB_Matrix3x3::Deserialize(const GB_ByteBuffer& data)
 {
     constexpr static uint16_t expectedPayloadVersion = 1;
-    constexpr static size_t minSize = 4 + 8 + 2 + 2 + 9 * 8;
+    constexpr static size_t expectedSize = 88;
 
-    if (data.size() < minSize)
+    if (data.size() != expectedSize)
     {
-        *this = GB_Matrix3x3();
         return false;
     }
 
@@ -1136,30 +1097,31 @@ bool GB_Matrix3x3::Deserialize(const GB_ByteBuffer& data)
     uint64_t typeId = 0;
     uint16_t payloadVersion = 0;
     uint16_t reserved = 0;
-
     if (!GB_ByteBufferIO::ReadUInt32LE(data, offset, magic)
         || !GB_ByteBufferIO::ReadUInt64LE(data, offset, typeId)
         || !GB_ByteBufferIO::ReadUInt16LE(data, offset, payloadVersion)
         || !GB_ByteBufferIO::ReadUInt16LE(data, offset, reserved))
     {
-        *this = GB_Matrix3x3();
         return false;
     }
 
-    if (magic != GB_ClassMagicNumber || typeId != GetClassTypeId() || payloadVersion != expectedPayloadVersion)
+    if (magic != GB_ClassMagicNumber || typeId != GetClassTypeId() || payloadVersion != expectedPayloadVersion || reserved != 0)
     {
-        *this = GB_Matrix3x3();
         return false;
     }
 
-    double values[9] = { GB_QuietNan };
-    for (int i = 0; i < 9; i++)
+    double values[9] = { GB_QuietNan, GB_QuietNan, GB_QuietNan, GB_QuietNan, GB_QuietNan, GB_QuietNan, GB_QuietNan, GB_QuietNan, GB_QuietNan };
+    for (size_t valueIndex = 0; valueIndex < 9; valueIndex++)
     {
-        if (!GB_ByteBufferIO::ReadDoubleLE(data, offset, values[i]))
+        if (!GB_ByteBufferIO::ReadDoubleLE(data, offset, values[valueIndex]))
         {
-            *this = GB_Matrix3x3();
             return false;
         }
+    }
+
+    if (offset != data.size())
+    {
+        return false;
     }
 
     Set(values[0], values[1], values[2], values[3], values[4], values[5], values[6], values[7], values[8]);
@@ -1168,81 +1130,47 @@ bool GB_Matrix3x3::Deserialize(const GB_ByteBuffer& data)
 
 bool GB_Matrix3x3::TryInvertAffine2d(double tolerance)
 {
-    if (!IsAffine2d(tolerance))
+    double absoluteTolerance = 0.0;
+    if (!IsExactlyAffine2d(*this) || !TryGetAbsoluteTolerance(tolerance, absoluteTolerance))
     {
         return false;
     }
 
-    const double det = Det2x2();
-    if (!IsFinite(det) || std::abs(det) <= std::abs(tolerance))
+    const double linearScale = std::max(std::max(std::abs(m[0][0]), std::abs(m[0][1])), std::max(std::abs(m[1][0]), std::abs(m[1][1])));
+    if (linearScale == 0.0)
     {
-        *this = GB_Matrix3x3();
         return false;
     }
 
-    const double invDet = 1.0 / det;
+    const double normalized00 = m[0][0] / linearScale;
+    const double normalized01 = m[0][1] / linearScale;
+    const double normalized10 = m[1][0] / linearScale;
+    const double normalized11 = m[1][1] / linearScale;
+    const double normalizedDeterminant = std::fma(normalized00, normalized11, -normalized01 * normalized10);
+    if (!IsFinite(normalizedDeterminant) || std::abs(normalizedDeterminant) <= absoluteTolerance)
+    {
+        return false;
+    }
 
-    const double a00 = m[0][0];
-    const double a01 = m[0][1];
-    const double a10 = m[1][0];
-    const double a11 = m[1][1];
+    const double inverseScaledDeterminant = 1.0 / (linearScale * normalizedDeterminant);
+    if (!IsFinite(inverseScaledDeterminant))
+    {
+        return false;
+    }
 
-    const double tx = m[0][2];
-    const double ty = m[1][2];
+    const double inverse00 = normalized11 * inverseScaledDeterminant;
+    const double inverse01 = -normalized01 * inverseScaledDeterminant;
+    const double inverse10 = -normalized10 * inverseScaledDeterminant;
+    const double inverse11 = normalized00 * inverseScaledDeterminant;
+    const double inverseTranslateX = -std::fma(inverse00, m[0][2], inverse01 * m[1][2]);
+    const double inverseTranslateY = -std::fma(inverse10, m[0][2], inverse11 * m[1][2]);
 
-    const double inv00 = a11 * invDet;
-    const double inv01 = -a01 * invDet;
-    const double inv10 = -a10 * invDet;
-    const double inv11 = a00 * invDet;
+    const GB_Matrix3x3 result(inverse00, inverse01, inverseTranslateX, inverse10, inverse11, inverseTranslateY, 0, 0, 1);
+    if (!result.IsValid())
+    {
+        return false;
+    }
 
-    const double invTx = -(inv00 * tx + inv01 * ty);
-    const double invTy = -(inv10 * tx + inv11 * ty);
-
-    Set(inv00, inv01, invTx, inv10, inv11, invTy, 0, 0, 1);
+    *this = result;
     return true;
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-

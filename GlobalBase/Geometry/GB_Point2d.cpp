@@ -1,16 +1,73 @@
-﻿#include "GB_Point2d.h"
+#include "GB_Point2d.h"
 #include "GB_Vector2d.h"
 #include "GB_Matrix3x3.h"
 #include "../GB_IO.h"
 
+#include <assert.h>
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
-#include <cstdlib>
-#include <cstring>
 #include <iomanip>
+#include <limits>
 #include <locale>
 #include <sstream>
-#include <assert.h>
+
+namespace
+{
+    static bool TryGetAbsoluteTolerance(double tolerance, double& absoluteTolerance)
+    {
+        if (std::isnan(tolerance))
+        {
+            absoluteTolerance = 0.0;
+            return false;
+        }
+
+        absoluteTolerance = std::abs(tolerance);
+        return true;
+    }
+
+    static double SquareLengthOrInfinity(double x, double y)
+    {
+        if (!std::isfinite(x) || !std::isfinite(y))
+        {
+            return GB_QuietNan;
+        }
+
+        const double absoluteX = std::abs(x);
+        const double absoluteY = std::abs(y);
+        const double maxComponent = std::max(absoluteX, absoluteY);
+        if (maxComponent == 0.0)
+        {
+            return 0.0;
+        }
+
+        const double normalizedX = x / maxComponent;
+        const double normalizedY = y / maxComponent;
+        const double normalizedSquareLength = normalizedX * normalizedX + normalizedY * normalizedY;
+        const double maxSafeScale = std::sqrt(std::numeric_limits<double>::max() / normalizedSquareLength);
+        if (maxComponent > maxSafeScale)
+        {
+            return std::numeric_limits<double>::infinity();
+        }
+
+        return maxComponent * maxComponent * normalizedSquareLength;
+    }
+
+    static double RobustMidpoint(double firstValue, double secondValue)
+    {
+        return firstValue * 0.5 + secondValue * 0.5;
+    }
+
+    static double RobustLerp(double firstValue, double secondValue, double t)
+    {
+        if (t >= 0.0 && t <= 1.0)
+        {
+            return firstValue * (1.0 - t) + secondValue * t;
+        }
+
+        return firstValue + (secondValue - firstValue) * t;
+    }
+}
 
 const GB_Point2d GB_Point2d::Origin(0, 0);
 
@@ -18,11 +75,15 @@ GB_Point2d::GB_Point2d()
 {
 }
 
-GB_Point2d::GB_Point2d(double x, double y) : x(x), y(y)
+GB_Point2d::GB_Point2d(double x, double y)
+    : x(x)
+    , y(y)
 {
 }
 
-GB_Point2d::GB_Point2d(const GB_Vector2d& vec) : x(vec.x), y(vec.y)
+GB_Point2d::GB_Point2d(const GB_Vector2d& vec)
+    : x(vec.x)
+    , y(vec.y)
 {
 }
 
@@ -60,7 +121,13 @@ bool GB_Point2d::IsOrigin(double tolerance) const
         return false;
     }
 
-    return (x * x + y * y <= tolerance * tolerance);
+    double absoluteTolerance = 0.0;
+    if (!TryGetAbsoluteTolerance(tolerance, absoluteTolerance))
+    {
+        return false;
+    }
+
+    return std::hypot(x, y) <= absoluteTolerance;
 }
 
 GB_Point2d GB_Point2d::operator*(double scalar) const
@@ -89,27 +156,25 @@ GB_Point2d& GB_Point2d::operator*=(double scalar)
 
 GB_Point2d GB_Point2d::operator/(double scalar) const
 {
-    if (!std::isfinite(scalar) || std::abs(scalar) <= GB_Epsilon)
+    if (!std::isfinite(scalar) || scalar == 0.0)
     {
         return GB_Point2d();
     }
 
-    const double inv = 1.0 / scalar;
-    return GB_Point2d(x * inv, y * inv);
+    return GB_Point2d(x / scalar, y / scalar);
 }
 
 GB_Point2d& GB_Point2d::operator/=(double scalar)
 {
-    if (!std::isfinite(scalar) || std::abs(scalar) <= GB_Epsilon)
+    if (!std::isfinite(scalar) || scalar == 0.0)
     {
         x = GB_QuietNan;
         y = GB_QuietNan;
         return *this;
     }
 
-    const double inv = 1.0 / scalar;
-    x *= inv;
-    y *= inv;
+    x /= scalar;
+    y /= scalar;
     return *this;
 }
 
@@ -155,13 +220,13 @@ bool GB_Point2d::operator!=(const GB_Point2d& other) const
 double& GB_Point2d::operator[](size_t index)
 {
     assert(index < 2);
-    return (index == 0) ? x : y;
+    return index == 0 ? x : y;
 }
 
 const double& GB_Point2d::operator[](size_t index) const
 {
     assert(index < 2);
-    return (index == 0) ? x : y;
+    return index == 0 ? x : y;
 }
 
 GB_Vector2d GB_Point2d::ToVector2d() const
@@ -171,7 +236,12 @@ GB_Vector2d GB_Point2d::ToVector2d() const
 
 double GB_Point2d::DistanceTo(const GB_Point2d& other) const
 {
-    return std::sqrt(DistanceToSquared(other));
+    if (!IsValid() || !other.IsValid())
+    {
+        return GB_QuietNan;
+    }
+
+    return std::hypot(x - other.x, y - other.y);
 }
 
 double GB_Point2d::DistanceToSquared(const GB_Point2d& other) const
@@ -181,15 +251,17 @@ double GB_Point2d::DistanceToSquared(const GB_Point2d& other) const
         return GB_QuietNan;
     }
 
-    const double dx = x - other.x;
-    const double dy = y - other.y;
-    const double dist2 = dx * dx + dy * dy;
-    return std::isfinite(dist2) ? dist2 : GB_QuietNan;
+    return SquareLengthOrInfinity(x - other.x, y - other.y);
 }
 
 double GB_Point2d::DistanceToOrigin() const
 {
-    return std::sqrt(DistanceToOriginSquared());
+    if (!IsValid())
+    {
+        return GB_QuietNan;
+    }
+
+    return std::hypot(x, y);
 }
 
 double GB_Point2d::DistanceToOriginSquared() const
@@ -199,8 +271,7 @@ double GB_Point2d::DistanceToOriginSquared() const
         return GB_QuietNan;
     }
 
-    const double dist2 = x * x + y * y;
-    return std::isfinite(dist2) ? dist2 : GB_QuietNan;
+    return SquareLengthOrInfinity(x, y);
 }
 
 bool GB_Point2d::IsNearEqual(const GB_Point2d& other, double tolerance) const
@@ -210,9 +281,13 @@ bool GB_Point2d::IsNearEqual(const GB_Point2d& other, double tolerance) const
         return false;
     }
 
-    const double dx = x - other.x;
-    const double dy = y - other.y;
-    return (dx * dx + dy * dy <= tolerance * tolerance);
+    double absoluteTolerance = 0.0;
+    if (!TryGetAbsoluteTolerance(tolerance, absoluteTolerance))
+    {
+        return false;
+    }
+
+    return std::hypot(x - other.x, y - other.y) <= absoluteTolerance;
 }
 
 GB_Point2d GB_Point2d::Transformed(const GB_Matrix3x3& mat) const
@@ -237,16 +312,14 @@ GB_Point2d GB_Point2d::Rotated(double angle, const GB_Point2d& center) const
         return GB_Point2d();
     }
 
-    const double c = std::cos(angle);
-    const double s = std::sin(angle);
-
+    const double cosAngle = std::cos(angle);
+    const double sinAngle = std::sin(angle);
     const double localX = x - center.x;
     const double localY = y - center.y;
-
-    const double rotatedX = localX * c - localY * s;
-    const double rotatedY = localX * s + localY * c;
-
-    return GB_Point2d(center.x + rotatedX, center.y + rotatedY);
+    const double rotatedX = localX * cosAngle - localY * sinAngle;
+    const double rotatedY = localX * sinAngle + localY * cosAngle;
+    const GB_Point2d result(center.x + rotatedX, center.y + rotatedY);
+    return result.IsValid() ? result : GB_Point2d();
 }
 
 void GB_Point2d::Rotate(double angle, const GB_Point2d& center)
@@ -261,7 +334,8 @@ GB_Point2d GB_Point2d::Offsetted(double deltaX, double deltaY) const
         return GB_Point2d();
     }
 
-    return GB_Point2d(x + deltaX, y + deltaY);
+    const GB_Point2d result(x + deltaX, y + deltaY);
+    return result.IsValid() ? result : GB_Point2d();
 }
 
 void GB_Point2d::Offset(double deltaX, double deltaY)
@@ -276,7 +350,7 @@ GB_Point2d GB_Point2d::MidPoint(const GB_Point2d& a, const GB_Point2d& b)
         return GB_Point2d();
     }
 
-    return GB_Point2d(0.5 * (a.x + b.x), 0.5 * (a.y + b.y));
+    return GB_Point2d(RobustMidpoint(a.x, b.x), RobustMidpoint(a.y, b.y));
 }
 
 GB_Point2d GB_Point2d::MidPointTo(const GB_Point2d& other) const
@@ -291,7 +365,8 @@ GB_Point2d GB_Point2d::Lerp(const GB_Point2d& a, const GB_Point2d& b, double t)
         return GB_Point2d();
     }
 
-    return GB_Point2d(GB_Lerp(a.x, b.x, t), GB_Lerp(a.y, b.y, t));
+    const GB_Point2d result(RobustLerp(a.x, b.x, t), RobustLerp(a.y, b.y, t));
+    return result.IsValid() ? result : GB_Point2d();
 }
 
 GB_Point2d GB_Point2d::LerpTo(const GB_Point2d& other, double t) const
@@ -301,10 +376,10 @@ GB_Point2d GB_Point2d::LerpTo(const GB_Point2d& other, double t) const
 
 std::string GB_Point2d::SerializeToString() const
 {
-    std::ostringstream oss;
-    oss.imbue(std::locale::classic());
-    oss << "(" << GetClassType() << " " << std::setprecision(17) << x << "," << y << ")";
-    return oss.str();
+    std::ostringstream stream;
+    stream.imbue(std::locale::classic());
+    stream << "(" << GetClassType() << " " << std::setprecision(17) << x << "," << y << ")";
+    return stream.str();
 }
 
 GB_ByteBuffer GB_Point2d::SerializeToBinary() const
@@ -313,42 +388,35 @@ GB_ByteBuffer GB_Point2d::SerializeToBinary() const
 
     GB_ByteBuffer buffer;
     buffer.reserve(32);
-
     GB_ByteBufferIO::AppendUInt32LE(buffer, GB_ClassMagicNumber);
     GB_ByteBufferIO::AppendUInt64LE(buffer, GetClassTypeId());
     GB_ByteBufferIO::AppendUInt16LE(buffer, payloadVersion);
     GB_ByteBufferIO::AppendUInt16LE(buffer, 0);
-
     GB_ByteBufferIO::AppendDoubleLE(buffer, x);
     GB_ByteBufferIO::AppendDoubleLE(buffer, y);
-
     return buffer;
 }
 
 bool GB_Point2d::Deserialize(const std::string& data)
 {
-    std::istringstream iss(data);
-    iss.imbue(std::locale::classic());
+    std::istringstream stream(data);
+    stream.imbue(std::locale::classic());
 
-    char leftParen = 0;
+    char leftParenthesis = 0;
     std::string type;
     char comma = 0;
-    char rightParen = 0;
-
+    char rightParenthesis = 0;
     double parsedX = GB_QuietNan;
     double parsedY = GB_QuietNan;
 
-    if (!(iss >> leftParen >> type >> parsedX >> comma >> parsedY >> rightParen))
+    if (!(stream >> leftParenthesis >> type >> parsedX >> comma >> parsedY >> rightParenthesis))
     {
-        x = GB_QuietNan;
-        y = GB_QuietNan;
         return false;
     }
 
-    if (leftParen != '(' || rightParen != ')' || comma != ',' || type != GetClassType())
+    stream >> std::ws;
+    if (!stream.eof() || leftParenthesis != '(' || rightParenthesis != ')' || comma != ',' || type != GetClassType())
     {
-        x = GB_QuietNan;
-        y = GB_QuietNan;
         return false;
     }
 
@@ -360,12 +428,10 @@ bool GB_Point2d::Deserialize(const std::string& data)
 bool GB_Point2d::Deserialize(const GB_ByteBuffer& data)
 {
     constexpr static uint16_t expectedPayloadVersion = 1;
-    constexpr static size_t minSize = 32;
+    constexpr static size_t expectedSize = 32;
 
-    if (data.size() < minSize)
+    if (data.size() != expectedSize)
     {
-        x = GB_QuietNan;
-        y = GB_QuietNan;
         return false;
     }
 
@@ -374,7 +440,6 @@ bool GB_Point2d::Deserialize(const GB_ByteBuffer& data)
     uint64_t typeId = 0;
     uint16_t payloadVersion = 0;
     uint16_t reserved = 0;
-
     double parsedX = GB_QuietNan;
     double parsedY = GB_QuietNan;
 
@@ -385,15 +450,11 @@ bool GB_Point2d::Deserialize(const GB_ByteBuffer& data)
         || !GB_ByteBufferIO::ReadDoubleLE(data, offset, parsedX)
         || !GB_ByteBufferIO::ReadDoubleLE(data, offset, parsedY))
     {
-        x = GB_QuietNan;
-        y = GB_QuietNan;
         return false;
     }
 
-    if (magic != GB_ClassMagicNumber || typeId != GetClassTypeId() || payloadVersion != expectedPayloadVersion)
+    if (magic != GB_ClassMagicNumber || typeId != GetClassTypeId() || payloadVersion != expectedPayloadVersion || reserved != 0 || offset != data.size())
     {
-        x = GB_QuietNan;
-        y = GB_QuietNan;
         return false;
     }
 
@@ -406,9 +467,3 @@ GB_Point2d operator*(double scalar, const GB_Point2d& point)
 {
     return point * scalar;
 }
-
-
-
-
-
-

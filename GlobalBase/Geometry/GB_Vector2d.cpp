@@ -1,18 +1,96 @@
-﻿#include "GB_Vector2d.h"
+#include "GB_Vector2d.h"
 #include "GB_Matrix3x3.h"
 #include "../GB_IO.h"
-#include <cstdlib>
-#include <iomanip>
-#include <sstream>
-#include <locale>
+
+#include <algorithm>
+#include <cmath>
 #include <cstdint>
-#include <cstring>
+#include <iomanip>
+#include <limits>
+#include <locale>
+#include <sstream>
 
 namespace
 {
+    struct NormalizedVector2d
+    {
+        double x = 0.0;
+        double y = 0.0;
+        double scaledLength = 0.0;
+        double componentScale = 0.0;
+    };
+
     static inline GB_Vector2d MakeNanVector()
     {
         return GB_Vector2d(GB_QuietNan, GB_QuietNan);
+    }
+
+    static bool TryGetAbsoluteTolerance(double tolerance, double& absoluteTolerance)
+    {
+        if (std::isnan(tolerance))
+        {
+            absoluteTolerance = 0.0;
+            return false;
+        }
+
+        absoluteTolerance = std::abs(tolerance);
+        return true;
+    }
+
+    static bool TryNormalizeComponents(double x, double y, NormalizedVector2d& normalizedVector)
+    {
+        if (!std::isfinite(x) || !std::isfinite(y))
+        {
+            return false;
+        }
+
+        const double componentScale = std::max(std::abs(x), std::abs(y));
+        if (componentScale == 0.0)
+        {
+            return false;
+        }
+
+        const double scaledX = x / componentScale;
+        const double scaledY = y / componentScale;
+        const double scaledLength = std::hypot(scaledX, scaledY);
+        if (!std::isfinite(scaledLength) || scaledLength <= 0.0)
+        {
+            return false;
+        }
+
+        normalizedVector.x = scaledX / scaledLength;
+        normalizedVector.y = scaledY / scaledLength;
+        normalizedVector.scaledLength = scaledLength;
+        normalizedVector.componentScale = componentScale;
+        return true;
+    }
+
+    static double SquareLengthOrInfinity(double x, double y)
+    {
+        NormalizedVector2d normalizedVector;
+        if (!TryNormalizeComponents(x, y, normalizedVector))
+        {
+            return x == 0.0 && y == 0.0 ? 0.0 : GB_QuietNan;
+        }
+
+        const double normalizedSquareLength = normalizedVector.scaledLength * normalizedVector.scaledLength;
+        const double maxSafeScale = std::sqrt(std::numeric_limits<double>::max() / normalizedSquareLength);
+        if (normalizedVector.componentScale > maxSafeScale)
+        {
+            return std::numeric_limits<double>::infinity();
+        }
+
+        return normalizedVector.componentScale * normalizedVector.componentScale * normalizedSquareLength;
+    }
+
+    static bool IsNonDegenerate(const GB_Vector2d& vector)
+    {
+        return vector.IsValid() && (vector.x != 0.0 || vector.y != 0.0);
+    }
+
+    static bool TryGetNormalizedPair(const GB_Vector2d& firstVector, const GB_Vector2d& secondVector, NormalizedVector2d& firstNormalized, NormalizedVector2d& secondNormalized)
+    {
+        return TryNormalizeComponents(firstVector.x, firstVector.y, firstNormalized) && TryNormalizeComponents(secondVector.x, secondVector.y, secondNormalized);
     }
 }
 
@@ -20,11 +98,19 @@ const GB_Vector2d GB_Vector2d::Zero(0, 0);
 const GB_Vector2d GB_Vector2d::UnitX(1, 0);
 const GB_Vector2d GB_Vector2d::UnitY(0, 1);
 
-GB_Vector2d::GB_Vector2d() {}
+GB_Vector2d::GB_Vector2d()
+{
+}
 
-GB_Vector2d::GB_Vector2d(double x, double y) : x(x), y(y) {}
+GB_Vector2d::GB_Vector2d(double x, double y)
+    : x(x)
+    , y(y)
+{
+}
 
-GB_Vector2d::~GB_Vector2d() {}
+GB_Vector2d::~GB_Vector2d()
+{
+}
 
 const std::string& GB_Vector2d::GetClassType() const
 {
@@ -34,7 +120,7 @@ const std::string& GB_Vector2d::GetClassType() const
 
 uint64_t GB_Vector2d::GetClassTypeId() const
 {
-	static const uint64_t classTypeId = GB_GenerateClassTypeId(GetClassType()); // 15623057110163869400
+    static const uint64_t classTypeId = GB_GenerateClassTypeId(GetClassType()); // 15623057110163869400
     return classTypeId;
 }
 
@@ -56,8 +142,13 @@ bool GB_Vector2d::IsZero(double tolerance) const
         return false;
     }
 
-    const double tolerance2 = tolerance * tolerance;
-    return LengthSquared() <= tolerance2;
+    double absoluteTolerance = 0.0;
+    if (!TryGetAbsoluteTolerance(tolerance, absoluteTolerance))
+    {
+        return false;
+    }
+
+    return std::hypot(x, y) <= absoluteTolerance;
 }
 
 bool GB_Vector2d::IsUnit(double tolerance) const
@@ -67,13 +158,14 @@ bool GB_Vector2d::IsUnit(double tolerance) const
         return false;
     }
 
-    const double length = Length();
-    if (!std::isfinite(length) || length <= GB_Epsilon)
+    double absoluteTolerance = 0.0;
+    if (!TryGetAbsoluteTolerance(tolerance, absoluteTolerance))
     {
         return false;
     }
 
-    return std::abs(length - 1) <= std::abs(tolerance);
+    const double length = Length();
+    return std::isfinite(length) && std::abs(length - 1.0) <= absoluteTolerance;
 }
 
 bool GB_Vector2d::IsNearEqual(const GB_Vector2d& other, double tolerance) const
@@ -83,11 +175,13 @@ bool GB_Vector2d::IsNearEqual(const GB_Vector2d& other, double tolerance) const
         return false;
     }
 
-    const double dx = x - other.x;
-    const double dy = y - other.y;
+    double absoluteTolerance = 0.0;
+    if (!TryGetAbsoluteTolerance(tolerance, absoluteTolerance))
+    {
+        return false;
+    }
 
-    const double tolerance2 = tolerance * tolerance;
-    return (dx * dx + dy * dy) <= tolerance2;
+    return std::hypot(x - other.x, y - other.y) <= absoluteTolerance;
 }
 
 GB_Vector2d GB_Vector2d::operator+(const GB_Vector2d& other) const
@@ -102,18 +196,22 @@ GB_Vector2d GB_Vector2d::operator-(const GB_Vector2d& other) const
 
 GB_Vector2d GB_Vector2d::operator*(double scalar) const
 {
+    if (!std::isfinite(scalar))
+    {
+        return MakeNanVector();
+    }
+
     return GB_Vector2d(x * scalar, y * scalar);
 }
 
 GB_Vector2d GB_Vector2d::operator/(double scalar) const
 {
-    if (std::abs(scalar) <= GB_Epsilon)
+    if (!std::isfinite(scalar) || scalar == 0.0)
     {
         return MakeNanVector();
     }
 
-    const double inv = 1.0 / scalar;
-    return GB_Vector2d(x * inv, y * inv);
+    return GB_Vector2d(x / scalar, y / scalar);
 }
 
 GB_Vector2d& GB_Vector2d::operator+=(const GB_Vector2d& other)
@@ -132,6 +230,13 @@ GB_Vector2d& GB_Vector2d::operator-=(const GB_Vector2d& other)
 
 GB_Vector2d& GB_Vector2d::operator*=(double scalar)
 {
+    if (!std::isfinite(scalar))
+    {
+        x = GB_QuietNan;
+        y = GB_QuietNan;
+        return *this;
+    }
+
     x *= scalar;
     y *= scalar;
     return *this;
@@ -139,16 +244,15 @@ GB_Vector2d& GB_Vector2d::operator*=(double scalar)
 
 GB_Vector2d& GB_Vector2d::operator/=(double scalar)
 {
-    if (std::abs(scalar) <= GB_Epsilon)
+    if (!std::isfinite(scalar) || scalar == 0.0)
     {
         x = GB_QuietNan;
         y = GB_QuietNan;
         return *this;
     }
 
-    const double inv = 1.0 / scalar;
-    x *= inv;
-    y *= inv;
+    x /= scalar;
+    y /= scalar;
     return *this;
 }
 
@@ -169,23 +273,33 @@ bool GB_Vector2d::operator!=(const GB_Vector2d& other) const
 
 double GB_Vector2d::Length() const
 {
-    return std::sqrt(LengthSquared());
+    if (!IsValid())
+    {
+        return GB_QuietNan;
+    }
+
+    return std::hypot(x, y);
 }
 
 double GB_Vector2d::LengthSquared() const
 {
-    return x * x + y * y;
+    if (!IsValid())
+    {
+        return GB_QuietNan;
+    }
+
+    return SquareLengthOrInfinity(x, y);
 }
 
 double GB_Vector2d::Angle() const
 {
-    if (!IsValid() || IsZero())
+    if (!IsNonDegenerate(*this))
     {
         return GB_QuietNan;
     }
 
     double angle = std::atan2(y, x);
-    if (angle < 0)
+    if (angle < 0.0)
     {
         angle += GB_2Pi;
     }
@@ -204,18 +318,13 @@ GB_Vector2d GB_Vector2d::FromAngle(double angle)
 
 GB_Vector2d GB_Vector2d::Normalized() const
 {
-    if (!IsValid())
+    NormalizedVector2d normalizedVector;
+    if (!TryNormalizeComponents(x, y, normalizedVector))
     {
         return MakeNanVector();
     }
 
-    const double length = Length();
-    if (!std::isfinite(length) || length <= GB_Epsilon)
-    {
-        return MakeNanVector();
-    }
-
-    return (*this) / length;
+    return GB_Vector2d(normalizedVector.x, normalizedVector.y);
 }
 
 void GB_Vector2d::Normalize()
@@ -245,7 +354,7 @@ double GB_Vector2d::CrossProduct(const GB_Vector2d& other) const
 
 GB_Vector2d GB_Vector2d::Transform(const GB_Vector2d& vec, const GB_Matrix3x3& mat)
 {
-	return mat.TransformVector(vec);
+    return mat.TransformVector(vec);
 }
 
 void GB_Vector2d::Transform(const GB_Matrix3x3& mat)
@@ -260,20 +369,18 @@ GB_Vector2d GB_Vector2d::Transformed(const GB_Matrix3x3& mat) const
 
 double GB_Vector2d::AngleBetween(const GB_Vector2d& a, const GB_Vector2d& b)
 {
-    if (!a.IsValid() || !b.IsValid())
+    NormalizedVector2d firstNormalized;
+    NormalizedVector2d secondNormalized;
+    if (!TryGetNormalizedPair(a, b, firstNormalized, secondNormalized))
     {
         return GB_QuietNan;
     }
 
-    constexpr static double eps2 = GB_Epsilon * GB_Epsilon;
-    if (a.LengthSquared() <= eps2 || b.LengthSquared() <= eps2)
-    {
-        return GB_QuietNan;
-    }
-
-    const double dot = DotProduct(a, b);
-    const double crossAbs = std::abs(CrossProduct(a, b));
-    return std::atan2(crossAbs, dot);
+    double dot = firstNormalized.x * secondNormalized.x + firstNormalized.y * secondNormalized.y;
+    double cross = firstNormalized.x * secondNormalized.y - firstNormalized.y * secondNormalized.x;
+    dot = std::max(-1.0, std::min(1.0, dot));
+    cross = std::max(-1.0, std::min(1.0, cross));
+    return std::atan2(std::abs(cross), dot);
 }
 
 double GB_Vector2d::AngleBetween(const GB_Vector2d& other) const
@@ -283,70 +390,56 @@ double GB_Vector2d::AngleBetween(const GB_Vector2d& other) const
 
 double GB_Vector2d::SignedAngleTo(const GB_Vector2d& other) const
 {
-    if (!IsValid() || !other.IsValid())
+    NormalizedVector2d firstNormalized;
+    NormalizedVector2d secondNormalized;
+    if (!TryGetNormalizedPair(*this, other, firstNormalized, secondNormalized))
     {
         return GB_QuietNan;
     }
 
-    constexpr static double eps2 = GB_Epsilon * GB_Epsilon;
-    if (LengthSquared() <= eps2 || other.LengthSquared() <= eps2)
-    {
-        return GB_QuietNan;
-    }
-
-    const double dot = DotProduct(other);
-    const double cross = CrossProduct(other);
+    double dot = firstNormalized.x * secondNormalized.x + firstNormalized.y * secondNormalized.y;
+    double cross = firstNormalized.x * secondNormalized.y - firstNormalized.y * secondNormalized.x;
+    dot = std::max(-1.0, std::min(1.0, dot));
+    cross = std::max(-1.0, std::min(1.0, cross));
     return std::atan2(cross, dot);
 }
 
 bool GB_Vector2d::IsParallelTo(const GB_Vector2d& other, double tolerance) const
 {
-    if (!IsValid() || !other.IsValid())
+    double absoluteTolerance = 0.0;
+    if (!TryGetAbsoluteTolerance(tolerance, absoluteTolerance))
     {
         return false;
     }
 
-    constexpr static double eps2 = GB_Epsilon * GB_Epsilon;
-    const double lenA2 = LengthSquared();
-    const double lenB2 = other.LengthSquared();
-    if (lenA2 <= eps2 || lenB2 <= eps2)
+    NormalizedVector2d firstNormalized;
+    NormalizedVector2d secondNormalized;
+    if (!TryGetNormalizedPair(*this, other, firstNormalized, secondNormalized))
     {
         return false;
     }
 
-    const double cross = CrossProduct(other);
-    if (!std::isfinite(cross))
-    {
-        return false;
-    }
-
-    const double rhs = (tolerance * tolerance) * lenA2 * lenB2;
-    return (cross * cross) <= rhs;
+    const double normalizedCross = firstNormalized.x * secondNormalized.y - firstNormalized.y * secondNormalized.x;
+    return std::abs(normalizedCross) <= absoluteTolerance;
 }
 
 bool GB_Vector2d::IsPerpendicularTo(const GB_Vector2d& other, double tolerance) const
 {
-    if (!IsValid() || !other.IsValid())
+    double absoluteTolerance = 0.0;
+    if (!TryGetAbsoluteTolerance(tolerance, absoluteTolerance))
     {
         return false;
     }
 
-    constexpr static double eps2 = GB_Epsilon * GB_Epsilon;
-    const double lenA2 = LengthSquared();
-    const double lenB2 = other.LengthSquared();
-    if (lenA2 <= eps2 || lenB2 <= eps2)
+    NormalizedVector2d firstNormalized;
+    NormalizedVector2d secondNormalized;
+    if (!TryGetNormalizedPair(*this, other, firstNormalized, secondNormalized))
     {
         return false;
     }
 
-    const double dot = DotProduct(other);
-    if (!std::isfinite(dot))
-    {
-        return false;
-    }
-
-    const double rhs = (tolerance * tolerance) * lenA2 * lenB2;
-    return (dot * dot) <= rhs;
+    const double normalizedDot = firstNormalized.x * secondNormalized.x + firstNormalized.y * secondNormalized.y;
+    return std::abs(normalizedDot) <= absoluteTolerance;
 }
 
 bool GB_Vector2d::IsCodirectionalTo(const GB_Vector2d& other, double tolerance) const
@@ -356,7 +449,14 @@ bool GB_Vector2d::IsCodirectionalTo(const GB_Vector2d& other, double tolerance) 
         return false;
     }
 
-    return DotProduct(other) > 0;
+    NormalizedVector2d firstNormalized;
+    NormalizedVector2d secondNormalized;
+    if (!TryGetNormalizedPair(*this, other, firstNormalized, secondNormalized))
+    {
+        return false;
+    }
+
+    return firstNormalized.x * secondNormalized.x + firstNormalized.y * secondNormalized.y > 0.0;
 }
 
 GB_Vector2d GB_Vector2d::Rotated(double angle) const
@@ -366,10 +466,10 @@ GB_Vector2d GB_Vector2d::Rotated(double angle) const
         return MakeNanVector();
     }
 
-    const double c = std::cos(angle);
-    const double s = std::sin(angle);
-
-    return GB_Vector2d(x * c - y * s, x * s + y * c);
+    const double cosAngle = std::cos(angle);
+    const double sinAngle = std::sin(angle);
+    const GB_Vector2d result(x * cosAngle - y * sinAngle, x * sinAngle + y * cosAngle);
+    return result.IsValid() ? result : MakeNanVector();
 }
 
 void GB_Vector2d::Rotate(double angle)
@@ -384,23 +484,33 @@ GB_Vector2d GB_Vector2d::ProjectOn(const GB_Vector2d& onto) const
         return MakeNanVector();
     }
 
-    const double ontoLen2 = onto.LengthSquared();
-    constexpr static double eps2 = GB_Epsilon * GB_Epsilon;
-    if (!std::isfinite(ontoLen2) || ontoLen2 <= eps2)
+    NormalizedVector2d normalizedOnto;
+    if (!TryNormalizeComponents(onto.x, onto.y, normalizedOnto))
     {
         return MakeNanVector();
     }
 
-    const double scale = DotProduct(onto) / ontoLen2;
-    return onto * scale;
+    const double componentScale = std::max(std::abs(x), std::abs(y));
+    if (componentScale == 0.0)
+    {
+        return GB_Vector2d::Zero;
+    }
+
+    const double scaledX = x / componentScale;
+    const double scaledY = y / componentScale;
+    const double scaledProjectionLength = scaledX * normalizedOnto.x + scaledY * normalizedOnto.y;
+    const double resultX = componentScale * (normalizedOnto.x * scaledProjectionLength);
+    const double resultY = componentScale * (normalizedOnto.y * scaledProjectionLength);
+    const GB_Vector2d result(resultX, resultY);
+    return result.IsValid() ? result : MakeNanVector();
 }
 
 std::string GB_Vector2d::SerializeToString() const
 {
-    std::ostringstream oss;
-    oss.imbue(std::locale::classic());
-	oss << "(" << GetClassType() << " " << std::setprecision(17) << x << "," << y << ")";
-    return oss.str();
+    std::ostringstream stream;
+    stream.imbue(std::locale::classic());
+    stream << "(" << GetClassType() << " " << std::setprecision(17) << x << "," << y << ")";
+    return stream.str();
 }
 
 GB_ByteBuffer GB_Vector2d::SerializeToBinary() const
@@ -409,42 +519,35 @@ GB_ByteBuffer GB_Vector2d::SerializeToBinary() const
 
     GB_ByteBuffer buffer;
     buffer.reserve(32);
-
     GB_ByteBufferIO::AppendUInt32LE(buffer, GB_ClassMagicNumber);
     GB_ByteBufferIO::AppendUInt64LE(buffer, GetClassTypeId());
     GB_ByteBufferIO::AppendUInt16LE(buffer, payloadVersion);
     GB_ByteBufferIO::AppendUInt16LE(buffer, 0);
-
     GB_ByteBufferIO::AppendDoubleLE(buffer, x);
     GB_ByteBufferIO::AppendDoubleLE(buffer, y);
-
     return buffer;
 }
 
 bool GB_Vector2d::Deserialize(const std::string& data)
 {
-    std::istringstream iss(data);
-    iss.imbue(std::locale::classic());
+    std::istringstream stream(data);
+    stream.imbue(std::locale::classic());
 
-    char leftParen = 0;
+    char leftParenthesis = 0;
     std::string type;
     char comma = 0;
-    char rightParen = 0;
-
+    char rightParenthesis = 0;
     double parsedX = GB_QuietNan;
     double parsedY = GB_QuietNan;
 
-    if (!(iss >> leftParen >> type >> parsedX >> comma >> parsedY >> rightParen))
+    if (!(stream >> leftParenthesis >> type >> parsedX >> comma >> parsedY >> rightParenthesis))
     {
-        x = GB_QuietNan;
-        y = GB_QuietNan;
         return false;
     }
 
-    if (leftParen != '(' || rightParen != ')' || comma != ',' || type != GetClassType())
+    stream >> std::ws;
+    if (!stream.eof() || leftParenthesis != '(' || rightParenthesis != ')' || comma != ',' || type != GetClassType())
     {
-        x = GB_QuietNan;
-        y = GB_QuietNan;
         return false;
     }
 
@@ -456,12 +559,10 @@ bool GB_Vector2d::Deserialize(const std::string& data)
 bool GB_Vector2d::Deserialize(const GB_ByteBuffer& data)
 {
     constexpr static uint16_t expectedPayloadVersion = 1;
-    constexpr static size_t minSize = 32;
+    constexpr static size_t expectedSize = 32;
 
-    if (data.size() < minSize)
+    if (data.size() != expectedSize)
     {
-        x = GB_QuietNan;
-        y = GB_QuietNan;
         return false;
     }
 
@@ -470,7 +571,6 @@ bool GB_Vector2d::Deserialize(const GB_ByteBuffer& data)
     uint64_t typeId = 0;
     uint16_t payloadVersion = 0;
     uint16_t reserved = 0;
-
     double parsedX = GB_QuietNan;
     double parsedY = GB_QuietNan;
 
@@ -481,15 +581,11 @@ bool GB_Vector2d::Deserialize(const GB_ByteBuffer& data)
         || !GB_ByteBufferIO::ReadDoubleLE(data, offset, parsedX)
         || !GB_ByteBufferIO::ReadDoubleLE(data, offset, parsedY))
     {
-        x = GB_QuietNan;
-        y = GB_QuietNan;
         return false;
     }
 
-    if (magic != GB_ClassMagicNumber || typeId != GetClassTypeId() || payloadVersion != expectedPayloadVersion)
+    if (magic != GB_ClassMagicNumber || typeId != GetClassTypeId() || payloadVersion != expectedPayloadVersion || reserved != 0 || offset != data.size())
     {
-        x = GB_QuietNan;
-        y = GB_QuietNan;
         return false;
     }
 
