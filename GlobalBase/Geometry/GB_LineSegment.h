@@ -261,10 +261,10 @@ public:
     /** @brief 序列化为二进制字节缓冲区。 */
     virtual GB_ByteBuffer SerializeToBinary() const override;
 
-    /** @brief 从 SerializeToString() 生成的字符串反序列化。失败时对象变为无效线段。 */
+    /** @brief 从 SerializeToString() 生成的字符串反序列化。失败时保持当前对象原值不变。 */
     virtual bool Deserialize(const std::string& data) override;
 
-    /** @brief 从 SerializeToBinary() 生成的字节缓冲区反序列化。失败时对象变为无效线段。 */
+    /** @brief 从 SerializeToBinary() 生成的字节缓冲区反序列化。失败时保持当前对象原值不变。 */
     virtual bool Deserialize(const GB_ByteBuffer& data) override;
 };
 

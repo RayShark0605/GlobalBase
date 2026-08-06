@@ -224,16 +224,14 @@ GB_LineSegment::GB_LineSegment(const GB_Point2d& startPoint, const GB_Vector2d& 
         return;
     }
 
-    const double directionLengthSquared = direction.LengthSquared();
-    if (!std::isfinite(directionLengthSquared) || directionLengthSquared <= 0.0)
+    const GB_Vector2d unitDirection = direction.Normalized();
+    if (!unitDirection.IsValid())
     {
         Reset();
         return;
     }
 
-    const double directionLength = std::sqrt(directionLengthSquared);
-    const double scale = length / directionLength;
-    Set(startPoint, startPoint + direction * scale);
+    Set(startPoint, startPoint + unitDirection * length);
 }
 
 GB_LineSegment::~GB_LineSegment()
@@ -295,7 +293,8 @@ bool GB_LineSegment::IsDegenerate(double tolerance) const
     }
 
     const double absTol = AbsTol(tolerance);
-    return LengthSquared() <= absTol * absTol;
+    const double length = Length();
+    return std::isfinite(length) && length <= absTol;
 }
 
 double GB_LineSegment::Length() const
@@ -1248,35 +1247,38 @@ bool GB_LineSegment::Deserialize(const std::string& data)
 
     if (!(iss >> leftParen >> type >> parsedX1 >> comma1 >> parsedY1 >> comma2 >> parsedX2 >> comma3 >> parsedY2 >> rightParen))
     {
-        Reset();
         return false;
     }
 
     iss >> std::ws;
     if (!iss.eof())
     {
-        Reset();
         return false;
     }
 
     if (leftParen != '(' || rightParen != ')' || comma1 != ',' || comma2 != ',' || comma3 != ',' || type != GetClassType())
     {
-        Reset();
         return false;
     }
 
-    Set(parsedX1, parsedY1, parsedX2, parsedY2);
-    return IsValid();
+    GB_LineSegment parsedSegment;
+    parsedSegment.Set(parsedX1, parsedY1, parsedX2, parsedY2);
+    if (!parsedSegment.IsValid())
+    {
+        return false;
+    }
+
+    *this = parsedSegment;
+    return true;
 }
 
 bool GB_LineSegment::Deserialize(const GB_ByteBuffer& data)
 {
     constexpr static uint16_t expectedPayloadVersion = 1;
-    constexpr static size_t minSize = 48;
+    constexpr static size_t expectedSize = 48;
 
-    if (data.size() != minSize)
+    if (data.size() != expectedSize)
     {
-        Reset();
         return false;
     }
 
@@ -1300,16 +1302,21 @@ bool GB_LineSegment::Deserialize(const GB_ByteBuffer& data)
         || !GB_ByteBufferIO::ReadDoubleLE(data, offset, parsedX2)
         || !GB_ByteBufferIO::ReadDoubleLE(data, offset, parsedY2))
     {
-        Reset();
         return false;
     }
 
     if (magic != GB_ClassMagicNumber || typeId != GetClassTypeId() || payloadVersion != expectedPayloadVersion || reserved != 0 || offset != data.size())
     {
-        Reset();
         return false;
     }
 
-    Set(parsedX1, parsedY1, parsedX2, parsedY2);
-    return IsValid();
+    GB_LineSegment parsedSegment;
+    parsedSegment.Set(parsedX1, parsedY1, parsedX2, parsedY2);
+    if (!parsedSegment.IsValid())
+    {
+        return false;
+    }
+
+    *this = parsedSegment;
+    return true;
 }

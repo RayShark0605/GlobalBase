@@ -225,15 +225,23 @@ namespace
 		{
 			return std::wstring();
 		}
+		if (textUtf8.size() > static_cast<size_t>(std::numeric_limits<int>::max()))
+		{
+			return std::wstring();
+		}
 
-		const int wideLength = MultiByteToWideChar(CP_UTF8, 0, textUtf8.c_str(), static_cast<int>(textUtf8.size()), nullptr, 0);
+		const int textLength = static_cast<int>(textUtf8.size());
+		const int wideLength = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, textUtf8.c_str(), textLength, nullptr, 0);
 		if (wideLength <= 0)
 		{
 			return std::wstring();
 		}
 
 		std::wstring wideText(static_cast<size_t>(wideLength), L'\0');
-		MultiByteToWideChar(CP_UTF8, 0, textUtf8.c_str(), static_cast<int>(textUtf8.size()), &wideText[0], wideLength);
+		if (MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, textUtf8.c_str(), textLength, &wideText[0], wideLength) != wideLength)
+		{
+			return std::wstring();
+		}
 		return wideText;
 	}
 #endif
@@ -265,7 +273,7 @@ namespace
 		return errorMessage;
 	}
 
-	bool AddGlobalBaseDependencyDirectoryToDllSearchPath(const std::string& dependencyDirectoryPathUtf8, std::string& errorMessage)
+	bool PreloadOnnxRuntimeCudaDependencyDlls(const std::string& dependencyDirectoryPathUtf8, std::string& errorMessage)
 	{
 		errorMessage.clear();
 
@@ -275,37 +283,74 @@ namespace
 			return false;
 		}
 
-		const std::wstring wideDependencyDirectoryPath = Utf8ToWideString(dependencyDirectoryPathUtf8);
-		if (wideDependencyDirectoryPath.empty())
+		const std::vector<std::string> dependencyDllNames =
 		{
-			errorMessage = GB_STR("依赖库目录 UTF-8 转换失败：") + dependencyDirectoryPathUtf8;
-			return false;
+			"cudnn64_9.dll",
+			"onnxruntime_providers_shared.dll",
+			"onnxruntime_providers_cuda.dll"
+		};
+
+		std::vector<std::string> dependencyDllPathsUtf8;
+		dependencyDllPathsUtf8.reserve(dependencyDllNames.size());
+		for (const std::string& dllName : dependencyDllNames)
+		{
+			const std::string dllPathUtf8 = GB_JoinPath(dependencyDirectoryPathUtf8, dllName);
+			if (!GB_IsFileExists(dllPathUtf8))
+			{
+				errorMessage = GB_STR("缺少 ONNX Runtime CUDA 运行时依赖库：") + dllPathUtf8;
+				return false;
+			}
+			dependencyDllPathsUtf8.push_back(dllPathUtf8);
 		}
 
-		static std::mutex dependencyDirectoryMutex;
-		static bool hasAddedDependencyDirectory = false;
-		static std::string addedDependencyDirectoryPathUtf8;
+		static std::mutex dependencyDllMutex;
+		static std::string loadedDependencyDirectoryPathUtf8;
+		static std::vector<HMODULE> loadedDependencyModules;
 
-		std::lock_guard<std::mutex> lockGuard(dependencyDirectoryMutex);
-		if (hasAddedDependencyDirectory)
+		std::lock_guard<std::mutex> lockGuard(dependencyDllMutex);
+		if (!loadedDependencyModules.empty())
 		{
-			if (addedDependencyDirectoryPathUtf8 == dependencyDirectoryPathUtf8)
+			if (loadedDependencyDirectoryPathUtf8 == dependencyDirectoryPathUtf8)
 			{
 				return true;
 			}
 
-			errorMessage = GB_STR("当前进程已经设置过不同的 DLL 搜索目录：") + addedDependencyDirectoryPathUtf8;
+			errorMessage = GB_STR("当前进程已经从不同目录预加载过 ONNX Runtime CUDA 依赖库：") + loadedDependencyDirectoryPathUtf8;
 			return false;
 		}
 
-		if (!SetDllDirectoryW(wideDependencyDirectoryPath.c_str()))
+		std::vector<HMODULE> newlyLoadedModules;
+		newlyLoadedModules.reserve(dependencyDllPathsUtf8.size());
+		for (const std::string& dllPathUtf8 : dependencyDllPathsUtf8)
 		{
-			errorMessage = BuildWin32ErrorMessage(GB_STR("添加 DLL 搜索目录"), dependencyDirectoryPathUtf8, GetLastError());
-			return false;
+			const std::wstring wideDllPath = Utf8ToWideString(dllPathUtf8);
+			if (wideDllPath.empty())
+			{
+				errorMessage = GB_STR("依赖库路径 UTF-8 转换失败：") + dllPathUtf8;
+				for (std::vector<HMODULE>::reverse_iterator iterator = newlyLoadedModules.rbegin(); iterator != newlyLoadedModules.rend(); iterator++)
+				{
+					FreeLibrary(*iterator);
+				}
+				return false;
+			}
+
+			const HMODULE moduleHandle = LoadLibraryExW(wideDllPath.c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
+			if (moduleHandle == nullptr)
+			{
+				const DWORD errorCode = GetLastError();
+				for (std::vector<HMODULE>::reverse_iterator iterator = newlyLoadedModules.rbegin(); iterator != newlyLoadedModules.rend(); iterator++)
+				{
+					FreeLibrary(*iterator);
+				}
+				errorMessage = BuildWin32ErrorMessage(GB_STR("预加载 ONNX Runtime CUDA 依赖库"), dllPathUtf8, errorCode);
+				return false;
+			}
+
+			newlyLoadedModules.push_back(moduleHandle);
 		}
 
-		addedDependencyDirectoryPathUtf8 = dependencyDirectoryPathUtf8;
-		hasAddedDependencyDirectory = true;
+		loadedDependencyDirectoryPathUtf8 = dependencyDirectoryPathUtf8;
+		loadedDependencyModules = std::move(newlyLoadedModules);
 		return true;
 	}
 
@@ -326,29 +371,7 @@ namespace
 			return false;
 		}
 
-		if (!AddGlobalBaseDependencyDirectoryToDllSearchPath(dependencyDirectoryPathUtf8, errorMessage))
-		{
-			return false;
-		}
-
-		const std::vector<std::string> requiredCudaDependencyDllNames =
-		{
-			"onnxruntime_providers_shared.dll",
-			"onnxruntime_providers_cuda.dll",
-			"cudnn64_9.dll"
-		};
-
-		for (const std::string& dllName : requiredCudaDependencyDllNames)
-		{
-			const std::string dllPathUtf8 = GB_JoinPath(dependencyDirectoryPathUtf8, dllName);
-			if (!GB_IsFileExists(dllPathUtf8))
-			{
-				errorMessage = GB_STR("缺少 ONNX Runtime CUDA 运行时依赖库：") + dllPathUtf8;
-				return false;
-			}
-		}
-
-		return true;
+		return PreloadOnnxRuntimeCudaDependencyDlls(dependencyDirectoryPathUtf8, errorMessage);
 	}
 #else
 	bool PrepareOnnxRuntimeCudaDependencyDlls(std::string& errorMessage)
@@ -738,27 +761,111 @@ namespace
 
 	double GetRectangleCenterY(const GB_Rectangle& rectangle)
 	{
-		return (rectangle.minY + rectangle.maxY) * 0.5;
+		return rectangle.IsValid() ? rectangle.minY * 0.5 + rectangle.maxY * 0.5 : std::numeric_limits<double>::infinity();
 	}
 
 	double GetRectangleCenterX(const GB_Rectangle& rectangle)
 	{
-		return (rectangle.minX + rectangle.maxX) * 0.5;
+		return rectangle.IsValid() ? rectangle.minX * 0.5 + rectangle.maxX * 0.5 : std::numeric_limits<double>::infinity();
 	}
 
-	bool CompareTextBlocksReadingOrder(const GB_OCRTextBlock& leftBlock, const GB_OCRTextBlock& rightBlock)
+	struct OCRTextLine
 	{
-		const double leftHeight = std::max(0.0, leftBlock.boundingRectangle.maxY - leftBlock.boundingRectangle.minY);
-		const double rightHeight = std::max(0.0, rightBlock.boundingRectangle.maxY - rightBlock.boundingRectangle.minY);
-		const double yTolerance = std::max(10.0, std::min(leftHeight, rightHeight) * 0.5);
+		std::vector<GB_OCRTextBlock> blocks;
+		double centerY = 0.0;
+		double averageHeight = 0.0;
+	};
+
+	bool CompareTextBlocksByVerticalPosition(const GB_OCRTextBlock& leftBlock, const GB_OCRTextBlock& rightBlock)
+	{
 		const double leftCenterY = GetRectangleCenterY(leftBlock.boundingRectangle);
 		const double rightCenterY = GetRectangleCenterY(rightBlock.boundingRectangle);
-		if (std::fabs(leftCenterY - rightCenterY) > yTolerance)
+		if (leftCenterY != rightCenterY)
 		{
 			return leftCenterY < rightCenterY;
 		}
 
-		return GetRectangleCenterX(leftBlock.boundingRectangle) < GetRectangleCenterX(rightBlock.boundingRectangle);
+		const double leftCenterX = GetRectangleCenterX(leftBlock.boundingRectangle);
+		const double rightCenterX = GetRectangleCenterX(rightBlock.boundingRectangle);
+		if (leftCenterX != rightCenterX)
+		{
+			return leftCenterX < rightCenterX;
+		}
+
+		return leftBlock.text < rightBlock.text;
+	}
+
+	bool CompareTextBlocksByHorizontalPosition(const GB_OCRTextBlock& leftBlock, const GB_OCRTextBlock& rightBlock)
+	{
+		const double leftCenterX = GetRectangleCenterX(leftBlock.boundingRectangle);
+		const double rightCenterX = GetRectangleCenterX(rightBlock.boundingRectangle);
+		if (leftCenterX != rightCenterX)
+		{
+			return leftCenterX < rightCenterX;
+		}
+
+		const double leftCenterY = GetRectangleCenterY(leftBlock.boundingRectangle);
+		const double rightCenterY = GetRectangleCenterY(rightBlock.boundingRectangle);
+		if (leftCenterY != rightCenterY)
+		{
+			return leftCenterY < rightCenterY;
+		}
+
+		return leftBlock.text < rightBlock.text;
+	}
+
+	void SortTextBlocksReadingOrder(std::vector<GB_OCRTextBlock>& textBlocks)
+	{
+		if (textBlocks.size() < 2)
+		{
+			return;
+		}
+
+		std::stable_sort(textBlocks.begin(), textBlocks.end(), CompareTextBlocksByVerticalPosition);
+
+		std::vector<OCRTextLine> textLines;
+		textLines.reserve(textBlocks.size());
+		for (GB_OCRTextBlock& textBlock : textBlocks)
+		{
+			const double blockCenterY = GetRectangleCenterY(textBlock.boundingRectangle);
+			const double blockHeight = textBlock.boundingRectangle.IsValid() ? std::max(0.0, textBlock.boundingRectangle.Height()) : 0.0;
+			bool appendToCurrentLine = false;
+			if (!textLines.empty() && std::isfinite(blockCenterY))
+			{
+				const OCRTextLine& currentLine = textLines.back();
+				const double lineTolerance = std::max(10.0, std::min(currentLine.averageHeight, blockHeight) * 0.5);
+				appendToCurrentLine = std::isfinite(currentLine.centerY) && std::abs(blockCenterY - currentLine.centerY) <= lineTolerance;
+			}
+
+			if (!appendToCurrentLine)
+			{
+				OCRTextLine textLine;
+				textLine.centerY = blockCenterY;
+				textLine.averageHeight = blockHeight;
+				textLine.blocks.push_back(std::move(textBlock));
+				textLines.push_back(std::move(textLine));
+				continue;
+			}
+
+			OCRTextLine& currentLine = textLines.back();
+			const double oldBlockCount = static_cast<double>(currentLine.blocks.size());
+			currentLine.centerY = (currentLine.centerY * oldBlockCount + blockCenterY) / (oldBlockCount + 1.0);
+			currentLine.averageHeight = (currentLine.averageHeight * oldBlockCount + blockHeight) / (oldBlockCount + 1.0);
+			currentLine.blocks.push_back(std::move(textBlock));
+		}
+
+		std::vector<GB_OCRTextBlock> sortedTextBlocks;
+		sortedTextBlocks.reserve(textBlocks.size());
+		for (OCRTextLine& textLine : textLines)
+		{
+			std::stable_sort(textLine.blocks.begin(), textLine.blocks.end(), CompareTextBlocksByHorizontalPosition);
+			for (GB_OCRTextBlock& textBlock : textLine.blocks)
+			{
+				sortedTextBlocks.push_back(std::move(textBlock));
+			}
+		}
+
+		textBlocks = std::move(sortedTextBlocks);
 	}
 
 	cv::Mat BlendBgraMatWithWhiteBackground(const cv::Mat& bgraImage)
@@ -2021,23 +2128,42 @@ namespace
 
 	float GetStableMaxProbability(const float* values, int valueCount, int maxIndex, float maxValue, float minValue)
 	{
-		if (values == nullptr || valueCount <= 0 || maxIndex < 0 || maxIndex >= valueCount)
+		if (values == nullptr || valueCount <= 0 || maxIndex < 0 || maxIndex >= valueCount || !std::isfinite(maxValue) || !std::isfinite(minValue))
 		{
 			return 0.0f;
 		}
 
 		if (minValue >= 0.0f && maxValue <= 1.0f)
 		{
-			return maxValue;
+			double probabilitySum = 0.0;
+			for (int valueIndex = 0; valueIndex < valueCount; valueIndex++)
+			{
+				if (!std::isfinite(values[valueIndex]) || values[valueIndex] < 0.0f || values[valueIndex] > 1.0f)
+				{
+					probabilitySum = -1.0;
+					break;
+				}
+				probabilitySum += static_cast<double>(values[valueIndex]);
+			}
+
+			const double probabilitySumTolerance = std::max(1e-4, static_cast<double>(valueCount) * static_cast<double>(std::numeric_limits<float>::epsilon()) * 8.0);
+			if (probabilitySum >= 0.0 && std::abs(probabilitySum - 1.0) <= probabilitySumTolerance)
+			{
+				return maxValue;
+			}
 		}
 
 		double sumExp = 0.0;
 		for (int valueIndex = 0; valueIndex < valueCount; valueIndex++)
 		{
+			if (!std::isfinite(values[valueIndex]))
+			{
+				return 0.0f;
+			}
 			sumExp += std::exp(static_cast<double>(values[valueIndex]) - static_cast<double>(maxValue));
 		}
 
-		if (sumExp <= 0.0)
+		if (!std::isfinite(sumExp) || sumExp <= 0.0)
 		{
 			return 0.0f;
 		}
@@ -2542,7 +2668,7 @@ namespace
 
 				if (options.sortTextBlocks)
 				{
-					std::sort(textBlocks.begin(), textBlocks.end(), CompareTextBlocksReadingOrder);
+					SortTextBlocksReadingOrder(textBlocks);
 				}
 			}
 			catch (const Ort::Exception& exception)
@@ -3353,7 +3479,7 @@ namespace
 
 			if (options.sortTextBlocks && withLocation)
 			{
-				std::sort(textBlocks.begin(), textBlocks.end(), CompareTextBlocksReadingOrder);
+				SortTextBlocksReadingOrder(textBlocks);
 			}
 
 			return true;

@@ -1867,8 +1867,6 @@ GB_ByteBuffer GB_Polyline::SerializeToBinary() const
 
 bool GB_Polyline::Deserialize(const std::string& data)
 {
-    Clear();
-
     if (data.size() < 2 || data.front() != '(' || data.back() != ')')
     {
         return false;
@@ -1908,15 +1906,13 @@ bool GB_Polyline::Deserialize(const std::string& data)
         std::string yText;
         if (!ReadNextSerializedField(body, offset, xText) || !ReadNextSerializedField(body, offset, yText))
         {
-            Clear();
             return false;
         }
 
         double x = GB_QuietNan;
         double y = GB_QuietNan;
-        if (!TryParseDouble(xText, x) || !TryParseDouble(yText, y))
+        if (!TryParseDouble(xText, x) || !TryParseDouble(yText, y) || !std::isfinite(x) || !std::isfinite(y))
         {
-            Clear();
             return false;
         }
 
@@ -1925,7 +1921,6 @@ bool GB_Polyline::Deserialize(const std::string& data)
 
     if (offset != body.size() || (!body.empty() && body.back() == '|'))
     {
-        Clear();
         return false;
     }
 
@@ -1936,8 +1931,6 @@ bool GB_Polyline::Deserialize(const std::string& data)
 
 bool GB_Polyline::Deserialize(const GB_ByteBuffer& data)
 {
-    Clear();
-
     constexpr static uint16_t expectedPayloadVersion = 1;
     constexpr static size_t headerSize = 24;
 
@@ -1992,15 +1985,18 @@ bool GB_Polyline::Deserialize(const GB_ByteBuffer& data)
         double y = GB_QuietNan;
         if (!GB_ByteBufferIO::ReadDoubleLE(data, offset, x) || !GB_ByteBufferIO::ReadDoubleLE(data, offset, y))
         {
-            Clear();
             return false;
         }
         if (!std::isfinite(x) || !std::isfinite(y))
         {
-            Clear();
             return false;
         }
         parsedVertices.emplace_back(x, y);
+    }
+
+    if (offset != data.size())
+    {
+        return false;
     }
 
     vertices = std::move(parsedVertices);

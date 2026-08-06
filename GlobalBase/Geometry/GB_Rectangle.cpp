@@ -8,6 +8,7 @@
 #include <cmath>
 #include <cstdint>
 #include <iomanip>
+#include <limits>
 #include <locale>
 #include <sstream>
 
@@ -25,6 +26,107 @@ namespace
             return 0;
         }
         return std::abs(tolerance);
+    }
+
+    struct ScaledPositiveValue
+    {
+        double mantissa = 0.0;
+        int exponent = 0;
+    };
+
+    static void NormalizeScaledPositiveValue(ScaledPositiveValue& value)
+    {
+        if (value.mantissa == 0.0)
+        {
+            value.exponent = 0;
+            return;
+        }
+
+        int adjustment = 0;
+        value.mantissa = std::frexp(value.mantissa, &adjustment);
+        value.exponent += adjustment;
+    }
+
+    static bool TryGetPositiveDifferenceScaled(double largerValue, double smallerValue, ScaledPositiveValue& result)
+    {
+        result = ScaledPositiveValue();
+        if (!std::isfinite(largerValue) || !std::isfinite(smallerValue) || largerValue < smallerValue)
+        {
+            return false;
+        }
+
+        if (largerValue >= 0.0 && smallerValue < 0.0)
+        {
+            const double absoluteSmallerValue = std::abs(smallerValue);
+            const double scale = std::max(largerValue, absoluteSmallerValue);
+            if (scale == 0.0)
+            {
+                return true;
+            }
+
+            int scaleExponent = 0;
+            const double scaleMantissa = std::frexp(scale, &scaleExponent);
+            const double normalizedDifference = largerValue / scale + absoluteSmallerValue / scale;
+            int normalizedExponent = 0;
+            const double normalizedMantissa = std::frexp(normalizedDifference, &normalizedExponent);
+            result.mantissa = scaleMantissa * normalizedMantissa;
+            result.exponent = scaleExponent + normalizedExponent;
+            NormalizeScaledPositiveValue(result);
+            return true;
+        }
+
+        const double difference = largerValue - smallerValue;
+        if (difference == 0.0)
+        {
+            return true;
+        }
+
+        result.mantissa = std::frexp(difference, &result.exponent);
+        return true;
+    }
+
+    static double ScaledPositiveValueToDoubleOrInfinity(const ScaledPositiveValue& value)
+    {
+        if (value.mantissa == 0.0)
+        {
+            return 0.0;
+        }
+
+        const double result = std::scalbn(value.mantissa, value.exponent);
+        return std::isfinite(result) ? result : std::numeric_limits<double>::infinity();
+    }
+
+    static double PositiveDifferenceOrInfinity(double largerValue, double smallerValue)
+    {
+        ScaledPositiveValue difference;
+        if (!TryGetPositiveDifferenceScaled(largerValue, smallerValue, difference))
+        {
+            return GB_QuietNan;
+        }
+
+        return ScaledPositiveValueToDoubleOrInfinity(difference);
+    }
+
+    static double ProductOfPositiveDifferencesOrInfinity(double firstLargerValue, double firstSmallerValue, double secondLargerValue, double secondSmallerValue)
+    {
+        ScaledPositiveValue firstDifference;
+        ScaledPositiveValue secondDifference;
+        if (!TryGetPositiveDifferenceScaled(firstLargerValue, firstSmallerValue, firstDifference)
+            || !TryGetPositiveDifferenceScaled(secondLargerValue, secondSmallerValue, secondDifference))
+        {
+            return GB_QuietNan;
+        }
+
+        if (firstDifference.mantissa == 0.0 || secondDifference.mantissa == 0.0)
+        {
+            return 0.0;
+        }
+
+        ScaledPositiveValue product;
+        product.mantissa = firstDifference.mantissa * secondDifference.mantissa;
+        product.exponent = firstDifference.exponent + secondDifference.exponent;
+        NormalizeScaledPositiveValue(product);
+        return ScaledPositiveValueToDoubleOrInfinity(product);
     }
 }
 
@@ -196,8 +298,7 @@ double GB_Rectangle::Width() const
         return GB_QuietNan;
     }
 
-    const double value = maxX - minX;
-    return std::isfinite(value) ? value : GB_QuietNan;
+    return PositiveDifferenceOrInfinity(maxX, minX);
 }
 
 double GB_Rectangle::Height() const
@@ -207,8 +308,7 @@ double GB_Rectangle::Height() const
         return GB_QuietNan;
     }
 
-    const double value = maxY - minY;
-    return std::isfinite(value) ? value : GB_QuietNan;
+    return PositiveDifferenceOrInfinity(maxY, minY);
 }
 
 double GB_Rectangle::Perimeter() const
@@ -220,13 +320,18 @@ double GB_Rectangle::Perimeter() const
 
     const double width = Width();
     const double height = Height();
-    if (!std::isfinite(width) || !std::isfinite(height))
+    if (std::isnan(width) || std::isnan(height))
     {
         return GB_QuietNan;
     }
 
-    const double value = 2 * (width + height);
-    return std::isfinite(value) ? value : GB_QuietNan;
+    if (std::isinf(width) || std::isinf(height) || width > std::numeric_limits<double>::max() - height)
+    {
+        return std::numeric_limits<double>::infinity();
+    }
+
+    const double halfPerimeter = width + height;
+    return halfPerimeter > std::numeric_limits<double>::max() * 0.5 ? std::numeric_limits<double>::infinity() : halfPerimeter * 2.0;
 }
 
 double GB_Rectangle::Area() const
@@ -238,18 +343,17 @@ double GB_Rectangle::Area() const
 
     const double width = Width();
     const double height = Height();
-    if (!std::isfinite(width) || !std::isfinite(height))
-    {
-        return GB_QuietNan;
-    }
-
-    const double value = width * height;
-    return std::isfinite(value) ? value : GB_QuietNan;
+    return ProductOfPositiveDifferencesOrInfinity(maxX, minX, maxY, minY);
 }
 
 double GB_Rectangle::DiagLength() const
 {
-    return std::sqrt(DiagLengthSquared());
+    if (!IsValid())
+    {
+        return GB_QuietNan;
+    }
+
+    return std::hypot(Width(), Height());
 }
 
 double GB_Rectangle::DiagLengthSquared() const
@@ -259,10 +363,7 @@ double GB_Rectangle::DiagLengthSquared() const
         return GB_QuietNan;
     }
 
-    const double dx = maxX - minX;
-    const double dy = maxY - minY;
-    const double value = dx * dx + dy * dy;
-    return std::isfinite(value) ? value : GB_QuietNan;
+    return GB_Point2d(minX, minY).DistanceToSquared(GB_Point2d(maxX, maxY));
 }
 
 GB_Point2d GB_Rectangle::MinPoint() const
@@ -292,9 +393,7 @@ GB_Point2d GB_Rectangle::Center() const
         return GB_Point2d();
     }
 
-    const double cx = 0.5 * (minX + maxX);
-    const double cy = 0.5 * (minY + maxY);
-    return GB_Point2d(cx, cy);
+    return GB_Point2d::MidPoint(GB_Point2d(minX, minY), GB_Point2d(maxX, maxY));
 }
 
 std::vector<GB_Point2d> GB_Rectangle::GetCorners() const
@@ -723,33 +822,32 @@ bool GB_Rectangle::Deserialize(const std::string& data)
 
     if (!(iss >> leftParen >> type >> parsedMinX >> comma1 >> parsedMinY >> comma2 >> parsedMaxX >> comma3 >> parsedMaxY >> rightParen))
     {
-        Reset();
         return false;
     }
 
-    if (leftParen != '(' || rightParen != ')' || comma1 != ',' || comma2 != ',' || comma3 != ',' || type != GetClassType())
+    iss >> std::ws;
+    if (!iss.eof() || leftParen != '(' || rightParen != ')' || comma1 != ',' || comma2 != ',' || comma3 != ',' || type != GetClassType())
     {
-        Reset();
         return false;
     }
 
-    minX = parsedMinX;
-    minY = parsedMinY;
-    maxX = parsedMaxX;
-    maxY = parsedMaxY;
-
-    Normalize();
+    GB_Rectangle parsedRectangle;
+    parsedRectangle.minX = parsedMinX;
+    parsedRectangle.minY = parsedMinY;
+    parsedRectangle.maxX = parsedMaxX;
+    parsedRectangle.maxY = parsedMaxY;
+    parsedRectangle.Normalize();
+    *this = parsedRectangle;
     return true;
 }
 
 bool GB_Rectangle::Deserialize(const GB_ByteBuffer& data)
 {
     constexpr static uint16_t expectedPayloadVersion = 1;
-    constexpr static size_t minSize = 48;
+    constexpr static size_t expectedSize = 48;
 
-    if (data.size() < minSize)
+    if (data.size() != expectedSize)
     {
-        Reset();
         return false;
     }
 
@@ -773,21 +871,20 @@ bool GB_Rectangle::Deserialize(const GB_ByteBuffer& data)
         || !GB_ByteBufferIO::ReadDoubleLE(data, offset, parsedMaxX)
         || !GB_ByteBufferIO::ReadDoubleLE(data, offset, parsedMaxY))
     {
-        Reset();
         return false;
     }
 
-    if (magic != GB_ClassMagicNumber || typeId != GetClassTypeId() || payloadVersion != expectedPayloadVersion)
+    if (magic != GB_ClassMagicNumber || typeId != GetClassTypeId() || payloadVersion != expectedPayloadVersion || reserved != 0 || offset != data.size())
     {
-        Reset();
         return false;
     }
 
-    minX = parsedMinX;
-    minY = parsedMinY;
-    maxX = parsedMaxX;
-    maxY = parsedMaxY;
-
-    Normalize();
+    GB_Rectangle parsedRectangle;
+    parsedRectangle.minX = parsedMinX;
+    parsedRectangle.minY = parsedMinY;
+    parsedRectangle.maxX = parsedMaxX;
+    parsedRectangle.maxY = parsedMaxY;
+    parsedRectangle.Normalize();
+    *this = parsedRectangle;
     return true;
 }

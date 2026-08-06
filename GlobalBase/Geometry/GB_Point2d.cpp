@@ -53,6 +53,57 @@ namespace
         return maxComponent * maxComponent * normalizedSquareLength;
     }
 
+    static double AbsoluteDifferenceOrInfinity(double firstValue, double secondValue)
+    {
+        if (!std::isfinite(firstValue) || !std::isfinite(secondValue))
+        {
+            return GB_QuietNan;
+        }
+
+        if (std::signbit(firstValue) != std::signbit(secondValue))
+        {
+            const double absoluteFirstValue = std::abs(firstValue);
+            const double absoluteSecondValue = std::abs(secondValue);
+            if (absoluteFirstValue > std::numeric_limits<double>::max() - absoluteSecondValue)
+            {
+                return std::numeric_limits<double>::infinity();
+            }
+
+            return absoluteFirstValue + absoluteSecondValue;
+        }
+
+        return std::abs(firstValue - secondValue);
+    }
+
+    static double DistanceOrInfinity(double firstX, double firstY, double secondX, double secondY)
+    {
+        const double deltaX = AbsoluteDifferenceOrInfinity(firstX, secondX);
+        const double deltaY = AbsoluteDifferenceOrInfinity(firstY, secondY);
+        if (std::isnan(deltaX) || std::isnan(deltaY))
+        {
+            return GB_QuietNan;
+        }
+
+        return std::hypot(deltaX, deltaY);
+    }
+
+    static double DistanceSquaredOrInfinity(double firstX, double firstY, double secondX, double secondY)
+    {
+        const double deltaX = AbsoluteDifferenceOrInfinity(firstX, secondX);
+        const double deltaY = AbsoluteDifferenceOrInfinity(firstY, secondY);
+        if (std::isnan(deltaX) || std::isnan(deltaY))
+        {
+            return GB_QuietNan;
+        }
+
+        if (std::isinf(deltaX) || std::isinf(deltaY))
+        {
+            return std::numeric_limits<double>::infinity();
+        }
+
+        return SquareLengthOrInfinity(deltaX, deltaY);
+    }
+
     static double RobustMidpoint(double firstValue, double secondValue)
     {
         return firstValue * 0.5 + secondValue * 0.5;
@@ -241,7 +292,7 @@ double GB_Point2d::DistanceTo(const GB_Point2d& other) const
         return GB_QuietNan;
     }
 
-    return std::hypot(x - other.x, y - other.y);
+    return DistanceOrInfinity(x, y, other.x, other.y);
 }
 
 double GB_Point2d::DistanceToSquared(const GB_Point2d& other) const
@@ -251,7 +302,7 @@ double GB_Point2d::DistanceToSquared(const GB_Point2d& other) const
         return GB_QuietNan;
     }
 
-    return SquareLengthOrInfinity(x - other.x, y - other.y);
+    return DistanceSquaredOrInfinity(x, y, other.x, other.y);
 }
 
 double GB_Point2d::DistanceToOrigin() const
@@ -287,7 +338,7 @@ bool GB_Point2d::IsNearEqual(const GB_Point2d& other, double tolerance) const
         return false;
     }
 
-    return std::hypot(x - other.x, y - other.y) <= absoluteTolerance;
+    return DistanceOrInfinity(x, y, other.x, other.y) <= absoluteTolerance;
 }
 
 GB_Point2d GB_Point2d::Transformed(const GB_Matrix3x3& mat) const

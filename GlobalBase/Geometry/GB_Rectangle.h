@@ -142,7 +142,7 @@ public:
     virtual std::string SerializeToString() const override;
     virtual GB_ByteBuffer SerializeToBinary() const override;
 
-    // 反序列化。
+    // 反序列化。失败时保持当前对象原值不变。
     virtual bool Deserialize(const std::string& data) override;
     virtual bool Deserialize(const GB_ByteBuffer& data) override;
 };

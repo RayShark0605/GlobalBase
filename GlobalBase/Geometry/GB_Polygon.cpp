@@ -2639,8 +2639,6 @@ GB_ByteBuffer GB_Polygon::SerializeToBinary() const
 
 bool GB_Polygon::Deserialize(const std::string& data)
 {
-    Clear();
-
     const std::string trimmed = TrimAscii(data);
     if (trimmed.size() < 2 || trimmed.front() != '(' || trimmed.back() != ')')
     {
@@ -2687,7 +2685,19 @@ bool GB_Polygon::Deserialize(const std::string& data)
 
     if (numVertices == 0)
     {
-        return (offset == body.size()) && TrySetEmptyPolygon(parsedStorageMode, *this);
+        if (offset != body.size())
+        {
+            return false;
+        }
+
+        GB_Polygon parsedPolygon;
+        if (!TrySetEmptyPolygon(parsedStorageMode, parsedPolygon))
+        {
+            return false;
+        }
+
+        *this = std::move(parsedPolygon);
+        return true;
     }
 
     if (parsedStorageMode == CoordinateStorageMode::Double)
@@ -2702,15 +2712,13 @@ bool GB_Polygon::Deserialize(const std::string& data)
             if (!ReadNextSerializedField(body, offset, xText)
                 || !ReadNextSerializedField(body, offset, yText))
             {
-                Clear();
                 return false;
             }
 
             double x = GB_QuietNan;
             double y = GB_QuietNan;
-            if (!TryParseDoubleText(xText, x) || !TryParseDoubleText(yText, y))
+            if (!TryParseDoubleText(xText, x) || !TryParseDoubleText(yText, y) || !std::isfinite(x) || !std::isfinite(y))
             {
-                Clear();
                 return false;
             }
 
@@ -2719,11 +2727,17 @@ bool GB_Polygon::Deserialize(const std::string& data)
 
         if (offset != body.size())
         {
-            Clear();
             return false;
         }
 
-        return TrySetDoubleVerticesFromDeserialization(*this, std::move(parsedVertices));
+        GB_Polygon parsedPolygon;
+        if (!TrySetDoubleVerticesFromDeserialization(parsedPolygon, std::move(parsedVertices)))
+        {
+            return false;
+        }
+
+        *this = std::move(parsedPolygon);
+        return true;
     }
 
     std::vector<ExactStringVertex> parsedVertices;
@@ -2735,7 +2749,6 @@ bool GB_Polygon::Deserialize(const std::string& data)
         if (!ReadNextSerializedField(body, offset, xText)
             || !ReadNextSerializedField(body, offset, yText))
         {
-            Clear();
             return false;
         }
 
@@ -2744,17 +2757,21 @@ bool GB_Polygon::Deserialize(const std::string& data)
 
     if (offset != body.size())
     {
-        Clear();
         return false;
     }
 
-    return TrySetExactStringVerticesFromDeserialization(*this, std::move(parsedVertices));
+    GB_Polygon parsedPolygon;
+    if (!TrySetExactStringVerticesFromDeserialization(parsedPolygon, std::move(parsedVertices)))
+    {
+        return false;
+    }
+
+    *this = std::move(parsedPolygon);
+    return true;
 }
 
 bool GB_Polygon::Deserialize(const GB_ByteBuffer& data)
 {
-    Clear();
-
     constexpr static std::uint16_t supportedPayloadVersion = 1;
 
     size_t offset = 0;
@@ -2777,8 +2794,8 @@ bool GB_Polygon::Deserialize(const GB_ByteBuffer& data)
         return false;
     }
 
-    std::uint16_t reserved16 = 0;
-    if (!ReadUInt16LE(data, offset, reserved16))
+    std::uint16_t reservedHeader = 0;
+    if (!ReadUInt16LE(data, offset, reservedHeader))
     {
         return false;
     }
@@ -2796,13 +2813,19 @@ bool GB_Polygon::Deserialize(const GB_ByteBuffer& data)
 
     const CoordinateStorageMode parsedStorageMode = static_cast<CoordinateStorageMode>(storageModeValue);
 
-    std::uint8_t reserved8 = 0;
-    if (!ReadUInt8(data, offset, reserved8))
+    std::uint8_t reservedStorage = 0;
+    if (!ReadUInt8(data, offset, reservedStorage))
     {
         return false;
     }
 
-    if (!ReadUInt16LE(data, offset, reserved16))
+    std::uint16_t reservedTrailing = 0;
+    if (!ReadUInt16LE(data, offset, reservedTrailing))
+    {
+        return false;
+    }
+
+    if (reservedHeader != 0 || reservedStorage != 0 || reservedTrailing != 0)
     {
         return false;
     }
@@ -2825,7 +2848,14 @@ bool GB_Polygon::Deserialize(const GB_ByteBuffer& data)
         {
             return false;
         }
-        return TrySetEmptyPolygon(parsedStorageMode, *this);
+        GB_Polygon parsedPolygon;
+        if (!TrySetEmptyPolygon(parsedStorageMode, parsedPolygon))
+        {
+            return false;
+        }
+
+        *this = std::move(parsedPolygon);
+        return true;
     }
 
     if (parsedStorageMode == CoordinateStorageMode::Double)
@@ -2839,13 +2869,11 @@ bool GB_Polygon::Deserialize(const GB_ByteBuffer& data)
             double y = GB_QuietNan;
             if (!ReadDoubleLE(data, offset, x) || !ReadDoubleLE(data, offset, y))
             {
-                Clear();
                 return false;
             }
 
             if (!std::isfinite(x) || !std::isfinite(y))
             {
-                Clear();
                 return false;
             }
 
@@ -2854,11 +2882,17 @@ bool GB_Polygon::Deserialize(const GB_ByteBuffer& data)
 
         if (offset != data.size())
         {
-            Clear();
             return false;
         }
 
-        return TrySetDoubleVerticesFromDeserialization(*this, std::move(parsedVertices));
+        GB_Polygon parsedPolygon;
+        if (!TrySetDoubleVerticesFromDeserialization(parsedPolygon, std::move(parsedVertices)))
+        {
+            return false;
+        }
+
+        *this = std::move(parsedPolygon);
+        return true;
     }
 
     std::vector<ExactStringVertex> parsedVertices;
@@ -2870,7 +2904,6 @@ bool GB_Polygon::Deserialize(const GB_ByteBuffer& data)
         std::string yText;
         if (!ReadString(data, offset, xText) || !ReadString(data, offset, yText))
         {
-            Clear();
             return false;
         }
 
@@ -2879,11 +2912,17 @@ bool GB_Polygon::Deserialize(const GB_ByteBuffer& data)
 
     if (offset != data.size())
     {
-        Clear();
         return false;
     }
 
-    return TrySetExactStringVerticesFromDeserialization(*this, std::move(parsedVertices));
+    GB_Polygon parsedPolygon;
+    if (!TrySetExactStringVerticesFromDeserialization(parsedPolygon, std::move(parsedVertices)))
+    {
+        return false;
+    }
+
+    *this = std::move(parsedPolygon);
+    return true;
 }
 
 #ifdef _MSC_VER

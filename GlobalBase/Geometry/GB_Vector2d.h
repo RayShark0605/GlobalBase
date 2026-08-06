@@ -1,4 +1,4 @@
-#ifndef GLOBALBASE_VECTOR2D_H_H
+﻿#ifndef GLOBALBASE_VECTOR2D_H_H
 #define GLOBALBASE_VECTOR2D_H_H
 
 #include "../GlobalBasePort.h"

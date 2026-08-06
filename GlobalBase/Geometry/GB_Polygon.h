@@ -461,7 +461,7 @@ public:
      * @param data 输入字符串。
      * @return 成功返回 true，失败返回 false。
      *
-     * @note 失败时对象会被清空，不保留半写入状态。
+     * @note 失败时保持当前对象原值不变。
      */
     virtual bool Deserialize(const std::string& data) override;
 
@@ -470,7 +470,7 @@ public:
      * @param data 输入字节流。
      * @return 成功返回 true，失败返回 false。
      *
-     * @note 失败时对象会被清空，不保留半写入状态。
+     * @note 失败时保持当前对象原值不变。
      */
     virtual bool Deserialize(const GB_ByteBuffer& data) override;
 
