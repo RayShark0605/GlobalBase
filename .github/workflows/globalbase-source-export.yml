@@ -1,0 +1,31 @@
+name: GlobalBase Source Export
+
+on:
+  push:
+    branches:
+      - codex/globalbase-review-20260806
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  export-source:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Collect source files
+        shell: bash
+        run: |
+          mkdir -p source-export
+          find . -type f \( -name '*.h' -o -name '*.hpp' -o -name '*.inl' -o -name '*.c' -o -name '*.cc' -o -name '*.cpp' -o -name 'CMakeLists.txt' -o -name '*.vcxproj' -o -name '*.sln' \) -not -path './GlobalBase/CV/OCRModels/*' -not -path './.git/*' -print0 | while IFS= read -r -d '' sourceFile; do
+            targetFile="source-export/${sourceFile#./}"
+            mkdir -p "$(dirname "$targetFile")"
+            cp "$sourceFile" "$targetFile"
+          done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: globalbase-full-source
+          path: source-export
+          if-no-files-found: error
