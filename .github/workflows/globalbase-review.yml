@@ -9,9 +9,14 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: globalbase-review-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   static-review:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - name: Install cppcheck
@@ -19,15 +24,20 @@ jobs:
       - name: Prepare source list
         shell: bash
         run: |
-          mkdir -p review-output
+          mkdir -p review-output source-snapshot
           find GlobalBase/CV GlobalBase/Geometry GlobalBase/Desktop -maxdepth 1 -type f \( -name '*.h' -o -name '*.cpp' \) -print | sort > review-output/source-files.txt
-          tr '\n' '\0' < review-output/source-files.txt > review-output/source-files.bin
+          while IFS= read -r sourceFile; do
+            mkdir -p "source-snapshot/$(dirname "$sourceFile")"
+            cp "$sourceFile" "source-snapshot/$sourceFile"
+          done < review-output/source-files.txt
+          cp CMakeLists.txt source-snapshot/CMakeLists.txt
+          mkdir -p source-snapshot/GlobalBase
+          cp GlobalBase/CMakeLists.txt GlobalBase/GlobalBase.vcxproj source-snapshot/GlobalBase/
       - name: Run cppcheck
         shell: bash
         run: |
           mapfile -t SOURCES < review-output/source-files.txt
-          cppcheck --std=c++14 --platform=win64 --enable=warning,performance,portability --inconclusive --force --inline-suppr --suppress=missingInclude --suppress=missingIncludeSystem --xml --xml-version=2 "${SOURCES[@]}" 2> review-output/cppcheck.xml || true
-          cppcheck --std=c++14 --platform=win64 --enable=warning,performance,portability --inconclusive --force --inline-suppr --suppress=missingInclude --suppress=missingIncludeSystem --template='{file}:{line}: {severity}: {id}: {message}' "${SOURCES[@]}" 2> review-output/cppcheck.txt || true
+          cppcheck --std=c++14 --platform=win64 --enable=warning,performance,portability --inconclusive --inline-suppr --suppress=missingInclude --suppress=missingIncludeSystem --max-configs=12 --template='{file}:{line}: {severity}: {id}: {message}' "${SOURCES[@]}" 2> review-output/cppcheck.txt || true
       - name: Inspect C++14 compatibility and encodings
         shell: python
         run: |
@@ -44,6 +54,8 @@ jobs:
               'std::is_same_v': 'C++17 variable template helper',
               'std::is_integral_v': 'C++17 variable template helper',
               'std::clamp(': 'C++17 std::clamp',
+              'std::scoped_lock': 'C++17 std::scoped_lock',
+              'std::shared_mutex': 'C++17 std::shared_mutex',
           }
           for path in files:
               data = path.read_bytes()
@@ -72,4 +84,9 @@ jobs:
         with:
           name: globalbase-static-review
           path: review-output
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        with:
+          name: globalbase-source-snapshot
+          path: source-snapshot
           if-no-files-found: error
