@@ -1,0 +1,54 @@
+name: GlobalBase Review
+
+on:
+  push:
+    branches:
+      - codex/globalbase-review-20260806
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  static-review:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install cppcheck
+        run: sudo apt-get update && sudo apt-get install -y cppcheck
+      - name: Run cppcheck
+        shell: bash
+        run: |
+          mkdir -p review-output
+          cppcheck --std=c++14 --platform=win64 --enable=warning,performance,portability --inconclusive --force --inline-suppr --suppress=missingInclude --suppress=missingIncludeSystem --xml --xml-version=2 GlobalBase/CV GlobalBase/Geometry GlobalBase/Desktop 2> review-output/cppcheck.xml || true
+          cppcheck --std=c++14 --platform=win64 --enable=warning,performance,portability --inconclusive --force --inline-suppr --suppress=missingInclude --suppress=missingIncludeSystem --template='{file}:{line}: {severity}: {id}: {message}' GlobalBase/CV GlobalBase/Geometry GlobalBase/Desktop 2> review-output/cppcheck.txt || true
+      - name: Inspect source encodings
+        shell: python
+        run: |
+          from pathlib import Path
+          roots = [Path('GlobalBase/CV'), Path('GlobalBase/Geometry'), Path('GlobalBase/Desktop')]
+          lines = []
+          for root in roots:
+              for path in sorted(root.glob('*')):
+                  if path.suffix.lower() not in {'.h', '.cpp'}:
+                      continue
+                  data = path.read_bytes()
+                  has_bom = data.startswith(b'\xef\xbb\xbf')
+                  try:
+                      data.decode('utf-8-sig')
+                      valid_utf8 = True
+                  except UnicodeDecodeError:
+                      valid_utf8 = False
+                  non_ascii = any(byte >= 0x80 for byte in data)
+                  lines.append(f'{path}\tutf8={valid_utf8}\tbom={has_bom}\tnon_ascii={non_ascii}\tbytes={len(data)}')
+          Path('review-output/encodings.txt').write_text('\n'.join(lines) + '\n', encoding='utf-8')
+      - name: Build source inventory
+        shell: bash
+        run: |
+          find GlobalBase/CV GlobalBase/Geometry GlobalBase/Desktop -maxdepth 1 -type f \( -name '*.h' -o -name '*.cpp' \) -print0 | sort -z | xargs -0 wc -l > review-output/source-lines.txt
+          find GlobalBase/CV GlobalBase/Geometry GlobalBase/Desktop -maxdepth 1 -type f \( -name '*.h' -o -name '*.cpp' \) -print | sort > review-output/source-files.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: globalbase-static-review
+          path: review-output
+          if-no-files-found: error
