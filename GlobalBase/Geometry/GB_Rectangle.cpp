@@ -270,7 +270,7 @@ bool GB_Rectangle::SetFromCenter(const GB_Point2d& center, double width, double 
 
 bool GB_Rectangle::IsValid() const
 {
-    return IsFinite4(minX, minY, maxX, maxY) && (minX <= maxX) && (minY <= maxY);
+    return IsFinite4(minX, minY, maxX, maxY) && minX <= maxX && minY <= maxY;
 }
 
 void GB_Rectangle::Normalize()
@@ -341,8 +341,6 @@ double GB_Rectangle::Area() const
         return GB_QuietNan;
     }
 
-    const double width = Width();
-    const double height = Height();
     return ProductOfPositiveDifferencesOrInfinity(maxX, minX, maxY, minY);
 }
 
@@ -681,7 +679,13 @@ bool GB_Rectangle::IsContains(const GB_Rectangle& other, double tolerance) const
 
 double GB_Rectangle::DistanceTo(const GB_Point2d& point) const
 {
-    return std::sqrt(DistanceToSquared(point));
+    if (!IsValid() || !point.IsValid())
+    {
+        return GB_QuietNan;
+    }
+
+    const GB_Point2d closestPoint = ClampPoint(point);
+    return closestPoint.IsValid() ? closestPoint.DistanceTo(point) : GB_QuietNan;
 }
 
 double GB_Rectangle::DistanceToSquared(const GB_Point2d& point) const
@@ -691,28 +695,8 @@ double GB_Rectangle::DistanceToSquared(const GB_Point2d& point) const
         return GB_QuietNan;
     }
 
-    double dx = 0;
-    if (point.x < minX)
-    {
-        dx = minX - point.x;
-    }
-    else if (point.x > maxX)
-    {
-        dx = point.x - maxX;
-    }
-
-    double dy = 0;
-    if (point.y < minY)
-    {
-        dy = minY - point.y;
-    }
-    else if (point.y > maxY)
-    {
-        dy = point.y - maxY;
-    }
-
-    const double value = dx * dx + dy * dy;
-    return std::isfinite(value) ? value : GB_QuietNan;
+    const GB_Point2d closestPoint = ClampPoint(point);
+    return closestPoint.IsValid() ? closestPoint.DistanceToSquared(point) : GB_QuietNan;
 }
 
 GB_Point2d GB_Rectangle::ClampPoint(const GB_Point2d& point) const
@@ -729,17 +713,31 @@ GB_Point2d GB_Rectangle::ClampPoint(const GB_Point2d& point) const
 
 GB_Rectangle GB_Rectangle::Transformed(const GB_Matrix3x3& mat) const
 {
-    if (!IsValid() || !mat.IsValid())
+    if (!IsValid() || !mat.IsValid() || !mat.IsAffine2d(0.0))
     {
         return GB_Rectangle();
     }
 
-    const std::vector<GB_Point2d> corners = GetCorners();
-    GB_Rectangle bounds;
-    for (const GB_Point2d& corner : corners)
+    const GB_Point2d transformedCorners[4] =
     {
-        const GB_Point2d transformed = mat.TransformPoint(corner);
-        bounds.Expand(transformed);
+        mat.TransformPoint(GB_Point2d(minX, minY)),
+        mat.TransformPoint(GB_Point2d(maxX, minY)),
+        mat.TransformPoint(GB_Point2d(maxX, maxY)),
+        mat.TransformPoint(GB_Point2d(minX, maxY))
+    };
+
+    for (size_t cornerIndex = 0; cornerIndex < 4; cornerIndex++)
+    {
+        if (!transformedCorners[cornerIndex].IsValid())
+        {
+            return GB_Rectangle();
+        }
+    }
+
+    GB_Rectangle bounds(transformedCorners[0]);
+    for (size_t cornerIndex = 1; cornerIndex < 4; cornerIndex++)
+    {
+        bounds.Expand(transformedCorners[cornerIndex]);
     }
 
     return bounds;
@@ -809,7 +807,7 @@ bool GB_Rectangle::Deserialize(const std::string& data)
     iss.imbue(std::locale::classic());
 
     char leftParen = 0;
-    std::string type = "";
+    std::string type;
     char comma1 = 0;
     char comma2 = 0;
     char comma3 = 0;

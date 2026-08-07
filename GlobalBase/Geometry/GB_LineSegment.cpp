@@ -4,6 +4,15 @@
 #include "GB_Matrix3x3.h"
 #include "../GB_IO.h"
 
+#ifdef _MSC_VER
+#  pragma warning(push)
+#  pragma warning(disable: 4819)
+#endif
+#include <boost/multiprecision/cpp_bin_float.hpp>
+#ifdef _MSC_VER
+#  pragma warning(pop)
+#endif
+
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -14,6 +23,8 @@
 
 namespace
 {
+    using HighPrecisionFloat = boost::multiprecision::cpp_bin_float_quad;
+
     static inline double AbsTol(double tolerance)
     {
         if (!std::isfinite(tolerance))
@@ -38,139 +49,349 @@ namespace
         return GB_Vector2d(GB_QuietNan, GB_QuietNan);
     }
 
-    static inline int ComparePointLexicographically(const GB_Point2d& a, const GB_Point2d& b)
+    static inline int ComparePointLexicographically(const GB_Point2d& firstPoint, const GB_Point2d& secondPoint)
     {
-        if (a.x < b.x)
+        if (firstPoint.x < secondPoint.x)
         {
             return -1;
         }
-        if (a.x > b.x)
+        if (firstPoint.x > secondPoint.x)
         {
             return 1;
         }
-        if (a.y < b.y)
+        if (firstPoint.y < secondPoint.y)
         {
             return -1;
         }
-        if (a.y > b.y)
+        if (firstPoint.y > secondPoint.y)
         {
             return 1;
         }
         return 0;
     }
 
-    static inline long double CrossProductLongDouble(double firstVectorX, double firstVectorY, double secondVectorX, double secondVectorY)
+    static inline bool IsExactDegenerate(const GB_LineSegment& segment)
     {
-        return static_cast<long double>(firstVectorX) * static_cast<long double>(secondVectorY) - static_cast<long double>(firstVectorY) * static_cast<long double>(secondVectorX);
+        return segment.point1.x == segment.point2.x && segment.point1.y == segment.point2.y;
     }
 
-    static inline long double DotProductLongDouble(double firstVectorX, double firstVectorY, double secondVectorX, double secondVectorY)
+    static bool TryGetUnitDirectionAndLength(const GB_LineSegment& segment, double& unitX, double& unitY, double& length)
     {
-        return static_cast<long double>(firstVectorX) * static_cast<long double>(secondVectorX) + static_cast<long double>(firstVectorY) * static_cast<long double>(secondVectorY);
-    }
-
-    static inline double VectorLength(double vectorX, double vectorY)
-    {
-        return std::hypot(vectorX, vectorY);
-    }
-
-    static inline bool TryGetSegmentVectorAndLengthSquared(const GB_LineSegment& segment, double& vectorX, double& vectorY, double& lengthSquared)
-    {
+        unitX = GB_QuietNan;
+        unitY = GB_QuietNan;
+        length = GB_QuietNan;
         if (!segment.IsValid())
         {
             return false;
         }
 
-        vectorX = segment.point2.x - segment.point1.x;
-        vectorY = segment.point2.y - segment.point1.y;
-        lengthSquared = vectorX * vectorX + vectorY * vectorY;
-        return std::isfinite(lengthSquared);
-    }
-
-    static inline bool IsLengthSquaredDegenerate(double lengthSquared, double tolerance)
-    {
-        if (!std::isfinite(lengthSquared))
+        length = segment.point1.DistanceTo(segment.point2);
+        if (std::isnan(length) || length == 0.0)
         {
             return false;
         }
 
-        const double toleranceSquared = tolerance * tolerance;
-        return std::isfinite(toleranceSquared) && lengthSquared <= toleranceSquared;
-    }
+        const double directDeltaX = segment.point2.x - segment.point1.x;
+        const double directDeltaY = segment.point2.y - segment.point1.y;
+        if (std::isfinite(directDeltaX) && std::isfinite(directDeltaY))
+        {
+            const double componentScale = std::max(std::abs(directDeltaX), std::abs(directDeltaY));
+            if (componentScale == 0.0)
+            {
+                return false;
+            }
 
-    static inline bool IsCrossWithinDistanceTolerance(long double cross, double length, double tolerance)
-    {
-        if (!std::isfinite(cross) || !std::isfinite(length) || length < 0.0)
+            const double scaledDeltaX = directDeltaX / componentScale;
+            const double scaledDeltaY = directDeltaY / componentScale;
+            const double scaledLength = std::hypot(scaledDeltaX, scaledDeltaY);
+            if (!std::isfinite(scaledLength) || scaledLength <= 0.0)
+            {
+                return false;
+            }
+
+            unitX = scaledDeltaX / scaledLength;
+            unitY = scaledDeltaY / scaledLength;
+            return std::isfinite(unitX) && std::isfinite(unitY);
+        }
+
+        const double coordinateScale = std::max(std::max(std::abs(segment.point1.x), std::abs(segment.point1.y)), std::max(std::abs(segment.point2.x), std::abs(segment.point2.y)));
+        if (!std::isfinite(coordinateScale) || coordinateScale <= 0.0)
         {
             return false;
         }
 
-        const long double leftValue = std::abs(cross);
-        const long double rightValue = static_cast<long double>(tolerance) * static_cast<long double>(length);
-        return leftValue <= rightValue;
-    }
-
-    static inline bool IsRelativeCrossWithinTolerance(long double cross, double firstLengthSquared, double secondLengthSquared, double tolerance)
-    {
-        if (!std::isfinite(cross) || !std::isfinite(firstLengthSquared) || !std::isfinite(secondLengthSquared) || firstLengthSquared <= 0.0 || secondLengthSquared <= 0.0)
+        const double scaledDeltaX = segment.point2.x / coordinateScale - segment.point1.x / coordinateScale;
+        const double scaledDeltaY = segment.point2.y / coordinateScale - segment.point1.y / coordinateScale;
+        const double scaledLength = std::hypot(scaledDeltaX, scaledDeltaY);
+        if (!std::isfinite(scaledLength) || scaledLength <= 0.0)
         {
             return false;
         }
 
-        const long double firstLength = std::sqrt(static_cast<long double>(firstLengthSquared));
-        const long double secondLength = std::sqrt(static_cast<long double>(secondLengthSquared));
-        const long double leftValue = std::abs(cross);
-        const long double rightValue = static_cast<long double>(tolerance) * firstLength * secondLength;
-        return leftValue <= rightValue;
+        unitX = scaledDeltaX / scaledLength;
+        unitY = scaledDeltaY / scaledLength;
+        return std::isfinite(unitX) && std::isfinite(unitY);
     }
 
-    static inline bool IsRelativeDotWithinTolerance(long double dot, double firstLengthSquared, double secondLengthSquared, double tolerance)
+    static HighPrecisionFloat GetHighPrecisionSegmentLength(const GB_LineSegment& segment)
     {
-        if (!std::isfinite(dot) || !std::isfinite(firstLengthSquared) || !std::isfinite(secondLengthSquared) || firstLengthSquared <= 0.0 || secondLengthSquared <= 0.0)
+        const HighPrecisionFloat deltaX = HighPrecisionFloat(segment.point2.x) - HighPrecisionFloat(segment.point1.x);
+        const HighPrecisionFloat deltaY = HighPrecisionFloat(segment.point2.y) - HighPrecisionFloat(segment.point1.y);
+        return boost::multiprecision::sqrt(deltaX * deltaX + deltaY * deltaY);
+    }
+
+    static bool TryGetParameterHighPrecision(const GB_LineSegment& segment, const GB_Point2d& point, HighPrecisionFloat& parameter)
+    {
+        if (!segment.IsValid() || !point.IsValid())
         {
             return false;
         }
 
-        const long double firstLength = std::sqrt(static_cast<long double>(firstLengthSquared));
-        const long double secondLength = std::sqrt(static_cast<long double>(secondLengthSquared));
-        const long double leftValue = std::abs(dot);
-        const long double rightValue = static_cast<long double>(tolerance) * firstLength * secondLength;
-        return leftValue <= rightValue;
+        const HighPrecisionFloat segmentDeltaX = HighPrecisionFloat(segment.point2.x) - HighPrecisionFloat(segment.point1.x);
+        const HighPrecisionFloat segmentDeltaY = HighPrecisionFloat(segment.point2.y) - HighPrecisionFloat(segment.point1.y);
+        const HighPrecisionFloat denominator = segmentDeltaX * segmentDeltaX + segmentDeltaY * segmentDeltaY;
+        if (denominator == 0)
+        {
+            return false;
+        }
+
+        const HighPrecisionFloat pointDeltaX = HighPrecisionFloat(point.x) - HighPrecisionFloat(segment.point1.x);
+        const HighPrecisionFloat pointDeltaY = HighPrecisionFloat(point.y) - HighPrecisionFloat(segment.point1.y);
+        parameter = (pointDeltaX * segmentDeltaX + pointDeltaY * segmentDeltaY) / denominator;
+        return true;
     }
 
-    static inline double ToFiniteDoubleOrNan(long double value)
+    static double HighPrecisionToDoubleOrInfinity(const HighPrecisionFloat& value)
     {
-        const long double maxValue = static_cast<long double>(std::numeric_limits<double>::max());
-        if (!std::isfinite(value) || value > maxValue || value < -maxValue)
+        const HighPrecisionFloat maxValue = HighPrecisionFloat((std::numeric_limits<double>::max)());
+        if (value > maxValue)
+        {
+            return std::numeric_limits<double>::infinity();
+        }
+        if (value < -maxValue)
+        {
+            return -std::numeric_limits<double>::infinity();
+        }
+        return static_cast<double>(value);
+    }
+
+    static double NonNegativeHighPrecisionToDoubleOrInfinity(const HighPrecisionFloat& value)
+    {
+        if (value < 0)
         {
             return GB_QuietNan;
         }
 
+        const HighPrecisionFloat maxValue = HighPrecisionFloat((std::numeric_limits<double>::max)());
+        return value > maxValue ? std::numeric_limits<double>::infinity() : static_cast<double>(value);
+    }
+
+    static double HighPrecisionToFiniteDoubleOrNan(const HighPrecisionFloat& value)
+    {
+        const HighPrecisionFloat maxValue = HighPrecisionFloat((std::numeric_limits<double>::max)());
+        if (value > maxValue || value < -maxValue)
+        {
+            return GB_QuietNan;
+        }
         return static_cast<double>(value);
     }
 
-    static inline bool IsFinitePoint(double x, double y)
+    static bool TryProjectPointOnLineHighPrecision(const GB_LineSegment& segment, const GB_Point2d& point, GB_Point2d& projectedPoint)
     {
-        return std::isfinite(x) && std::isfinite(y);
+        HighPrecisionFloat parameter = 0;
+        if (!TryGetParameterHighPrecision(segment, point, parameter))
+        {
+            return false;
+        }
+
+        const HighPrecisionFloat segmentDeltaX = HighPrecisionFloat(segment.point2.x) - HighPrecisionFloat(segment.point1.x);
+        const HighPrecisionFloat segmentDeltaY = HighPrecisionFloat(segment.point2.y) - HighPrecisionFloat(segment.point1.y);
+        const HighPrecisionFloat projectedX = HighPrecisionFloat(segment.point1.x) + segmentDeltaX * parameter;
+        const HighPrecisionFloat projectedY = HighPrecisionFloat(segment.point1.y) + segmentDeltaY * parameter;
+        const double resultX = HighPrecisionToFiniteDoubleOrNan(projectedX);
+        const double resultY = HighPrecisionToFiniteDoubleOrNan(projectedY);
+        if (!std::isfinite(resultX) || !std::isfinite(resultY))
+        {
+            return false;
+        }
+
+        projectedPoint.Set(resultX, resultY);
+        return projectedPoint.IsValid();
     }
 
-    static inline long double ClampUnitParameterLongDouble(long double parameter)
+    static bool TryGetParameterFast(const GB_LineSegment& segment, const GB_Point2d& point, double& parameter)
     {
-        if (parameter < 0.0L)
+        parameter = GB_QuietNan;
+        const double segmentDeltaX = segment.point2.x - segment.point1.x;
+        const double segmentDeltaY = segment.point2.y - segment.point1.y;
+        const double pointDeltaX = point.x - segment.point1.x;
+        const double pointDeltaY = point.y - segment.point1.y;
+        if (!std::isfinite(segmentDeltaX) || !std::isfinite(segmentDeltaY) || !std::isfinite(pointDeltaX) || !std::isfinite(pointDeltaY))
         {
-            return 0.0L;
+            return false;
         }
-        if (parameter > 1.0L)
+
+        const double segmentScale = std::max(std::abs(segmentDeltaX), std::abs(segmentDeltaY));
+        if (segmentScale <= 0.0)
         {
-            return 1.0L;
+            return false;
+        }
+
+        const double normalizedSegmentX = segmentDeltaX / segmentScale;
+        const double normalizedSegmentY = segmentDeltaY / segmentScale;
+        const double scaledPointX = pointDeltaX / segmentScale;
+        const double scaledPointY = pointDeltaY / segmentScale;
+        if (!std::isfinite(scaledPointX) || !std::isfinite(scaledPointY))
+        {
+            return false;
+        }
+
+        const double denominator = normalizedSegmentX * normalizedSegmentX + normalizedSegmentY * normalizedSegmentY;
+        const double numerator = scaledPointX * normalizedSegmentX + scaledPointY * normalizedSegmentY;
+        if (!std::isfinite(denominator) || denominator <= 0.0 || !std::isfinite(numerator))
+        {
+            return false;
+        }
+
+        parameter = numerator / denominator;
+        return std::isfinite(parameter);
+    }
+
+    static double DistanceToLineHighPrecision(const GB_LineSegment& segment, const GB_Point2d& point)
+    {
+        const HighPrecisionFloat segmentDeltaX = HighPrecisionFloat(segment.point2.x) - HighPrecisionFloat(segment.point1.x);
+        const HighPrecisionFloat segmentDeltaY = HighPrecisionFloat(segment.point2.y) - HighPrecisionFloat(segment.point1.y);
+        const HighPrecisionFloat length = boost::multiprecision::sqrt(segmentDeltaX * segmentDeltaX + segmentDeltaY * segmentDeltaY);
+        if (length == 0)
+        {
+            return segment.point1.DistanceTo(point);
+        }
+
+        const HighPrecisionFloat pointDeltaX = HighPrecisionFloat(point.x) - HighPrecisionFloat(segment.point1.x);
+        const HighPrecisionFloat pointDeltaY = HighPrecisionFloat(point.y) - HighPrecisionFloat(segment.point1.y);
+        const HighPrecisionFloat cross = segmentDeltaX * pointDeltaY - segmentDeltaY * pointDeltaX;
+        const HighPrecisionFloat distance = boost::multiprecision::abs(cross) / length;
+        return NonNegativeHighPrecisionToDoubleOrInfinity(distance);
+    }
+
+    static int SideOfPointHighPrecision(const GB_LineSegment& segment, const GB_Point2d& point)
+    {
+        const HighPrecisionFloat segmentDeltaX = HighPrecisionFloat(segment.point2.x) - HighPrecisionFloat(segment.point1.x);
+        const HighPrecisionFloat segmentDeltaY = HighPrecisionFloat(segment.point2.y) - HighPrecisionFloat(segment.point1.y);
+        const HighPrecisionFloat pointDeltaX = HighPrecisionFloat(point.x) - HighPrecisionFloat(segment.point1.x);
+        const HighPrecisionFloat pointDeltaY = HighPrecisionFloat(point.y) - HighPrecisionFloat(segment.point1.y);
+        const HighPrecisionFloat cross = segmentDeltaX * pointDeltaY - segmentDeltaY * pointDeltaX;
+        if (cross > 0)
+        {
+            return 1;
+        }
+        if (cross < 0)
+        {
+            return -1;
+        }
+        return 0;
+    }
+
+    static bool TryGetIntersectionParametersFast(const GB_LineSegment& firstSegment, const GB_LineSegment& secondSegment, double& firstParameter, double& secondParameter)
+    {
+        firstParameter = GB_QuietNan;
+        secondParameter = GB_QuietNan;
+
+        const double firstDeltaX = firstSegment.point2.x - firstSegment.point1.x;
+        const double firstDeltaY = firstSegment.point2.y - firstSegment.point1.y;
+        const double secondDeltaX = secondSegment.point2.x - secondSegment.point1.x;
+        const double secondDeltaY = secondSegment.point2.y - secondSegment.point1.y;
+        const double pointDeltaX = secondSegment.point1.x - firstSegment.point1.x;
+        const double pointDeltaY = secondSegment.point1.y - firstSegment.point1.y;
+        if (!std::isfinite(firstDeltaX) || !std::isfinite(firstDeltaY) || !std::isfinite(secondDeltaX) || !std::isfinite(secondDeltaY) || !std::isfinite(pointDeltaX) || !std::isfinite(pointDeltaY))
+        {
+            return false;
+        }
+
+        const double denominatorProduct1 = firstDeltaX * secondDeltaY;
+        const double denominatorProduct2 = firstDeltaY * secondDeltaX;
+        const double firstNumeratorProduct1 = pointDeltaX * secondDeltaY;
+        const double firstNumeratorProduct2 = pointDeltaY * secondDeltaX;
+        const double secondNumeratorProduct1 = pointDeltaX * firstDeltaY;
+        const double secondNumeratorProduct2 = pointDeltaY * firstDeltaX;
+        if (std::isfinite(denominatorProduct1) && std::isfinite(denominatorProduct2)
+            && std::isfinite(firstNumeratorProduct1) && std::isfinite(firstNumeratorProduct2)
+            && std::isfinite(secondNumeratorProduct1) && std::isfinite(secondNumeratorProduct2))
+        {
+            const double denominator = denominatorProduct1 - denominatorProduct2;
+            const double firstNumerator = firstNumeratorProduct1 - firstNumeratorProduct2;
+            const double secondNumerator = secondNumeratorProduct1 - secondNumeratorProduct2;
+            if (std::isfinite(denominator) && denominator != 0.0 && std::isfinite(firstNumerator) && std::isfinite(secondNumerator))
+            {
+                firstParameter = firstNumerator / denominator;
+                secondParameter = secondNumerator / denominator;
+                if (std::isfinite(firstParameter) && std::isfinite(secondParameter))
+                {
+                    return true;
+                }
+            }
+        }
+
+        const double commonScale = std::max(std::max(std::max(std::abs(firstDeltaX), std::abs(firstDeltaY)), std::max(std::abs(secondDeltaX), std::abs(secondDeltaY))), std::max(std::abs(pointDeltaX), std::abs(pointDeltaY)));
+        if (!std::isfinite(commonScale) || commonScale <= 0.0)
+        {
+            return false;
+        }
+
+        const double normalizedFirstDeltaX = firstDeltaX / commonScale;
+        const double normalizedFirstDeltaY = firstDeltaY / commonScale;
+        const double normalizedSecondDeltaX = secondDeltaX / commonScale;
+        const double normalizedSecondDeltaY = secondDeltaY / commonScale;
+        const double normalizedPointDeltaX = pointDeltaX / commonScale;
+        const double normalizedPointDeltaY = pointDeltaY / commonScale;
+        const double denominator = normalizedFirstDeltaX * normalizedSecondDeltaY - normalizedFirstDeltaY * normalizedSecondDeltaX;
+        if (!std::isfinite(denominator) || denominator == 0.0)
+        {
+            return false;
+        }
+
+        firstParameter = (normalizedPointDeltaX * normalizedSecondDeltaY - normalizedPointDeltaY * normalizedSecondDeltaX) / denominator;
+        secondParameter = (normalizedPointDeltaX * normalizedFirstDeltaY - normalizedPointDeltaY * normalizedFirstDeltaX) / denominator;
+        return std::isfinite(firstParameter) && std::isfinite(secondParameter);
+    }
+
+    static bool TryGetIntersectionParametersHighPrecision(const GB_LineSegment& firstSegment, const GB_LineSegment& secondSegment, double& firstParameter, double& secondParameter)
+    {
+        const HighPrecisionFloat firstDeltaX = HighPrecisionFloat(firstSegment.point2.x) - HighPrecisionFloat(firstSegment.point1.x);
+        const HighPrecisionFloat firstDeltaY = HighPrecisionFloat(firstSegment.point2.y) - HighPrecisionFloat(firstSegment.point1.y);
+        const HighPrecisionFloat secondDeltaX = HighPrecisionFloat(secondSegment.point2.x) - HighPrecisionFloat(secondSegment.point1.x);
+        const HighPrecisionFloat secondDeltaY = HighPrecisionFloat(secondSegment.point2.y) - HighPrecisionFloat(secondSegment.point1.y);
+        const HighPrecisionFloat pointDeltaX = HighPrecisionFloat(secondSegment.point1.x) - HighPrecisionFloat(firstSegment.point1.x);
+        const HighPrecisionFloat pointDeltaY = HighPrecisionFloat(secondSegment.point1.y) - HighPrecisionFloat(firstSegment.point1.y);
+        const HighPrecisionFloat denominator = firstDeltaX * secondDeltaY - firstDeltaY * secondDeltaX;
+        if (denominator == 0)
+        {
+            return false;
+        }
+
+        const HighPrecisionFloat firstParameterHigh = (pointDeltaX * secondDeltaY - pointDeltaY * secondDeltaX) / denominator;
+        const HighPrecisionFloat secondParameterHigh = (pointDeltaX * firstDeltaY - pointDeltaY * firstDeltaX) / denominator;
+        firstParameter = HighPrecisionToDoubleOrInfinity(firstParameterHigh);
+        secondParameter = HighPrecisionToDoubleOrInfinity(secondParameterHigh);
+        return !std::isnan(firstParameter) && !std::isnan(secondParameter);
+    }
+
+    static inline bool IsParameterInRange(double parameter, double tolerance)
+    {
+        return parameter >= -tolerance && parameter <= 1.0 + tolerance;
+    }
+
+    static inline double ClampUnitParameter(double parameter)
+    {
+        if (parameter < 0.0)
+        {
+            return 0.0;
+        }
+        if (parameter > 1.0)
+        {
+            return 1.0;
         }
         return parameter;
-    }
-
-    static inline bool IsParameterInRangeLongDouble(long double parameter, double tolerance)
-    {
-        const long double absTolerance = static_cast<long double>(tolerance);
-        return parameter >= -absTolerance && parameter <= 1.0L + absTolerance;
     }
 
     static inline bool DoBoundingRectanglesOverlap(const GB_LineSegment& firstSegment, const GB_LineSegment& secondSegment, double tolerance)
@@ -292,9 +513,8 @@ bool GB_LineSegment::IsDegenerate(double tolerance) const
         return false;
     }
 
-    const double absTol = AbsTol(tolerance);
     const double length = Length();
-    return std::isfinite(length) && length <= absTol;
+    return !std::isnan(length) && length <= AbsTol(tolerance);
 }
 
 double GB_LineSegment::Length() const
@@ -304,7 +524,7 @@ double GB_LineSegment::Length() const
         return GB_QuietNan;
     }
 
-    return VectorLength(point2.x - point1.x, point2.y - point1.y);
+    return point1.DistanceTo(point2);
 }
 
 double GB_LineSegment::LengthSquared() const
@@ -344,23 +564,22 @@ GB_Vector2d GB_LineSegment::UnitDirectionVector(double tolerance) const
         return MakeNanVector();
     }
 
-    const double absTol = AbsTol(tolerance);
-    double segmentVectorX = 0.0;
-    double segmentVectorY = 0.0;
-    double lengthSquared = 0.0;
-    if (!TryGetSegmentVectorAndLengthSquared(*this, segmentVectorX, segmentVectorY, lengthSquared) || IsLengthSquaredDegenerate(lengthSquared, absTol))
+    const double absTolerance = AbsTol(tolerance);
+    const double length = Length();
+    if (std::isnan(length) || length <= absTolerance)
     {
         return MakeNanVector();
     }
 
-    const double length = VectorLength(segmentVectorX, segmentVectorY);
-    if (!std::isfinite(length) || length <= absTol)
+    double unitX = 0.0;
+    double unitY = 0.0;
+    double ignoredLength = 0.0;
+    if (!TryGetUnitDirectionAndLength(*this, unitX, unitY, ignoredLength))
     {
         return MakeNanVector();
     }
 
-    const double inverseLength = 1.0 / length;
-    return GB_Vector2d(segmentVectorX * inverseLength, segmentVectorY * inverseLength);
+    return GB_Vector2d(unitX, unitY);
 }
 
 double GB_LineSegment::Angle() const
@@ -370,7 +589,8 @@ double GB_LineSegment::Angle() const
         return GB_QuietNan;
     }
 
-    return ToVector().Angle();
+    const GB_Vector2d unitDirection = UnitDirectionVector(0.0);
+    return unitDirection.IsValid() ? unitDirection.Angle() : GB_QuietNan;
 }
 
 GB_Rectangle GB_LineSegment::BoundingRectangle() const
@@ -400,8 +620,8 @@ bool GB_LineSegment::IsNearEqual(const GB_LineSegment& other, double tolerance) 
         return false;
     }
 
-    const double absTol = AbsTol(tolerance);
-    return point1.IsNearEqual(other.point1, absTol) && point2.IsNearEqual(other.point2, absTol);
+    const double absTolerance = AbsTol(tolerance);
+    return point1.IsNearEqual(other.point1, absTolerance) && point2.IsNearEqual(other.point2, absTolerance);
 }
 
 bool GB_LineSegment::IsSameLineSegment(const GB_LineSegment& other, double tolerance) const
@@ -411,9 +631,9 @@ bool GB_LineSegment::IsSameLineSegment(const GB_LineSegment& other, double toler
         return false;
     }
 
-    const double absTol = AbsTol(tolerance);
-    return (point1.IsNearEqual(other.point1, absTol) && point2.IsNearEqual(other.point2, absTol))
-        || (point1.IsNearEqual(other.point2, absTol) && point2.IsNearEqual(other.point1, absTol));
+    const double absTolerance = AbsTol(tolerance);
+    return (point1.IsNearEqual(other.point1, absTolerance) && point2.IsNearEqual(other.point2, absTolerance))
+        || (point1.IsNearEqual(other.point2, absTolerance) && point2.IsNearEqual(other.point1, absTolerance));
 }
 
 GB_Point2d GB_LineSegment::PointAt(double t) const
@@ -428,23 +648,19 @@ GB_Point2d GB_LineSegment::PointAt(double t) const
 
 double GB_LineSegment::ParameterAt(const GB_Point2d& point) const
 {
-    if (!IsValid() || !point.IsValid())
+    if (!IsValid() || !point.IsValid() || IsExactDegenerate(*this))
     {
         return GB_QuietNan;
     }
 
-    double segmentVectorX = 0.0;
-    double segmentVectorY = 0.0;
-    double lengthSquared = 0.0;
-    if (!TryGetSegmentVectorAndLengthSquared(*this, segmentVectorX, segmentVectorY, lengthSquared) || lengthSquared <= 0.0)
+    double parameter = GB_QuietNan;
+    if (TryGetParameterFast(*this, point, parameter))
     {
-        return GB_QuietNan;
+        return parameter;
     }
 
-    const double pointVectorX = point.x - point1.x;
-    const double pointVectorY = point.y - point1.y;
-    const long double parameter = DotProductLongDouble(pointVectorX, pointVectorY, segmentVectorX, segmentVectorY) / static_cast<long double>(lengthSquared);
-    return ToFiniteDoubleOrNan(parameter);
+    HighPrecisionFloat highPrecisionParameter = 0;
+    return TryGetParameterHighPrecision(*this, point, highPrecisionParameter) ? HighPrecisionToDoubleOrInfinity(highPrecisionParameter) : GB_QuietNan;
 }
 
 GB_Point2d GB_LineSegment::ProjectPointOnLine(const GB_Point2d& point) const
@@ -454,25 +670,23 @@ GB_Point2d GB_LineSegment::ProjectPointOnLine(const GB_Point2d& point) const
         return MakeNanPoint();
     }
 
-    double segmentVectorX = 0.0;
-    double segmentVectorY = 0.0;
-    double lengthSquared = 0.0;
-    if (!TryGetSegmentVectorAndLengthSquared(*this, segmentVectorX, segmentVectorY, lengthSquared) || lengthSquared <= 0.0)
+    if (IsExactDegenerate(*this))
     {
         return point1;
     }
 
-    const double pointVectorX = point.x - point1.x;
-    const double pointVectorY = point.y - point1.y;
-    const long double parameter = DotProductLongDouble(pointVectorX, pointVectorY, segmentVectorX, segmentVectorY) / static_cast<long double>(lengthSquared);
-    if (!std::isfinite(parameter))
+    const double parameter = ParameterAt(point);
+    if (std::isfinite(parameter))
     {
-        return point1;
+        const GB_Point2d projectedPoint = PointAt(parameter);
+        if (projectedPoint.IsValid())
+        {
+            return projectedPoint;
+        }
     }
 
-    const double projectedX = ToFiniteDoubleOrNan(static_cast<long double>(point1.x) + static_cast<long double>(segmentVectorX) * parameter);
-    const double projectedY = ToFiniteDoubleOrNan(static_cast<long double>(point1.y) + static_cast<long double>(segmentVectorY) * parameter);
-    return IsFinitePoint(projectedX, projectedY) ? GB_Point2d(projectedX, projectedY) : MakeNanPoint();
+    GB_Point2d projectedPoint;
+    return TryProjectPointOnLineHighPrecision(*this, point, projectedPoint) ? projectedPoint : MakeNanPoint();
 }
 
 GB_Point2d GB_LineSegment::ClosestPointTo(const GB_Point2d& point) const
@@ -482,31 +696,33 @@ GB_Point2d GB_LineSegment::ClosestPointTo(const GB_Point2d& point) const
         return MakeNanPoint();
     }
 
-    double segmentVectorX = 0.0;
-    double segmentVectorY = 0.0;
-    double lengthSquared = 0.0;
-    if (!TryGetSegmentVectorAndLengthSquared(*this, segmentVectorX, segmentVectorY, lengthSquared) || lengthSquared <= 0.0)
+    if (IsExactDegenerate(*this))
     {
         return point1;
     }
 
-    const double pointVectorX = point.x - point1.x;
-    const double pointVectorY = point.y - point1.y;
-    const long double parameter = DotProductLongDouble(pointVectorX, pointVectorY, segmentVectorX, segmentVectorY) / static_cast<long double>(lengthSquared);
-    if (!std::isfinite(parameter))
+    const double parameter = ParameterAt(point);
+    if (std::isnan(parameter) || parameter <= 0.0)
     {
         return point1;
     }
+    if (parameter >= 1.0)
+    {
+        return point2;
+    }
 
-    const long double clampedParameter = ClampUnitParameterLongDouble(parameter);
-    const double closestX = ToFiniteDoubleOrNan(static_cast<long double>(point1.x) + static_cast<long double>(segmentVectorX) * clampedParameter);
-    const double closestY = ToFiniteDoubleOrNan(static_cast<long double>(point1.y) + static_cast<long double>(segmentVectorY) * clampedParameter);
-    return IsFinitePoint(closestX, closestY) ? GB_Point2d(closestX, closestY) : MakeNanPoint();
+    return PointAt(parameter);
 }
 
 double GB_LineSegment::DistanceTo(const GB_Point2d& point) const
 {
-    return std::sqrt(DistanceToSquared(point));
+    if (!IsValid() || !point.IsValid())
+    {
+        return GB_QuietNan;
+    }
+
+    const GB_Point2d closestPoint = ClosestPointTo(point);
+    return closestPoint.IsValid() ? closestPoint.DistanceTo(point) : GB_QuietNan;
 }
 
 double GB_LineSegment::DistanceToSquared(const GB_Point2d& point) const
@@ -516,40 +732,8 @@ double GB_LineSegment::DistanceToSquared(const GB_Point2d& point) const
         return GB_QuietNan;
     }
 
-    double segmentVectorX = 0.0;
-    double segmentVectorY = 0.0;
-    double lengthSquared = 0.0;
-    if (!TryGetSegmentVectorAndLengthSquared(*this, segmentVectorX, segmentVectorY, lengthSquared) || lengthSquared <= 0.0)
-    {
-        return point1.DistanceToSquared(point);
-    }
-
-    const double pointVectorX = point.x - point1.x;
-    const double pointVectorY = point.y - point1.y;
-    const long double dot = DotProductLongDouble(pointVectorX, pointVectorY, segmentVectorX, segmentVectorY);
-    if (!std::isfinite(dot))
-    {
-        return GB_QuietNan;
-    }
-
-    if (dot <= 0.0L)
-    {
-        return point1.DistanceToSquared(point);
-    }
-
-    if (dot >= static_cast<long double>(lengthSquared))
-    {
-        return point2.DistanceToSquared(point);
-    }
-
-    const long double cross = CrossProductLongDouble(segmentVectorX, segmentVectorY, pointVectorX, pointVectorY);
-    if (!std::isfinite(cross))
-    {
-        return GB_QuietNan;
-    }
-
-    const long double distanceSquared = cross * cross / static_cast<long double>(lengthSquared);
-    return ToFiniteDoubleOrNan(distanceSquared);
+    const GB_Point2d closestPoint = ClosestPointTo(point);
+    return closestPoint.IsValid() ? closestPoint.DistanceToSquared(point) : GB_QuietNan;
 }
 
 double GB_LineSegment::DistanceToLine(const GB_Point2d& point) const
@@ -559,24 +743,53 @@ double GB_LineSegment::DistanceToLine(const GB_Point2d& point) const
         return GB_QuietNan;
     }
 
-    double segmentVectorX = 0.0;
-    double segmentVectorY = 0.0;
-    double lengthSquared = 0.0;
-    if (!TryGetSegmentVectorAndLengthSquared(*this, segmentVectorX, segmentVectorY, lengthSquared) || lengthSquared <= 0.0)
+    if (IsExactDegenerate(*this))
     {
         return point1.DistanceTo(point);
     }
 
-    const double pointVectorX = point.x - point1.x;
-    const double pointVectorY = point.y - point1.y;
-    const long double cross = CrossProductLongDouble(segmentVectorX, segmentVectorY, pointVectorX, pointVectorY);
-    const double length = VectorLength(segmentVectorX, segmentVectorY);
-    if (!std::isfinite(cross) || !std::isfinite(length) || length <= 0.0)
+    double unitX = 0.0;
+    double unitY = 0.0;
+    double length = 0.0;
+    if (!TryGetUnitDirectionAndLength(*this, unitX, unitY, length))
     {
         return GB_QuietNan;
     }
 
-    return ToFiniteDoubleOrNan(std::abs(cross) / static_cast<long double>(length));
+    const double pointDeltaX = point.x - point1.x;
+    const double pointDeltaY = point.y - point1.y;
+    if (std::isfinite(pointDeltaX) && std::isfinite(pointDeltaY))
+    {
+        const double pointScale = std::max(std::abs(pointDeltaX), std::abs(pointDeltaY));
+        if (pointScale == 0.0)
+        {
+            return 0.0;
+        }
+
+        if (unitX == 0.0)
+        {
+            return std::abs(pointDeltaX);
+        }
+        if (unitY == 0.0)
+        {
+            return std::abs(pointDeltaY);
+        }
+
+        const double normalizedPointX = pointDeltaX / pointScale;
+        const double normalizedPointY = pointDeltaY / pointScale;
+        const double normalizedCross = unitX * normalizedPointY - unitY * normalizedPointX;
+        const double absoluteNormalizedCross = std::abs(normalizedCross);
+        if (std::isfinite(absoluteNormalizedCross) && absoluteNormalizedCross > std::numeric_limits<double>::epsilon() * 64.0)
+        {
+            if (absoluteNormalizedCross > std::numeric_limits<double>::max() / pointScale)
+            {
+                return std::numeric_limits<double>::infinity();
+            }
+            return pointScale * absoluteNormalizedCross;
+        }
+    }
+
+    return DistanceToLineHighPrecision(*this, point);
 }
 
 double GB_LineSegment::DistanceTo(const GB_LineSegment& other) const
@@ -588,32 +801,31 @@ double GB_LineSegment::DistanceTo(const GB_LineSegment& other) const
 
     if (IsIntersects(other))
     {
-        return 0;
+        return 0.0;
     }
 
-    double minDistanceSquared = std::numeric_limits<double>::infinity();
-    bool hasValidDistanceSquared = false;
-    const double distanceSquaredValues[4] =
+    const double distanceValues[4] =
     {
-        DistanceToSquared(other.point1),
-        DistanceToSquared(other.point2),
-        other.DistanceToSquared(point1),
-        other.DistanceToSquared(point2)
+        DistanceTo(other.point1),
+        DistanceTo(other.point2),
+        other.DistanceTo(point1),
+        other.DistanceTo(point2)
     };
 
-    for (int i = 0; i < 4; i++)
+    double minimumDistance = std::numeric_limits<double>::infinity();
+    bool hasDistance = false;
+    for (int valueIndex = 0; valueIndex < 4; valueIndex++)
     {
-        if (!std::isnan(distanceSquaredValues[i]))
+        if (std::isnan(distanceValues[valueIndex]))
         {
-            if (!hasValidDistanceSquared || distanceSquaredValues[i] < minDistanceSquared)
-            {
-                minDistanceSquared = distanceSquaredValues[i];
-            }
-            hasValidDistanceSquared = true;
+            continue;
         }
+
+        minimumDistance = std::min(minimumDistance, distanceValues[valueIndex]);
+        hasDistance = true;
     }
 
-    return hasValidDistanceSquared ? std::sqrt(minDistanceSquared) : GB_QuietNan;
+    return hasDistance ? minimumDistance : GB_QuietNan;
 }
 
 GB_LineSegment GB_LineSegment::Reversed() const
@@ -644,12 +856,7 @@ GB_LineSegment GB_LineSegment::NormalizedEndpointOrder() const
         return GB_LineSegment::Invalid;
     }
 
-    if (ComparePointLexicographically(point2, point1) < 0)
-    {
-        return GB_LineSegment(point2, point1);
-    }
-
-    return *this;
+    return ComparePointLexicographically(point2, point1) < 0 ? GB_LineSegment(point2, point1) : *this;
 }
 
 void GB_LineSegment::NormalizeEndpointOrder()
@@ -690,6 +897,10 @@ void GB_LineSegment::Offset(double deltaX, double deltaY)
 
     point1.Offset(deltaX, deltaY);
     point2.Offset(deltaX, deltaY);
+    if (!point1.IsValid() || !point2.IsValid())
+    {
+        Reset();
+    }
 }
 
 void GB_LineSegment::Offset(const GB_Vector2d& translation)
@@ -799,10 +1010,7 @@ void GB_LineSegment::Extend(double deltaAtPoint1, double deltaAtPoint2)
         return;
     }
 
-    double segmentVectorX = 0.0;
-    double segmentVectorY = 0.0;
-    double lengthSquared = 0.0;
-    if (!TryGetSegmentVectorAndLengthSquared(*this, segmentVectorX, segmentVectorY, lengthSquared) || lengthSquared <= 0.0)
+    if (IsExactDegenerate(*this))
     {
         if (std::abs(deltaAtPoint1) <= GB_Epsilon && std::abs(deltaAtPoint2) <= GB_Epsilon)
         {
@@ -813,27 +1021,63 @@ void GB_LineSegment::Extend(double deltaAtPoint1, double deltaAtPoint2)
         return;
     }
 
-    const double length = VectorLength(segmentVectorX, segmentVectorY);
-    if (!std::isfinite(length) || length <= 0.0)
+    double unitX = 0.0;
+    double unitY = 0.0;
+    double ignoredLength = 0.0;
+    if (!TryGetUnitDirectionAndLength(*this, unitX, unitY, ignoredLength))
     {
         Reset();
         return;
     }
 
-    const double newLength = length + deltaAtPoint1 + deltaAtPoint2;
-    const double lengthTolerance = GB_Epsilon * std::max(1.0, length);
-    if (newLength < -lengthTolerance)
+    bool shouldCollapse = false;
+    bool checkedLength = false;
+    const double currentLength = Length();
+    if (std::isfinite(currentLength))
+    {
+        const double totalDelta = deltaAtPoint1 + deltaAtPoint2;
+        if (std::isfinite(totalDelta))
+        {
+            const double newLength = currentLength + totalDelta;
+            if (std::isfinite(newLength))
+            {
+                const double lengthTolerance = GB_Epsilon * std::max(1.0, currentLength);
+                if (newLength < -lengthTolerance)
+                {
+                    Reset();
+                    return;
+                }
+
+                shouldCollapse = std::abs(newLength) <= lengthTolerance;
+                checkedLength = true;
+            }
+        }
+    }
+
+    if (!checkedLength)
+    {
+        const HighPrecisionFloat highPrecisionLength = GetHighPrecisionSegmentLength(*this);
+        const HighPrecisionFloat newLength = highPrecisionLength + HighPrecisionFloat(deltaAtPoint1) + HighPrecisionFloat(deltaAtPoint2);
+        const HighPrecisionFloat lengthTolerance = HighPrecisionFloat(GB_Epsilon) * (highPrecisionLength > 1 ? highPrecisionLength : HighPrecisionFloat(1));
+        if (newLength < -lengthTolerance)
+        {
+            Reset();
+            return;
+        }
+
+        shouldCollapse = boost::multiprecision::abs(newLength) <= lengthTolerance;
+    }
+
+    const GB_Vector2d unitDirection(unitX, unitY);
+    const GB_Point2d newPoint1 = point1 - unitDirection * deltaAtPoint1;
+    const GB_Point2d newPoint2 = point2 + unitDirection * deltaAtPoint2;
+    if (!newPoint1.IsValid() || !newPoint2.IsValid())
     {
         Reset();
         return;
     }
 
-    const double inverseLength = 1.0 / length;
-    const GB_Vector2d unit(segmentVectorX * inverseLength, segmentVectorY * inverseLength);
-    const GB_Point2d newPoint1 = point1 - unit * deltaAtPoint1;
-    const GB_Point2d newPoint2 = point2 + unit * deltaAtPoint2;
-
-    if (std::abs(newLength) <= lengthTolerance)
+    if (shouldCollapse)
     {
         const GB_Point2d collapsePoint = GB_Point2d::MidPoint(newPoint1, newPoint2);
         Set(collapsePoint, collapsePoint);
@@ -850,76 +1094,48 @@ bool GB_LineSegment::IsContains(const GB_Point2d& point, double tolerance) const
         return false;
     }
 
-    const double absTol = AbsTol(tolerance);
-    double segmentVectorX = 0.0;
-    double segmentVectorY = 0.0;
-    double lengthSquared = 0.0;
-    if (!TryGetSegmentVectorAndLengthSquared(*this, segmentVectorX, segmentVectorY, lengthSquared))
-    {
-        return false;
-    }
-
-    const long double toleranceSquared = static_cast<long double>(absTol) * static_cast<long double>(absTol);
-    if (IsLengthSquaredDegenerate(lengthSquared, absTol))
-    {
-        const double distanceSquared = point1.DistanceToSquared(point);
-        return std::isfinite(distanceSquared) && static_cast<long double>(distanceSquared) <= toleranceSquared;
-    }
-
-    const double pointVectorX = point.x - point1.x;
-    const double pointVectorY = point.y - point1.y;
-    const long double dot = DotProductLongDouble(pointVectorX, pointVectorY, segmentVectorX, segmentVectorY);
-    if (!std::isfinite(dot))
-    {
-        return false;
-    }
-
-    if (dot <= 0.0L)
-    {
-        const double distanceSquared = point1.DistanceToSquared(point);
-        return std::isfinite(distanceSquared) && static_cast<long double>(distanceSquared) <= toleranceSquared;
-    }
-
-    if (dot >= static_cast<long double>(lengthSquared))
-    {
-        const double distanceSquared = point2.DistanceToSquared(point);
-        return std::isfinite(distanceSquared) && static_cast<long double>(distanceSquared) <= toleranceSquared;
-    }
-
-    const long double cross = CrossProductLongDouble(segmentVectorX, segmentVectorY, pointVectorX, pointVectorY);
-    if (!std::isfinite(cross))
-    {
-        return false;
-    }
-
-    const long double distanceSquared = cross * cross / static_cast<long double>(lengthSquared);
-    return distanceSquared <= toleranceSquared;
+    const double distance = DistanceTo(point);
+    return !std::isnan(distance) && distance <= AbsTol(tolerance);
 }
 
 int GB_LineSegment::SideOfPoint(const GB_Point2d& point, double tolerance) const
 {
-    if (!IsValid() || !point.IsValid())
+    if (!IsValid() || !point.IsValid() || IsDegenerate(AbsTol(tolerance)))
     {
         return 0;
     }
 
-    const double absTol = AbsTol(tolerance);
-    double segmentVectorX = 0.0;
-    double segmentVectorY = 0.0;
-    double lengthSquared = 0.0;
-    if (!TryGetSegmentVectorAndLengthSquared(*this, segmentVectorX, segmentVectorY, lengthSquared) || IsLengthSquaredDegenerate(lengthSquared, absTol))
+    const double absTolerance = AbsTol(tolerance);
+    const double distance = DistanceToLine(point);
+    if (std::isnan(distance) || distance <= absTolerance)
     {
         return 0;
     }
 
-    const double length = VectorLength(segmentVectorX, segmentVectorY);
-    const long double cross = CrossProductLongDouble(segmentVectorX, segmentVectorY, point.x - point1.x, point.y - point1.y);
-    if (!std::isfinite(cross) || !std::isfinite(length) || IsCrossWithinDistanceTolerance(cross, length, absTol))
+    double unitX = 0.0;
+    double unitY = 0.0;
+    double ignoredLength = 0.0;
+    if (!TryGetUnitDirectionAndLength(*this, unitX, unitY, ignoredLength))
     {
         return 0;
     }
 
-    return cross > 0.0L ? 1 : -1;
+    const double pointDeltaX = point.x - point1.x;
+    const double pointDeltaY = point.y - point1.y;
+    if (std::isfinite(pointDeltaX) && std::isfinite(pointDeltaY))
+    {
+        const double pointScale = std::max(std::abs(pointDeltaX), std::abs(pointDeltaY));
+        if (pointScale > 0.0)
+        {
+            const double normalizedCross = unitX * (pointDeltaY / pointScale) - unitY * (pointDeltaX / pointScale);
+            if (std::isfinite(normalizedCross) && std::abs(normalizedCross) > std::numeric_limits<double>::epsilon() * 64.0)
+            {
+                return normalizedCross > 0.0 ? 1 : -1;
+            }
+        }
+    }
+
+    return SideOfPointHighPrecision(*this, point);
 }
 
 bool GB_LineSegment::IsParallelTo(const GB_LineSegment& other, double tolerance) const
@@ -929,23 +1145,21 @@ bool GB_LineSegment::IsParallelTo(const GB_LineSegment& other, double tolerance)
         return false;
     }
 
-    const double absTol = AbsTol(tolerance);
-    double thisVectorX = 0.0;
-    double thisVectorY = 0.0;
-    double thisLengthSquared = 0.0;
-    double otherVectorX = 0.0;
-    double otherVectorY = 0.0;
-    double otherLengthSquared = 0.0;
-    if (!TryGetSegmentVectorAndLengthSquared(*this, thisVectorX, thisVectorY, thisLengthSquared)
-        || !TryGetSegmentVectorAndLengthSquared(other, otherVectorX, otherVectorY, otherLengthSquared)
-        || IsLengthSquaredDegenerate(thisLengthSquared, absTol)
-        || IsLengthSquaredDegenerate(otherLengthSquared, absTol))
+    const double absTolerance = AbsTol(tolerance);
+    if (IsDegenerate(absTolerance) || other.IsDegenerate(absTolerance))
     {
         return false;
     }
 
-    const long double cross = CrossProductLongDouble(thisVectorX, thisVectorY, otherVectorX, otherVectorY);
-    return IsRelativeCrossWithinTolerance(cross, thisLengthSquared, otherLengthSquared, absTol);
+    const GB_Vector2d firstUnit = UnitDirectionVector(0.0);
+    const GB_Vector2d secondUnit = other.UnitDirectionVector(0.0);
+    if (!firstUnit.IsValid() || !secondUnit.IsValid())
+    {
+        return false;
+    }
+
+    const double cross = firstUnit.x * secondUnit.y - firstUnit.y * secondUnit.x;
+    return std::isfinite(cross) && std::abs(cross) <= absTolerance;
 }
 
 bool GB_LineSegment::IsPerpendicularTo(const GB_LineSegment& other, double tolerance) const
@@ -955,23 +1169,21 @@ bool GB_LineSegment::IsPerpendicularTo(const GB_LineSegment& other, double toler
         return false;
     }
 
-    const double absTol = AbsTol(tolerance);
-    double thisVectorX = 0.0;
-    double thisVectorY = 0.0;
-    double thisLengthSquared = 0.0;
-    double otherVectorX = 0.0;
-    double otherVectorY = 0.0;
-    double otherLengthSquared = 0.0;
-    if (!TryGetSegmentVectorAndLengthSquared(*this, thisVectorX, thisVectorY, thisLengthSquared)
-        || !TryGetSegmentVectorAndLengthSquared(other, otherVectorX, otherVectorY, otherLengthSquared)
-        || IsLengthSquaredDegenerate(thisLengthSquared, absTol)
-        || IsLengthSquaredDegenerate(otherLengthSquared, absTol))
+    const double absTolerance = AbsTol(tolerance);
+    if (IsDegenerate(absTolerance) || other.IsDegenerate(absTolerance))
     {
         return false;
     }
 
-    const long double dot = DotProductLongDouble(thisVectorX, thisVectorY, otherVectorX, otherVectorY);
-    return IsRelativeDotWithinTolerance(dot, thisLengthSquared, otherLengthSquared, absTol);
+    const GB_Vector2d firstUnit = UnitDirectionVector(0.0);
+    const GB_Vector2d secondUnit = other.UnitDirectionVector(0.0);
+    if (!firstUnit.IsValid() || !secondUnit.IsValid())
+    {
+        return false;
+    }
+
+    const double dot = firstUnit.x * secondUnit.x + firstUnit.y * secondUnit.y;
+    return std::isfinite(dot) && std::abs(dot) <= absTolerance;
 }
 
 bool GB_LineSegment::IsCollinearWith(const GB_LineSegment& other, double tolerance) const
@@ -981,69 +1193,56 @@ bool GB_LineSegment::IsCollinearWith(const GB_LineSegment& other, double toleran
         return false;
     }
 
-    const double absTol = AbsTol(tolerance);
-    const bool thisDegenerate = IsDegenerate(absTol);
-    const bool otherDegenerate = other.IsDegenerate(absTol);
+    const double absTolerance = AbsTol(tolerance);
+    const bool thisDegenerate = IsDegenerate(absTolerance);
+    const bool otherDegenerate = other.IsDegenerate(absTolerance);
 
     if (thisDegenerate && otherDegenerate)
     {
-        return point1.IsNearEqual(other.point1, absTol);
+        return point1.IsNearEqual(other.point1, absTolerance);
     }
-
     if (thisDegenerate)
     {
-        return other.DistanceToLine(point1) <= absTol;
+        const double distance = other.DistanceToLine(point1);
+        return !std::isnan(distance) && distance <= absTolerance;
     }
-
     if (otherDegenerate)
     {
-        return DistanceToLine(other.point1) <= absTol;
+        const double distance = DistanceToLine(other.point1);
+        return !std::isnan(distance) && distance <= absTolerance;
     }
 
-    return IsParallelTo(other, absTol) && DistanceToLine(other.point1) <= absTol && DistanceToLine(other.point2) <= absTol;
+    if (!IsParallelTo(other, absTolerance))
+    {
+        return false;
+    }
+
+    const double firstDistance = DistanceToLine(other.point1);
+    const double secondDistance = DistanceToLine(other.point2);
+    return !std::isnan(firstDistance) && !std::isnan(secondDistance) && firstDistance <= absTolerance && secondDistance <= absTolerance;
 }
 
 double GB_LineSegment::AngleBetween(const GB_LineSegment& other) const
 {
-    if (!IsValid() || !other.IsValid())
+    if (!IsValid() || !other.IsValid() || IsDegenerate() || other.IsDegenerate())
     {
         return GB_QuietNan;
     }
 
-    double thisVectorX = 0.0;
-    double thisVectorY = 0.0;
-    double thisLengthSquared = 0.0;
-    double otherVectorX = 0.0;
-    double otherVectorY = 0.0;
-    double otherLengthSquared = 0.0;
-    if (!TryGetSegmentVectorAndLengthSquared(*this, thisVectorX, thisVectorY, thisLengthSquared)
-        || !TryGetSegmentVectorAndLengthSquared(other, otherVectorX, otherVectorY, otherLengthSquared)
-        || IsLengthSquaredDegenerate(thisLengthSquared, GB_Epsilon)
-        || IsLengthSquaredDegenerate(otherLengthSquared, GB_Epsilon))
+    const GB_Vector2d firstUnit = UnitDirectionVector(0.0);
+    const GB_Vector2d secondUnit = other.UnitDirectionVector(0.0);
+    if (!firstUnit.IsValid() || !secondUnit.IsValid())
     {
         return GB_QuietNan;
     }
 
-    const long double denominator = std::sqrt(static_cast<long double>(thisLengthSquared)) * std::sqrt(static_cast<long double>(otherLengthSquared));
-    if (!std::isfinite(denominator) || denominator <= 0.0L)
+    double cosineValue = std::abs(firstUnit.x * secondUnit.x + firstUnit.y * secondUnit.y);
+    if (!std::isfinite(cosineValue))
     {
         return GB_QuietNan;
     }
-
-    const long double dot = DotProductLongDouble(thisVectorX, thisVectorY, otherVectorX, otherVectorY);
-    if (!std::isfinite(dot))
-    {
-        return GB_QuietNan;
-    }
-
-    long double cosineValue = std::abs(dot / denominator);
-    if (cosineValue > 1.0L)
-    {
-        cosineValue = 1.0L;
-    }
-
-    const long double angle = std::acos(cosineValue);
-    return ToFiniteDoubleOrNan(angle);
+    cosineValue = std::min(1.0, cosineValue);
+    return std::acos(cosineValue);
 }
 
 bool GB_LineSegment::IsIntersects(const GB_LineSegment& other, double tolerance) const
@@ -1063,38 +1262,35 @@ int GB_LineSegment::Intersect(const GB_LineSegment& other, GB_Point2d& outInters
         return 0;
     }
 
-    const double absTol = AbsTol(tolerance);
-    if (!DoBoundingRectanglesOverlap(*this, other, absTol))
+    const double absTolerance = AbsTol(tolerance);
+    if (!DoBoundingRectanglesOverlap(*this, other, absTolerance))
     {
         return 0;
     }
 
-    const bool thisDegenerate = IsDegenerate(absTol);
-    const bool otherDegenerate = other.IsDegenerate(absTol);
-
+    const bool thisDegenerate = IsDegenerate(absTolerance);
+    const bool otherDegenerate = other.IsDegenerate(absTolerance);
     if (thisDegenerate && otherDegenerate)
     {
-        if (point1.IsNearEqual(other.point1, absTol))
+        if (point1.IsNearEqual(other.point1, absTolerance))
         {
             outIntersection = point1;
             return 1;
         }
         return 0;
     }
-
     if (thisDegenerate)
     {
-        if (other.IsContains(point1, absTol))
+        if (other.IsContains(point1, absTolerance))
         {
             outIntersection = point1;
             return 1;
         }
         return 0;
     }
-
     if (otherDegenerate)
     {
-        if (IsContains(other.point1, absTol))
+        if (IsContains(other.point1, absTolerance))
         {
             outIntersection = other.point1;
             return 1;
@@ -1102,101 +1298,81 @@ int GB_LineSegment::Intersect(const GB_LineSegment& other, GB_Point2d& outInters
         return 0;
     }
 
-    double thisVectorX = 0.0;
-    double thisVectorY = 0.0;
-    double thisLengthSquared = 0.0;
-    double otherVectorX = 0.0;
-    double otherVectorY = 0.0;
-    double otherLengthSquared = 0.0;
-    if (!TryGetSegmentVectorAndLengthSquared(*this, thisVectorX, thisVectorY, thisLengthSquared)
-        || !TryGetSegmentVectorAndLengthSquared(other, otherVectorX, otherVectorY, otherLengthSquared)
-        || thisLengthSquared <= 0.0
-        || otherLengthSquared <= 0.0)
+    const GB_Vector2d thisUnit = UnitDirectionVector(0.0);
+    const GB_Vector2d otherUnit = other.UnitDirectionVector(0.0);
+    if (!thisUnit.IsValid() || !otherUnit.IsValid())
     {
         return 0;
     }
 
-    const double thisLength = VectorLength(thisVectorX, thisVectorY);
-    const double otherLength = VectorLength(otherVectorX, otherVectorY);
-    if (!std::isfinite(thisLength) || !std::isfinite(otherLength) || thisLength <= 0.0 || otherLength <= 0.0)
+    const double relativeCross = thisUnit.x * otherUnit.y - thisUnit.y * otherUnit.x;
+    if (!std::isfinite(relativeCross))
     {
         return 0;
     }
 
-    const double pointDeltaX = other.point1.x - point1.x;
-    const double pointDeltaY = other.point1.y - point1.y;
-    const long double denominator = CrossProductLongDouble(thisVectorX, thisVectorY, otherVectorX, otherVectorY);
-    const long double denominatorAbs = std::abs(denominator);
-    const long double relativeScale = static_cast<long double>(thisLength) * static_cast<long double>(otherLength);
-    const long double parallelThreshold = static_cast<long double>(absTol) * relativeScale;
-    const long double numericThreshold = static_cast<long double>(std::numeric_limits<double>::epsilon()) * relativeScale * 64.0L;
-
-    if (denominatorAbs <= parallelThreshold)
+    if (std::abs(relativeCross) <= absTolerance)
     {
-        const long double otherPoint1LineCross = CrossProductLongDouble(thisVectorX, thisVectorY, other.point1.x - point1.x, other.point1.y - point1.y);
-        const long double otherPoint2LineCross = CrossProductLongDouble(thisVectorX, thisVectorY, other.point2.x - point1.x, other.point2.y - point1.y);
-        const bool isCollinear = IsCrossWithinDistanceTolerance(otherPoint1LineCross, thisLength, absTol)
-            && IsCrossWithinDistanceTolerance(otherPoint2LineCross, thisLength, absTol);
-
-        if (isCollinear)
-        {
-            const double parameterTolerance = thisLength > 0.0 ? absTol / thisLength : 0.0;
-            const long double inverseThisLengthSquared = 1.0L / static_cast<long double>(thisLengthSquared);
-            long double otherPoint1Parameter = DotProductLongDouble(other.point1.x - point1.x, other.point1.y - point1.y, thisVectorX, thisVectorY) * inverseThisLengthSquared;
-            long double otherPoint2Parameter = DotProductLongDouble(other.point2.x - point1.x, other.point2.y - point1.y, thisVectorX, thisVectorY) * inverseThisLengthSquared;
-            if (!std::isfinite(otherPoint1Parameter) || !std::isfinite(otherPoint2Parameter))
-            {
-                return 0;
-            }
-
-            if (otherPoint1Parameter > otherPoint2Parameter)
-            {
-                std::swap(otherPoint1Parameter, otherPoint2Parameter);
-            }
-
-            const long double overlapStart = std::max(0.0L, otherPoint1Parameter);
-            const long double overlapEnd = std::min(1.0L, otherPoint2Parameter);
-            if (overlapStart > overlapEnd + static_cast<long double>(parameterTolerance))
-            {
-                return 0;
-            }
-
-            if (std::abs(overlapEnd - overlapStart) <= static_cast<long double>(parameterTolerance))
-            {
-                const double intersectionParameter = ToFiniteDoubleOrNan(ClampUnitParameterLongDouble(0.5L * (overlapStart + overlapEnd)));
-                outIntersection = PointAt(intersectionParameter);
-                return outIntersection.IsValid() ? 1 : 0;
-            }
-
-            const double overlapStartParameter = ToFiniteDoubleOrNan(ClampUnitParameterLongDouble(overlapStart));
-            const double overlapEndParameter = ToFiniteDoubleOrNan(ClampUnitParameterLongDouble(overlapEnd));
-            outOverlap.Set(PointAt(overlapStartParameter), PointAt(overlapEndParameter));
-            return outOverlap.IsValid() ? 2 : 0;
-        }
-
-        if (denominatorAbs <= numericThreshold)
+        const double firstDistance = DistanceToLine(other.point1);
+        const double secondDistance = DistanceToLine(other.point2);
+        const bool isCollinear = !std::isnan(firstDistance) && !std::isnan(secondDistance) && firstDistance <= absTolerance && secondDistance <= absTolerance;
+        if (!isCollinear)
         {
             return 0;
         }
+
+        double otherPoint1Parameter = ParameterAt(other.point1);
+        double otherPoint2Parameter = ParameterAt(other.point2);
+        if (std::isnan(otherPoint1Parameter) || std::isnan(otherPoint2Parameter))
+        {
+            return 0;
+        }
+        if (otherPoint1Parameter > otherPoint2Parameter)
+        {
+            std::swap(otherPoint1Parameter, otherPoint2Parameter);
+        }
+
+        const double thisLength = Length();
+        const double parameterTolerance = std::isfinite(thisLength) && thisLength > 0.0 ? absTolerance / thisLength : 0.0;
+        const double overlapStart = std::max(0.0, otherPoint1Parameter);
+        const double overlapEnd = std::min(1.0, otherPoint2Parameter);
+        if (overlapStart > overlapEnd + parameterTolerance)
+        {
+            return 0;
+        }
+
+        if (std::abs(overlapEnd - overlapStart) <= parameterTolerance)
+        {
+            const double intersectionParameter = ClampUnitParameter((overlapStart + overlapEnd) * 0.5);
+            outIntersection = PointAt(intersectionParameter);
+            return outIntersection.IsValid() ? 1 : 0;
+        }
+
+        outOverlap.Set(PointAt(ClampUnitParameter(overlapStart)), PointAt(ClampUnitParameter(overlapEnd)));
+        return outOverlap.IsValid() ? 2 : 0;
     }
 
-    const long double thisParameterLong = CrossProductLongDouble(pointDeltaX, pointDeltaY, otherVectorX, otherVectorY) / denominator;
-    const long double otherParameterLong = CrossProductLongDouble(pointDeltaX, pointDeltaY, thisVectorX, thisVectorY) / denominator;
-    if (!std::isfinite(thisParameterLong) || !std::isfinite(otherParameterLong))
+    double thisParameter = GB_QuietNan;
+    double otherParameter = GB_QuietNan;
+    const bool preferHighPrecision = std::abs(relativeCross) <= std::numeric_limits<double>::epsilon() * 64.0;
+    const bool parameterSucceeded = preferHighPrecision
+        ? TryGetIntersectionParametersHighPrecision(*this, other, thisParameter, otherParameter)
+        : (TryGetIntersectionParametersFast(*this, other, thisParameter, otherParameter) || TryGetIntersectionParametersHighPrecision(*this, other, thisParameter, otherParameter));
+    if (!parameterSucceeded)
     {
         return 0;
     }
 
-    const double thisParameterTolerance = absTol / thisLength;
-    const double otherParameterTolerance = absTol / otherLength;
-
-    if (!IsParameterInRangeLongDouble(thisParameterLong, thisParameterTolerance) || !IsParameterInRangeLongDouble(otherParameterLong, otherParameterTolerance))
+    const double thisLength = Length();
+    const double otherLength = other.Length();
+    const double thisParameterTolerance = std::isfinite(thisLength) && thisLength > 0.0 ? absTolerance / thisLength : 0.0;
+    const double otherParameterTolerance = std::isfinite(otherLength) && otherLength > 0.0 ? absTolerance / otherLength : 0.0;
+    if (!IsParameterInRange(thisParameter, thisParameterTolerance) || !IsParameterInRange(otherParameter, otherParameterTolerance))
     {
         return 0;
     }
 
-    const double thisParameter = ToFiniteDoubleOrNan(ClampUnitParameterLongDouble(thisParameterLong));
-    outIntersection = PointAt(thisParameter);
+    outIntersection = PointAt(ClampUnitParameter(thisParameter));
     return outIntersection.IsValid() ? 1 : 0;
 }
 
@@ -1251,12 +1427,7 @@ bool GB_LineSegment::Deserialize(const std::string& data)
     }
 
     iss >> std::ws;
-    if (!iss.eof())
-    {
-        return false;
-    }
-
-    if (leftParen != '(' || rightParen != ')' || comma1 != ',' || comma2 != ',' || comma3 != ',' || type != GetClassType())
+    if (!iss.eof() || leftParen != '(' || rightParen != ')' || comma1 != ',' || comma2 != ',' || comma3 != ',' || type != GetClassType())
     {
         return false;
     }
