@@ -2252,13 +2252,15 @@ namespace GBImage_Internal
                 return true;
             }
 
-            const int scaledCols = static_cast<int>(std::floor(static_cast<double>(templateImage.cols) * scale + 0.5));
-            const int scaledRows = static_cast<int>(std::floor(static_cast<double>(templateImage.rows) * scale + 0.5));
-            if (scaledRows <= 0 || scaledCols <= 0)
+            const double scaledColsValue = std::floor(static_cast<double>(templateImage.cols) * scale + 0.5);
+            const double scaledRowsValue = std::floor(static_cast<double>(templateImage.rows) * scale + 0.5);
+            if (!IsFiniteDouble(scaledColsValue) || !IsFiniteDouble(scaledRowsValue) || scaledColsValue <= 0.0 || scaledRowsValue <= 0.0 || scaledColsValue > static_cast<double>(std::numeric_limits<int>::max()) || scaledRowsValue > static_cast<double>(std::numeric_limits<int>::max()))
             {
                 return false;
             }
 
+            const int scaledCols = static_cast<int>(scaledColsValue);
+            const int scaledRows = static_cast<int>(scaledRowsValue);
             cv::resize(templateImage, scaledTemplateImage, cv::Size(scaledCols, scaledRows), 0.0, 0.0, ToCvInterpolation(interpolation));
             return !scaledTemplateImage.empty();
         }
@@ -2559,12 +2561,6 @@ namespace GBImage_Internal
 
             sourceMatchImage = sourceGrayImage;
             templateMatchImage = templateGrayImage;
-        }
-
-        if (templateMatchImage.rows > sourceMatchImage.rows || templateMatchImage.cols > sourceMatchImage.cols)
-        {
-            result.message = GB_STR("模板图像尺寸大于大图像。");
-            return result;
         }
 
         const int cvMatchMethod = ToCvTemplateMatchMethod(findOptions.templateMatchMethod);
@@ -3011,14 +3007,6 @@ namespace GBImage_Internal
     }
 
     /**
-     * @brief 将逻辑 RGBA 转为直通道 BGRA 标量。
-     */
-    static cv::Scalar ToBgraScalar(const GB_ColorRGBA& color)
-    {
-        return cv::Scalar(static_cast<double>(color.b), static_cast<double>(color.g), static_cast<double>(color.r), static_cast<double>(color.a));
-    }
-
-    /**
      * @brief 将矩形裁剪到图像范围内。
      */
     static cv::Rect ClipRectToImage(const cv::Rect& rectangle, const int imageWidth, const int imageHeight)
@@ -3274,6 +3262,45 @@ namespace GBImage_Internal
     /**
      * @brief 将指定图像矩阵转换为 8 位直通道 BGRA 图像。
      */
+    static bool MatsMayShareStorage(const cv::Mat& firstImage, const cv::Mat& secondImage)
+    {
+        if (firstImage.empty() || secondImage.empty())
+        {
+            return false;
+        }
+
+        return firstImage.datastart != nullptr && secondImage.datastart != nullptr && firstImage.datastart == secondImage.datastart;
+    }
+
+    static bool BuildStraightBgraColorLayerFromCoverageMask(const cv::Mat& coverageMask, const GB_ColorRGBA& color, cv::Mat& straightBgraLayer)
+    {
+        straightBgraLayer.release();
+        if (coverageMask.empty() || coverageMask.type() != CV_8UC1)
+        {
+            return false;
+        }
+
+        try
+        {
+            straightBgraLayer = cv::Mat(coverageMask.rows, coverageMask.cols, CV_8UC4, cv::Scalar(static_cast<double>(color.b), static_cast<double>(color.g), static_cast<double>(color.r), 0.0));
+            for (int rowIndex = 0; rowIndex < coverageMask.rows; rowIndex++)
+            {
+                const unsigned char* maskRow = coverageMask.ptr<unsigned char>(rowIndex);
+                cv::Vec4b* layerRow = straightBgraLayer.ptr<cv::Vec4b>(rowIndex);
+                for (int colIndex = 0; colIndex < coverageMask.cols; colIndex++)
+                {
+                    layerRow[colIndex][3] = static_cast<unsigned char>((static_cast<int>(maskRow[colIndex]) * static_cast<int>(color.a) + 127) / 255);
+                }
+            }
+            return true;
+        }
+        catch (...)
+        {
+            straightBgraLayer.release();
+            return false;
+        }
+    }
+
     static bool TryConvertImageMatToStraightBgra(const cv::Mat& sourceImage, ImageChannelLayout sourceLayout, cv::Mat& straightBgraImage)
     {
         straightBgraImage.release();
@@ -3848,7 +3875,7 @@ bool GB_Image::EncodeToMemory(GB_ByteBuffer& encodedBytes, const std::string& fi
 bool GB_Image::SetFromCvMat(const cv::Mat& imageMat, GB_ImageCopyMode copyMode)
 {
     GBImage_Internal::EnsureOpenCvErrorLogOnly();
-    if (imageMat.empty())
+    if (imageMat.empty() || imageMat.dims != 2 || imageMat.rows <= 0 || imageMat.cols <= 0)
     {
         return false;
     }
@@ -4930,23 +4957,36 @@ bool GB_Image::DrawPolygon(const GB_Polygon& polygon, const GB_ImageDrawPolygonO
             localPoints.push_back(cv::Point(points[i].x - clippedDrawRectangle.x, points[i].y - clippedDrawRectangle.y));
         }
 
-        cv::Mat layerStraightBgra(clippedDrawRectangle.height, clippedDrawRectangle.width, CV_8UC4, cv::Scalar(0, 0, 0, 0));
+        cv::Mat coverageMask(clippedDrawRectangle.height, clippedDrawRectangle.width, CV_8UC1, cv::Scalar(0));
+        cv::Mat targetRoi = imageImpl->imageMat(clippedDrawRectangle);
         const int lineType = GBImage_Internal::GetOpenCvLineType(drawOptions.antialias);
 
         if (drawFill)
         {
             std::vector<std::vector<cv::Point>> fillPoints(1, localPoints);
-            cv::fillPoly(layerStraightBgra, fillPoints, GBImage_Internal::ToBgraScalar(drawOptions.fillColor), lineType);
+            cv::fillPoly(coverageMask, fillPoints, cv::Scalar(255), lineType);
+
+            cv::Mat fillLayerStraightBgra;
+            if (!GBImage_Internal::BuildStraightBgraColorLayerFromCoverageMask(coverageMask, drawOptions.fillColor, fillLayerStraightBgra) || !GBImage_Internal::BlendStraightBgraOverImageMat(targetRoi, imageImpl->channelLayout, fillLayerStraightBgra))
+            {
+                return false;
+            }
         }
 
         if (drawBoundary)
         {
+            coverageMask.setTo(cv::Scalar(0));
             std::vector<std::vector<cv::Point>> boundaryPoints(1, localPoints);
-            cv::polylines(layerStraightBgra, boundaryPoints, true, GBImage_Internal::ToBgraScalar(drawOptions.boundaryColor), drawOptions.boundaryThickness, lineType);
+            cv::polylines(coverageMask, boundaryPoints, true, cv::Scalar(255), drawOptions.boundaryThickness, lineType);
+
+            cv::Mat boundaryLayerStraightBgra;
+            if (!GBImage_Internal::BuildStraightBgraColorLayerFromCoverageMask(coverageMask, drawOptions.boundaryColor, boundaryLayerStraightBgra) || !GBImage_Internal::BlendStraightBgraOverImageMat(targetRoi, imageImpl->channelLayout, boundaryLayerStraightBgra))
+            {
+                return false;
+            }
         }
 
-        cv::Mat targetRoi = imageImpl->imageMat(clippedDrawRectangle);
-        return GBImage_Internal::BlendStraightBgraOverImageMat(targetRoi, imageImpl->channelLayout, layerStraightBgra);
+        return true;
     }
     catch (...)
     {
@@ -4992,6 +5032,15 @@ bool GB_Image::DrawImage(const GB_Image& image, const GB_ImageDrawImageOptions& 
 
     try
     {
+        if (GBImage_Internal::MatsMayShareStorage(sourceStraightBgra, imageImpl->imageMat))
+        {
+            sourceStraightBgra = sourceStraightBgra.clone();
+            if (sourceStraightBgra.empty())
+            {
+                return false;
+            }
+        }
+
         if (drawOptions.outOfBoundsPolicy == GB_ImageDrawOutOfBoundsPolicy::ExpandImage)
         {
             int offsetX = 0;

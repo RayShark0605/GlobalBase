@@ -183,7 +183,7 @@ namespace
     static bool TryParseSizeT(const std::string& text, size_t& outValue)
     {
         const std::string trimmed = TrimAscii(text);
-        if (trimmed.empty())
+        if (trimmed.empty() || trimmed[0] == '-')
         {
             outValue = 0;
             return false;
@@ -613,6 +613,21 @@ namespace
         oss.imbue(std::locale::classic());
         oss << value;
         return oss.str();
+    }
+
+
+    template<typename ValueType>
+    static bool TryReserveVector(std::vector<ValueType>& values, size_t count)
+    {
+        try
+        {
+            values.reserve(count);
+            return true;
+        }
+        catch (...)
+        {
+            return false;
+        }
     }
 
 
@@ -2683,6 +2698,13 @@ bool GB_Polygon::Deserialize(const std::string& data)
         return false;
     }
 
+    const size_t remainingFieldTextLength = body.size() - offset;
+    const size_t maximumVertexCountByTextLength = remainingFieldTextLength / 4 + ((remainingFieldTextLength % 4) == 3 ? 1 : 0);
+    if (numVertices > maximumVertexCountByTextLength)
+    {
+        return false;
+    }
+
     if (numVertices == 0)
     {
         if (offset != body.size())
@@ -2703,7 +2725,10 @@ bool GB_Polygon::Deserialize(const std::string& data)
     if (parsedStorageMode == CoordinateStorageMode::Double)
     {
         std::vector<GB_Point2d> parsedVertices;
-        parsedVertices.reserve(numVertices);
+        if (!TryReserveVector(parsedVertices, numVertices))
+        {
+            return false;
+        }
 
         for (size_t i = 0; i < numVertices; i++)
         {
@@ -2741,7 +2766,10 @@ bool GB_Polygon::Deserialize(const std::string& data)
     }
 
     std::vector<ExactStringVertex> parsedVertices;
-    parsedVertices.reserve(numVertices);
+    if (!TryReserveVector(parsedVertices, numVertices))
+    {
+        return false;
+    }
     for (size_t i = 0; i < numVertices; i++)
     {
         std::string xText;
@@ -2842,6 +2870,12 @@ bool GB_Polygon::Deserialize(const GB_ByteBuffer& data)
         return false;
     }
 
+    const size_t remainingBinaryByteCount = data.size() - offset;
+    if (numVertices > remainingBinaryByteCount / 16)
+    {
+        return false;
+    }
+
     if (numVertices == 0)
     {
         if (offset != data.size())
@@ -2861,7 +2895,10 @@ bool GB_Polygon::Deserialize(const GB_ByteBuffer& data)
     if (parsedStorageMode == CoordinateStorageMode::Double)
     {
         std::vector<GB_Point2d> parsedVertices;
-        parsedVertices.reserve(numVertices);
+        if (!TryReserveVector(parsedVertices, numVertices))
+        {
+            return false;
+        }
 
         for (size_t i = 0; i < numVertices; i++)
         {
@@ -2896,7 +2933,10 @@ bool GB_Polygon::Deserialize(const GB_ByteBuffer& data)
     }
 
     std::vector<ExactStringVertex> parsedVertices;
-    parsedVertices.reserve(numVertices);
+    if (!TryReserveVector(parsedVertices, numVertices))
+    {
+        return false;
+    }
 
     for (size_t i = 0; i < numVertices; i++)
     {

@@ -1152,7 +1152,7 @@ bool GB_Matrix3x3::TryInvertAffine2d(double tolerance)
         return false;
     }
 
-    const double inverseScaledDeterminant = 1.0 / (linearScale * normalizedDeterminant);
+    const double inverseScaledDeterminant = (1.0 / linearScale) / normalizedDeterminant;
     if (!IsFinite(inverseScaledDeterminant))
     {
         return false;

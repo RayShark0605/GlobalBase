@@ -2055,11 +2055,6 @@ namespace internal
         return true;
     }
 
-    static cv::Scalar ToBgraScalar(const GB_ColorRGBA& color)
-    {
-        return cv::Scalar(static_cast<double>(color.b), static_cast<double>(color.g), static_cast<double>(color.r), static_cast<double>(color.a));
-    }
-
     static void BlendStraightBgraOverPremultipliedBgra(cv::Mat& targetPremultipliedBgra, const cv::Mat& sourceStraightBgra)
     {
         if (targetPremultipliedBgra.empty() || sourceStraightBgra.empty() || targetPremultipliedBgra.rows != sourceStraightBgra.rows || targetPremultipliedBgra.cols != sourceStraightBgra.cols || targetPremultipliedBgra.type() != CV_8UC4 || sourceStraightBgra.type() != CV_8UC4)
@@ -2092,6 +2087,35 @@ namespace internal
                 targetRow[colIndex][2] = static_cast<unsigned char>((static_cast<int>(sourceRow[colIndex][2]) * sourceAlpha + static_cast<int>(targetRow[colIndex][2]) * inverseAlpha + 127) / 255);
                 targetRow[colIndex][3] = static_cast<unsigned char>(sourceAlpha + (static_cast<int>(targetRow[colIndex][3]) * inverseAlpha + 127) / 255);
             }
+        }
+    }
+
+    static bool BuildStraightBgraColorLayerFromCoverageMask(const cv::Mat& coverageMask, const GB_ColorRGBA& color, cv::Mat& straightBgraLayer)
+    {
+        straightBgraLayer.release();
+        if (coverageMask.empty() || coverageMask.type() != CV_8UC1)
+        {
+            return false;
+        }
+
+        try
+        {
+            straightBgraLayer = cv::Mat(coverageMask.rows, coverageMask.cols, CV_8UC4, cv::Scalar(static_cast<double>(color.b), static_cast<double>(color.g), static_cast<double>(color.r), 0.0));
+            for (int rowIndex = 0; rowIndex < coverageMask.rows; rowIndex++)
+            {
+                const unsigned char* maskRow = coverageMask.ptr<unsigned char>(rowIndex);
+                cv::Vec4b* layerRow = straightBgraLayer.ptr<cv::Vec4b>(rowIndex);
+                for (int colIndex = 0; colIndex < coverageMask.cols; colIndex++)
+                {
+                    layerRow[colIndex][3] = static_cast<unsigned char>((static_cast<int>(maskRow[colIndex]) * static_cast<int>(color.a) + 127) / 255);
+                }
+            }
+            return true;
+        }
+        catch (...)
+        {
+            straightBgraLayer.release();
+            return false;
         }
     }
 
@@ -2172,23 +2196,37 @@ namespace internal
             localPoints.push_back(cv::Point(points[i].x - boundingRectangle.x, points[i].y - boundingRectangle.y));
         }
 
-        cv::Mat layerStraightBgra(boundingRectangle.height, boundingRectangle.width, CV_8UC4, cv::Scalar(0, 0, 0, 0));
+        cv::Mat coverageMask(boundingRectangle.height, boundingRectangle.width, CV_8UC1, cv::Scalar(0));
+        cv::Mat targetRoi = canvasPremultipliedBgra(boundingRectangle);
         const int lineType = GetOpenCvLineType(paintObject.polygonOptions.antialias);
 
         if (drawFill)
         {
             std::vector<std::vector<cv::Point>> fillPoints(1, localPoints);
-            cv::fillPoly(layerStraightBgra, fillPoints, ToBgraScalar(paintObject.polygonOptions.fillColor), lineType);
+            cv::fillPoly(coverageMask, fillPoints, cv::Scalar(255), lineType);
+
+            cv::Mat fillLayerStraightBgra;
+            if (!BuildStraightBgraColorLayerFromCoverageMask(coverageMask, paintObject.polygonOptions.fillColor, fillLayerStraightBgra))
+            {
+                return false;
+            }
+            BlendStraightBgraOverPremultipliedBgra(targetRoi, fillLayerStraightBgra);
         }
 
         if (drawBoundary)
         {
+            coverageMask.setTo(cv::Scalar(0));
             std::vector<std::vector<cv::Point>> boundaryPoints(1, localPoints);
-            cv::polylines(layerStraightBgra, boundaryPoints, true, ToBgraScalar(paintObject.polygonOptions.boundaryColor), paintObject.polygonOptions.boundaryThickness, lineType);
+            cv::polylines(coverageMask, boundaryPoints, true, cv::Scalar(255), paintObject.polygonOptions.boundaryThickness, lineType);
+
+            cv::Mat boundaryLayerStraightBgra;
+            if (!BuildStraightBgraColorLayerFromCoverageMask(coverageMask, paintObject.polygonOptions.boundaryColor, boundaryLayerStraightBgra))
+            {
+                return false;
+            }
+            BlendStraightBgraOverPremultipliedBgra(targetRoi, boundaryLayerStraightBgra);
         }
 
-        cv::Mat targetRoi = canvasPremultipliedBgra(boundingRectangle);
-        BlendStraightBgraOverPremultipliedBgra(targetRoi, layerStraightBgra);
         return true;
     }
 
@@ -3713,4 +3751,3 @@ void GB_ScreenPainter::Clear()
     internal::GetScreenPainterManager().Clear();
 #endif
 }
-
