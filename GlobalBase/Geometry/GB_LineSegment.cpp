@@ -936,15 +936,25 @@ void GB_LineSegment::Rotate(double angle, const GB_Point2d& center)
         Reset();
         return;
     }
+    if (cosAngle == 1.0 && sinAngle == 0.0)
+    {
+        return;
+    }
 
     const double point1DeltaX = point1.x - center.x;
     const double point1DeltaY = point1.y - center.y;
     const double point2DeltaX = point2.x - center.x;
     const double point2DeltaY = point2.y - center.y;
 
-    const GB_Point2d newPoint1(center.x + point1DeltaX * cosAngle - point1DeltaY * sinAngle, center.y + point1DeltaX * sinAngle + point1DeltaY * cosAngle);
-    const GB_Point2d newPoint2(center.x + point2DeltaX * cosAngle - point2DeltaY * sinAngle, center.y + point2DeltaX * sinAngle + point2DeltaY * cosAngle);
-    Set(newPoint1, newPoint2);
+    const GB_Point2d fastPoint1(center.x + point1DeltaX * cosAngle - point1DeltaY * sinAngle, center.y + point1DeltaX * sinAngle + point1DeltaY * cosAngle);
+    const GB_Point2d fastPoint2(center.x + point2DeltaX * cosAngle - point2DeltaY * sinAngle, center.y + point2DeltaX * sinAngle + point2DeltaY * cosAngle);
+    if (fastPoint1.IsValid() && fastPoint2.IsValid())
+    {
+        Set(fastPoint1, fastPoint2);
+        return;
+    }
+
+    Set(point1.Rotated(angle, center), point2.Rotated(angle, center));
 }
 
 GB_LineSegment GB_LineSegment::Scaled(double scaleFactor, const GB_Point2d& center) const
@@ -962,9 +972,7 @@ void GB_LineSegment::Scale(double scaleFactor, const GB_Point2d& center)
         return;
     }
 
-    const GB_Point2d newPoint1 = center + (point1 - center) * scaleFactor;
-    const GB_Point2d newPoint2 = center + (point2 - center) * scaleFactor;
-    Set(newPoint1, newPoint2);
+    Set(GB_Point2d::Lerp(center, point1, scaleFactor), GB_Point2d::Lerp(center, point2, scaleFactor));
 }
 
 GB_LineSegment GB_LineSegment::Transformed(const GB_Matrix3x3& mat) const

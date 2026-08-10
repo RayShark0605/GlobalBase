@@ -75,39 +75,44 @@ namespace
         return std::abs(distance1 - distance2) <= tolerance;
     }
 
-    static inline bool IsBetterDistanceCandidate(double candidateDistanceSquared, size_t candidateSegmentIndex, double bestDistanceSquared, size_t bestSegmentIndex)
+    static inline bool IsBetterDistanceCandidate(double candidateDistance, size_t candidateSegmentIndex, double bestDistance, size_t bestSegmentIndex)
     {
-        if (!std::isfinite(candidateDistanceSquared))
+        if (std::isnan(candidateDistance))
         {
             return false;
         }
 
-        if (!std::isfinite(bestDistanceSquared))
+        if (std::isnan(bestDistance))
         {
             return true;
         }
 
-        if (candidateDistanceSquared < bestDistanceSquared)
+        if (candidateDistance < bestDistance)
         {
             return true;
         }
+        if (candidateDistance > bestDistance)
+        {
+            return false;
+        }
 
-        const double distanceScale = std::max(1.0, std::max(std::abs(candidateDistanceSquared), std::abs(bestDistanceSquared)));
+        if (!std::isfinite(candidateDistance))
+        {
+            return candidateSegmentIndex < bestSegmentIndex;
+        }
+
+        const double distanceScale = std::max(1.0, std::max(std::abs(candidateDistance), std::abs(bestDistance)));
         const double compareTolerance = std::numeric_limits<double>::epsilon() * 64.0 * distanceScale;
-        return std::abs(candidateDistanceSquared - bestDistanceSquared) <= compareTolerance && candidateSegmentIndex < bestSegmentIndex;
+        return std::abs(candidateDistance - bestDistance) <= compareTolerance && candidateSegmentIndex < bestSegmentIndex;
     }
 
     static inline double Clamp01(double value)
     {
-        if (!std::isfinite(value))
+        if (std::isnan(value) || value <= 0.0)
         {
             return 0.0;
         }
-        if (value < 0.0)
-        {
-            return 0.0;
-        }
-        if (value > 1.0)
+        if (value >= 1.0)
         {
             return 1.0;
         }
@@ -244,6 +249,62 @@ namespace
         return std::hypot(deltaX, deltaY);
     }
 
+    static inline double PointDistanceForComparison(const GB_Point2d& point1, const GB_Point2d& point2)
+    {
+        if (!point1.IsValid() || !point2.IsValid())
+        {
+            return GB_QuietNan;
+        }
+
+        const double coordinateScale = std::ldexp(1.0, std::numeric_limits<double>::max_exponent - 1);
+        const double scaledDeltaX = point1.x / coordinateScale - point2.x / coordinateScale;
+        const double scaledDeltaY = point1.y / coordinateScale - point2.y / coordinateScale;
+        return std::hypot(scaledDeltaX, scaledDeltaY);
+    }
+
+    static inline double ScaleCoordinate(double value, double center, double scale)
+    {
+        if (scale >= 0.0 && scale <= 1.0)
+        {
+            return center * (1.0 - scale) + value * scale;
+        }
+
+        const double fastResult = center + (value - center) * scale;
+        if (std::isfinite(fastResult))
+        {
+            return fastResult;
+        }
+
+        const GB_Point2d robustResult = GB_Point2d::Lerp(GB_Point2d(center, 0.0), GB_Point2d(value, 0.0), scale);
+        return robustResult.IsValid() ? robustResult.x : GB_QuietNan;
+    }
+
+    static bool TryGetClosestPointOnSegmentRobust(const GB_Point2d& point, const GB_Point2d& segmentStart, const GB_Point2d& segmentEnd, double& outSegmentParameter, GB_Point2d& outClosestPoint)
+    {
+        const GB_LineSegment segment(segmentStart, segmentEnd);
+        if (!segment.IsValid())
+        {
+            return false;
+        }
+
+        if (segmentStart == segmentEnd)
+        {
+            outSegmentParameter = 0.0;
+            outClosestPoint = segmentStart;
+            return true;
+        }
+
+        const double parameter = segment.ParameterAt(point);
+        if (std::isnan(parameter))
+        {
+            return false;
+        }
+
+        outSegmentParameter = Clamp01(parameter);
+        outClosestPoint = segment.PointAt(outSegmentParameter);
+        return outClosestPoint.IsValid();
+    }
+
     static inline double PointToSegmentDistanceSquared(const GB_Point2d& point, const GB_Point2d& segmentStart, const GB_Point2d& segmentEnd, double& outSegmentParameter, GB_Point2d& outClosestPoint)
     {
         outSegmentParameter = GB_QuietNan;
@@ -259,36 +320,43 @@ namespace
         const double pointVectorX = point.x - segmentStart.x;
         const double pointVectorY = point.y - segmentStart.y;
 
-        if (!std::isfinite(vectorX) || !std::isfinite(vectorY) || !std::isfinite(pointVectorX) || !std::isfinite(pointVectorY))
+        if (std::isfinite(vectorX) && std::isfinite(vectorY) && std::isfinite(pointVectorX) && std::isfinite(pointVectorY))
+        {
+            const double scale = std::max(std::abs(vectorX), std::abs(vectorY));
+            if (scale <= 0.0)
+            {
+                outSegmentParameter = 0.0;
+                outClosestPoint = segmentStart;
+                return PointDistanceSquared(point, segmentStart);
+            }
+
+            const double scaledVectorX = vectorX / scale;
+            const double scaledVectorY = vectorY / scale;
+            const double scaledPointVectorX = pointVectorX / scale;
+            const double scaledPointVectorY = pointVectorY / scale;
+            const double scaledLengthSquared = scaledVectorX * scaledVectorX + scaledVectorY * scaledVectorY;
+            if (std::isfinite(scaledLengthSquared) && scaledLengthSquared > 0.0)
+            {
+                const double parameter = Clamp01((scaledPointVectorX * scaledVectorX + scaledPointVectorY * scaledVectorY) / scaledLengthSquared);
+                const GB_Point2d closestPoint(segmentStart.x + vectorX * parameter, segmentStart.y + vectorY * parameter);
+                if (closestPoint.IsValid())
+                {
+                    outSegmentParameter = parameter;
+                    outClosestPoint = closestPoint;
+                    const double distanceSquared = PointDistanceSquared(point, outClosestPoint);
+                    if (!std::isnan(distanceSquared))
+                    {
+                        return distanceSquared;
+                    }
+                }
+            }
+        }
+
+        if (!TryGetClosestPointOnSegmentRobust(point, segmentStart, segmentEnd, outSegmentParameter, outClosestPoint))
         {
             return GB_QuietNan;
         }
 
-        const double scale = std::max(std::abs(vectorX), std::abs(vectorY));
-        if (scale <= 0.0)
-        {
-            outSegmentParameter = 0.0;
-            outClosestPoint = segmentStart;
-            return PointDistanceSquared(point, segmentStart);
-        }
-
-        const double scaledVectorX = vectorX / scale;
-        const double scaledVectorY = vectorY / scale;
-        const double scaledPointVectorX = pointVectorX / scale;
-        const double scaledPointVectorY = pointVectorY / scale;
-        const double scaledLengthSquared = scaledVectorX * scaledVectorX + scaledVectorY * scaledVectorY;
-        if (!std::isfinite(scaledLengthSquared) || scaledLengthSquared <= 0.0)
-        {
-            outSegmentParameter = 0.0;
-            outClosestPoint = segmentStart;
-            return PointDistanceSquared(point, segmentStart);
-        }
-
-        double parameter = (scaledPointVectorX * scaledVectorX + scaledPointVectorY * scaledVectorY) / scaledLengthSquared;
-        parameter = Clamp01(parameter);
-
-        outSegmentParameter = parameter;
-        outClosestPoint = GB_Point2d(segmentStart.x + vectorX * parameter, segmentStart.y + vectorY * parameter);
         return PointDistanceSquared(point, outClosestPoint);
     }
 
@@ -315,7 +383,13 @@ namespace
             return false;
         }
 
-        return PointDistanceSquared(point1, point2) <= SquaredTolerance(tolerance);
+        const double toleranceSquared = SquaredTolerance(tolerance);
+        if (std::isfinite(toleranceSquared))
+        {
+            return PointDistanceSquared(point1, point2) <= toleranceSquared;
+        }
+
+        return point1.IsNearEqual(point2, tolerance);
     }
 
     static inline bool TryParseSizeT(const std::string& text, size_t& value)
@@ -396,7 +470,7 @@ namespace
 
     static GB_Point2d LerpPoint(const GB_Point2d& point1, const GB_Point2d& point2, double parameter)
     {
-        return GB_Point2d(point1.x + (point2.x - point1.x) * parameter, point1.y + (point2.y - point1.y) * parameter);
+        return GB_Point2d::Lerp(point1, point2, parameter);
     }
 
     static inline void EnsureAtLeastTwoVertices(std::vector<GB_Point2d>& vertices)
@@ -630,8 +704,8 @@ struct GB_Polyline::CacheData
             {
                 const GB_Rectangle& leftBox = segmentBoxes[leftSegmentIndex].box;
                 const GB_Rectangle& rightBox = segmentBoxes[rightSegmentIndex].box;
-                const double leftCenter = splitByX ? (leftBox.minX + leftBox.maxX) * 0.5 : (leftBox.minY + leftBox.maxY) * 0.5;
-                const double rightCenter = splitByX ? (rightBox.minX + rightBox.maxX) * 0.5 : (rightBox.minY + rightBox.maxY) * 0.5;
+                const double leftCenter = splitByX ? leftBox.minX * 0.5 + leftBox.maxX * 0.5 : leftBox.minY * 0.5 + leftBox.maxY * 0.5;
+                const double rightCenter = splitByX ? rightBox.minX * 0.5 + rightBox.maxX * 0.5 : rightBox.minY * 0.5 + rightBox.maxY * 0.5;
                 if (leftCenter != rightCenter)
                 {
                     return leftCenter < rightCenter;
@@ -1102,8 +1176,15 @@ bool GB_Polyline::IsContains(const GB_Point2d& point, double tolerance) const
         return false;
     }
 
-    const double distanceSquared = DistanceToSquared(point);
-    return std::isfinite(distanceSquared) && distanceSquared <= SquaredTolerance(absTolerance);
+    const double maxSafeTolerance = std::sqrt(std::numeric_limits<double>::max());
+    if (absTolerance < maxSafeTolerance)
+    {
+        const double distanceSquared = DistanceToSquared(point);
+        return !std::isnan(distanceSquared) && distanceSquared <= absTolerance * absTolerance;
+    }
+
+    const double distance = DistanceTo(point);
+    return !std::isnan(distance) && distance <= absTolerance;
 }
 
 GB_Point2d GB_Polyline::ClosestPointTo(const GB_Point2d& point) const
@@ -1114,14 +1195,14 @@ GB_Point2d GB_Polyline::ClosestPointTo(const GB_Point2d& point) const
 
 double GB_Polyline::DistanceTo(const GB_Point2d& point) const
 {
-    const double distanceSquared = DistanceToSquared(point);
-    return std::isfinite(distanceSquared) ? std::sqrt(distanceSquared) : GB_QuietNan;
+    const ClosestPointResult result = GetClosestPointResult(point);
+    return result.succeeded ? result.distance : GB_QuietNan;
 }
 
 double GB_Polyline::DistanceToSquared(const GB_Point2d& point) const
 {
     const ClosestPointResult result = GetClosestPointResult(point);
-    return (result.succeeded && result.closestPoint.IsValid() && point.IsValid()) ? PointDistanceSquared(point, result.closestPoint) : GB_QuietNan;
+    return (result.succeeded && result.closestPoint.IsValid() && point.IsValid()) ? point.DistanceToSquared(result.closestPoint) : GB_QuietNan;
 }
 
 GB_Polyline::ClosestPointResult GB_Polyline::GetClosestPointResult(const GB_Point2d& point) const
@@ -1146,7 +1227,10 @@ GB_Polyline::ClosestPointResult GB_Polyline::GetClosestPointResult(const GB_Poin
     }
 
     const size_t numSegments = GetNumSegments();
+    const double saturatedDistanceSquared = std::numeric_limits<double>::max();
     double bestDistanceSquared = std::numeric_limits<double>::infinity();
+    double bestSaturatedComparisonDistance = std::numeric_limits<double>::infinity();
+    double bestSaturatedDistance = std::numeric_limits<double>::infinity();
     double bestSegmentParameter = GB_QuietNan;
     GB_Point2d bestClosestPoint = MakeNanPoint();
     size_t bestSegmentIndex = 0;
@@ -1161,18 +1245,54 @@ GB_Polyline::ClosestPointResult GB_Polyline::GetClosestPointResult(const GB_Poin
             double segmentParameter = GB_QuietNan;
             GB_Point2d closestPoint = MakeNanPoint();
             const double distanceSquared = PointToSegmentDistanceSquared(point, vertices[segmentIndex], vertices[segmentIndex + 1], segmentParameter, closestPoint);
-            if (!std::isfinite(distanceSquared))
+            if (std::isnan(distanceSquared) || !closestPoint.IsValid())
             {
                 return;
             }
 
-            if (IsBetterDistanceCandidate(distanceSquared, segmentIndex, bestDistanceSquared, bestSegmentIndex))
+            const bool candidateDistanceSquaredSaturated = distanceSquared >= saturatedDistanceSquared;
+            const bool bestDistanceSquaredSaturated = bestDistanceSquared >= saturatedDistanceSquared;
+            bool isBetter = false;
+            double saturatedComparisonDistance = GB_QuietNan;
+            double saturatedDistance = GB_QuietNan;
+
+            if (!candidateDistanceSquaredSaturated && !bestDistanceSquaredSaturated)
             {
-                bestDistanceSquared = distanceSquared;
-                bestSegmentParameter = segmentParameter;
-                bestClosestPoint = closestPoint;
-                bestSegmentIndex = segmentIndex;
+                isBetter = IsBetterDistanceCandidate(distanceSquared, segmentIndex, bestDistanceSquared, bestSegmentIndex);
             }
+            else if (!candidateDistanceSquaredSaturated)
+            {
+                isBetter = true;
+            }
+            else if (bestDistanceSquaredSaturated)
+            {
+                saturatedComparisonDistance = PointDistanceForComparison(point, closestPoint);
+                if (std::isnan(saturatedComparisonDistance))
+                {
+                    return;
+                }
+                isBetter = IsBetterDistanceCandidate(saturatedComparisonDistance, segmentIndex, bestSaturatedComparisonDistance, bestSegmentIndex);
+                if (isBetter)
+                {
+                    saturatedDistance = point.DistanceTo(closestPoint);
+                    if (std::isnan(saturatedDistance))
+                    {
+                        return;
+                    }
+                }
+            }
+
+            if (!isBetter)
+            {
+                return;
+            }
+
+            bestDistanceSquared = distanceSquared;
+            bestSaturatedComparisonDistance = candidateDistanceSquaredSaturated ? saturatedComparisonDistance : std::numeric_limits<double>::infinity();
+            bestSaturatedDistance = candidateDistanceSquaredSaturated ? saturatedDistance : std::numeric_limits<double>::infinity();
+            bestSegmentParameter = segmentParameter;
+            bestClosestPoint = closestPoint;
+            bestSegmentIndex = segmentIndex;
         };
 
     if (!cachedData->bvhNodes.empty())
@@ -1274,7 +1394,7 @@ GB_Polyline::ClosestPointResult GB_Polyline::GetClosestPointResult(const GB_Poin
         }
     }
 
-    if (!std::isfinite(bestDistanceSquared) || !bestClosestPoint.IsValid())
+    if (std::isnan(bestDistanceSquared) || !bestClosestPoint.IsValid())
     {
         return result;
     }
@@ -1282,7 +1402,7 @@ GB_Polyline::ClosestPointResult GB_Polyline::GetClosestPointResult(const GB_Poin
     result.succeeded = true;
     result.segmentIndex = bestSegmentIndex;
     result.segmentParameter = bestSegmentParameter;
-    result.distance = std::sqrt(bestDistanceSquared);
+    result.distance = bestDistanceSquared >= saturatedDistanceSquared ? bestSaturatedDistance : std::sqrt(bestDistanceSquared);
     result.closestPoint = bestClosestPoint;
 
     const double totalLength = cachedData->totalLength;
@@ -1433,15 +1553,35 @@ void GB_Polyline::Rotate(double angle, const GB_Point2d& center)
         return;
     }
 
-    for (GB_Point2d& vertex : vertices)
-    {
-        vertex.Rotate(angle, center);
-    }
-
-    if (!AreVerticesFinite(vertices))
+    const double cosAngle = std::cos(angle);
+    const double sinAngle = std::sin(angle);
+    if (!std::isfinite(cosAngle) || !std::isfinite(sinAngle))
     {
         Reset();
         return;
+    }
+    if (cosAngle == 1.0 && sinAngle == 0.0)
+    {
+        return;
+    }
+
+    for (GB_Point2d& vertex : vertices)
+    {
+        const double localX = vertex.x - center.x;
+        const double localY = vertex.y - center.y;
+        const GB_Point2d fastResult(center.x + localX * cosAngle - localY * sinAngle, center.y + localX * sinAngle + localY * cosAngle);
+        if (fastResult.IsValid())
+        {
+            vertex = fastResult;
+            continue;
+        }
+
+        vertex = vertex.Rotated(angle, center);
+        if (!vertex.IsValid())
+        {
+            Reset();
+            return;
+        }
     }
 
     InvalidateCaches();
@@ -1474,14 +1614,15 @@ void GB_Polyline::Scale(double scaleX, double scaleY, const GB_Point2d& center)
 
     for (GB_Point2d& vertex : vertices)
     {
-        vertex.x = center.x + (vertex.x - center.x) * scaleX;
-        vertex.y = center.y + (vertex.y - center.y) * scaleY;
-    }
+        const double scaledX = ScaleCoordinate(vertex.x, center.x, scaleX);
+        const double scaledY = ScaleCoordinate(vertex.y, center.y, scaleY);
+        if (!std::isfinite(scaledX) || !std::isfinite(scaledY))
+        {
+            Reset();
+            return;
+        }
 
-    if (!AreVerticesFinite(vertices))
-    {
-        Reset();
-        return;
+        vertex.Set(scaledX, scaledY);
     }
 
     InvalidateCaches();
