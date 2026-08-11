@@ -1464,12 +1464,12 @@ namespace
 			{
 				const size_t pixelOffset = static_cast<size_t>(row) * imageWidth + col;
 				const cv::Vec3b& pixelValue = rowData[col];
-				const float redValue = static_cast<float>(pixelValue[2]) / 255.0f;
-				const float greenValue = static_cast<float>(pixelValue[1]) / 255.0f;
 				const float blueValue = static_cast<float>(pixelValue[0]) / 255.0f;
-				inputData[pixelOffset] = (redValue - meanValues[0]) / stdValues[0];
+				const float greenValue = static_cast<float>(pixelValue[1]) / 255.0f;
+				const float redValue = static_cast<float>(pixelValue[2]) / 255.0f;
+				inputData[pixelOffset] = (blueValue - meanValues[0]) / stdValues[0];
 				inputData[imageArea + pixelOffset] = (greenValue - meanValues[1]) / stdValues[1];
-				inputData[imageArea * 2 + pixelOffset] = (blueValue - meanValues[2]) / stdValues[2];
+				inputData[imageArea * 2 + pixelOffset] = (redValue - meanValues[2]) / stdValues[2];
 			}
 		}
 
@@ -1510,9 +1510,9 @@ namespace
 			{
 				const size_t pixelOffset = static_cast<size_t>(row) * safeRecImageWidth + col;
 				const cv::Vec3b& pixelValue = rowData[col];
-				inputData[pixelOffset] = static_cast<float>(pixelValue[2]) / 127.5f - 1.0f;
+				inputData[pixelOffset] = static_cast<float>(pixelValue[0]) / 127.5f - 1.0f;
 				inputData[imageArea + pixelOffset] = static_cast<float>(pixelValue[1]) / 127.5f - 1.0f;
-				inputData[imageArea * 2 + pixelOffset] = static_cast<float>(pixelValue[0]) / 127.5f - 1.0f;
+				inputData[imageArea * 2 + pixelOffset] = static_cast<float>(pixelValue[2]) / 127.5f - 1.0f;
 			}
 		}
 	}

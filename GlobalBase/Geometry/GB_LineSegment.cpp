@@ -292,6 +292,15 @@ namespace
         return 0;
     }
 
+    static bool AreSegmentDirectionsExactlyParallelHighPrecision(const GB_LineSegment& firstSegment, const GB_LineSegment& secondSegment)
+    {
+        const HighPrecisionFloat firstDeltaX = HighPrecisionFloat(firstSegment.point2.x) - HighPrecisionFloat(firstSegment.point1.x);
+        const HighPrecisionFloat firstDeltaY = HighPrecisionFloat(firstSegment.point2.y) - HighPrecisionFloat(firstSegment.point1.y);
+        const HighPrecisionFloat secondDeltaX = HighPrecisionFloat(secondSegment.point2.x) - HighPrecisionFloat(secondSegment.point1.x);
+        const HighPrecisionFloat secondDeltaY = HighPrecisionFloat(secondSegment.point2.y) - HighPrecisionFloat(secondSegment.point1.y);
+        return firstDeltaX * secondDeltaY - firstDeltaY * secondDeltaX == 0;
+    }
+
     static bool TryGetIntersectionParametersFast(const GB_LineSegment& firstSegment, const GB_LineSegment& secondSegment, double& firstParameter, double& secondParameter)
     {
         firstParameter = GB_QuietNan;
@@ -1319,7 +1328,9 @@ int GB_LineSegment::Intersect(const GB_LineSegment& other, GB_Point2d& outInters
         return 0;
     }
 
-    if (std::abs(relativeCross) <= absTolerance)
+    const double numericalParallelThreshold = std::numeric_limits<double>::epsilon() * 64.0;
+    const bool isExactlyParallel = std::abs(relativeCross) <= numericalParallelThreshold && AreSegmentDirectionsExactlyParallelHighPrecision(*this, other);
+    if (isExactlyParallel)
     {
         const double firstDistance = DistanceToLine(other.point1);
         const double secondDistance = DistanceToLine(other.point2);
@@ -1362,7 +1373,7 @@ int GB_LineSegment::Intersect(const GB_LineSegment& other, GB_Point2d& outInters
 
     double thisParameter = GB_QuietNan;
     double otherParameter = GB_QuietNan;
-    const bool preferHighPrecision = std::abs(relativeCross) <= std::numeric_limits<double>::epsilon() * 64.0;
+    const bool preferHighPrecision = std::abs(relativeCross) <= numericalParallelThreshold;
     const bool parameterSucceeded = preferHighPrecision
         ? TryGetIntersectionParametersHighPrecision(*this, other, thisParameter, otherParameter)
         : (TryGetIntersectionParametersFast(*this, other, thisParameter, otherParameter) || TryGetIntersectionParametersHighPrecision(*this, other, thisParameter, otherParameter));

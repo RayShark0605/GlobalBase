@@ -420,7 +420,7 @@ namespace
 
         const double length = std::sqrt(lengthSquared);
         const double absTolerance = AbsTolerance(tolerance);
-        return std::max(1e-12, absTolerance / std::max(length, 1.0));
+        return std::max(1e-12, absTolerance / length);
     }
 
     int OrientationSign(const GB_Point2d& point1, const GB_Point2d& point2, const GB_Point2d& point3, double tolerance)
@@ -438,7 +438,7 @@ namespace
         }
 
         const double lineLength = std::sqrt(lengthSquared);
-        const double areaTolerance = AbsTolerance(tolerance) * std::max(lineLength, 1.0);
+        const double areaTolerance = AbsTolerance(tolerance) * lineLength;
         if (std::abs(crossValue) <= areaTolerance)
         {
             return 0;
@@ -488,7 +488,7 @@ namespace
         }
 
         const double segmentLength = std::sqrt(lengthSquared);
-        const double scaledTolerance = absTolerance * std::max(segmentLength, 1.0);
+        const double scaledTolerance = absTolerance * segmentLength;
         const double crossValue = std::abs(CrossProduct(segment.point1, segment.point2, point));
         if (crossValue > scaledTolerance)
         {
@@ -514,7 +514,7 @@ namespace
         }
 
         const double crossValue = std::abs(CrossProduct(line.point1, line.point2, point));
-        return crossValue <= AbsTolerance(tolerance) * std::max(std::sqrt(lengthSquared), 1.0);
+        return crossValue <= AbsTolerance(tolerance) * std::sqrt(lengthSquared);
     }
 
     double ParameterOnSegmentLine(const GB_Point2d& point, const Segment2d& segment)
@@ -523,14 +523,14 @@ namespace
         const double dy = segment.point2.y - segment.point1.y;
         if (std::abs(dx) >= std::abs(dy))
         {
-            if (std::abs(dx) <= std::numeric_limits<double>::epsilon())
+            if (dx == 0.0)
             {
                 return 0.0;
             }
             return (point.x - segment.point1.x) / dx;
         }
 
-        if (std::abs(dy) <= std::numeric_limits<double>::epsilon())
+        if (dy == 0.0)
         {
             return 0.0;
         }
@@ -647,7 +647,7 @@ namespace
 
         const auto clip = [&outBeginParameter, &outEndParameter](double denominator, double numerator) -> bool
             {
-                if (std::abs(denominator) <= std::numeric_limits<double>::epsilon())
+                if (denominator == 0.0)
                 {
                     return numerator >= 0.0;
                 }
@@ -772,15 +772,27 @@ namespace
         const double dy1 = segment1.point2.y - segment1.point1.y;
         const double dx2 = segment2.point2.x - segment2.point1.x;
         const double dy2 = segment2.point2.y - segment2.point1.y;
-        const double denominator = dx1 * dy2 - dy1 * dx2;
-        if (std::abs(denominator) <= std::numeric_limits<double>::epsilon())
+        const double dx3 = segment2.point1.x - segment1.point1.x;
+        const double dy3 = segment2.point1.y - segment1.point1.y;
+        const double commonScale = std::max(std::max(std::max(std::abs(dx1), std::abs(dy1)), std::max(std::abs(dx2), std::abs(dy2))), std::max(std::abs(dx3), std::abs(dy3)));
+        if (!std::isfinite(commonScale) || commonScale <= 0.0)
         {
             return;
         }
 
-        const double dx3 = segment2.point1.x - segment1.point1.x;
-        const double dy3 = segment2.point1.y - segment1.point1.y;
-        const double parameter = (dx3 * dy2 - dy3 * dx2) / denominator;
+        const double normalizedDx1 = dx1 / commonScale;
+        const double normalizedDy1 = dy1 / commonScale;
+        const double normalizedDx2 = dx2 / commonScale;
+        const double normalizedDy2 = dy2 / commonScale;
+        const double normalizedDx3 = dx3 / commonScale;
+        const double normalizedDy3 = dy3 / commonScale;
+        const double denominator = normalizedDx1 * normalizedDy2 - normalizedDy1 * normalizedDx2;
+        if (denominator == 0.0)
+        {
+            return;
+        }
+
+        const double parameter = (normalizedDx3 * normalizedDy2 - normalizedDy3 * normalizedDx2) / denominator;
         AddUniqueParameter(parameters, parameter);
     }
 
@@ -851,7 +863,7 @@ namespace
             }
 
             const double denominator = edge.point2.y - edge.point1.y;
-            if (std::abs(denominator) <= std::numeric_limits<double>::epsilon())
+            if (denominator == 0.0)
             {
                 continue;
             }
