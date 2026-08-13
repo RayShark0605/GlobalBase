@@ -28,6 +28,23 @@ namespace
         return std::abs(tolerance);
     }
 
+    static inline double ScaleCoordinate(double value, double center, double scale)
+    {
+        if (scale >= 0.0 && scale <= 1.0)
+        {
+            return center * (1.0 - scale) + value * scale;
+        }
+
+        const double fastResult = center + (value - center) * scale;
+        if (std::isfinite(fastResult))
+        {
+            return fastResult;
+        }
+
+        const GB_Point2d robustResult = GB_Point2d::Lerp(GB_Point2d(center, 0.0), GB_Point2d(value, 0.0), scale);
+        return robustResult.IsValid() ? robustResult.x : GB_QuietNan;
+    }
+
     struct ScaledPositiveValue
     {
         double mantissa = 0.0;
@@ -481,10 +498,10 @@ GB_Rectangle GB_Rectangle::Scaled(double scaleX, double scaleY, const GB_Point2d
         return GB_Rectangle();
     }
 
-    const double newMinX = center.x + (minX - center.x) * scaleX;
-    const double newMaxX = center.x + (maxX - center.x) * scaleX;
-    const double newMinY = center.y + (minY - center.y) * scaleY;
-    const double newMaxY = center.y + (maxY - center.y) * scaleY;
+    const double newMinX = ScaleCoordinate(minX, center.x, scaleX);
+    const double newMaxX = ScaleCoordinate(maxX, center.x, scaleX);
+    const double newMinY = ScaleCoordinate(minY, center.y, scaleY);
+    const double newMaxY = ScaleCoordinate(maxY, center.y, scaleY);
 
     GB_Rectangle result;
     result.Set(newMinX, newMinY, newMaxX, newMaxY);

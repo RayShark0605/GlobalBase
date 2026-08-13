@@ -5,7 +5,7 @@
 #include "../GB_BaseTypes.h"
 #include <string>
 
-uint64_t GB_GenerateClassTypeId(const std::string& classType);
+GLOBALBASE_PORT uint64_t GB_GenerateClassTypeId(const std::string& classType);
 
 class GLOBALBASE_PORT GB_SerializableClass
 {

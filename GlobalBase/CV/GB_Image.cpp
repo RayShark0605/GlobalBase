@@ -10,7 +10,6 @@
 #include <cstring>
 #include <limits>
 #include <locale>
-#include <mutex>
 #include <sstream>
 #include <utility>
 #include <vector>
@@ -21,7 +20,6 @@
 #endif
 
 #include <opencv2/core.hpp>
-#include <opencv2/core/utils/logger.hpp>
 #include <opencv2/calib3d.hpp>
 #include <opencv2/features2d.hpp>
 #include <opencv2/imgcodecs.hpp>
@@ -42,28 +40,6 @@
 
 namespace GBImage_Internal
 {
-    /**
-     * @brief 将 OpenCV 日志级别一次性收敛到 Error。
-     *
-     * OpenCV 在首次进入部分编解码或图像处理路径时，可能会输出并行后端插件探测
-     * 的 INFO 日志。这里在 GB_Image 模块内统一将日志级别压到 ERROR，避免污染
-     * 调用方的控制台输出。
-     */
-    static void EnsureOpenCvErrorLogOnly()
-    {
-        static std::once_flag configureLogLevelOnce;
-        std::call_once(configureLogLevelOnce, []()
-            {
-                try
-                {
-                    cv::utils::logging::setLogLevel(cv::utils::logging::LOG_LEVEL_ERROR);
-                }
-                catch (...)
-                {
-                }
-            });
-    }
-
     /**
      * @brief 将 size_t 安全转换为 int。
      *
@@ -3495,7 +3471,6 @@ GB_Image::GB_Image(const GB_Image& other) : imageImpl(new Impl())
  */
 GB_Image::GB_Image(const GB_Image& other, GB_ImageCopyMode copyMode) : imageImpl(new Impl())
 {
-    GBImage_Internal::EnsureOpenCvErrorLogOnly();
     if (other.imageImpl == nullptr)
     {
         return;
@@ -3634,7 +3609,6 @@ bool GB_Image::EnsureImageImpl()
  */
 bool GB_Image::Create(size_t rows, size_t cols, GB_ImageDepth depth, int channels, bool zeroInitialize)
 {
-    GBImage_Internal::EnsureOpenCvErrorLogOnly();
     if (rows == 0 || cols == 0)
     {
         return false;
@@ -3716,7 +3690,6 @@ bool GB_Image::LoadFromMemory(const GB_ByteBuffer& encodedBytes, const GB_ImageL
  */
 bool GB_Image::LoadFromMemory(const void* encodedData, size_t encodedSize, const GB_ImageLoadOptions& loadOptions)
 {
-    GBImage_Internal::EnsureOpenCvErrorLogOnly();
     if (encodedData == nullptr || encodedSize == 0)
     {
         return false;
@@ -3821,7 +3794,6 @@ bool GB_Image::SaveToFile(const std::string& filePathUtf8, const GB_ImageSaveOpt
  */
 bool GB_Image::EncodeToMemory(GB_ByteBuffer& encodedBytes, const std::string& fileExt, const GB_ImageSaveOptions& saveOptions) const
 {
-    GBImage_Internal::EnsureOpenCvErrorLogOnly();
     encodedBytes.clear();
 
     if (IsEmpty())
@@ -3874,7 +3846,6 @@ bool GB_Image::EncodeToMemory(GB_ByteBuffer& encodedBytes, const std::string& fi
  */
 bool GB_Image::SetFromCvMat(const cv::Mat& imageMat, GB_ImageCopyMode copyMode)
 {
-    GBImage_Internal::EnsureOpenCvErrorLogOnly();
     if (imageMat.empty() || imageMat.dims != 2 || imageMat.rows <= 0 || imageMat.cols <= 0)
     {
         return false;
@@ -3917,7 +3888,6 @@ bool GB_Image::SetFromCvMat(const cv::Mat& imageMat, GB_ImageCopyMode copyMode)
  */
 cv::Mat GB_Image::ToCvMat(GB_ImageCopyMode copyMode) const
 {
-    GBImage_Internal::EnsureOpenCvErrorLogOnly();
     if (IsEmpty())
     {
         return cv::Mat();
@@ -4059,7 +4029,6 @@ std::vector<unsigned char> GB_Image::GetSequentialRgbaPixels() const
  */
 bool GB_Image::GetSequentialRgbaPixels(std::vector<unsigned char>& sequentialRgbaPixels) const
 {
-    GBImage_Internal::EnsureOpenCvErrorLogOnly();
     sequentialRgbaPixels.clear();
     if (IsEmpty())
     {
@@ -4080,7 +4049,6 @@ bool GB_Image::GetSequentialRgbaPixels(std::vector<unsigned char>& sequentialRgb
  */
 bool GB_Image::SetFromColorMatrix(const std::vector<std::vector<GB_ColorRGBA>>& colorMatrix)
 {
-    GBImage_Internal::EnsureOpenCvErrorLogOnly();
     if (colorMatrix.empty() || colorMatrix[0].empty())
     {
         return false;
@@ -4855,7 +4823,6 @@ bool GB_Image::SetPixelColor(size_t row, size_t col, const GB_ColorRGBA& pixelCo
  */
 bool GB_Image::Fill(const GB_ColorRGBA& pixelColor)
 {
-    GBImage_Internal::EnsureOpenCvErrorLogOnly();
     if (IsEmpty() || imageImpl->imageMat.depth() != CV_8U)
     {
         return false;
@@ -4883,7 +4850,6 @@ bool GB_Image::Fill(const GB_ColorRGBA& pixelColor)
  */
 bool GB_Image::DrawPolygon(const GB_Polygon& polygon, const GB_ImageDrawPolygonOptions& drawOptions)
 {
-    GBImage_Internal::EnsureOpenCvErrorLogOnly();
     if (IsEmpty() || imageImpl->imageMat.depth() != CV_8U || !GBImage_Internal::IsSupportedDrawTargetLayout(imageImpl->channelLayout))
     {
         return false;
@@ -5012,7 +4978,6 @@ bool GB_Image::DrawPolygon(const GB_Polygon& polygon, const GB_ColorRGBA& bounda
  */
 bool GB_Image::DrawImage(const GB_Image& image, const GB_ImageDrawImageOptions& drawOptions)
 {
-    GBImage_Internal::EnsureOpenCvErrorLogOnly();
     if (IsEmpty() || image.IsEmpty() || imageImpl->imageMat.depth() != CV_8U || !GBImage_Internal::IsSupportedDrawTargetLayout(imageImpl->channelLayout))
     {
         return false;
@@ -5093,7 +5058,6 @@ bool GB_Image::DrawImage(const GB_Image& image, const GB_Rectangle& imageRectang
  */
 GB_Image GB_Image::Clone() const
 {
-    GBImage_Internal::EnsureOpenCvErrorLogOnly();
     GB_Image resultImage;
     if (IsEmpty())
     {
@@ -5118,7 +5082,6 @@ GB_Image GB_Image::Clone() const
  */
 bool GB_Image::Detach()
 {
-    GBImage_Internal::EnsureOpenCvErrorLogOnly();
     if (IsEmpty())
     {
         return true;
@@ -5140,7 +5103,6 @@ bool GB_Image::Detach()
  */
 GB_Image GB_Image::ConvertTo(GB_ImageDepth targetDepth, double scale, double shift) const
 {
-    GBImage_Internal::EnsureOpenCvErrorLogOnly();
     GB_Image resultImage;
     if (IsEmpty() || !GBImage_Internal::IsFiniteDouble(scale) || !GBImage_Internal::IsFiniteDouble(shift))
     {
@@ -5191,7 +5153,6 @@ bool GB_Image::ConvertToInPlace(GB_ImageDepth targetDepth, double scale, double 
  */
 GB_Image GB_Image::Flip(bool horizontalFlip, bool verticalFlip) const
 {
-    GBImage_Internal::EnsureOpenCvErrorLogOnly();
     GB_Image resultImage;
     if (IsEmpty())
     {
@@ -5248,7 +5209,6 @@ bool GB_Image::FlipInPlace(bool horizontalFlip, bool verticalFlip)
  */
 GB_Image GB_Image::Rotate(double angleDegrees, const GB_ImageRotateOptions& rotateOptions) const
 {
-    GBImage_Internal::EnsureOpenCvErrorLogOnly();
     GB_Image resultImage;
     if (IsEmpty() || !GBImage_Internal::IsFiniteDouble(angleDegrees))
     {
@@ -5354,7 +5314,6 @@ bool GB_Image::RotateInPlace(double angleDegrees, const GB_ImageRotateOptions& r
  */
 GB_Image GB_Image::Resize(size_t newRows, size_t newCols, GB_ImageInterpolation interpolation) const
 {
-    GBImage_Internal::EnsureOpenCvErrorLogOnly();
     GB_Image resultImage;
     if (IsEmpty() || newRows == 0 || newCols == 0)
     {
@@ -5416,7 +5375,6 @@ bool GB_Image::ResizeInPlace(size_t newRows, size_t newCols, GB_ImageInterpolati
  */
 GB_Image GB_Image::Crop(size_t row, size_t col, size_t cropRows, size_t cropCols, GB_ImageCopyMode copyMode) const
 {
-    GBImage_Internal::EnsureOpenCvErrorLogOnly();
     GB_Image resultImage;
     if (IsEmpty() || cropRows == 0 || cropCols == 0)
     {
@@ -5492,7 +5450,6 @@ bool GB_Image::CropInPlace(size_t row, size_t col, size_t cropRows, size_t cropC
  */
 GB_Image GB_Image::ConvertColor(GB_ImageColorConversion conversion) const
 {
-    GBImage_Internal::EnsureOpenCvErrorLogOnly();
     GB_Image resultImage;
     if (IsEmpty())
     {
@@ -5548,7 +5505,6 @@ bool GB_Image::ConvertColorInPlace(GB_ImageColorConversion conversion)
  */
 GB_Image GB_Image::ConvertToBgra8() const
 {
-    GBImage_Internal::EnsureOpenCvErrorLogOnly();
     GB_Image resultImage;
     if (IsEmpty())
     {
@@ -5580,7 +5536,6 @@ GB_ImageTemplateFindResult GB_Image::FindTemplate(const GB_Image& templateImage,
  */
 GB_ImageTemplateFindResult GB_Image::FindTemplate(const GB_Image& sourceImage, const GB_Image& templateImage, const GB_ImageTemplateFindOptions& findOptions)
 {
-    GBImage_Internal::EnsureOpenCvErrorLogOnly();
 
     GB_ImageTemplateFindResult result;
     if (sourceImage.IsEmpty() || templateImage.IsEmpty())
