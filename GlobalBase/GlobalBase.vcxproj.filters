@@ -171,6 +171,9 @@
     <ClInclude Include="Desktop\GB_SystemBluetooth.h">
       <Filter>头文件\Desktop\System</Filter>
     </ClInclude>
+    <ClInclude Include="Desktop\GB_SystemBluetoothWinRt.h">
+      <Filter>头文件\Desktop\System</Filter>
+    </ClInclude>
     <ClInclude Include="Desktop\GB_SystemError.h">
       <Filter>头文件\Desktop</Filter>
     </ClInclude>
@@ -333,6 +336,9 @@
       <Filter>源文件\Desktop\System</Filter>
     </ClCompile>
     <ClCompile Include="Desktop\GB_SystemBluetooth.cpp">
+      <Filter>源文件\Desktop\System</Filter>
+    </ClCompile>
+    <ClCompile Include="Desktop\GB_SystemBluetoothWinRt.cpp">
       <Filter>源文件\Desktop\System</Filter>
     </ClCompile>
     <ClCompile Include="Desktop\GB_SystemError.cpp">

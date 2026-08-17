@@ -107,8 +107,19 @@ namespace
     {
         std::vector<GB_BluetoothDeviceInfo> lowEnergyDevices;
         const GB_SystemResult lowEnergyResult = GB_SystemBluetooth::GetLowEnergyDevices(lowEnergyDevices);
+#if defined(_WIN32)
+        RequireResultSucceeded(lowEnergyResult, "GB_SystemBluetooth::GetLowEnergyDevices Windows");
+        for (size_t index = 0; index < lowEnergyDevices.size(); index++)
+        {
+            RequireTrueSystemBluetooth(lowEnergyDevices[index].deviceKind == GB_BluetoothDeviceKind::LowEnergy
+                                           || lowEnergyDevices[index].deviceKind == GB_BluetoothDeviceKind::DualMode,
+                                       "GB_SystemBluetooth BLE kind",
+                                       "Windows BLE interface enumeration should identify low-energy capability.");
+        }
+#else
         RequireResultFailed(lowEnergyResult, "GB_SystemBluetooth::GetLowEnergyDevices unsupported");
         RequireTrueSystemBluetooth(lowEnergyResult.errorCode == GB_SystemErrorCode::UnsupportedPlatform, "GB_SystemBluetooth BLE unsupported code", "BLE enumeration should explicitly report UnsupportedPlatform until WinRT implementation exists.");
+#endif
 
         GB_BluetoothDeviceId invalidDeviceId;
         invalidDeviceId.deviceKind = GB_BluetoothDeviceKind::Classic;
@@ -132,14 +143,51 @@ namespace
         GB_BluetoothPairingOptions pinOptions;
         pinOptions.pinCodeUtf8 = "0000";
         const GB_SystemResult pinPairResult = GB_SystemBluetooth::PairDevice(validFormatDeviceId, pinOptions);
-        RequireResultFailed(pinPairResult, "GB_SystemBluetooth::PairDevice pin unsupported");
-        RequireTrueSystemBluetooth(pinPairResult.errorCode == GB_SystemErrorCode::UnsupportedPlatform, "GB_SystemBluetooth pin unsupported code", "PIN pairing should explicitly report UnsupportedPlatform until custom authentication exists.");
+        RequireResultFailed(pinPairResult, "GB_SystemBluetooth::PairDevice nonexistent PIN target");
 
         GB_BluetoothPairingOptions noUiOptions;
         noUiOptions.allowSystemPairingUi = false;
         const GB_SystemResult noUiPairResult = GB_SystemBluetooth::PairDevice(validFormatDeviceId, noUiOptions);
-        RequireResultFailed(noUiPairResult, "GB_SystemBluetooth::PairDevice no UI unsupported");
-        RequireTrueSystemBluetooth(noUiPairResult.errorCode == GB_SystemErrorCode::UnsupportedPlatform, "GB_SystemBluetooth no UI unsupported code", "Non-UI pairing should explicitly report UnsupportedPlatform until custom authentication exists.");
+        RequireResultFailed(noUiPairResult, "GB_SystemBluetooth::PairDevice no UI without PIN");
+        RequireTrueSystemBluetooth(noUiPairResult.errorCode == GB_SystemErrorCode::InvalidArgument,
+                                   "GB_SystemBluetooth no UI without PIN code",
+                                   "Non-UI pairing should require an explicit PIN before enumerating hardware.");
+    }
+
+    void TestWinRtBlePrimitiveLifecycle()
+    {
+        GB_BluetoothLeAdvertisementWatcherOptions watcherOptions;
+        watcherOptions.activeScanning = true;
+        watcherOptions.allowDuplicateAddresses = false;
+        watcherOptions.maxTrackedDevices = 8;
+        GB_BluetoothLeAdvertisementWatcher watcher(watcherOptions);
+        RequireTrueSystemBluetooth(watcher.IsValid(), "GB_BluetoothLeAdvertisementWatcher valid", "Advertisement watcher should create its PIMPL state.");
+        RequireTrueSystemBluetooth(!watcher.IsRunning(), "GB_BluetoothLeAdvertisementWatcher initially stopped", "Advertisement watcher should initially be stopped.");
+        RequireTrueSystemBluetooth(watcher.GetTrackedDevices().empty(), "GB_BluetoothLeAdvertisementWatcher initially empty", "Advertisement watcher should initially have no tracked devices.");
+        RequireResultSucceeded(watcher.Start(), "GB_BluetoothLeAdvertisementWatcher Start");
+        RequireTrueSystemBluetooth(watcher.IsRunning(), "GB_BluetoothLeAdvertisementWatcher running", "Advertisement watcher should report running after Start().");
+        RequireResultSucceeded(watcher.Stop(), "GB_BluetoothLeAdvertisementWatcher Stop");
+        RequireTrueSystemBluetooth(!watcher.IsRunning(), "GB_BluetoothLeAdvertisementWatcher stopped", "Advertisement watcher should report stopped after Stop().");
+        RequireResultSucceeded(watcher.Stop(), "GB_BluetoothLeAdvertisementWatcher Stop idempotent");
+
+        GB_BluetoothLeGattClient client;
+        RequireTrueSystemBluetooth(client.IsValid(), "GB_BluetoothLeGattClient valid", "GATT client should create its PIMPL state.");
+        RequireTrueSystemBluetooth(!client.IsConnected() && !client.IsReady(), "GB_BluetoothLeGattClient initially disconnected", "GATT client should initially be disconnected and not ready.");
+
+        GB_BluetoothLeGattProfile profile;
+        profile.serviceUuid = "0000FFF0-0000-1000-8000-00805F9B34FB";
+        profile.notifyCharacteristicUuid = "0000FFF1-0000-1000-8000-00805F9B34FB";
+        profile.writeCharacteristicUuid = "0000FFF2-0000-1000-8000-00805F9B34FB";
+        GB_BluetoothLeGattClientOptions clientOptions;
+        clientOptions.connectTimeoutMilliseconds = 1;
+        clientOptions.operationTimeoutMilliseconds = 1;
+        const GB_SystemResult invalidAddressResult = client.Connect(0, GB_BluetoothLeAddressType::Unknown, profile, clientOptions);
+        RequireResultFailed(invalidAddressResult, "GB_BluetoothLeGattClient zero address");
+        RequireTrueSystemBluetooth(invalidAddressResult.errorCode == GB_SystemErrorCode::InvalidArgument,
+                                   "GB_BluetoothLeGattClient zero address code",
+                                   "A zero BLE address should be rejected before touching Windows Runtime.");
+        RequireResultFailed(client.Write(std::vector<uint8_t>()), "GB_BluetoothLeGattClient empty write");
+        RequireResultSucceeded(client.Disconnect(), "GB_BluetoothLeGattClient Disconnect idempotent");
     }
 
     void TestWatcherLifecycle()
@@ -187,6 +235,7 @@ int RunGB_SystemBluetoothTests()
         TestNameHelpers();
         TestRadioAndClassicEnumeration();
         TestUnsupportedAndInvalidOperations();
+        TestWinRtBlePrimitiveLifecycle();
         TestWatcherLifecycle();
     }
     catch (const std::exception& exceptionObject)

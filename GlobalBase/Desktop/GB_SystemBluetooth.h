@@ -4,6 +4,7 @@
 #include "../GlobalBasePort.h"
 #include "GB_EventDispatcher.h"
 #include "GB_SystemResult.h"
+#include "GB_SystemBluetoothWinRt.h"
 
 #include <cstddef>
 #include <cstdint>
